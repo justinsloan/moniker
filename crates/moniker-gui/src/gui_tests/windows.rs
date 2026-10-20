@@ -349,7 +349,7 @@ pub(super) fn picking_a_profile_turns_the_tab_into_the_session(bin: &Path, dir: 
 }
 
 /// A profile without startup sequences has connect choices too, behind its "›"
-/// or the Right arrow on its row: "Just connect" and the transcript box, ticked
+/// or the Right arrow on its row: "Just connect" and the transcript box, checked
 /// as the profile says. This is the keyboard route to the connect-time
 /// transcript choice. Looking at the choices connects nothing; "Just connect"
 /// there connects in that same tab and closes the popover.
@@ -367,7 +367,7 @@ pub(super) fn the_new_tab_choices_reach_profiles_without_sequences(bin: &Path, d
     pump_for(Duration::from_millis(200));
     let list = list_in(&page).expect("the list");
 
-    // Right on a row opens its choices; a profile that records starts ticked.
+    // Right on a row opens its choices; a profile that records starts checked.
     let choices_of = |profile: &Profile| -> (gtk::Popover, gtk::Widget) {
         let more: gtk::MenuButton = find_widget(&row(&list, &profile.id)).expect("the › button");
         let popover = more.popover().expect("its popover");
@@ -388,7 +388,7 @@ pub(super) fn the_new_tab_choices_reach_profiles_without_sequences(bin: &Path, d
         "showing the choices connects nothing"
     );
 
-    // A profile that does not record starts unticked; Just connect connects.
+    // A profile that does not record starts unchecked; Just connect connects.
     let (popover, column) = choices_of(&plain);
     let parts = choices_parts(&column);
     assert_eq!(parts.labels, [("Just connect".to_owned(), false)]);

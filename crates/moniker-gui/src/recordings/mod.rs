@@ -1406,7 +1406,7 @@ impl State {
             self.window.upgrade().as_ref(),
             gio::Cancellable::NONE,
             move |chosen| {
-                // An error here is the person cancelling.
+                // An error here is the person canceling.
                 let (Ok(file), Some(state)) = (chosen, weak.upgrade()) else {
                     return;
                 };

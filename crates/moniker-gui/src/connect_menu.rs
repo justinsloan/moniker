@@ -2,7 +2,7 @@
 //! "Just connect", each startup sequence, and "Save transcript"; for the Local
 //! terminal ([`local_choices`]), "Open" and "Save transcript".
 //!
-//! A click (or Enter) on a row opens it at once, with "Save transcript" ticked
+//! A click (or Enter) on a row opens it at once, with "Save transcript" checked
 //! if the profile says so or "Save transcripts of all sessions" is on
 //! ([`crate::terminal_tab::default_save`]); there is no per-profile default
 //! sequence. The choices are for every profile, with or without sequences, and
@@ -60,7 +60,7 @@ fn entry_button(label: &str) -> gtk::Button {
         .build()
 }
 
-/// The "Save transcript" check box, ticked if `save`.
+/// The "Save transcript" check box, checked if `save`.
 fn save_box(save: bool) -> gtk::CheckButton {
     gtk::CheckButton::builder()
         .label(RECORD_LABEL)
@@ -99,7 +99,7 @@ fn column(name: &str, buttons: &[gtk::Button], record: &gtk::CheckButton) -> gtk
 /// ([`crate::terminal_tab::default_save`]).
 ///
 /// Clicking a button calls `on_choose` with that entry's choice and with
-/// whether the box is ticked: that is the connect-time override of the
+/// whether the box is checked: that is the connect-time override of the
 /// profile's transcript setting. The labels are plain text: sequence names
 /// come from profile data. "Just connect" takes the focus when the column is
 /// shown, so Enter connects.
@@ -128,8 +128,8 @@ pub fn choices(
 }
 
 /// The Local terminal's choices: an "Open" button, then the "Save transcript"
-/// check box, ticked if `save`. "Open" calls `on_open` with whether the box is
-/// ticked; it takes the focus when the column is shown, so Enter opens.
+/// check box, checked if `save`. "Open" calls `on_open` with whether the box is
+/// checked; it takes the focus when the column is shown, so Enter opens.
 pub fn local_choices(save: bool, on_open: impl Fn(bool) + 'static) -> gtk::Widget {
     let record = save_box(save);
     let open = entry_button(OPEN_LABEL);

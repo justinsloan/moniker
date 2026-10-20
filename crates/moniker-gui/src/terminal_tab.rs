@@ -579,10 +579,10 @@ pub fn transcript_spec(
     })
 }
 
-/// Whether a session's "Save transcript" choice starts out ticked (and what a
+/// Whether a session's "Save transcript" choice starts out checked (and what a
 /// plain click or Enter does): "Save transcripts of all sessions" (`save_all`)
 /// wins over everything, else the profile's own setting. A local terminal has no
-/// setting of its own, so it passes `false`. The person can still untick one
+/// setting of its own, so it passes `false`. The person can still uncheck one
 /// session in the choices behind "›".
 pub fn default_save(profile_setting: bool, save_all: bool) -> bool {
     save_all || profile_setting
@@ -879,7 +879,7 @@ pub(crate) fn set_scrollback(lines: i64) {
     SCROLLBACK.set(c_long::try_from(lines).unwrap_or(c_long::MAX));
 }
 
-/// A terminal that fills its tab, in the colours of the current light or dark
+/// A terminal that fills its tab, in the colors of the current light or dark
 /// style and the font of the Preferences, with the Preferences' scrollback (a
 /// tab that saves a transcript then gets unlimited scrollback instead) and the
 /// Copy and Paste menu ([`terminal_menu`]).
@@ -1208,7 +1208,7 @@ fn is_parked(terminal: &Terminal) -> bool {
 ///
 /// Best effort: whether the child really exits is only known from VTE's
 /// `child-exited` ([`end_session`] waits for it). Moniker's own process, group
-/// and session, and the ids 0 and 1, are never signalled
+/// and session, and the ids 0 and 1, are never signaled
 /// ([`signal_target`]). The group and the session are read from the pty
 /// itself, so this cannot reach a process that merely reused the pid of a child
 /// that has gone. (Unsetting the pty, which would close it, crashes VTE 0.84
@@ -1238,7 +1238,7 @@ fn hang_up(terminal: &Terminal) {
 ///
 /// Not rustix's `tcgetsid`: that wraps the number in a `Pid`, which cannot be
 /// zero, without looking, so a 0 (the kernel's answer for a session outside our
-/// pid namespace) would panic a debug build and be undefined behaviour in a
+/// pid namespace) would panic a debug build and be undefined behavior in a
 /// release build before any check of ours could run. Read as a plain integer,
 /// the 0 reaches [`signal_target`].
 fn pty_session(fd: impl AsFd) -> Option<c_int> {
@@ -1909,7 +1909,7 @@ mod tests {
 
     #[test]
     fn default_save_truth_table() {
-        // (profile's own setting, save all) -> ticked
+        // (profile's own setting, save all) -> checked
         assert!(!default_save(false, false), "nothing asks for it");
         assert!(default_save(true, false), "the profile's own setting");
         assert!(
@@ -2226,14 +2226,14 @@ mod tests {
     // signal_target
 
     #[test]
-    fn zero_one_and_below_are_never_signalled() {
+    fn zero_one_and_below_are_never_signaled() {
         for raw in [0, 1, -1, c_int::MIN] {
             assert_eq!(signal_target(raw), None, "{raw}");
         }
     }
 
     #[test]
-    fn moniker_itself_is_never_signalled() {
+    fn moniker_itself_is_never_signaled() {
         assert_eq!(signal_target(getpid().as_raw_pid()), None);
         assert_eq!(signal_target(getpgrp().as_raw_pid()), None);
         let session = getsid(None).expect("our session");
@@ -2241,7 +2241,7 @@ mod tests {
     }
 
     #[test]
-    fn another_process_may_be_signalled() {
+    fn another_process_may_be_signaled() {
         let other = Pid::from_raw(c_int::MAX).expect("a pid");
         assert_eq!(signal_target(c_int::MAX), Some(other));
         // The one after init is as good as any other.

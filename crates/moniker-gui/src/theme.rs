@@ -1,13 +1,13 @@
-//! The terminal's colours: a light and a dark palette that follow the style of
+//! The terminal's colors: a light and a dark palette that follow the style of
 //! the desktop.
 //!
-//! Colours are set once on a terminal ([`follow_style`]) and again only when the
+//! Colors are set once on a terminal ([`follow_style`]) and again only when the
 //! application's light/dark style changes (`adw::StyleManager:dark`), by one
 //! handler for the whole application. Nothing runs per frame, so this costs the
 //! render path nothing.
 //!
 //! The dark palette is GNOME Console's own; the light one is close to Console's:
-//! the GNOME colour set on libadwaita's view colours. In both palettes the
+//! the GNOME color set on libadwaita's view colors. In both palettes the
 //! neutrals run from dark to light in order (black, bright black, white, bright
 //! white), because programs pair them: tmux's `fg=white,bg=black`, mc's bright
 //! white on blue, powerline and starship prompts. White and bright white are
@@ -26,16 +26,16 @@ use libadwaita as adw;
 use vte4::Terminal;
 use vte4::prelude::*;
 
-/// The colours of one style.
+/// The colors of one style.
 pub struct Palette {
     pub foreground: gdk::RGBA,
     pub background: gdk::RGBA,
-    /// The 16 ANSI colours: black, red, green, yellow, blue, magenta, cyan,
+    /// The 16 ANSI colors: black, red, green, yellow, blue, magenta, cyan,
     /// white, and the bright version of each.
     pub colors: [gdk::RGBA; 16],
 }
 
-/// An opaque colour from `0xRRGGBB`.
+/// An opaque color from `0xRRGGBB`.
 fn rgb(hex: u32) -> gdk::RGBA {
     let channel = |shift: u32| ((hex >> shift) & 0xff) as f32 / 255.0;
     gdk::RGBA::new(channel(16), channel(8), channel(0), 1.0)
@@ -69,7 +69,7 @@ pub fn palette(dark: bool) -> Palette {
     }
 }
 
-/// Give `terminal` the colours of the current style now, and again whenever the
+/// Give `terminal` the colors of the current style now, and again whenever the
 /// style changes between light and dark for as long as the terminal lives.
 pub fn follow_style(terminal: &Terminal) {
     let manager = adw::StyleManager::default();
@@ -110,7 +110,7 @@ thread_local! {
     static WATCHING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Set the colours of `terminal` to the palette of the dark or light style.
+/// Set the colors of `terminal` to the palette of the dark or light style.
 fn apply(terminal: &Terminal, dark: bool) {
     let palette = palette(dark);
     let colors: Vec<&gdk::RGBA> = palette.colors.iter().collect();
@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn every_colour_is_opaque_and_the_ansi_colours_are_distinct() {
+    fn every_color_is_opaque_and_the_ansi_colors_are_distinct() {
         for p in [palette(true), palette(false)] {
             assert_eq!(p.colors.len(), 16);
             for color in p.colors.iter().chain([&p.foreground, &p.background]) {
@@ -173,7 +173,7 @@ mod tests {
             + 0.0722 * linear(color.blue())
     }
 
-    /// WCAG contrast ratio of two colours, 1 (the same) to 21 (black on white).
+    /// WCAG contrast ratio of two colors, 1 (the same) to 21 (black on white).
     fn contrast(a: &gdk::RGBA, b: &gdk::RGBA) -> f32 {
         let (a, b) = (relative_luminance(a), relative_luminance(b));
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
@@ -195,7 +195,7 @@ mod tests {
                 let ratio = contrast(&p.colors[text], &p.colors[background]);
                 assert!(
                     ratio >= 4.5,
-                    "light: colour {text} on colour {background} is only {ratio:.2}:1"
+                    "light: color {text} on color {background} is only {ratio:.2}:1"
                 );
             }
         }
@@ -216,16 +216,16 @@ mod tests {
     }
 
     #[test]
-    fn the_ansi_colours_can_be_read_on_their_own_background() {
+    fn the_ansi_colors_can_be_read_on_their_own_background() {
         // Black and bright black are for backgrounds and dim text and may sit
-        // close to it; every colour a program prints text in must not vanish.
+        // close to it; every color a program prints text in must not vanish.
         // (White and bright white are light in the light style, as in GNOME
         // Console, so text in them directly on its white background is faint
         // by design; it stays above this loose bar.)
         for p in [palette(true), palette(false)] {
             for index in (1..8).chain(9..16) {
                 let gap = (luminance(&p.colors[index]) - luminance(&p.background)).abs();
-                assert!(gap > 0.1, "colour {index} is too close to the background");
+                assert!(gap > 0.1, "color {index} is too close to the background");
             }
         }
     }

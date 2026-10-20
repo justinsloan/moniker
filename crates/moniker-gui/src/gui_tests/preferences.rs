@@ -28,7 +28,7 @@ use super::main_window::{ctx_with, menu_items, test_app};
 use super::save_transcripts::listed_in_transcripts_window;
 use super::windows::{main_window, named};
 use super::{
-    MARKUP_NAME, all_widgets, assert_plain_row, button_labelled, find_widget, labels_in,
+    MARKUP_NAME, all_widgets, assert_plain_row, button_labeled, find_widget, labels_in,
     literal_labels, pump_for, pump_until,
 };
 use crate::context::AppContext;
@@ -220,7 +220,7 @@ pub(super) fn preferences_has_the_four_settings_and_sync(dir: &Path) {
     );
     literal_labels("folder row", &folder_row, folder_text);
     assert!(
-        button_labelled(&folder_row, "Choose…").is_some(),
+        button_labeled(&folder_row, "Choose…").is_some(),
         "a Choose… button"
     );
 
@@ -232,7 +232,7 @@ pub(super) fn preferences_has_the_four_settings_and_sync(dir: &Path) {
         Some("Sync key, the other machine, automatic sync")
     );
     assert!(
-        button_labelled(&sync_row, "Open").is_some(),
+        button_labeled(&sync_row, "Open").is_some(),
         "an Open button"
     );
 
@@ -478,7 +478,7 @@ pub(super) fn choosing_a_folder_moves_the_transcripts(dir: &Path) {
     assert_eq!(listed_in_transcripts_window(&app), names);
     let dialog = open(&app, &ctx, &main);
     let folder_row = action_row(&dialog, "Transcripts folder");
-    let choose = button_labelled(&folder_row, "Choose…").expect("Choose…");
+    let choose = button_labeled(&folder_row, "Choose…").expect("Choose…");
 
     // Refused: nothing saved, nothing moved, nothing made.
     let shown = ctx.notice.delivered();
@@ -520,7 +520,7 @@ pub(super) fn choosing_a_folder_moves_the_transcripts(dir: &Path) {
     close_dialog(&main, &dialog);
     let dialog = open(&app, &ctx, &main);
     let reopened =
-        button_labelled(&action_row(&dialog, "Transcripts folder"), "Choose…").expect("Choose…");
+        button_labeled(&action_row(&dialog, "Transcripts folder"), "Choose…").expect("Choose…");
     assert!(!reopened.is_sensitive(), "the new dialog waits as well");
     let shown = ctx.notice.delivered();
     let third = dir.join("third");
@@ -670,7 +670,7 @@ pub(super) fn a_folder_that_cannot_be_saved_is_refused(dir: &Path) {
     assert_eq!(folder_row.subtitle().as_deref(), old.to_str());
     assert_eq!(preferences::moves_holding_the_app(), 0, "no move started");
     assert!(
-        button_labelled(&folder_row, "Choose…").is_some_and(|b| b.is_sensitive()),
+        button_labeled(&folder_row, "Choose…").is_some_and(|b| b.is_sensitive()),
         "Choose… is still there to use"
     );
 
@@ -716,7 +716,7 @@ pub(super) fn the_same_folder_by_another_name_changes_nothing(dir: &Path) {
         assert_eq!(preferences::moves_holding_the_app(), 0, "{same:?}");
     }
     assert!(
-        button_labelled(&folder_row, "Choose…").is_some_and(|b| b.is_sensitive()),
+        button_labeled(&folder_row, "Choose…").is_some_and(|b| b.is_sensitive()),
         "no move was started"
     );
 
@@ -766,7 +766,7 @@ pub(super) fn the_sync_button_opens_the_sync_page(dir: &Path) {
     let app = test_app();
     let main = main_window(&app, &ctx);
     let dialog = open(&app, &ctx, &main);
-    button_labelled(&action_row(&dialog, "Sync settings"), "Open")
+    button_labeled(&action_row(&dialog, "Sync settings"), "Open")
         .expect("the Open button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));

@@ -6,8 +6,8 @@ Everything automatable is covered by `cargo test --workspace`, the window tests 
 
 1. In a connected tab, `htop` and `tmux` render correctly, resizing works, and `seq 1 200000` scrolls without lag. They feel as fast as in your old terminal.
 2. Scrollback in an ordinary tab holds about 10,000 lines (the Scrollback preference's default).
-3. Switch the system style between light and dark (GNOME Settings, Appearance): open terminals recolour at once, and new ones start in the matching palette.
-4. In light mode, white and bright white text on a black and on a blue background is readable (for example `printf '\e[37;40m a \e[97;40m b \e[37;44m c \e[97;44m d \e[0m'`); the light palette's neutrals were flagged, and white and bright white are now light in both palettes. Dark mode uses GNOME Console's own colours: it should look like Console.
+3. Switch the system style between light and dark (GNOME Settings, Appearance): open terminals recolor at once, and new ones start in the matching palette.
+4. In light mode, white and bright white text on a black and on a blue background is readable (for example `printf '\e[37;40m a \e[97;40m b \e[37;44m c \e[97;44m d \e[0m'`); the light palette's neutrals were flagged, and white and bright white are now light in both palettes. Dark mode uses GNOME Console's own colors: it should look like Console.
 
 ## Launch, tabs and windows
 
@@ -60,11 +60,11 @@ Everything automatable is covered by `cargo test --workspace`, the window tests 
 39. Make B unreachable during a sync: after at most two minutes, "the other machine did not finish in time…".
 40. Leave the Sync page while a sync runs: the app stays responsive and the profile list refreshes when it finishes.
 41. Automatic sync: quit and start Moniker again. The local terminal appears and works at once, and a successful sync is silent. With B unreachable there is one notification. The switch on the Sync page turns it off.
-42. Automatic sync at launch with the keyring locked: the terminal stays responsive, the system's unlock prompt may appear, and cancelling it gives one notification on failure.
+42. Automatic sync at launch with the keyring locked: the terminal stays responsive, the system's unlock prompt may appear, and canceling it gives one notification on failure.
 43. Sync Now (☰) reports the result in a notification; pressed while a sync runs it says "A sync is already running.".
 44. Start `moniker` from a terminal with a sync partner whose key has a passphrase: note whether a prompt appears in that terminal (a known open item: the sync's ssh has no `BatchMode`).
 
-## Known behaviours to confirm you are happy with
+## Known behaviors to confirm you are happy with
 
 45. Some keyring calls (opening the Sync page, saving a sync key, connecting) run on the GTK main thread, so a locked keyring can freeze the window briefly while GNOME asks for the unlock.
 46. "Remove stored password (this machine only)" does not propagate through sync, and the password can come back from a machine that still has it.
@@ -95,7 +95,7 @@ Everything automatable is covered by `cargo test --workspace`, the window tests 
 
 ## Alpha 3: the Transcripts window (Recorded Sessions until alpha 4)
 
-Make a few transcripts first: connect to a profile with "Save transcript" on (or ticked in its › choices), run something, and close the tab. For the odd-file checks use a throwaway data directory (`XDG_DATA_HOME=$(mktemp -d) target/debug/moniker`) rather than your real transcripts.
+Make a few transcripts first: connect to a profile with "Save transcript" on (or checked in its › choices), run something, and close the tab. For the odd-file checks use a throwaway data directory (`XDG_DATA_HOME=$(mktemp -d) target/debug/moniker`) rather than your real transcripts.
 
 65. ☰ → Transcripts opens a window in the Connection Profiles window's layout. The sidebar lists the transcripts under day headings (Today, Yesterday, then dates), each row with its host and local start time, and the window warns that transcripts may include secrets.
 66. The order choice flips Newest first / Oldest first. The host filter lists "All hosts" and each host that has transcripts, and narrows the list to one.
@@ -109,10 +109,10 @@ Make a few transcripts first: connect to a profile with "Save transcript" on (or
 74. A very large transcript (in a tab that saves a transcript run `seq 1 2000000`, close the tab, open the transcript) and one with a single multi-megabyte line (`yes | head -c 5000000 | tr -d '\n'`): the window stays responsive while the text loads, and scrolling and searching work. Say how long it takes. (Run on 0.3.0: the single line took about 6 s; checks 105-108 repeat it for alpha 4.)
 75. Odd files (in a throwaway data directory, in `moniker/transcripts/`): files that are not named like transcripts are not listed: `notes.txt`, `.bashrc`, `host_badstamp.txt`, and a big one (`truncate -s 1G big.iso`, which takes no disk space). None of them appears, none is offered as a host, and a search across all transcripts stays quick (they are not read). A symbolic link is not listed, even one named like a transcript. A file named `<b>x&amp;_20261017-120000.txt` is listed under the host `<b>x&amp;`, shown literally, not in bold. (Until alpha 4 a name that did not parse was listed under its file name with its modification time.)
 
-## Alpha 3: sessions, licence and the empty case
+## Alpha 3: sessions, license and the empty case
 
 76. Close a tab that runs `vim` in a local shell, and close a tab with a live `ssh` session (also closing a whole window with such tabs): `ps` shows no `vim` or `ssh` left over from that tab or window.
-77. ☰ → About Moniker shows version 0.4.0, "Copyright 2026 Justin M. Sloan" and the MIT licence, and no website link.
+77. ☰ → About Moniker shows version 0.4.0, "Copyright 2026 Justin M. Sloan" and the MIT license, and no website link.
 78. With no profiles (start Moniker with `XDG_CONFIG_HOME` pointing at an empty directory), the new-tab list shows only Local terminal; ☰ → Connection Profiles opens the empty Connection Profiles window, and the first profile saved there appears in an open new-tab list.
 
 ## Alpha 3: tab rename fixes
@@ -129,8 +129,8 @@ Make a few transcripts first: connect to a profile with "Save transcript" on (or
 
 ## Alpha 4: saving transcripts
 
-85. With a fresh config, Save transcripts of all sessions is off. Clicking Local terminal in the new-tab list and closing that tab saves nothing. The › on Local terminal shows Open and an unticked "Save transcript" box; ticking it and pressing Open saves a transcript when the tab closes.
-86. Switch it on. A local tab (click Local terminal) now saves a transcript on close, and so does a connection to a profile whose own "Save transcript" switch is off; the box under › starts ticked for both, and unticking it before Open or Just connect saves nothing for that session while other tabs still do. A tab that was already open when the switch changed is not affected.
+85. With a fresh config, Save transcripts of all sessions is off. Clicking Local terminal in the new-tab list and closing that tab saves nothing. The › on Local terminal shows Open and an unchecked "Save transcript" box; checking it and pressing Open saves a transcript when the tab closes.
+86. Switch it on. A local tab (click Local terminal) now saves a transcript on close, and so does a connection to a profile whose own "Save transcript" switch is off; the box under › starts checked for both, and unchecking it before Open or Just connect saves nothing for that session while other tabs still do. A tab that was already open when the switch changed is not affected.
 87. The launch tab: with the switch on, quit and start Moniker, type something in the first tab and close it: a transcript is saved. Switch it off, start again: the first tab saves nothing.
 88. A local transcript is named `<this computer's host name>_<date>-<time>.txt` (compare `hostname`). In the Transcripts window it is listed under that host, which the host filter offers, with the connection transcripts under theirs.
 89. Wording: the ☰ menu says Connection Profiles, Transcripts and Preferences; a profile's page has a "Save transcript" switch; the › choices have a "Save transcript" box; the windows are titled Connection Profiles and Transcripts; and "Recorded Sessions" and "Record transcript" appear nowhere. In the narrowest layout the Connection Profiles and Transcripts sidebar titles are not cut off badly.

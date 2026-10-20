@@ -35,11 +35,11 @@ pub const REMOVE_PASSWORD_NOTE: &str = "Other machines keep their copy; a later 
 /// What saving the editor does to the stored password.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasswordAction {
-    /// Nothing typed and "remove" not ticked: leave the stored password alone.
+    /// Nothing typed and "remove" not checked: leave the stored password alone.
     Keep,
     /// A new password was typed: store it.
     Set,
-    /// "Remove stored password (this machine only)" was ticked: delete it from
+    /// "Remove stored password (this machine only)" was checked: delete it from
     /// this machine's keyring. The removal is not synced: other machines keep
     /// their copy and a later sync can bring the password back.
     Remove,
@@ -97,14 +97,14 @@ fn describe(err: ProfileError) -> String {
 /// Decide what to do with the stored password from what the editor shows.
 ///
 /// Any typed text counts (a password may be all spaces). Typing a password
-/// and ticking "remove" is contradictory, so it is an error rather than a guess.
-pub fn password_action(typed: &str, remove_ticked: bool) -> Result<PasswordAction, String> {
-    match (typed.is_empty(), remove_ticked) {
+/// and checking "remove" is contradictory, so it is an error rather than a guess.
+pub fn password_action(typed: &str, remove_checked: bool) -> Result<PasswordAction, String> {
+    match (typed.is_empty(), remove_checked) {
         (true, false) => Ok(PasswordAction::Keep),
         (false, false) => Ok(PasswordAction::Set),
         (true, true) => Ok(PasswordAction::Remove),
         (false, true) => Err(format!(
-            "Either type a new password or tick \u{201c}{REMOVE_PASSWORD_LABEL}\u{201d}, not both."
+            "Either type a new password or check \u{201c}{REMOVE_PASSWORD_LABEL}\u{201d}, not both."
         )),
     }
 }
@@ -327,7 +327,7 @@ pub enum Move {
     Down,
 }
 
-/// `seqs` with the sequence at `index` swapped with its neighbour in direction
+/// `seqs` with the sequence at `index` swapped with its neighbor in direction
 /// `dir`. Unchanged at either end, or for an `index` that is not in the list.
 ///
 /// The order is the order of the connect choices.
@@ -885,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn moving_swaps_neighbours_and_stops_at_the_ends() {
+    fn moving_swaps_neighbors_and_stops_at_the_ends() {
         let s = [seq("a", &["1"]), seq("b", &["2"]), seq("c", &["3"])];
         let names = |v: Vec<StartupSequence>| v.into_iter().map(|s| s.name).collect::<Vec<_>>();
         assert_eq!(names(moved(&s, 1, Move::Up)), ["b", "a", "c"]);

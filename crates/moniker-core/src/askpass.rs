@@ -1424,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn not_used_keeps_todays_behaviour() {
+    fn not_used_keeps_todays_behavior() {
         // The sync path: no marker, and ssh itself allows one prompt.
         let store = store_with_secret();
         for prompt in [

@@ -293,7 +293,7 @@ fn gui_integration() {
     tabs::the_tab_menus_rename_puts_the_cursor_in_the_name_field();
     tabs::double_clicking_a_tab_asks_for_a_new_name();
     tabs::the_tab_bars_close_button_closes_the_tab(&bin, &tmp.path().join("t-bar"));
-    tabs::terminal_colours_follow_light_and_dark();
+    tabs::terminal_colors_follow_light_and_dark();
     tabs::copy_and_paste_round_trip(&bin, &tmp.path().join("c-trip"));
     tabs::paste_is_bracketed_when_the_program_asks(&bin, &tmp.path().join("c-bracket"));
     tabs::the_copy_key_is_handled_without_a_selection(&bin, &tmp.path().join("c-select"));
@@ -335,7 +335,7 @@ fn gui_integration() {
         &bin,
         &tmp.path().join("v-all"),
     );
-    save_transcripts::unticking_skips_one_session(&bin, &tmp.path().join("v-untick"));
+    save_transcripts::unchecking_skips_one_session(&bin, &tmp.path().join("v-uncheck"));
     save_transcripts::the_launch_tab_saves_when_save_all_is_on(&tmp.path().join("v-launch"));
     save_transcripts::transcripts_go_to_the_chosen_folder(&bin, &tmp.path().join("v-folder"));
     preferences::preferences_has_the_four_settings_and_sync(&tmp.path().join("f-rows"));
@@ -641,7 +641,7 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     );
 
     // The delete confirmation names the profile as it is. Cancel leaves it be.
-    button_labelled(&profiles_window, "Delete Profile")
+    button_labeled(&profiles_window, "Delete Profile")
         .expect("the delete button")
         .emit_clicked();
     pump_for(Duration::from_millis(200));
@@ -656,7 +656,7 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         "dialog heading parses markup"
     );
     literal_labels("delete dialog", &dialog, &heading);
-    button_labelled(&dialog, "Cancel")
+    button_labeled(&dialog, "Cancel")
         .expect("the dialog's Cancel button")
         .emit_clicked();
     pump_for(Duration::from_millis(200));
@@ -758,7 +758,7 @@ fn widgets_of_type(root: &impl IsA<gtk::Widget>, type_name: &str) -> Vec<gtk::Wi
 }
 
 /// The button below `root` whose label is `label`.
-fn button_labelled(root: &impl IsA<gtk::Widget>, label: &str) -> Option<gtk::Button> {
+fn button_labeled(root: &impl IsA<gtk::Widget>, label: &str) -> Option<gtk::Button> {
     let mut stack = vec![root.clone().upcast::<gtk::Widget>()];
     while let Some(widget) = stack.pop() {
         if let Some(button) = widget.downcast_ref::<gtk::Button>()

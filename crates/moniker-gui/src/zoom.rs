@@ -95,7 +95,7 @@ mod tests {
     }
 
     #[test]
-    fn an_in_between_value_goes_to_the_neighbouring_step() {
+    fn an_in_between_value_goes_to_the_neighboring_step() {
         assert_eq!(larger(1.05), 1.1);
         assert_eq!(smaller(1.05), 1.0);
         assert_eq!(larger(1.4), 1.5);

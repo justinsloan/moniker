@@ -608,7 +608,7 @@ impl State {
         let selected = self.selected.borrow().clone();
         // GTK moves focus on from a focused row that is removed, and the list
         // selects whatever row gets focus: a deleted selection would silently
-        // become its neighbour. So focus leaves the list while it is rebuilt
+        // become its neighbor. So focus leaves the list while it is rebuilt
         // and comes back only to the row that stays selected.
         let root = self.list.root();
         let focus_in_list = root.as_ref().and_then(RootExt::focus).is_some_and(|f| {

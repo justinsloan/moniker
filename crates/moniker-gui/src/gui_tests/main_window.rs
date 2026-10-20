@@ -22,7 +22,7 @@ use moniker_core::secrets::MemorySecretStore;
 use moniker_core::store::ProfileStore;
 
 use super::{
-    MARKUP_NAME, all_widgets, button_labelled, fake_ssh, files_in, find_widget, fixture, labels_in,
+    MARKUP_NAME, all_widgets, button_labeled, fake_ssh, files_in, find_widget, fixture, labels_in,
     make_helper, pump_for, pump_until, wait_for_text,
 };
 use crate::connect_menu::{self, RECORD_LABEL};
@@ -375,14 +375,14 @@ fn the_choices_widget_offers_each_sequence() {
         [(Some(1), false), (None, false), (Some(0), false)]
     );
 
-    // Ticking the box overrides the profile (off -> record).
+    // Checking the box overrides the profile (off -> record).
     chosen.borrow_mut().clear();
     parts.record.set_active(true);
     parts.buttons[1].emit_clicked();
     parts.buttons[0].emit_clicked();
     assert_eq!(*chosen.borrow(), [(Some(0), true), (None, true)]);
 
-    // A profile that records starts ticked; unticking overrides it, and the box
+    // A profile that records starts checked; unchecking overrides it, and the box
     // is read when a button is clicked.
     let mut recording = p.clone();
     recording.transcript = true;
@@ -466,8 +466,8 @@ fn the_connect_time_choice_decides_whether_a_transcript_is_written(bin: &Path, d
     }
 }
 
-/// About shows who owns Moniker and under which licence: the copyright line
-/// and the MIT licence, and nothing else linked (no website yet).
+/// About shows who owns Moniker and under which license: the copyright line
+/// and the MIT license, and nothing else linked (no website yet).
 pub(super) fn about_shows_copyright_and_mit() {
     let about = crate::about_dialog();
     assert_eq!(
@@ -556,7 +556,7 @@ pub(super) fn profiles_connect_opens_in_the_last_active_window(dir: &Path) {
     });
     profiles::select(&profiles_window, &p.id);
     pump_for(Duration::from_millis(100));
-    button_labelled(&profiles_window, "Connect")
+    button_labeled(&profiles_window, "Connect")
         .expect("the Connection Profiles window's Connect button")
         .emit_clicked();
     pump_for(Duration::from_millis(100));

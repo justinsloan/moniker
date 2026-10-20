@@ -9,7 +9,7 @@
 //! Below it the tab bar, which hides itself while there is one tab, so a fresh
 //! window looks like a plain terminal; then the tabs ([`crate::terminal_tab`])
 //! inside a notification area ([`crate::notify`]) attached to the context's
-//! [`crate::context::Notice`], so messages appear at the top centre of the
+//! [`crate::context::Notice`], so messages appear at the top center of the
 //! terminal, below the bars.
 //!
 //! Each main window has the actions of its tabs: `win.new-tab` (as ＋ does),

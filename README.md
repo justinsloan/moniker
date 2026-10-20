@@ -12,9 +12,9 @@ This is alpha 4 (version 0.4.0).
 Profiles and their passwords can be synced between your own machines, with no
 server of anyone's: Moniker runs `moniker-server sync-serve` on the other
 machine over plain `ssh` and exchanges one bundle encrypted with a shared sync
-key. There are no split panes, no terminal search and no colour settings (the
-terminal colours follow the system light or dark style; Preferences has the font,
-the scrollback and the transcripts). Moniker is released under the MIT licence
+key. There are no split panes, no terminal search and no color settings (the
+terminal colors follow the system light or dark style; Preferences has the font,
+the scrollback and the transcripts). Moniker is released under the MIT license
 (see `LICENSE`), copyright 2026 Justin M. Sloan.
 
 Three programs are built: `moniker` (the terminal app), `moniker-server` (the
@@ -41,7 +41,7 @@ so.
 `bash scripts/build-deb.sh` builds two Debian packages into `target/debian/`:
 `moniker-server` (`moniker-server` and `moniker-askpass`, no GTK, for every
 machine that syncs) and `moniker` (the terminal app, which depends on it). Each
-carries the MIT licence and the copyright line in its `copyright` file. Both
+carries the MIT license and the copyright line in its `copyright` file. Both
 list Justin Sloan as Maintainer (the address comes from `git config user.email`),
 and the `moniker` package carries AppStream metadata
 (`data/org.moniker.Moniker.metainfo.xml`) that names the same developer, which
@@ -70,7 +70,7 @@ or VTE, so a headless machine can build just `cargo build --release -p moniker-c
   is set to (or if "Save transcripts of all sessions" is on, see Preferences).
   The **›** on a row (or Right arrow) shows the choices for that profile instead:
   "Just connect", one entry per startup sequence, and a "Save transcript" box
-  that starts as the profile's setting (ticked when every session is saved) and
+  that starts as the profile's setting (checked when every session is saved) and
   overrides it for that connection, in either direction.
 * **Tabs**: Ctrl+Shift+T new, Ctrl+Shift+W close, Ctrl+PgUp / Ctrl+PgDn switch,
   Ctrl+Shift+N new window. Every other key, Ctrl+Tab and F10 included, goes to
@@ -125,7 +125,7 @@ or VTE, so a headless machine can build just `cargo build --release -p moniker-c
   **›** choices of a profile and of Local terminal have a "Save transcript" box,
   and Preferences has "Save transcripts of all sessions" (off to start with),
   which saves every new tab, the first tab at launch included, whatever the
-  profile says; the box under **›** then starts ticked, and unticking it skips
+  profile says; the box under **›** then starts checked, and unchecking it skips
   that one session. Transcripts are never synced. The folder is chosen in
   Preferences.
 * **Transcripts window** (☰ → Transcripts) opens a window, laid out like the
@@ -280,9 +280,9 @@ Preferences change then says it cannot be saved and leaves it too.
   launch too) can appear in that shell's terminal.
 * Sync needs a Secret Service on the remote machine; there is no fallback store.
 
-## Licence
+## License
 
-Moniker is released under the MIT licence; see `LICENSE`. Copyright 2026 Justin
+Moniker is released under the MIT license; see `LICENSE`. Copyright 2026 Justin
 M. Sloan.
 
 ## Tests

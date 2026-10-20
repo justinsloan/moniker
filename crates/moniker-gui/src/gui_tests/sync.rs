@@ -25,7 +25,7 @@ use zeroize::Zeroizing;
 
 use super::main_window::test_app;
 use super::{
-    WAIT, all_widgets, button_labelled, find_widget, labels_in, make_helper, pump_for, pump_until,
+    WAIT, all_widgets, button_labeled, find_widget, labels_in, make_helper, pump_for, pump_until,
     widgets_of_type,
 };
 use crate::context::AppContext;
@@ -178,7 +178,7 @@ fn page_in(window: &adw::Window) -> Page {
         machine: find_widget(&widget).expect("the profile choice"),
         auto_sync: find_widget(&widget).expect("the switch"),
         hint: named_label(&widget, sync_page::HINT_NAME),
-        sync_button: button_labelled(&widget, "Sync").expect("the Sync button"),
+        sync_button: button_labeled(&widget, "Sync").expect("the Sync button"),
         result: named_label(&widget, sync_page::RESULT_NAME),
         widget,
     }

@@ -148,7 +148,7 @@ pub(crate) fn save_sync_key(secrets: &dyn SecretStore, typed: &str) -> Result<()
         .map_err(|err| format!("Could not save the sync key: {err}"))
 }
 
-/// `message` as a sentence for the sync page: first letter capitalized, full stop.
+/// `message` as a sentence for the sync page: first letter capitalized, period at the end.
 fn sentence(message: &str) -> String {
     let mut chars = message.chars();
     let first: String = chars
@@ -311,7 +311,7 @@ pub(crate) fn run_with(
 ///
 /// Only `work` crosses to the worker (it is `Send`); `done` stays on the main
 /// thread and may hold GTK objects. If the worker panics or cannot be started,
-/// `done` gets an error instead. The thread is never cancelled: if whatever
+/// `done` gets an error instead. The thread is never canceled: if whatever
 /// `done` belongs to is gone by then, `done` simply finds nothing to update.
 ///
 /// Must be called from the thread that runs the main loop.

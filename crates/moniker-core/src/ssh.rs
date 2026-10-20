@@ -12,7 +12,7 @@
 //! the password up in the keyring itself.
 //!
 //! The builders assume a validated live profile (see `Profile::validate`).
-//! The `--` separator before the destination is a second line of defence in
+//! The `--` separator before the destination is a second line of defense in
 //! case a bad host or username ever slips through: after `--`, `ssh` cannot
 //! parse the destination as an option.
 //!
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn destination_follows_double_dash() {
         // Deliberately unvalidated: `Profile::new` does not validate, and this
-        // proves `--` is a second line of defence behind `Profile::validate`.
+        // proves `--` is a second line of defense behind `Profile::validate`.
         let mut bad_host = profile();
         bad_host.host = "-oProxyCommand=x".to_string();
         let mut bad_user = profile();

@@ -20,7 +20,7 @@ use moniker_core::transcript::{transcript_path, write_transcript};
 
 use super::main_window::{ctx_with, test_app};
 use super::{
-    all_widgets, button_labelled, find_widget, labels_in, literal_labels, pump_for, pump_until,
+    all_widgets, button_labeled, find_widget, labels_in, literal_labels, pump_for, pump_until,
 };
 use crate::notify::NotificationArea;
 use crate::recordings::{
@@ -427,7 +427,7 @@ pub(super) fn odd_recordings_show_literally(dir: &Path) {
     literal_labels("viewer title", &title, markup_host);
 
     // The delete confirmation names it as it is. Cancel keeps the file.
-    button_labelled(&window, "Delete")
+    button_labeled(&window, "Delete")
         .expect("the Delete button")
         .emit_clicked();
     pump_for(Duration::from_millis(200));
@@ -440,7 +440,7 @@ pub(super) fn odd_recordings_show_literally(dir: &Path) {
     let body = dialog.body();
     assert!(body.contains(markup_host), "{body:?}");
     literal_labels("delete dialog", &dialog, &body);
-    button_labelled(&dialog, "Cancel")
+    button_labeled(&dialog, "Cancel")
         .expect("Cancel")
         .emit_clicked();
     pump_for(Duration::from_millis(200));
@@ -471,7 +471,7 @@ pub(super) fn deleting_the_open_recording_clears_the_viewer(dir: &Path) {
     open_row(&window, &gone);
     pump_until("the text", || viewer_text(&window) == "delete me\n");
 
-    button_labelled(&window, "Delete")
+    button_labeled(&window, "Delete")
         .expect("the Delete button")
         .emit_clicked();
     pump_for(Duration::from_millis(200));
@@ -479,7 +479,7 @@ pub(super) fn deleting_the_open_recording_clears_the_viewer(dir: &Path) {
         .visible_dialog()
         .and_downcast::<adw::AlertDialog>()
         .expect("the delete confirmation");
-    button_labelled(&dialog, "Delete")
+    button_labeled(&dialog, "Delete")
         .expect("the dialog's Delete")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -491,7 +491,7 @@ pub(super) fn deleting_the_open_recording_clears_the_viewer(dir: &Path) {
     let title: adw::WindowTitle = named(&window, TITLE_NAME);
     assert_ne!(title.title(), "web");
     assert!(
-        !button_labelled(&window, "Delete").is_some_and(|b| b.is_visible()),
+        !button_labeled(&window, "Delete").is_some_and(|b| b.is_visible()),
         "nothing open, nothing to delete"
     );
     close(&window);
@@ -510,7 +510,7 @@ pub(super) fn a_failed_delete_is_told_in_the_transcripts_window(dir: &Path) {
     pump_until("the text", || viewer_text(&window) == "keep me\n");
     fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("make the folder read-only");
 
-    button_labelled(&window, "Delete")
+    button_labeled(&window, "Delete")
         .expect("the Delete button")
         .emit_clicked();
     pump_for(Duration::from_millis(200));
@@ -518,7 +518,7 @@ pub(super) fn a_failed_delete_is_told_in_the_transcripts_window(dir: &Path) {
         .visible_dialog()
         .and_downcast::<adw::AlertDialog>()
         .expect("the delete confirmation");
-    button_labelled(&dialog, "Delete")
+    button_labeled(&dialog, "Delete")
         .expect("the dialog's Delete")
         .emit_clicked();
     let area: NotificationArea = find_widget(&window).expect("the window's notification area");

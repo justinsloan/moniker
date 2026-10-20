@@ -1,5 +1,5 @@
 //! Scenarios: the notification area ([`crate::notify`]), where the app's short
-//! messages appear: at the top centre of a window, below the header bar,
+//! messages appear: at the top center of a window, below the header bar,
 //! wrapped, one after another, as plain text, fading after a few seconds.
 //!
 //! While a dialog is open over a window its area waits
@@ -45,7 +45,7 @@ fn watch_until_done(area: &NotificationArea) -> Vec<String> {
     seen
 }
 
-/// A message appears at the top centre of a main window, below the header bar
+/// A message appears at the top center of a main window, below the header bar
 /// and over the tabs, and takes no click from what is under it.
 pub(super) fn notifications_appear_at_the_top_center(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
@@ -102,7 +102,7 @@ pub(super) fn notifications_appear_at_the_top_center(dir: &Path) {
     let pill_middle = f64::from(pill.x() + pill.width() / 2.0);
     assert!(
         (pill_middle - window_middle).abs() <= 2.0,
-        "centred: the pill's middle is at {pill_middle}, the window's at {window_middle}"
+        "centered: the pill's middle is at {pill_middle}, the window's at {window_middle}"
     );
 
     main.window.destroy();

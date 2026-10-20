@@ -1,6 +1,6 @@
 //! State shared by every window and dialog ([`AppContext`]) and the way the app
 //! tells the person something short ([`Notice`], shown in a window's
-//! [`NotificationArea`] at the top centre, or in the Preferences dialog while
+//! [`NotificationArea`] at the top center, or in the Preferences dialog while
 //! that is open).
 //!
 //! The context also says when the profiles changed: whoever shows profiles
@@ -314,7 +314,7 @@ fn runtime_dir_from(value: Option<OsString>) -> Option<PathBuf> {
     value.map(PathBuf::from).filter(|dir| dir.is_absolute())
 }
 
-/// Short messages shown at the top centre of a window (plain text, never
+/// Short messages shown at the top center of a window (plain text, never
 /// markup), or in the Preferences dialog while it is open
 /// ([`show_over`](Notice::show_over)).
 ///

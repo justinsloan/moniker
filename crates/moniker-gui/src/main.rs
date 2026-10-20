@@ -359,7 +359,7 @@ fn shortcuts_dialog() -> adw::ShortcutsDialog {
     dialog
 }
 
-/// About Moniker: name, version, the copyright line and the MIT licence. No
+/// About Moniker: name, version, the copyright line and the MIT license. No
 /// website yet: the repository link is added once the repository exists.
 fn about_dialog() -> adw::AboutDialog {
     adw::AboutDialog::builder()
@@ -375,7 +375,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_about_text_names_the_owner_and_licence() {
+    fn the_about_text_names_the_owner_and_license() {
         assert_eq!(ABOUT_COPYRIGHT, "Copyright 2026 Justin M. Sloan");
     }
 }

@@ -349,7 +349,7 @@ fn more_button(tooltip: &str, popover: &gtk::Popover) -> gtk::MenuButton {
         .build()
 }
 
-/// Tick or untick the "Save transcript" box of `popover`'s choices to `save()`
+/// Check or uncheck the "Save transcript" box of `popover`'s choices to `save()`
 /// each time the popover opens, so it shows the setting as it is then and not
 /// as it was when the list was made.
 fn refresh_box_on_show(popover: &gtk::Popover, save: impl Fn() -> bool + 'static) {

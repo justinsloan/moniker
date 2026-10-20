@@ -21,7 +21,7 @@ use moniker_core::store::ProfileStore;
 use zeroize::Zeroizing;
 
 use super::{
-    MARKUP_NAME, all_widgets, button_labelled, find_widget, make_helper, pump_for, pump_until,
+    MARKUP_NAME, all_widgets, button_labeled, find_widget, make_helper, pump_for, pump_until,
 };
 use crate::context::AppContext;
 use crate::form;
@@ -228,7 +228,7 @@ impl Setup {
 
     /// Click `label` on the sub-page.
     fn click(&self, page: &adw::NavigationPage, label: &str) {
-        button_labelled(page, label)
+        button_labeled(page, label)
             .unwrap_or_else(|| panic!("no {label:?} button"))
             .emit_clicked();
         pump_for(Duration::from_millis(50));
@@ -549,7 +549,7 @@ pub(super) fn switch_port_and_key_file_save_when_changed(dir: &Path) {
         Some("/home/alice/.ssh/id_ed25519")
     );
     assert!(!key_row.uses_markup());
-    button_labelled(&key_row, "Clear")
+    button_labeled(&key_row, "Clear")
         .expect("the clear button")
         .emit_clicked();
     pump_for(Duration::from_millis(50));
@@ -681,7 +681,7 @@ pub(super) fn double_click_and_connect_button_connect(dir: &Path) {
     s.sidebar().emit_by_name::<()>("row-activated", &[&row]);
     assert_eq!(*s.connected.borrow(), [(p.id.clone(), None, true)]);
 
-    let connect = button_labelled(&s.window, "Connect").expect("the Connect button");
+    let connect = button_labeled(&s.window, "Connect").expect("the Connect button");
     assert!(connect.has_css_class("suggested-action"));
     connect.emit_clicked();
     assert_eq!(
@@ -722,7 +722,7 @@ pub(super) fn new_profile_dialog_creates_and_selects(dir: &Path) {
             .find(|r| r.title() == title)
             .unwrap_or_else(|| panic!("no {title:?} row"))
     };
-    let create = button_labelled(&dialog, "Create").expect("the Create button");
+    let create = button_labeled(&dialog, "Create").expect("the Create button");
     assert!(!create.is_sensitive());
     row("Name").set_text("NAS");
     row("Host").set_text("nas.lan");
@@ -765,7 +765,7 @@ pub(super) fn delete_asks_then_removes_profile_and_password(dir: &Path) {
     s.secrets.set(&password_key(&p.id), "pw").expect("set");
     s.select(&p.id);
 
-    button_labelled(&s.window, "Delete Profile")
+    button_labeled(&s.window, "Delete Profile")
         .expect("the delete button")
         .emit_clicked();
     pump_for(Duration::from_millis(200));
@@ -781,7 +781,7 @@ pub(super) fn delete_asks_then_removes_profile_and_password(dir: &Path) {
     assert!(!dialog.is_heading_use_markup());
     // Nothing happens before the answer.
     assert!(s.on_disk(&p.id).is_some());
-    button_labelled(&dialog, "Delete")
+    button_labeled(&dialog, "Delete")
         .expect("the dialog's Delete button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -811,7 +811,7 @@ pub(super) fn the_page_says_password_removal_is_local(dir: &Path) {
 
     // Remove asks first, then deletes the keyring entry only.
     let before = s.file_bytes();
-    button_labelled(&row, "Remove")
+    button_labeled(&row, "Remove")
         .expect("the remove button")
         .emit_clicked();
     pump_for(Duration::from_millis(200));
@@ -822,7 +822,7 @@ pub(super) fn the_page_says_password_removal_is_local(dir: &Path) {
         .expect("the remove confirmation");
     assert!(dialog.body().contains(form::REMOVE_PASSWORD_NOTE));
     assert_eq!(s.secrets.password(&p.id).as_deref(), Some("pw"));
-    button_labelled(&dialog, "Remove")
+    button_labeled(&dialog, "Remove")
         .expect("the dialog's Remove button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -898,7 +898,7 @@ pub(super) fn add_edit_move_delete_a_sequence(dir: &Path) {
     assert_eq!(commands_text(&page), "");
     for label in ["Move Up", "Move Down", "Delete Sequence"] {
         assert!(
-            button_labelled(&page, label).is_none_or(|b| !b.is_mapped()),
+            button_labeled(&page, label).is_none_or(|b| !b.is_mapped()),
             "{label} on a new sequence"
         );
     }
@@ -928,8 +928,8 @@ pub(super) fn add_edit_move_delete_a_sequence(dir: &Path) {
     assert_eq!(sub_name(&page).text(), "update");
     assert_eq!(commands_text(&page), "sudo apt update\ndf -h");
     // First in the list: Move Up has nowhere to go.
-    let up = button_labelled(&page, "Move Up").expect("Move Up");
-    let down = button_labelled(&page, "Move Down").expect("Move Down");
+    let up = button_labeled(&page, "Move Up").expect("Move Up");
+    let down = button_labeled(&page, "Move Down").expect("Move Down");
     assert!(up.is_mapped() && down.is_mapped());
     assert!(!up.is_sensitive());
     assert!(down.is_sensitive());
@@ -955,8 +955,8 @@ pub(super) fn add_edit_move_delete_a_sequence(dir: &Path) {
     // Move: the second goes up. The page stays open, and text typed but not
     // saved is neither saved nor lost.
     let page = s.open_sequence("dmesg");
-    let up = button_labelled(&page, "Move Up").expect("Move Up");
-    let down = button_labelled(&page, "Move Down").expect("Move Down");
+    let up = button_labeled(&page, "Move Up").expect("Move Up");
+    let down = button_labeled(&page, "Move Down").expect("Move Down");
     assert!(up.is_sensitive());
     assert!(!down.is_sensitive(), "last in the list");
     set_commands(&page, "dmesg -T\nuptime");
@@ -1015,7 +1015,7 @@ pub(super) fn cancel_discards_sequence_edits(dir: &Path) {
     assert_eq!(sub_name(&page).text(), "update");
     assert_eq!(commands_text(&page), "sudo apt update");
 
-    // A new sequence that is cancelled adds nothing.
+    // A new sequence that is canceled adds nothing.
     s.click(&page, "Cancel");
     s.wait_for_sub_page_to_close();
     let page = s.open_sequence("Add sequence");

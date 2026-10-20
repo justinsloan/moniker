@@ -14,7 +14,7 @@
 //!
 //! [`list_recordings`] reads the directory back for the Transcripts
 //! window. [`parse_file_name`] undoes the naming above to get the host and the
-//! start time, and only files whose names it recognises are listed: the folder
+//! start time, and only files whose names it recognizes are listed: the folder
 //! can be one the person also uses for other things (their home folder,
 //! Downloads), and the window reads, searches, exports and deletes what it
 //! lists. Only regular files directly in the directory are listed, and links
@@ -24,7 +24,7 @@
 //!
 //! [`move_transcripts`] carries the transcripts to another folder when the
 //! person chooses one. It moves only regular files directly in the old folder
-//! whose names [`parse_file_name`] recognises (the names Moniker gives
+//! whose names [`parse_file_name`] recognizes (the names Moniker gives
 //! transcripts), with the same no-follow rules as [`list_recordings`], and never
 //! replaces a file in the new folder. Everything else in the old folder stays
 //! where it is: the person may once have chosen their home folder or Documents
@@ -284,7 +284,7 @@ pub struct Recording {
 /// it is an error.
 ///
 /// Only Moniker's own transcripts are listed: regular files directly in `dir`
-/// whose names [`parse_file_name`] recognises (the names Moniker gives
+/// whose names [`parse_file_name`] recognizes (the names Moniker gives
 /// transcripts, the same rule [`move_transcripts`] follows), with the host and
 /// start time read from the name. Every other file is left out, never opened
 /// and never shown: the Transcripts window reads, searches, exports and deletes
@@ -392,7 +392,7 @@ pub fn prepare_folder(to: &Path) -> io::Result<()> {
 ///
 /// What moves: regular files directly in `from`, found without following links
 /// (as [`list_recordings`] finds them), whose names [`parse_file_name`]
-/// recognises, i.e. `<host>_<YYYYMMDD>-<HHMMSS>.txt` with the optional `-<n>`
+/// recognizes, i.e. `<host>_<YYYYMMDD>-<HHMMSS>.txt` with the optional `-<n>`
 /// collision number, the names Moniker gives transcripts. Every other entry
 /// stays where it is, untouched: a regular file with another name (`.bashrc`,
 /// `notes.txt`) is counted in [`MoveReport::other`] so the person can be told,

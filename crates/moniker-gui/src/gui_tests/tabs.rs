@@ -1,5 +1,5 @@
 //! Scenarios: terminal tabs (argv and environment, exit handling, transcripts,
-//! the local shell, titles and renaming, colours) and the notifications that
+//! the local shell, titles and renaming, colors) and the notifications that
 //! report on them.
 
 use std::cell::{Cell, RefCell};
@@ -21,8 +21,8 @@ use vte4::prelude::*;
 
 use super::main_window::{ctx_with, menu_items, test_app};
 use super::{
-    HELPER, MARKUP_NAME, all_widgets, button_labelled, fake_command, fake_shell, fake_ssh,
-    files_in, find_widget, fixture, labels_in, launch_ctx, make_helper, page_of, profile, pump_for,
+    HELPER, MARKUP_NAME, all_widgets, button_labeled, fake_command, fake_shell, fake_ssh, files_in,
+    find_widget, fixture, labels_in, launch_ctx, make_helper, page_of, profile, pump_for,
     pump_until, shown, tab_window, wait_for_text, widgets_of_type,
 };
 use crate::context::{AppContext, Notice};
@@ -849,7 +849,7 @@ pub(super) fn ask_rename_renames_the_page() {
     assert_eq!(dialog.heading().as_deref(), Some("Rename Tab"));
     assert_eq!(entry.text(), MARKUP_NAME);
     entry.set_text("scratch");
-    button_labelled(&dialog, "Cancel")
+    button_labeled(&dialog, "Cancel")
         .expect("a Cancel button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -861,7 +861,7 @@ pub(super) fn ask_rename_renames_the_page() {
     pump_for(Duration::from_millis(300));
     let (dialog, entry) = rename_dialog(&fx.window).expect("the rename dialog");
     entry.set_text("prod");
-    button_labelled(&dialog, "Rename")
+    button_labeled(&dialog, "Rename")
         .expect("a Rename button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -903,7 +903,7 @@ pub(super) fn renaming_an_unchanged_title_keeps_following_the_shell(bin: &Path) 
     pump_for(Duration::from_millis(300));
     let (dialog, entry) = rename_dialog(&fx.window).expect("the rename dialog");
     assert_eq!(entry.text(), "one");
-    button_labelled(&dialog, "Rename")
+    button_labeled(&dialog, "Rename")
         .expect("a Rename button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -943,7 +943,7 @@ pub(super) fn the_tab_menu_renames_the_tab_it_was_opened_for() {
     let (dialog, entry) = rename_dialog(&fx.window).expect("the rename dialog");
     assert_eq!(entry.text(), "First");
     entry.set_text("one");
-    button_labelled(&dialog, "Rename")
+    button_labeled(&dialog, "Rename")
         .expect("a Rename button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -995,7 +995,7 @@ pub(super) fn the_tab_menus_rename_puts_the_cursor_in_the_name_field() {
         "the focus is on {} instead of the name field",
         focus.type_().name()
     );
-    button_labelled(&dialog, "Cancel")
+    button_labeled(&dialog, "Cancel")
         .expect("a Cancel button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -1014,7 +1014,7 @@ fn double_click_gesture(bar: &adw::TabBar) -> gtk::GestureClick {
 }
 
 /// The middle of `widget`, in the coordinates of `bar`.
-fn centre_in(bar: &adw::TabBar, widget: &gtk::Widget) -> (f64, f64) {
+fn center_in(bar: &adw::TabBar, widget: &gtk::Widget) -> (f64, f64) {
     let bounds = widget.compute_bounds(bar).expect("bounds");
     (
         f64::from(bounds.x() + bounds.width() / 2.0),
@@ -1039,13 +1039,13 @@ pub(super) fn double_clicking_a_tab_asks_for_a_new_name() {
     };
 
     // A single click: a tab is just selected.
-    press(1, centre_in(&fx.bar, tab));
+    press(1, center_in(&fx.bar, tab));
     pump_for(Duration::from_millis(200));
     assert!(rename_dialog(&fx.window).is_none());
 
     // A double click on a button in the tab (the close button).
     let close = find_widget::<gtk::Button>(tab).expect("a button in the tab");
-    press(2, centre_in(&fx.bar, close.upcast_ref()));
+    press(2, center_in(&fx.bar, close.upcast_ref()));
     pump_for(Duration::from_millis(200));
     assert!(
         rename_dialog(&fx.window).is_none(),
@@ -1053,12 +1053,12 @@ pub(super) fn double_clicking_a_tab_asks_for_a_new_name() {
     );
 
     // A double click on the title.
-    press(2, centre_in(&fx.bar, tab));
+    press(2, center_in(&fx.bar, tab));
     pump_for(Duration::from_millis(300));
     let (dialog, entry) = rename_dialog(&fx.window).expect("the rename dialog");
     assert_eq!(entry.text(), "Plain");
     entry.set_text("db");
-    button_labelled(&dialog, "Rename")
+    button_labeled(&dialog, "Rename")
         .expect("a Rename button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
@@ -1090,7 +1090,7 @@ pub(super) fn the_tab_bars_close_button_closes_the_tab(bin: &Path, dir: &Path) {
 
 /// A terminal gets the palette of the current style when it is made, and the
 /// palette of the other style when the application's style changes.
-pub(super) fn terminal_colours_follow_light_and_dark() {
+pub(super) fn terminal_colors_follow_light_and_dark() {
     let manager = adw::StyleManager::default();
     let fx = fixture();
     let wanted = |dark: bool| theme::palette(dark).background;
@@ -1362,7 +1362,7 @@ pub(super) fn the_window_actions_wait_while_a_dialog_is_open(bin: &Path, dir: &P
 
     // Cancel: the actions come back, and now they act.
     let (dialog, _) = rename_dialog(&main.window).expect("the rename dialog");
-    button_labelled(&dialog, "Cancel")
+    button_labeled(&dialog, "Cancel")
         .expect("a Cancel button")
         .emit_clicked();
     pump_until("the Rename dialog to close", || {

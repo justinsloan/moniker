@@ -1,7 +1,7 @@
-//! Short messages shown at the top centre of a window ([`NotificationArea`]).
+//! Short messages shown at the top center of a window ([`NotificationArea`]).
 //!
 //! The area wraps a window's content in a [`gtk::Overlay`]. A message appears in
-//! a dark pill at the top centre, just below the header bar, over the content
+//! a dark pill at the top center, just below the header bar, over the content
 //! (over the terminal, in a main window). It is plain text that wraps onto
 //! several lines within a comfortable width, stays for a few seconds
 //! ([`display_time`]: longer for a long message, so there is time to read it),
@@ -445,7 +445,7 @@ impl NotificationArea {
         area
     }
 
-    /// Show `text` at the top centre: now, if nothing is up, else after the
+    /// Show `text` at the top center: now, if nothing is up, else after the
     /// messages before it. It is plain text, never markup. Each message stays
     /// for [`display_time`] and then fades.
     pub fn show(&self, text: &str) {

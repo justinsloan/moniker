@@ -3,7 +3,7 @@
 //! Every test runs the binary against a throwaway config directory and aims at a
 //! path that stops before the system keyring or `/dev/tty` is reached: a test
 //! must never block on a terminal or read the developer's real secrets. As a
-//! second line of defence the environment points the keyring at an unreachable
+//! second line of defense the environment points the keyring at an unreachable
 //! D-Bus address and a throwaway service name.
 
 use std::fs;

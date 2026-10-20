@@ -171,8 +171,8 @@ fn connect_plainly(main: &window::MainWindow, ctx: &Rc<AppContext>, id: &str) ->
 }
 
 /// Local terminal has a "›" like a profile: its choices are "Open" and the
-/// "Save transcript" box, unticked unless "save all" is on. A plain click saves
-/// nothing; ticking the box and Opening saves the session when its tab closes,
+/// "Save transcript" box, unchecked unless "save all" is on. A plain click saves
+/// nothing; checking the box and Opening saves the session when its tab closes,
 /// in a mode 0600 file named after this machine, in the transcripts folder.
 pub(super) fn a_local_tab_can_save_its_transcript(dir: &Path) {
     let transcripts = dir.join("transcripts");
@@ -192,7 +192,7 @@ pub(super) fn a_local_tab_can_save_its_transcript(dir: &Path) {
         "a plain click saves nothing"
     );
 
-    // The Right arrow on the row opens the choices; the box is unticked.
+    // The Right arrow on the row opens the choices; the box is unchecked.
     let (page, list) = new_list(&main, &ctx);
     let (popover, column) =
         open_choices(&list, new_tab::LOCAL_ROW, connect_menu::LOCAL_CHOICES_NAME);
@@ -253,7 +253,7 @@ pub(super) fn a_local_tab_can_save_its_transcript(dir: &Path) {
 
 /// With "Save transcripts of all sessions" on, a profile whose own setting is
 /// off is saved all the same by a plain click, and its box under "›" starts
-/// ticked, even when the list was made before the setting changed. With it off
+/// checked, even when the list was made before the setting changed. With it off
 /// each profile follows its own setting and local tabs save nothing.
 pub(super) fn save_all_overrides_a_profile_that_saves_nothing(bin: &Path, dir: &Path) {
     let fake = fake_ssh(bin, "save-all", "echo FAKE-END\nexec sleep 600");
@@ -286,7 +286,7 @@ pub(super) fn save_all_overrides_a_profile_that_saves_nothing(bin: &Path, dir: &
     let (popover, column) = open_choices(&list, &quiet.id, connect_menu::CHOICES_NAME);
     assert!(
         choices_parts(&column).record.is_active(),
-        "the box starts ticked, whatever the profile says"
+        "the box starts checked, whatever the profile says"
     );
     popover.popdown();
     pump_until("the choices to close", || !popover.is_visible());
@@ -330,10 +330,10 @@ pub(super) fn save_all_overrides_a_profile_that_saves_nothing(bin: &Path, dir: &
     pump_for(Duration::from_millis(200));
 }
 
-/// Unticking the box under "›" skips the transcript of that one session, for a
+/// Unchecking the box under "›" skips the transcript of that one session, for a
 /// profile and for Local terminal; the next plain click saves again.
-pub(super) fn unticking_skips_one_session(bin: &Path, dir: &Path) {
-    let fake = fake_ssh(bin, "untick", "echo FAKE-END\nexec sleep 600");
+pub(super) fn unchecking_skips_one_session(bin: &Path, dir: &Path) {
+    let fake = fake_ssh(bin, "uncheck", "echo FAKE-END\nexec sleep 600");
     let transcripts = dir.join("transcripts");
     let mut quiet = Profile::new("quiet", "quiet.example.test", "quinn");
     quiet.transcript = false;
@@ -343,12 +343,12 @@ pub(super) fn unticking_skips_one_session(bin: &Path, dir: &Path) {
     let main = main_window(&app, &ctx);
     set_test_ssh_program(Some(fake));
 
-    // Local terminal: ticked because of "save all"; unticked, nothing is saved.
+    // Local terminal: checked because of "save all"; unchecked, nothing is saved.
     let (page, list) = new_list(&main, &ctx);
     let (popover, column) =
         open_choices(&list, new_tab::LOCAL_ROW, connect_menu::LOCAL_CHOICES_NAME);
     let parts = local_parts(&column);
-    assert!(parts.record.is_active(), "save all ticks the box");
+    assert!(parts.record.is_active(), "save all checks the box");
     parts.record.set_active(false);
     parts.open.emit_clicked();
     pump_until("the choices to close", || !popover.is_visible());
@@ -363,7 +363,7 @@ pub(super) fn unticking_skips_one_session(bin: &Path, dir: &Path) {
     let (page, list) = new_list(&main, &ctx);
     let (_popover, column) = open_choices(&list, &quiet.id, connect_menu::CHOICES_NAME);
     let parts = choices_parts(&column);
-    assert!(parts.record.is_active(), "save all ticks the box");
+    assert!(parts.record.is_active(), "save all checks the box");
     parts.record.set_active(false);
     parts.buttons[0].emit_clicked();
     wait_for_text(&terminal_of(&page).expect("the session"), "FAKE-END");

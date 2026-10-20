@@ -92,7 +92,7 @@ with_floor() {
 }
 
 # stage_copyright PACKAGE: the package's copyright file: the owner, then the
-# MIT licence text from LICENSE. (The publisher above is only the Maintainer
+# MIT license text from LICENSE. (The publisher above is only the Maintainer
 # field and the metainfo's developer.)
 stage_copyright() {
     {
