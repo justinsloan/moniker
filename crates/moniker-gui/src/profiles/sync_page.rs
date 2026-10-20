@@ -1,0 +1,496 @@
+//! The sync page: the content pane of the Connection Profiles window when the sidebar's
+//! Sync entry is chosen. Set the sync key, pick the other machine's profile,
+//! turn automatic sync on or off, and sync.
+//!
+//! The logic and the worker thread are in [`crate::sync`]; this file is the
+//! widgets. The page starts its syncs with [`sync::begin_app_sync`], like Sync
+//! Now and the sync on launch, and listens to every sync of the app
+//! ([`AppContext::on_sync_event`]): while any of them runs, the page says so
+//! and Sync is off, and it shows the result of each.
+//!
+//! The first sync that succeeds from here records its profile as the sync
+//! partner in the GUI settings ([`sync::record_partner`]), which offers Sync
+//! Now and turns on the sync on launch (unless the switch here is off). The
+//! first sync is always started by hand, so a mistyped key or a wrong host is
+//! seen on this page rather than as a notification at launch.
+//!
+//! The sync key is read from its field into a `Zeroizing` buffer, never shown
+//! again, and the field is emptied after a save and when the page goes. Every
+//! text is plain (Pango markup off): profile names come from other machines.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use adw::prelude::*;
+use gtk::{glib, pango};
+use gtk4 as gtk;
+use libadwaita as adw;
+use zeroize::Zeroizing;
+
+use crate::context::AppContext;
+use crate::form;
+use crate::settings;
+use crate::sync::{self, KeyState, SyncEvent, SyncFailure};
+
+/// Widget names of the page's message lines (tests look for them).
+pub(crate) const KEY_STATUS_NAME: &str = "sync-key-status";
+pub(crate) const KEY_MESSAGE_NAME: &str = "sync-key-message";
+pub(crate) const HINT_NAME: &str = "sync-hint";
+pub(crate) const RESULT_NAME: &str = "sync-result";
+
+/// The explanation of the "Other machine" group.
+const MACHINE_NOTE: &str = "Pick the saved profile of your other machine. Moniker connects \
+    with ssh and runs moniker-server there; afterwards both machines have the same profiles.";
+
+/// The automatic-sync switch's subtitle before any sync from this page has
+/// succeeded (or after its profile was deleted).
+pub(crate) const AUTO_SYNC_NO_PARTNER: &str = "Once a sync from this page succeeds, sync \
+    with that machine each time Moniker starts.";
+
+/// The automatic-sync switch's subtitle once there is a partner.
+pub(crate) fn auto_sync_with(name: &str) -> String {
+    format!("Sync with {name} each time Moniker starts.")
+}
+
+/// The page's widgets and state. The Connection Profiles window holds it while the page
+/// is shown; everything else holds it weakly, so it goes when the page does.
+pub(crate) struct SyncPage {
+    ctx: Rc<AppContext>,
+    pub(crate) widget: adw::PreferencesPage,
+    key_entry: adw::PasswordEntryRow,
+    key_status: gtk::Label,
+    key_message: gtk::Label,
+    /// The other machine's profile; its subtitle says where it connects.
+    machine: adw::ComboRow,
+    auto_sync: adw::SwitchRow,
+    /// Why Sync is unavailable, if it is.
+    hint: gtk::Label,
+    sync_button: gtk::Button,
+    result: gtk::Label,
+    /// Profile id of each `machine` entry, by position.
+    ids: RefCell<Vec<String>>,
+    key_set: Cell<bool>,
+    /// The switch is being set to what the settings file says, not by the
+    /// person.
+    loading: Cell<bool>,
+}
+
+impl SyncPage {
+    pub(crate) fn new(ctx: &Rc<AppContext>) -> Rc<SyncPage> {
+        let key_entry = adw::PasswordEntryRow::builder()
+            .title(sync::KEY_PLACEHOLDER)
+            .show_apply_button(true)
+            .build();
+        // The keyring's error can be long (it names the bus address): wrap it.
+        let key_status = gtk::Label::builder()
+            .name(KEY_STATUS_NAME)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(pango::WrapMode::WordChar)
+            .margin_top(12)
+            .css_classes(["dim-label"])
+            .build();
+        let key_message = inline_message(KEY_MESSAGE_NAME);
+        let key_group = adw::PreferencesGroup::builder()
+            .title("Sync Key")
+            .description(sync::KEY_NOTE)
+            .build();
+        key_group.add(&key_entry);
+        key_group.add(&key_status);
+        key_group.add(&key_message);
+
+        let machine = adw::ComboRow::builder()
+            .title("Profile")
+            .use_markup(false)
+            .factory(&plain_text_factory())
+            .model(&gtk::StringList::new(&[]))
+            .build();
+        let auto_sync = adw::SwitchRow::builder()
+            .title("Sync Automatically")
+            .use_markup(false)
+            .build();
+        let hint = gtk::Label::builder()
+            .name(HINT_NAME)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(pango::WrapMode::WordChar)
+            .margin_top(12)
+            .css_classes(["dim-label"])
+            .visible(false)
+            .build();
+        let machine_group = adw::PreferencesGroup::builder()
+            .title("Other Machine")
+            .description(MACHINE_NOTE)
+            .build();
+        machine_group.add(&machine);
+        machine_group.add(&auto_sync);
+        machine_group.add(&hint);
+
+        let sync_button = gtk::Button::builder()
+            .label("Sync")
+            .halign(gtk::Align::Center)
+            .css_classes(["suggested-action", "pill"])
+            .build();
+        let result = inline_message(RESULT_NAME);
+        result.set_halign(gtk::Align::Center);
+        result.set_justify(gtk::Justification::Center);
+        let actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .build();
+        actions.append(&sync_button);
+        actions.append(&result);
+        let sync_group = adw::PreferencesGroup::new();
+        sync_group.add(&actions);
+
+        let widget = adw::PreferencesPage::new();
+        widget.add(&key_group);
+        widget.add(&machine_group);
+        widget.add(&sync_group);
+
+        let page = Rc::new(SyncPage {
+            ctx: Rc::clone(ctx),
+            widget,
+            key_entry,
+            key_status,
+            key_message,
+            machine,
+            auto_sync,
+            hint,
+            sync_button,
+            result,
+            ids: RefCell::new(Vec::new()),
+            key_set: Cell::new(false),
+            loading: Cell::new(false),
+        });
+        page.wire();
+        page.refresh_key_status();
+        page.refresh_targets();
+        page.refresh_auto_sync();
+        // A sync started elsewhere (Sync Now, on launch) may be running.
+        if ctx.sync_running.get() {
+            page.show_result(sync::SYNCING, false);
+        }
+        page
+    }
+
+    /// Connect the widgets' signals and the app's notifications. Every
+    /// handler holds the page weakly.
+    fn wire(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.key_entry.connect_apply(glib::clone!(
+            #[strong]
+            weak,
+            move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.save_key();
+                }
+            }
+        ));
+        self.machine.connect_selected_notify(glib::clone!(
+            #[strong]
+            weak,
+            move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.update_target();
+                }
+            }
+        ));
+        self.auto_sync.connect_active_notify(glib::clone!(
+            #[strong]
+            weak,
+            move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.switch_changed();
+                }
+            }
+        ));
+        self.sync_button.connect_clicked(glib::clone!(
+            #[strong]
+            weak,
+            move |_| {
+                if let Some(page) = weak.upgrade() {
+                    begin_sync(&page);
+                }
+            }
+        ));
+        self.ctx.on_profiles_changed(
+            &self.widget,
+            glib::clone!(
+                #[strong]
+                weak,
+                move || {
+                    if let Some(page) = weak.upgrade() {
+                        page.refresh_targets();
+                        page.refresh_auto_sync();
+                    }
+                }
+            ),
+        );
+        self.ctx.on_sync_event(&self.widget, move |event| {
+            if let Some(page) = weak.upgrade() {
+                page.sync_event(event);
+            }
+        });
+    }
+
+    /// Empty the key field: nothing typed stays in a page that goes.
+    /// Emptying it is not an edit: the ✓ stays hidden.
+    pub(crate) fn clear_secret(&self) {
+        self.key_entry.set_show_apply_button(false);
+        self.key_entry.set_text("");
+        self.key_entry.set_show_apply_button(true);
+    }
+
+    /// Id of the profile the "Profile" row shows.
+    fn selected_id(&self) -> Option<String> {
+        let index = self.machine.selected();
+        if index == gtk::INVALID_LIST_POSITION {
+            return None;
+        }
+        self.ids.borrow().get(usize::try_from(index).ok()?).cloned()
+    }
+
+    /// Re-read the keyring and update the "Sync key: ..." line.
+    fn refresh_key_status(&self) {
+        let state = sync::key_state(self.ctx.secrets.as_ref());
+        self.key_status.set_label(&sync::key_status_text(&state));
+        self.key_set.set(state == KeyState::Set);
+    }
+
+    /// Rebuild the profile choice from the store as it is now, keeping the
+    /// chosen profile if it is still there, else choosing the partner, else
+    /// the first.
+    fn refresh_targets(&self) {
+        let previous = self.selected_id();
+        let (names, ids): (Vec<String>, Vec<String>) = {
+            let store = self.ctx.store.borrow();
+            store
+                .live()
+                .into_iter()
+                .map(|p| (p.name.clone(), p.id.clone()))
+                .unzip()
+        };
+        let partner = settings::load(&self.ctx.settings_path).sync_partner;
+        let position = |id: &String| ids.iter().position(|i| i == id);
+        let keep = previous
+            .as_ref()
+            .and_then(position)
+            .or_else(|| partner.as_ref().and_then(position))
+            .and_then(|i| u32::try_from(i).ok())
+            .unwrap_or(0);
+        let empty = ids.is_empty();
+        // Ids first: replacing the model fires `notify::selected`.
+        *self.ids.borrow_mut() = ids;
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        self.machine.set_model(Some(&gtk::StringList::new(&names)));
+        if !empty {
+            self.machine.set_selected(keep);
+        }
+        self.update_target();
+        self.refresh_controls();
+    }
+
+    /// "Connects to user@host:port" under the profile's name, so a duplicate
+    /// name is still told apart.
+    fn update_target(&self) {
+        let subtitle = self
+            .selected_id()
+            .and_then(|id| self.ctx.store.borrow().get(&id).map(form::subtitle));
+        let text = subtitle.map_or_else(String::new, |s| format!("Connects to {s}"));
+        self.machine.set_subtitle(&text);
+    }
+
+    /// Set the switch, and its subtitle, to what the settings file says.
+    fn refresh_auto_sync(&self) {
+        let settings = settings::load(&self.ctx.settings_path);
+        let partner_name = {
+            let store = self.ctx.store.borrow();
+            sync::live_partner(&settings, &store)
+                .and_then(|id| store.get(&id).map(|p| p.name.clone()))
+        };
+        self.auto_sync.set_subtitle(
+            &partner_name.map_or_else(|| AUTO_SYNC_NO_PARTNER.to_owned(), |n| auto_sync_with(&n)),
+        );
+        self.loading.set(true);
+        self.auto_sync.set_active(settings.auto_sync);
+        self.loading.set(false);
+    }
+
+    /// The person flipped the switch: save it. If that fails, say so and put
+    /// the switch back to what the file says.
+    fn switch_changed(&self) {
+        if self.loading.get() {
+            return;
+        }
+        let path = &self.ctx.settings_path;
+        let settings = settings::GuiSettings {
+            auto_sync: self.auto_sync.is_active(),
+            ..settings::load(path)
+        };
+        if let Err(err) = settings::save(path, &settings) {
+            self.ctx.notice.show_near(
+                &self.widget,
+                &format!("Could not save the sync settings: {err}"),
+            );
+            self.refresh_auto_sync();
+        }
+    }
+
+    /// Enable or disable the controls and show why Sync is unavailable.
+    fn refresh_controls(&self) {
+        let profiles = self.ids.borrow().len();
+        let hint = sync::sync_hint(self.key_set.get(), profiles);
+        self.hint.set_label(hint.unwrap_or(""));
+        self.hint.set_visible(hint.is_some());
+        let idle = !self.ctx.sync_running.get();
+        // The whole "Other machine" part waits for what the hint asks for.
+        self.machine.set_sensitive(idle && hint.is_none());
+        self.sync_button.set_sensitive(idle && hint.is_none());
+    }
+
+    /// Any sync of the app started or ended.
+    fn sync_event(&self, event: &SyncEvent) {
+        match event {
+            SyncEvent::Started => self.show_result(sync::SYNCING, false),
+            SyncEvent::Finished(result) => {
+                let (text, is_error) = sync::result_text(result);
+                self.show_result(&text, is_error);
+                // The worker found no key: the status line catches up without
+                // reading the keyring here.
+                if matches!(result, Err(SyncFailure::NoSyncKey)) {
+                    self.key_status
+                        .set_label(&sync::key_status_text(&KeyState::NotSet));
+                    self.key_set.set(false);
+                }
+                // The sync may have added or removed profiles, or recorded a
+                // partner.
+                self.refresh_targets();
+                self.refresh_auto_sync();
+            }
+        }
+        self.refresh_controls();
+    }
+
+    /// Save what is in the key field as the sync key.
+    fn save_key(&self) {
+        // GTK's own copy of the text is out of our hands; ours is wiped on drop.
+        let typed = Zeroizing::new(self.key_entry.text().to_string());
+        match sync::save_sync_key(self.ctx.secrets.as_ref(), &typed) {
+            Ok(()) => {
+                self.clear_secret();
+                show_message(&self.key_message, "Sync key saved.", false);
+            }
+            Err(message) => show_message(&self.key_message, &message, true),
+        }
+        self.refresh_key_status();
+        self.refresh_controls();
+    }
+
+    /// Show `text` as the result line (plain text), red for an error.
+    fn show_result(&self, text: &str, is_error: bool) {
+        show_message(&self.result, text, is_error);
+    }
+}
+
+impl Drop for SyncPage {
+    fn drop(&mut self) {
+        self.clear_secret();
+    }
+}
+
+/// Start a sync with the chosen profile (the Sync button).
+///
+/// Does nothing while any sync of the app runs (the button is off then). If
+/// the profile is gone the page says so at once and shows the profiles as
+/// they are now; what the worker finds missing (the key, the askpass helper)
+/// comes back as the sync's result. A success records
+/// the profile as the sync partner. If the page has gone by the time the sync
+/// ends, the result is a notification instead, as nothing else would show it.
+fn begin_sync(page: &Rc<SyncPage>) {
+    if page.ctx.sync_running.get() {
+        return;
+    }
+    let Some(id) = page.selected_id() else {
+        page.show_result("Choose the other machine first.", true);
+        return;
+    };
+    let ctx = Rc::clone(&page.ctx);
+    let weak = Rc::downgrade(page);
+    let partner = id.clone();
+    let started = sync::begin_app_sync(&page.ctx, &id, sync::runner(&page.ctx), move |result| {
+        if result.is_ok()
+            && let Err(err) = sync::record_partner(&ctx, &partner)
+        {
+            ctx.notice
+                .show(&format!("Could not save the sync settings: {err}"));
+        }
+        if weak.upgrade().is_none() {
+            let (text, is_error) = sync::result_text(result);
+            ctx.notice.show(&if is_error {
+                format!("Sync failed: {text}")
+            } else {
+                text
+            });
+        }
+    });
+    if let Err(message) = started {
+        page.show_result(&message, true);
+        // The profile list may be stale (that profile is gone).
+        page.refresh_targets();
+    }
+}
+
+/// A list item factory for a string list whose labels show the text as it is
+/// (Pango markup off): the entries are profile names.
+fn plain_text_factory() -> gtk::SignalListItemFactory {
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let label = gtk::Label::builder()
+            .use_markup(false)
+            .xalign(0.0)
+            .ellipsize(pango::EllipsizeMode::End)
+            .build();
+        item.set_child(Some(&label));
+    });
+    factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let text = item
+            .item()
+            .and_downcast::<gtk::StringObject>()
+            .map(|s| s.string())
+            .unwrap_or_default();
+        if let Some(label) = item.child().and_downcast::<gtk::Label>() {
+            label.set_label(&text);
+        }
+    });
+    factory
+}
+
+fn show_message(label: &gtk::Label, text: &str, is_error: bool) {
+    label.set_label(text);
+    label.set_visible(!text.is_empty());
+    if is_error {
+        label.add_css_class("error");
+    } else {
+        label.remove_css_class("error");
+    }
+}
+
+/// A selectable, wrapping, initially hidden line for messages.
+fn inline_message(name: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .name(name)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(pango::WrapMode::WordChar)
+        .selectable(true)
+        .margin_top(12)
+        .visible(false)
+        .build()
+}

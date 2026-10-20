@@ -1,0 +1,9 @@
+/target
+
+# Local working files, kept out of the public repository
+/CLAUDE.md
+/CLAUDE.local.md
+/.claude/
+/docs/superpowers/
+/.superpowers/
+.remember/

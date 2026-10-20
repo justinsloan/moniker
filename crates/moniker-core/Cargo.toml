@@ -1,0 +1,25 @@
+[package]
+name = "moniker-core"
+description = "GTK-free core of Moniker: profiles, storage, crypto, sync, transcripts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+argon2 = { version = "0.6.0", default-features = false, features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+getrandom = "0.4.3"
+keyring = "4.2.0"
+rustix = { version = "1.1.5", features = ["fs", "process", "termios"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+time = { version = "0.3.55", default-features = false }
+uuid = { version = "1.28.0", features = ["v4"] }
+zeroize = "1.9.1"
+
+[dev-dependencies]
+rustix = { version = "1.1.5", features = ["pty", "fs"] }
+tempfile = "3.27.0"

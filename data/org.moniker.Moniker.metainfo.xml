@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metadata of the `moniker` package, installed by scripts/build-deb.sh
+  as /usr/share/metainfo/org.moniker.Moniker.metainfo.xml. App Center and GNOME
+  Software take the publisher ("developer") they show from it.
+
+  The id is the one of the desktop file the script installs next to it
+  (org.moniker.Moniker.desktop). There is no <url>: Moniker has no website
+  until its repository exists, as in the About box. The developer has no id
+  attribute: that must be a domain or Fediverse handle the developer owns, and
+  there is none yet. The release list is kept in step with Cargo.toml's version
+  by the build script, which refuses a mismatch.
+-->
+<component type="desktop-application">
+  <id>org.moniker.Moniker</id>
+  <launchable type="desktop-id">org.moniker.Moniker.desktop</launchable>
+  <name>Moniker</name>
+  <summary>SSH terminal with saved connection profiles</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer>
+    <name>Justin Sloan</name>
+  </developer>
+  <description>
+    <p>
+      Moniker is a terminal built around saved SSH connections: one click opens
+      a logged-in tab, optionally running a fixed startup sequence such as
+      apt update.
+    </p>
+    <p>
+      Sessions, local ones too, can be saved as plain-text transcripts that you
+      can search and read back, and connection profiles with their passwords can
+      be synced between your own machines over plain SSH, with no central
+      server.
+    </p>
+  </description>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.4.0" date="2026-10-17"/>
+  </releases>
+</component>
