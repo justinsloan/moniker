@@ -1,0 +1,253 @@
+# Checks, packages and releases.
+#
+# Every push and pull request: the checks (fmt, clippy, the unit tests, the
+# no-GTK check, the window tests on a virtual display, the desktop file and
+# the AppStream metadata), the .deb (Ubuntu 26.04) and .rpm (Fedora 44)
+# packages, and an install test of each in a fresh container of its
+# distribution (scripts/install-test.sh). A pushed tag vX.Y.Z, once all of that
+# passed, also makes a DRAFT GitHub Release with both packages, SHA256SUMS and
+# build-provenance attestations; it stays private until published by hand, so
+# the packages it holds can be checked first.
+#
+# Each package is built in a container of the distribution it is for, so it
+# links that distribution's libraries and its dependencies are read from them.
+# The hands-on checks of docs/manual-verification.md are not here: they need a
+# real desktop. Only GitHub's own actions are used, pinned to commits; there
+# are no secrets. Standard hosted runners are free for a public repository.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # The toolchain Moniker is developed with. Raise it on purpose: a new
+  # release's clippy lints would otherwise fail the build without warning.
+  RUST_TOOLCHAIN: 1.99.1
+  CARGO_TERM_COLOR: always
+  # The address in the packages' Maintainer and Packager fields (the build
+  # scripts read it from git config, as on a desktop).
+  MAINTAINER_EMAIL: 10264528+justinsloan@users.noreply.github.com
+
+jobs:
+  checks:
+    name: Checks and tests (Ubuntu 26.04)
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    timeout-minutes: 45
+    # The checks run as an ordinary user, as Moniker does: as root, permission
+    # checks pass that must not, some tests skip themselves, and a shell's
+    # prompt is "#". The container starts as root only to install packages.
+    # uid 1001 is the runner's own, which owns the workspace on the host.
+    defaults:
+      run:
+        shell: runuser -u builder -- bash --noprofile --norc -eo pipefail {0}
+    steps:
+      - name: Install build and test dependencies
+        shell: bash
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config \
+            libadwaita-1-dev libvte-2.91-gtk4-dev \
+            xvfb xauth fonts-dejavu-core jq desktop-file-utils appstream
+          useradd --create-home --uid 1001 builder
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Hand the checkout to the ordinary user
+        shell: bash
+        run: chown -R builder:builder "$GITHUB_WORKSPACE"
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q \
+            --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN" \
+            --component clippy,rustfmt
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Unit tests
+        run: cargo test --workspace --locked
+      - name: Core and CLI without GTK
+        run: bash scripts/check-no-gtk.sh
+      - name: Window tests (virtual display)
+        run: bash scripts/gui-tests.sh
+      - name: Desktop file and AppStream metadata
+        run: |
+          desktop-file-validate data/org.moniker.Moniker.desktop
+          appstreamcli validate --no-net data/org.moniker.Moniker.metainfo.xml
+
+  deb:
+    name: .deb (Ubuntu 26.04)
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    timeout-minutes: 45
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update -q
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config \
+            libadwaita-1-dev libvte-2.91-gtk4-dev
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q \
+            --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+      - name: Build the packages
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.email "$MAINTAINER_EMAIL"
+          bash scripts/build-deb.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deb
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  rpm:
+    name: .rpm (Fedora 44)
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 45
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y -q --setopt=install_weak_deps=False \
+            git-core gcc pkgconf-pkg-config libadwaita-devel vte291-gtk4-devel rpm-build
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y -q \
+            --no-modify-path --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"
+      - name: Build the packages
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global user.email "$MAINTAINER_EMAIL"
+          bash scripts/build-rpm.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rpm
+          path: target/rpm/*.rpm
+          if-no-files-found: error
+
+  install-deb:
+    name: Install test (.deb, fresh Ubuntu 26.04)
+    needs: deb
+    runs-on: ubuntu-latest
+    container: ubuntu:26.04
+    timeout-minutes: 20
+    steps:
+      # No git in the fresh container: checkout downloads the files instead.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deb
+          path: dist
+      - name: Install and try the packages
+        run: bash scripts/install-test.sh dist
+
+  install-rpm:
+    name: Install test (.rpm, fresh Fedora 44)
+    needs: rpm
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rpm
+          path: dist
+      - name: Install and try the packages
+        run: bash scripts/install-test.sh dist
+
+  release:
+    name: Draft release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [checks, install-deb, install-rpm]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the draft release
+      id-token: write # sign the provenance attestations
+      attestations: write # store them
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The tag is the version in Cargo.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME is not v$version, the version in Cargo.toml"
+            exit 1
+          fi
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- *.deb *.rpm >SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.deb
+            dist/*.rpm
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          {
+            echo "Moniker $VERSION, built by GitHub Actions from commit $GITHUB_SHA."
+            echo
+            echo '**Ubuntu 26.04 or newer**'
+            echo
+            printf '    sudo apt install'; printf ' ./%s' *.deb; echo
+            echo
+            echo '**Fedora 44 or newer**'
+            echo
+            printf '    sudo dnf install'; printf ' ./%s' *.rpm; echo
+            echo
+            echo "A headless machine that only syncs needs just \`moniker-server\`."
+            echo
+            echo '**Check a download**'
+            echo
+            echo '    sha256sum --ignore-missing -c SHA256SUMS'
+            echo "    gh attestation verify FILE --repo $GITHUB_REPOSITORY"
+          } >"$RUNNER_TEMP/notes.md"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease \
+            --title "Moniker $VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
+            -- *.deb *.rpm SHA256SUMS

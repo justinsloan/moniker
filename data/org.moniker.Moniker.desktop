@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Moniker
+GenericName=Terminal
+Comment=SSH terminal with saved connection profiles
+Exec=moniker
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;GTK;
+StartupNotify=true

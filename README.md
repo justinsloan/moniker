@@ -50,9 +50,41 @@ metadata (`data/org.moniker.Moniker.metainfo.xml`) that names the same
 developer, which App Center's page for the installed app and GNOME Software
 should show as the publisher (not yet confirmed on a desktop).
 
+`bash scripts/build-rpm.sh` builds the same two packages as RPMs into
+`target/rpm/`, for Fedora 44 or newer (the first Fedora with libadwaita 1.9).
+Run it on the Fedora release the packages are for; it needs `rpm-build`. Vendor
+is Justin Sloan and Packager the same name with the `git config user.email`
+address.
+
 Passwords and the sync key live in the system keyring (Secret Service, e.g.
 GNOME Keyring), which must be running and unlocked. The CLI and core need no GTK
 or VTE, so a headless machine can build just `cargo build --release -p moniker-cli`.
+
+## Releases
+
+Released packages are built by GitHub Actions (`.github/workflows/ci.yml`), each
+in a container of the distribution it is for: the `.deb` on Ubuntu 26.04 and
+the `.rpm` on Fedora 44, so they install on those releases or newer. To make a
+release, raise `version` in `Cargo.toml`, add the version to the release list
+in `data/org.moniker.Moniker.metainfo.xml`, commit, and push a tag named after
+it:
+
+```
+git tag v0.5.0
+git push origin v0.5.0
+```
+
+The workflow runs every check (below), builds both packages, installs each in a
+fresh container and starts it there, and only then makes a **draft** release
+with the four packages, `SHA256SUMS` and a build-provenance attestation for
+each package. A draft is not public: download its packages, try them, and
+publish it on GitHub when they are good. A tag that does not match the version
+in `Cargo.toml` makes no release. To check a downloaded package:
+
+```
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify moniker_0.5.0_amd64.deb --repo justinsloan/moniker
+```
 
 ## Using Moniker
 
@@ -308,5 +340,12 @@ starts no bus or keyring and kills nothing.
 `sshd`, all private, and it fails if your real session files change. Its
 "`moniker-server` not on remote PATH" check fails on a machine that has
 `moniker-server` installed in `/usr/bin`.
+
+GitHub Actions runs the formatting and clippy checks, `cargo test`,
+`check-no-gtk.sh`, `gui-tests.sh` and a validation of the desktop file and the
+AppStream metadata on every push and pull request, in an Ubuntu 26.04
+container, and builds and install-tests both packages (`scripts/install-test.sh`,
+which installs packages as root and so runs only in a throwaway container).
+`e2e-sync.sh` is not run there yet.
 
 `docs/manual-verification.md` lists what needs a real desktop and a real host.

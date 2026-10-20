@@ -1,15 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   AppStream metadata of the `moniker` package, installed by scripts/build-deb.sh
-  as /usr/share/metainfo/org.moniker.Moniker.metainfo.xml. App Center and GNOME
-  Software take the publisher ("developer") they show from it.
+  and scripts/build-rpm.sh as /usr/share/metainfo/org.moniker.Moniker.metainfo.xml.
+  App Center and GNOME Software take the publisher ("developer") they show
+  from it.
 
-  The id is the one of the desktop file the script installs next to it
-  (org.moniker.Moniker.desktop). The homepage <url> is the repository, as in
-  the About box. The developer has no id attribute: that must be a domain or
+  The id is the one of the desktop file the scripts install next to it
+  (data/org.moniker.Moniker.desktop). The homepage <url> is the repository, as
+  in the About box. The developer has no id attribute: that must be a domain or
   Fediverse handle the developer owns, and there is none yet. The release list
   and the homepage are kept in step with Cargo.toml's version and repository by
-  the build script, which refuses a mismatch.
+  both build scripts, which refuse a mismatch.
 -->
 <component type="desktop-application">
   <id>org.moniker.Moniker</id>

@@ -147,18 +147,8 @@ stage_bin moniker moniker
 stage_copyright moniker
 # The AppStream metadata: App Center and GNOME Software show the developer from it.
 install -D -m 644 "$METAINFO" "$STAGE/moniker/usr/share/metainfo/org.moniker.Moniker.metainfo.xml"
-install -D -m 644 /dev/stdin "$STAGE/moniker/usr/share/applications/org.moniker.Moniker.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=Moniker
-GenericName=Terminal
-Comment=SSH terminal with saved connection profiles
-Exec=moniker
-Icon=utilities-terminal
-Terminal=false
-Categories=System;TerminalEmulator;GTK;
-StartupNotify=true
-EOF
+# The desktop file, shared with scripts/build-rpm.sh.
+install -D -m 644 data/org.moniker.Moniker.desktop "$STAGE/moniker/usr/share/applications/org.moniker.Moniker.desktop"
 # The floors are the versions the GUI is built and tested against: libadwaita
 # 1.9 (the `v1_9` feature of libadwaita) and VTE 0.76 (vte4's `v0_76`
 # feature: the terminal's context menu model). dpkg-shlibdeps reads 0.75.0 for
