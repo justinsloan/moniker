@@ -5,11 +5,11 @@
   Software take the publisher ("developer") they show from it.
 
   The id is the one of the desktop file the script installs next to it
-  (org.moniker.Moniker.desktop). There is no <url>: Moniker has no website
-  until its repository exists, as in the About box. The developer has no id
-  attribute: that must be a domain or Fediverse handle the developer owns, and
-  there is none yet. The release list is kept in step with Cargo.toml's version
-  by the build script, which refuses a mismatch.
+  (org.moniker.Moniker.desktop). The homepage <url> is the repository, as in
+  the About box. The developer has no id attribute: that must be a domain or
+  Fediverse handle the developer owns, and there is none yet. The release list
+  and the homepage are kept in step with Cargo.toml's version and repository by
+  the build script, which refuses a mismatch.
 -->
 <component type="desktop-application">
   <id>org.moniker.Moniker</id>
@@ -34,6 +34,7 @@
       server.
     </p>
   </description>
+  <url type="homepage">https://github.com/justinsloan/moniker</url>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="0.4.0" date="2026-10-17"/>

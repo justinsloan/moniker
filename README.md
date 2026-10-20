@@ -29,6 +29,8 @@ and libadwaita 1.9+ with development files. On Ubuntu/Debian:
 
 ```
 sudo apt install libvte-2.91-gtk4-dev libadwaita-1-dev
+git clone https://github.com/justinsloan/moniker
+cd moniker
 cargo build --workspace
 target/debug/moniker
 ```
@@ -42,11 +44,11 @@ so.
 `moniker-server` (`moniker-server` and `moniker-askpass`, no GTK, for every
 machine that syncs) and `moniker` (the terminal app, which depends on it). Each
 carries the MIT license and the copyright line in its `copyright` file. Both
-list Justin Sloan as Maintainer (the address comes from `git config user.email`),
-and the `moniker` package carries AppStream metadata
-(`data/org.moniker.Moniker.metainfo.xml`) that names the same developer, which
-App Center's page for the installed app and GNOME Software should show as the
-publisher (not yet confirmed on a desktop).
+list Justin Sloan as Maintainer (the address comes from `git config user.email`)
+and the repository as Homepage, and the `moniker` package carries AppStream
+metadata (`data/org.moniker.Moniker.metainfo.xml`) that names the same
+developer, which App Center's page for the installed app and GNOME Software
+should show as the publisher (not yet confirmed on a desktop).
 
 Passwords and the sync key live in the system keyring (Secret Service, e.g.
 GNOME Keyring), which must be running and unlocked. The CLI and core need no GTK

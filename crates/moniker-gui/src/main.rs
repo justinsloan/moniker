@@ -47,6 +47,10 @@ const APP_ID: &str = "org.moniker.Moniker";
 /// `copyright` file carry the same owner and year.
 pub(crate) const ABOUT_COPYRIGHT: &str = "Copyright 2026 Justin M. Sloan";
 
+/// The About box's website: the workspace's `repository` in Cargo.toml, which
+/// the packages' Homepage field and the metainfo's homepage carry too.
+pub(crate) const REPOSITORY_URL: &str = env!("CARGO_PKG_REPOSITORY");
+
 /// One keyboard shortcut: (title, action, accelerators). The accelerators are
 /// in `gtk::accelerator_parse` form, several separated by spaces when one
 /// action has more than one key (the Keyboard Shortcuts dialog shows them as
@@ -359,14 +363,15 @@ fn shortcuts_dialog() -> adw::ShortcutsDialog {
     dialog
 }
 
-/// About Moniker: name, version, the copyright line and the MIT license. No
-/// website yet: the repository link is added once the repository exists.
+/// About Moniker: name, version, the copyright line, the MIT license and the
+/// repository as its website.
 fn about_dialog() -> adw::AboutDialog {
     adw::AboutDialog::builder()
         .application_name("Moniker")
         .version(env!("CARGO_PKG_VERSION"))
         .copyright(ABOUT_COPYRIGHT)
         .license_type(gtk::License::MitX11)
+        .website(REPOSITORY_URL)
         .build()
 }
 
@@ -377,5 +382,10 @@ mod tests {
     #[test]
     fn the_about_text_names_the_owner_and_license() {
         assert_eq!(ABOUT_COPYRIGHT, "Copyright 2026 Justin M. Sloan");
+    }
+
+    #[test]
+    fn the_about_box_links_the_repository() {
+        assert_eq!(REPOSITORY_URL, "https://github.com/justinsloan/moniker");
     }
 }

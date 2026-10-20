@@ -8,6 +8,7 @@ edition.workspace = true
 rust-version = "1.92"
 publish.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "moniker"

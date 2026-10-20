@@ -33,6 +33,11 @@ VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
 METAINFO=data/org.moniker.Moniker.metainfo.xml
 grep -qF "<release version=\"$VERSION\"" "$METAINFO" ||
     { echo "build-deb: $METAINFO has no release $VERSION; add one" >&2; exit 2; }
+# The repository is the packages' Homepage and the metainfo's homepage.
+REPOSITORY=$(sed -n 's/^repository = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+[ -n "$REPOSITORY" ] || { echo "build-deb: no repository in Cargo.toml" >&2; exit 2; }
+grep -qF "<url type=\"homepage\">$REPOSITORY</url>" "$METAINFO" ||
+    { echo "build-deb: $METAINFO's homepage is not $REPOSITORY" >&2; exit 2; }
 ARCH=$(dpkg --print-architecture)
 # Timestamps inside the .deb come from the last commit, so a rebuild of the
 # same commit gives the same files.
@@ -115,6 +120,7 @@ build_deb() {
         [ -z "${CONTROL_RECOMMENDS:-}" ] || printf 'Recommends: %s\n' "$CONTROL_RECOMMENDS"
         printf 'Section: %s\n' "$CONTROL_SECTION"
         printf 'Priority: optional\n'
+        printf 'Homepage: %s\n' "$REPOSITORY"
         printf 'Description: %s\n' "$CONTROL_DESCRIPTION"
     } >"$dir/DEBIAN/control"
     dpkg-deb --root-owner-group --build "$dir" "$OUT/${1}_${VERSION}_${ARCH}.deb" >/dev/null

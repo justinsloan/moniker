@@ -112,7 +112,7 @@ Make a few transcripts first: connect to a profile with "Save transcript" on (or
 ## Alpha 3: sessions, license and the empty case
 
 76. Close a tab that runs `vim` in a local shell, and close a tab with a live `ssh` session (also closing a whole window with such tabs): `ps` shows no `vim` or `ssh` left over from that tab or window.
-77. ☰ → About Moniker shows version 0.4.0, "Copyright 2026 Justin M. Sloan" and the MIT license, and no website link.
+77. ☰ → About Moniker shows version 0.4.0, "Copyright 2026 Justin M. Sloan" and the MIT license, and its website link opens https://github.com/justinsloan/moniker.
 78. With no profiles (start Moniker with `XDG_CONFIG_HOME` pointing at an empty directory), the new-tab list shows only Local terminal; ☰ → Connection Profiles opens the empty Connection Profiles window, and the first profile saved there appears in an open new-tab list.
 
 ## Alpha 3: tab rename fixes
@@ -169,5 +169,5 @@ Use the release build (`cargo build --release --workspace`, then `target/release
 
 ## Alpha 4: packaging
 
-109. `bash scripts/build-deb.sh` makes `target/debian/moniker_0.4.0_amd64.deb` and `moniker-server_0.4.0_amd64.deb`. `dpkg-deb -f` of each shows `Maintainer: Justin Sloan <your address>` and, for `moniker`, `Depends` with `libadwaita-1-0 (>= 1.9)` and `libvte-2.91-gtk4-0 (>= 0.76)`; `dpkg-deb -c` of `moniker` lists `/usr/share/metainfo/org.moniker.Moniker.metainfo.xml`.
+109. `bash scripts/build-deb.sh` makes `target/debian/moniker_0.4.0_amd64.deb` and `moniker-server_0.4.0_amd64.deb`. `dpkg-deb -f` of each shows `Maintainer: Justin Sloan <your address>` and `Homepage: https://github.com/justinsloan/moniker` and, for `moniker`, `Depends` with `libadwaita-1-0 (>= 1.9)` and `libvte-2.91-gtk4-0 (>= 0.76)`; `dpkg-deb -c` of `moniker` lists `/usr/share/metainfo/org.moniker.Moniker.metainfo.xml`.
 110. After installing the packages yourself: open Moniker's page in App Center (or GNOME Software, Installed): the publisher or developer reads "Justin Sloan". `apt show moniker` shows the Maintainer as Justin Sloan. Opening the .deb file itself in App Center shows only the package name and no publisher: that is App Center's own page and no package can change it.

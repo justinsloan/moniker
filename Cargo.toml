@@ -11,6 +11,7 @@ edition = "2024"
 rust-version = "1.89"
 publish = false
 license = "MIT"
+repository = "https://github.com/justinsloan/moniker"
 
 # Dependencies are optimized even in dev builds: Argon2 is unusably slow unoptimized.
 [profile.dev.package."*"]

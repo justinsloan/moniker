@@ -30,7 +30,7 @@ use crate::context::AppContext;
 use crate::terminal_tab::{
     launch, new_holder_page, rename_page, start_command, tab_title, terminal_of,
 };
-use crate::{ABOUT_COPYRIGHT, profiles, window};
+use crate::{ABOUT_COPYRIGHT, REPOSITORY_URL, profiles, window};
 
 fn sequence(name: &str) -> StartupSequence {
     StartupSequence {
@@ -466,8 +466,8 @@ fn the_connect_time_choice_decides_whether_a_transcript_is_written(bin: &Path, d
     }
 }
 
-/// About shows who owns Moniker and under which license: the copyright line
-/// and the MIT license, and nothing else linked (no website yet).
+/// About shows who owns Moniker, under which license and where it lives: the
+/// copyright line, the MIT license and the repository as its website.
 pub(super) fn about_shows_copyright_and_mit() {
     let about = crate::about_dialog();
     assert_eq!(
@@ -476,7 +476,7 @@ pub(super) fn about_shows_copyright_and_mit() {
         "the copyright line of the About box"
     );
     assert_eq!(about.license_type(), gtk::License::MitX11);
-    assert!(about.website().is_empty(), "no link until there is a repo");
+    assert_eq!(about.website(), REPOSITORY_URL, "the About box's website");
 }
 
 /// The header bar has ＋, the tab's title and ☰ and no Connect button: new
