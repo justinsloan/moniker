@@ -189,29 +189,30 @@ fn show_and_lay_out(notice: &Notice, area: &NotificationArea, text: &str) {
 
 /// A long message wraps within a comfortable width (it is never cut off with
 /// "..." or run past the window's edge), and stays up longer, to the limit.
+///
+/// The layout is checked while the message is up, with the clock at its own
+/// speed (15 seconds up), each time in a window of its own that is closed
+/// afterwards: a slow machine can take longer to lay a long message out than a
+/// sped-up clock would leave it up. Only the durations at the end run faster.
 pub(super) fn long_notifications_wrap_and_stay_longer() {
-    let notice = Notice::default();
-    let (window, area) = sized_window_with_area(&notice, 900, 500);
-    // The time a message is given is read from `shown_for`; the clock runs at
-    // a twentieth of the speed so that the scenario does not wait 15 seconds.
-    area.set_clock_scale(0.05);
-
-    let label = area.label();
-    assert!(label.wraps(), "wraps");
-    assert_eq!(label.wrap_mode(), pango::WrapMode::WordChar);
-    assert_eq!(
-        label.ellipsize(),
-        pango::EllipsizeMode::None,
-        "never cut off"
-    );
-    assert_eq!(label.max_width_chars(), 60, "a comfortable width");
-    assert!(!label.uses_markup());
-
     // Words, and then one word of 2,000 characters: both wrap, the second
     // anywhere (WordChar), so neither runs past the window.
     let words = "word ".repeat(400);
     let unbroken = "x".repeat(2_000);
     for text in [words.as_str(), unbroken.as_str()] {
+        let notice = Notice::default();
+        let (window, area) = sized_window_with_area(&notice, 900, 500);
+        let label = area.label();
+        assert!(label.wraps(), "wraps");
+        assert_eq!(label.wrap_mode(), pango::WrapMode::WordChar);
+        assert_eq!(
+            label.ellipsize(),
+            pango::EllipsizeMode::None,
+            "never cut off"
+        );
+        assert_eq!(label.max_width_chars(), 60, "a comfortable width");
+        assert!(!label.uses_markup());
+
         assert_eq!(text.chars().count(), 2_000);
         show_and_lay_out(&notice, &area, text);
         assert_eq!(label.label(), text, "all of it, as it is");
@@ -229,16 +230,13 @@ pub(super) fn long_notifications_wrap_and_stay_longer() {
             (150..700).contains(&width),
             "about 60 characters wide, not the window's 900 or a line of 2,000: {width}"
         );
-        pump_until("the notification to go", || area.shown_text().is_none());
+        window.destroy();
+        pump_for(Duration::from_millis(100));
     }
-    window.destroy();
-    drop(window);
-    pump_for(Duration::from_millis(100));
 
     // In a window narrower than 60 characters, it wraps to the window.
     let notice = Notice::default();
     let (window, area) = sized_window_with_area(&notice, 300, 400);
-    area.set_clock_scale(0.05);
     show_and_lay_out(&notice, &area, &words);
     assert!(
         area.label().width() <= area.width(),
@@ -247,10 +245,16 @@ pub(super) fn long_notifications_wrap_and_stay_longer() {
         area.width()
     );
     assert!(area.label().layout().is_wrapped());
-    pump_until("the notification to go", || area.shown_text().is_none());
+    window.destroy();
+    pump_for(Duration::from_millis(100));
 
     // How long each length is given: 8 seconds up to 80 characters, then a
-    // second more for every 40, at most 15; and it really is that long.
+    // second more for every 40, at most 15; and it really is that long. The
+    // time a message is given is read from `shown_for`; here the clock runs at
+    // a twentieth of the speed so that the scenario does not wait 41 seconds.
+    let notice = Notice::default();
+    let (window, area) = sized_window_with_area(&notice, 900, 500);
+    area.set_clock_scale(0.05);
     let mut expected = Vec::new();
     for (chars, secs) in [(10, 8), (80, 8), (160, 10), (2_000, 15)] {
         // Different texts, so the watcher tells them apart.
@@ -266,10 +270,9 @@ pub(super) fn long_notifications_wrap_and_stay_longer() {
             .map(|(text, _)| text.clone())
             .collect::<Vec<_>>()
     );
-    // (The log also holds the message of the narrow window before these.)
     let up_log = area.up_log();
-    assert_eq!(up_log.len(), 5);
-    for ((text, secs), (logged, up_for)) in expected.iter().zip(&up_log[1..]) {
+    assert_eq!(up_log.len(), 4);
+    for ((text, secs), (logged, up_for)) in expected.iter().zip(&up_log) {
         assert_eq!(logged, text);
         // Each was up for what it was given, at a twentieth of the speed. (A
         // timer never fires early.)

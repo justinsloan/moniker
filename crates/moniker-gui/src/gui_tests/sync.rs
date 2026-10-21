@@ -1039,9 +1039,17 @@ pub(super) fn auto_sync_failure_is_one_notification(dir: &Path) {
     set_runner(&ctx, counting(&runs, || Ok(added(1))));
     let delivered = ctx.notice.delivered();
     crate::launch(&app, &ctx);
-    pump_for(Duration::from_millis(400));
+    // Wait for the notification itself, not a fixed time: the launch sync
+    // starts from an idle callback after the window, which a slow machine
+    // reaches late. Then a little longer, to see that nothing else comes.
+    pump_until("the notification", || ctx.notice.delivered() > delivered);
+    pump_for(Duration::from_millis(300));
     assert_eq!(runs.load(Ordering::SeqCst), 1, "nothing ran");
-    assert_eq!(ctx.notice.delivered(), delivered + 1);
+    assert_eq!(
+        ctx.notice.delivered(),
+        delivered + 1,
+        "exactly one notification"
+    );
     assert_eq!(
         ctx.notice.last_text().as_deref(),
         Some("Automatic sync failed: Set a sync key first.")
