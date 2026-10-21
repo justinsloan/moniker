@@ -291,6 +291,7 @@ fn gui_integration() {
     tabs::renaming_an_unchanged_title_keeps_following_the_shell(&bin);
     tabs::the_tab_menu_renames_the_tab_it_was_opened_for();
     tabs::the_tab_menus_rename_puts_the_cursor_in_the_name_field();
+    tabs::opening_after_the_menu_waits_for_the_focus_to_leave_it();
     tabs::double_clicking_a_tab_asks_for_a_new_name();
     tabs::the_tab_bars_close_button_closes_the_tab(&bin, &tmp.path().join("t-bar"));
     tabs::terminal_colors_follow_light_and_dark();

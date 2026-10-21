@@ -424,6 +424,86 @@ pub fn ask_rename(page: &adw::TabPage) {
     );
 }
 
+/// How long [`after_the_menu_lets_go`] waits for the focus to leave the menu
+/// before it runs anyway.
+const MENU_FOCUS_FALLBACK: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Run `open` from an idle callback once the keyboard focus of `window` has
+/// left the menu it is in. A closing menu hands the focus back to where it was
+/// (the terminal) from an event of its own, a few milliseconds after it closes,
+/// and an idle callback alone can run before that event: a dialog opened then
+/// loses the focus to one of its buttons when it comes, as the terminal behind
+/// the dialog cannot take it (seen on slow machines, and now and then on fast
+/// ones). With the focus not in a menu (elsewhere or nowhere), or no window,
+/// `open` waits for the idle callback only. While it waits, the focus going
+/// nowhere is not yet the hand-back; if the focus never lands outside the
+/// menu, `open` runs after [`MENU_FOCUS_FALLBACK`].
+pub(crate) fn after_the_menu_lets_go(window: Option<&gtk::Window>, open: impl FnOnce() + 'static) {
+    let Some(window) = window.filter(|window| focus_in_a_menu(window) == Some(true)) else {
+        glib::idle_add_local_once(open);
+        return;
+    };
+    let wait = Rc::new(MenuWait {
+        open: RefCell::new(Some(open)),
+        handler: Cell::new(None),
+        fallback: Cell::new(None),
+    });
+    let handler = window.connect_focus_widget_notify(glib::clone!(
+        #[strong]
+        wait,
+        move |window| {
+            if focus_in_a_menu(window) == Some(false) {
+                wait.finish(window);
+            }
+        }
+    ));
+    wait.handler.set(Some(handler));
+    let fallback = glib::timeout_add_local_once(
+        MENU_FOCUS_FALLBACK,
+        glib::clone!(
+            #[strong]
+            wait,
+            #[weak]
+            window,
+            move || {
+                // This source is the one running, and it goes by itself.
+                wait.fallback.take();
+                wait.finish(&window);
+            }
+        ),
+    );
+    wait.fallback.set(Some(fallback));
+}
+
+/// Whether the keyboard focus of `window` is in a menu (a popover): `None` when
+/// nothing has the focus.
+fn focus_in_a_menu(window: &gtk::Window) -> Option<bool> {
+    gtk::prelude::RootExt::focus(window)
+        .map(|focus| focus.ancestor(gtk::Popover::static_type()).is_some())
+}
+
+/// What [`after_the_menu_lets_go`] keeps while it waits.
+struct MenuWait<F> {
+    open: RefCell<Option<F>>,
+    handler: Cell<Option<glib::SignalHandlerId>>,
+    fallback: Cell<Option<glib::SourceId>>,
+}
+
+impl<F: FnOnce() + 'static> MenuWait<F> {
+    /// Stop waiting, and run `open` from an idle callback, once.
+    fn finish(&self, window: &gtk::Window) {
+        if let Some(handler) = self.handler.take() {
+            window.disconnect(handler);
+        }
+        if let Some(fallback) = self.fallback.take() {
+            fallback.remove();
+        }
+        if let Some(open) = self.open.borrow_mut().take() {
+            glib::idle_add_local_once(open);
+        }
+    }
+}
+
 /// The tab menu: what the person gets by right clicking a tab.
 fn tab_menu() -> gio::Menu {
     let menu = gio::Menu::new();
@@ -490,13 +570,14 @@ pub fn setup_tab_view(view: &adw::TabView) {
             }
         }
     ));
-    // The menu closes only after its action has run, and closing hands the
-    // keyboard focus back, which would take it from the dialog's name field. So
-    // the dialog opens once the main loop is idle again, after the menu is gone.
+    // The menu closes only after its action has run, and hands the keyboard
+    // focus back a moment later, which would take it from the dialog's name
+    // field. So the dialog opens once the focus has left the menu.
     let rename = gio::SimpleAction::new("rename", None);
     rename.connect_activate(move |_, _| {
         if let Some(page) = menu_page.upgrade() {
-            glib::idle_add_local_once(move || ask_rename(&page));
+            let window = page.child().root().and_downcast::<gtk::Window>();
+            after_the_menu_lets_go(window.as_ref(), move || ask_rename(&page));
         }
     });
     let actions = gio::SimpleActionGroup::new();

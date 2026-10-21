@@ -28,10 +28,10 @@ use super::{
 use crate::context::{AppContext, Notice};
 use crate::notify::NotificationArea;
 use crate::terminal_tab::{
-    ASKPASS_MISSING_NOTICE, TranscriptSpec, ask_rename, end_sessions_on_close, launch,
-    new_holder_page, new_holder_page_at, open_command, open_local_shell, rename_page, scale_of,
-    set_test_ssh_program, start_command, start_profile, start_shell_in, terminal_of, terminal_text,
-    write_transcripts,
+    ASKPASS_MISSING_NOTICE, TranscriptSpec, after_the_menu_lets_go, ask_rename,
+    end_sessions_on_close, launch, new_holder_page, new_holder_page_at, open_command,
+    open_local_shell, rename_page, scale_of, set_test_ssh_program, start_command, start_profile,
+    start_shell_in, terminal_of, terminal_text, write_transcripts,
 };
 use crate::theme;
 use crate::window;
@@ -976,7 +976,7 @@ pub(super) fn the_tab_menus_rename_puts_the_cursor_in_the_name_field() {
         .expect("the Rename… item");
     item.emit_by_name::<()>("clicked", &[]);
 
-    // The dialog opens once the menu is gone (an idle callback) and takes the
+    // The dialog opens once the menu has handed the focus back, and takes the
     // focus after that, so wait for each instead of for a fixed time, which a
     // slow machine can overrun.
     pump_until("the rename dialog", || rename_dialog(&fx.window).is_some());
@@ -999,6 +999,64 @@ pub(super) fn the_tab_menus_rename_puts_the_cursor_in_the_name_field() {
         .expect("a Cancel button")
         .emit_clicked();
     pump_for(Duration::from_millis(300));
+    menu.unparent();
+    fx.click_close(&terminal);
+    fx.window.destroy();
+}
+
+/// What the tab menu's Rename… waits for before it opens its dialog: not while
+/// the keyboard focus is still in the menu, soon after it has left, and after a
+/// short wait if it never does. (The menu hands the focus back from an event of
+/// its own, so in the real menu the order of that event and an idle callback
+/// is down to timing; here the focus is moved by hand.)
+pub(super) fn opening_after_the_menu_waits_for_the_focus_to_leave_it() {
+    let fx = fixture();
+    let page = new_holder_page(&fx.view, "Named");
+    let terminal = start_shell_in(&page, "/bin/sh", Path::new("/"), None);
+    pump_for(Duration::from_millis(300));
+    let menu = gtk::PopoverMenu::from_model(fx.view.menu_model().as_ref());
+    menu.set_parent(&fx.bar);
+    let in_menu = || {
+        gtk::prelude::RootExt::focus(&fx.window)
+            .is_some_and(|f| f.ancestor(gtk::Popover::static_type()).is_some())
+    };
+
+    // The focus leaves the menu: then, and only then, it opens.
+    menu.popup();
+    pump_until("the focus to go into the menu", in_menu);
+    let opened = Rc::new(Cell::new(false));
+    after_the_menu_lets_go(Some(&fx.window), {
+        let opened = Rc::clone(&opened);
+        move || opened.set(true)
+    });
+    pump_for(Duration::from_millis(100));
+    assert!(!opened.get(), "not while the focus is in the menu");
+    menu.popdown();
+    terminal.grab_focus();
+    pump_until("it to open once the focus has left", || opened.get());
+
+    // The focus stays in the menu: it opens after the fallback, and only once.
+    menu.popup();
+    pump_until("the focus to go into the menu again", in_menu);
+    let runs = Rc::new(Cell::new(0));
+    after_the_menu_lets_go(Some(&fx.window), {
+        let runs = Rc::clone(&runs);
+        move || runs.set(runs.get() + 1)
+    });
+    pump_until("the fallback", || runs.get() > 0);
+    menu.popdown();
+    terminal.grab_focus();
+    pump_for(Duration::from_millis(300));
+    assert_eq!(runs.get(), 1, "it opens once");
+
+    // No menu: it opens from an idle callback, as before.
+    let opened = Rc::new(Cell::new(false));
+    after_the_menu_lets_go(Some(&fx.window), {
+        let opened = Rc::clone(&opened);
+        move || opened.set(true)
+    });
+    pump_until("it to open with no menu", || opened.get());
+
     menu.unparent();
     fx.click_close(&terminal);
     fx.window.destroy();
