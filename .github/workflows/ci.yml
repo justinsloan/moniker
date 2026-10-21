@@ -246,6 +246,9 @@ jobs:
             echo '**Check a download**'
             echo
             echo '    sha256sum --ignore-missing -c SHA256SUMS'
+            echo
+            echo "and, with GitHub CLI 2.49 or newer (Ubuntu 26.04's own \`gh\` package is older), that GitHub built it from this repository:"
+            echo
             echo "    gh attestation verify FILE --repo $GITHUB_REPOSITORY"
           } >"$RUNNER_TEMP/notes.md"
           gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease \

@@ -79,7 +79,9 @@ fresh container and starts it there, and only then makes a **draft** release
 with the four packages, `SHA256SUMS` and a build-provenance attestation for
 each package. A draft is not public: download its packages, try them, and
 publish it on GitHub when they are good. A tag that does not match the version
-in `Cargo.toml` makes no release. To check a downloaded package:
+in `Cargo.toml` makes no release. To check a downloaded package against
+`SHA256SUMS`, and, with GitHub CLI 2.49 or newer (Ubuntu 26.04's own `gh`
+package is 2.46), that GitHub built it from this repository:
 
 ```
 sha256sum --ignore-missing -c SHA256SUMS
