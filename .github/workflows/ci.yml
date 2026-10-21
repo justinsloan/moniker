@@ -251,6 +251,6 @@ jobs:
             echo
             echo "    gh attestation verify FILE --repo $GITHUB_REPOSITORY"
           } >"$RUNNER_TEMP/notes.md"
-          gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease \
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
             --title "Moniker $VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
             -- *.deb *.rpm SHA256SUMS
