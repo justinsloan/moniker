@@ -19,6 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -73,7 +74,9 @@ pub(crate) type MakeRunner = Box<dyn Fn() -> crate::sync::Runner>;
 /// State shared by every window and dialog of the application.
 pub struct AppContext {
     pub store: RefCell<ProfileStore>,
-    pub secrets: Rc<dyn SecretStore>,
+    /// The keyring. The GUI calls it only on the keyring worker
+    /// (`crate::keyring::run`), never on the main thread.
+    pub secrets: Arc<dyn SecretStore>,
     /// The `moniker-askpass` helper that sits next to this executable.
     pub askpass_path: PathBuf,
     /// The per-user runtime directory (`XDG_RUNTIME_DIR`, absolute only), where
@@ -131,7 +134,7 @@ impl AppContext {
             .map_err(|err| format!("cannot find the path of this program: {err}"))?;
         Ok(AppContext::with_paths(
             store,
-            Rc::new(KeyringSecretStore::new()),
+            Arc::new(KeyringSecretStore::new()),
             exe.with_file_name("moniker-askpass"),
             settings::default_path(),
             runtime_dir_from(std::env::var_os("XDG_RUNTIME_DIR")),
@@ -141,14 +144,17 @@ impl AppContext {
     /// A context over the given store, secret store and helper path, with no
     /// overlay attached and nobody listening yet. Tests use it with a
     /// temporary store and an in-memory secret store; the settings file is the
-    /// one beside the store, as in the app.
+    /// one beside the store, as in the app. The secret store is watched: every
+    /// call made on the thread that makes the context (the main thread, in the
+    /// window tests) is counted (`keyring::MainThreadWatch`).
     #[cfg(test)]
     pub fn with_parts(
         store: ProfileStore,
-        secrets: Rc<dyn SecretStore>,
+        secrets: Arc<dyn SecretStore>,
         askpass_path: PathBuf,
     ) -> AppContext {
         let settings_path = store.path().with_file_name(settings::FILE_NAME);
+        let secrets = Arc::new(crate::keyring::MainThreadWatch::new(secrets));
         AppContext::with_paths(store, secrets, askpass_path, settings_path, None)
     }
 
@@ -164,7 +170,7 @@ impl AppContext {
 
     fn with_paths(
         store: ProfileStore,
-        secrets: Rc<dyn SecretStore>,
+        secrets: Arc<dyn SecretStore>,
         askpass_path: PathBuf,
         settings_path: PathBuf,
         runtime_dir: Option<PathBuf>,
@@ -541,7 +547,7 @@ mod tests {
         let store = ProfileStore::open(&dir.join("profiles.json")).unwrap();
         AppContext::with_parts(
             store,
-            Rc::new(MemorySecretStore::default()),
+            Arc::new(MemorySecretStore::default()),
             dir.join("askpass"),
         )
     }

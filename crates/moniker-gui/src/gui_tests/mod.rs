@@ -24,6 +24,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -74,6 +75,13 @@ fn pump_until(what: &str, mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// The terminal of `page` once its session has started: connecting to a
+/// profile asks the keyring, on its worker, first.
+fn wait_for_session(page: &adw::TabPage) -> Terminal {
+    pump_until("the session", || terminal_of(page).is_some());
+    terminal_of(page).expect("the session")
 }
 
 /// Run the main loop for `duration`.
@@ -268,6 +276,13 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #4 first: they fail fast when a keyring call is on the main thread.
+    sync::the_sync_page_uses_the_keyring_off_the_main_thread(&tmp.path().join("k-sync"));
+    profiles::the_profile_window_uses_the_keyring_off_the_main_thread(&tmp.path().join("k-prof"));
+    windows::connecting_waits_for_the_keyring_off_the_main_thread(
+        &bin,
+        &tmp.path().join("k-connect"),
+    );
     tabs::argv_and_environment_reach_the_child(&bin);
     tabs::startup_sequence_is_one_literal_argument(&bin);
     tabs::clean_exit_closes_the_tab(&bin);
@@ -423,6 +438,14 @@ fn gui_integration() {
     recordings::the_export_dialog_starts_in_the_home_directory();
     recordings::closing_the_last_main_window_closes_it(&tmp.path().join("r-quit"));
     markup_is_shown_literally_everywhere(&bin, &tmp.path().join("markup"));
+    // Every scenario, not only the three above: the GUI never called the
+    // keyring on the main thread (issue #4). Tests seed and read the keyring
+    // through their own handles, which are not counted.
+    assert_eq!(
+        crate::keyring::main_thread_calls(),
+        0,
+        "keyring calls on the main thread"
+    );
 }
 
 /// The labels below `root` that show exactly `text`, none of which may parse
@@ -535,7 +558,7 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     let fake = fake_ssh(bin, "markup", "echo FAKE-END\nexec sleep 600");
     set_test_ssh_program(Some(fake));
     list.emit_by_name::<()>("row-activated", &[&row]);
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     wait_for_text(&terminal, "FAKE-END");
     assert_eq!(page.title(), tab_title(&p));
     assert_eq!(page.title(), MARKUP_NAME);
@@ -680,18 +703,24 @@ fn bare_area() -> NotificationArea {
 }
 
 /// A context over a temp store and an in-memory keyring whose helper path is
-/// `askpass_path`, with a notification area attached. Keep the area alive for
-/// as long as messages should reach it: `Notice` holds it weakly.
-fn launch_ctx(dir: &Path, askpass_path: PathBuf) -> (Rc<AppContext>, NotificationArea) {
+/// `askpass_path`, with a notification area attached, and the test's own
+/// handle on the keyring (to seed it without going through the context's).
+/// Keep the area alive for as long as messages should reach it: `Notice`
+/// holds it weakly.
+fn launch_ctx(
+    dir: &Path,
+    askpass_path: PathBuf,
+) -> (Rc<AppContext>, NotificationArea, Arc<MemorySecretStore>) {
     fs::create_dir_all(dir).expect("dir");
+    let secrets = Arc::new(MemorySecretStore::default());
     let ctx = Rc::new(AppContext::with_parts(
         ProfileStore::open(&dir.join("profiles.json")).expect("store"),
-        Rc::new(MemorySecretStore::default()),
+        Arc::clone(&secrets) as Arc<dyn SecretStore>,
         askpass_path,
     ));
     let area = bare_area();
     ctx.notice.attach(&area);
-    (ctx, area)
+    (ctx, area, secrets)
 }
 
 /// The first widget of type `T` at or below `root`.

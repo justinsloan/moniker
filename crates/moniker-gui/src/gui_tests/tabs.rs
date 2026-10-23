@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -23,7 +24,7 @@ use super::main_window::{ctx_with, menu_items, test_app};
 use super::{
     HELPER, MARKUP_NAME, all_widgets, button_labeled, fake_command, fake_shell, fake_ssh, files_in,
     find_widget, fixture, labels_in, launch_ctx, make_helper, page_of, profile, pump_for,
-    pump_until, shown, tab_window, wait_for_text, widgets_of_type,
+    pump_until, shown, tab_window, wait_for_session, wait_for_text, widgets_of_type,
 };
 use crate::context::{AppContext, Notice};
 use crate::notify::NotificationArea;
@@ -373,9 +374,8 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
     // A password is stored but the helper is not there: the command is the plain
     // one (ssh asks in the terminal) and a notification says why, in the tab's
     // window.
-    let (ctx, _attached) = launch_ctx(dir, dir.join("no-such-helper"));
-    ctx.secrets.set(&password_key(&p.id), "hunter2").unwrap();
-    let launched = launch(&page, &p, None, false, &ctx, &transcripts);
+    let (ctx, _attached, _secrets) = launch_ctx(dir, dir.join("no-such-helper"));
+    let launched = launch(&page, &p, None, false, &ctx, &transcripts, true);
     assert!(
         launched.command.env.is_empty(),
         "{:?}",
@@ -387,9 +387,8 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
     assert!(!said.contains("hunter2"));
 
     // The helper is there: ssh is pointed at it and nothing is said.
-    let (ctx, _area) = launch_ctx(dir, make_helper(dir));
-    ctx.secrets.set(&password_key(&p.id), "hunter2").unwrap();
-    let launched = launch(&page, &p, None, false, &ctx, &transcripts);
+    let (ctx, _area, _secrets) = launch_ctx(dir, make_helper(dir));
+    let launched = launch(&page, &p, None, false, &ctx, &transcripts, true);
     let names: Vec<&str> = launched
         .command
         .env
@@ -413,8 +412,8 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
     assert!(launched.marker.is_none());
 
     // No password stored and no helper: nothing to explain.
-    let (ctx, _area) = launch_ctx(dir, dir.join("no-such-helper"));
-    let launched = launch(&page, &p, None, false, &ctx, &transcripts);
+    let (ctx, _area, _secrets) = launch_ctx(dir, dir.join("no-such-helper"));
+    let launched = launch(&page, &p, None, false, &ctx, &transcripts, false);
     assert!(launched.command.env.is_empty());
     assert!(launched.marker.is_none());
     assert_eq!(ctx.notice.last_text(), None);
@@ -443,14 +442,15 @@ fn pump_until_freed(what: &str, terminal: glib::WeakRef<Terminal>) {
 pub(super) fn the_marker_is_released_when_the_session_ends(bin: &Path, dir: &Path) {
     let runtime = dir.join("run");
     fs::create_dir_all(&runtime).expect("runtime dir");
+    let secrets = Arc::new(MemorySecretStore::default());
     let ctx = AppContext::with_parts(
         ProfileStore::open(&dir.join("profiles.json")).expect("store"),
-        Rc::new(MemorySecretStore::default()),
+        Arc::clone(&secrets) as Arc<dyn SecretStore>,
         make_helper(dir),
     )
     .with_runtime_dir(runtime.clone());
     let p = profile(&[]);
-    ctx.secrets.set(&password_key(&p.id), "hunter2").unwrap();
+    secrets.set(&password_key(&p.id), "hunter2").unwrap();
 
     // Connect in a new tab of `view`, with a fake ssh that prints FAKE-END and
     // then runs `then`, and make the marker as the helper does for the first
@@ -458,7 +458,7 @@ pub(super) fn the_marker_is_released_when_the_session_ends(bin: &Path, dir: &Pat
     let connect = |view: &adw::TabView, name: &str, then: &str| -> (Terminal, PathBuf) {
         let fake = fake_ssh(bin, name, &format!("echo FAKE-END\n{then}"));
         let page = new_holder_page(view, "x");
-        let mut launched = launch(&page, &p, None, false, &ctx, &dir.join("transcripts"));
+        let mut launched = launch(&page, &p, None, false, &ctx, &dir.join("transcripts"), true);
         launched.command.program = fake;
         let token = launched
             .command
@@ -622,8 +622,8 @@ pub(super) fn a_closed_local_tab_hangs_up_its_shell_and_its_job(bin: &Path, dir:
 pub(super) fn the_missing_helper_notification_lands_in_the_tabs_window(bin: &Path, dir: &Path) {
     let fake = fake_ssh(bin, "askpass-toast", "echo FAKE-END\nexec sleep 600");
     let p = profile(&[]);
-    let (ctx, _first) = launch_ctx(dir, dir.join("no-such-helper"));
-    ctx.secrets.set(&password_key(&p.id), "hunter2").unwrap();
+    let (ctx, _first, secrets) = launch_ctx(dir, dir.join("no-such-helper"));
+    secrets.set(&password_key(&p.id), "hunter2").unwrap();
 
     let view = adw::TabView::new();
     crate::terminal_tab::setup_tab_view(&view);
@@ -637,6 +637,7 @@ pub(super) fn the_missing_helper_notification_lands_in_the_tabs_window(bin: &Pat
     set_test_ssh_program(Some(fake));
     let page = new_holder_page(&view, "x");
     start_profile(&page, &ctx, &p, None, false);
+    let terminal = wait_for_session(&page);
     set_test_ssh_program(None);
 
     assert_eq!(
@@ -648,7 +649,6 @@ pub(super) fn the_missing_helper_notification_lands_in_the_tabs_window(bin: &Pat
         Some(&tab_area),
         "the notification is in the tab's window"
     );
-    let terminal = terminal_of(&page).expect("the session");
     wait_for_text(&terminal, "FAKE-END");
     window.destroy();
     profiles_window.destroy();

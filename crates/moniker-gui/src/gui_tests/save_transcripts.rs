@@ -25,7 +25,10 @@ use vte4::prelude::*;
 
 use super::main_window::{choices_parts, ctx_with, press_key, test_app};
 use super::windows::{list_in, main_window, named, row};
-use super::{all_widgets, fake_ssh, files_in, find_widget, pump_for, pump_until, wait_for_text};
+use super::{
+    all_widgets, fake_ssh, files_in, find_widget, pump_for, pump_until, wait_for_session,
+    wait_for_text,
+};
 use crate::context::AppContext;
 use crate::terminal_tab::{local_host_name, set_test_ssh_program, terminal_of};
 use crate::{connect_menu, new_tab, preferences, recordings, settings, window};
@@ -165,7 +168,7 @@ fn assert_transcript(file: &Path, needle: &str) {
 fn connect_plainly(main: &window::MainWindow, ctx: &Rc<AppContext>, id: &str) -> adw::TabPage {
     let (page, list) = new_list(main, ctx);
     click(&list, id);
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     wait_for_text(&terminal, "FAKE-END");
     page
 }
@@ -297,7 +300,7 @@ pub(super) fn save_all_overrides_a_profile_that_saves_nothing(bin: &Path, dir: &
 
     // A plain click on the profile that saves nothing: saved.
     click(&list, &quiet.id);
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     wait_for_text(&terminal, "FAKE-END");
     close(&main, &page);
     let files = files_of(&transcripts, "quiet.example.test");
@@ -321,7 +324,7 @@ pub(super) fn save_all_overrides_a_profile_that_saves_nothing(bin: &Path, dir: &
     popover.popdown();
     pump_until("the choices to close", || !popover.is_visible());
     click(&list, &quiet.id);
-    wait_for_text(&terminal_of(&page).expect("the session"), "FAKE-END");
+    wait_for_text(&wait_for_session(&page), "FAKE-END");
     close(&main, &page);
     assert_eq!(files_in(&transcripts).len(), 3, "nothing more was saved");
 
@@ -366,7 +369,7 @@ pub(super) fn unchecking_skips_one_session(bin: &Path, dir: &Path) {
     assert!(parts.record.is_active(), "save all checks the box");
     parts.record.set_active(false);
     parts.buttons[0].emit_clicked();
-    wait_for_text(&terminal_of(&page).expect("the session"), "FAKE-END");
+    wait_for_text(&wait_for_session(&page), "FAKE-END");
     close(&main, &page);
     assert!(
         files_in(&transcripts).is_empty(),

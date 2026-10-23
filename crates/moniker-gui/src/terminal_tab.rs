@@ -107,7 +107,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -1590,11 +1590,12 @@ pub(crate) struct Launch {
 
 /// Work out the tab for connecting to `profile` with its startup sequence number
 /// `sequence`: its title, the `ssh` command and the transcript settings. `record`
-/// says whether the session is recorded (see [`transcript_spec`]). Shows a note
-/// as a notification if the stored password cannot be used, in the window of
-/// `page`, the tab being opened: a connection started from the Connection
-/// Profiles window opens its tab in a main window, and that is where the note
-/// belongs.
+/// says whether the session is recorded (see [`transcript_spec`]), and
+/// `has_password` whether a password is stored for it (the keyring worker's
+/// answer, [`has_stored_password`]). Shows a note as a notification if the
+/// stored password cannot be used, in the window of `page`, the tab being
+/// opened: a connection started from the Connection Profiles window opens its
+/// tab in a main window, and that is where the note belongs.
 pub(crate) fn launch(
     page: &adw::TabPage,
     profile: &Profile,
@@ -1602,8 +1603,8 @@ pub(crate) fn launch(
     record: bool,
     ctx: &AppContext,
     transcript_dir: &Path,
+    has_password: bool,
 ) -> Launch {
-    let has_password = has_stored_password(profile, ctx.secrets.as_ref());
     if let Some(note) = askpass_notice(has_password, &ctx.askpass_path) {
         ctx.notice.show_near(&page.child(), note);
     }
@@ -1628,7 +1629,7 @@ pub(crate) fn launch(
 /// `view`, or, in a window with none, at the size saved for the next launch.
 pub fn open_profile(
     view: &adw::TabView,
-    ctx: &AppContext,
+    ctx: &Rc<AppContext>,
     profile: &Profile,
     sequence: Option<usize>,
     record: bool,
@@ -1638,26 +1639,127 @@ pub fn open_profile(
 }
 
 /// [`open_profile`] in the page `page`, which [`new_holder_page`] made.
+///
+/// Whether a password is stored is asked on the keyring worker
+/// (`crate::keyring::run`), never on the main thread: a locked keyring waits
+/// for its unlock prompt, and the window must not freeze meanwhile. Until the
+/// answer is back the tab waits ([`show_waiting`]); then the session starts,
+/// unless the tab was closed meanwhile (its window too), which starts nothing.
+/// A tab dragged to another window meanwhile starts there. A keyring worker
+/// that stopped counts as no stored password: ssh asks in the terminal.
 pub(crate) fn start_profile(
     page: &adw::TabPage,
-    ctx: &AppContext,
+    ctx: &Rc<AppContext>,
     profile: &Profile,
     sequence: Option<usize>,
     record: bool,
 ) {
-    let Launch {
-        title,
-        command,
-        transcript,
-        marker,
-    } = launch(page, profile, sequence, record, ctx, &ctx.transcripts_dir());
-    start_command(
-        page,
-        &title,
-        test_hook::command(command),
-        transcript,
-        marker,
+    let waiting = show_waiting(page);
+    // Named after the profile at once, while it waits (a name the person gave
+    // the tab is kept).
+    if let Some(holder) = holder_of(page) {
+        holder
+            .title()
+            .borrow_mut()
+            .adopt(TabTitle::remote(tab_title(profile)));
+        refresh_title(page, &holder);
+    }
+    let asked = profile.clone();
+    let profile = profile.clone();
+    let page = page.downgrade();
+    let ctx_done = Rc::clone(ctx);
+    crate::keyring::run(
+        ctx,
+        move |secrets| has_stored_password(&asked, secrets),
+        move |has_password| {
+            let ctx = ctx_done;
+            let Some(page) = page.upgrade() else {
+                return;
+            };
+            // Closing the tab or its window emptied the holder.
+            let still_waiting = holder_of(&page)
+                .and_then(|holder| holder.first_child())
+                .is_some_and(|child| child == waiting);
+            if !still_waiting {
+                return;
+            }
+            let Launch {
+                title,
+                command,
+                transcript,
+                marker,
+            } = launch(
+                &page,
+                &profile,
+                sequence,
+                record,
+                &ctx,
+                &ctx.transcripts_dir(),
+                has_password.unwrap_or(false),
+            );
+            start_command(
+                &page,
+                &title,
+                test_hook::command(command),
+                transcript,
+                marker,
+            );
+        },
     );
+}
+
+/// How long a tab waits for the keyring before it says so: a quick answer
+/// shows nothing.
+const WAITING_SHOWN_AFTER: Duration = Duration::from_millis(400);
+
+/// What the tab says while it waits for the keyring.
+pub(crate) const WAITING_TEXT: &str = "Waiting for the keyring\u{2026}";
+
+/// Show in `page` (which has not run a session yet) that it waits for the
+/// keyring before its session starts, in place of whatever it showed (the
+/// new-tab list, so that a second pick there starts nothing), and return
+/// what it shows now. The spinner and its line appear only after
+/// [`WAITING_SHOWN_AFTER`].
+fn show_waiting(page: &adw::TabPage) -> gtk::Widget {
+    let holder = holder_of(page).expect("session tabs are made by new_holder_page");
+    while let Some(old) = holder.first_child() {
+        holder.remove(&old);
+    }
+    let waiting = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let spinner = adw::Spinner::builder()
+        .width_request(32)
+        .height_request(32)
+        .build();
+    let label = gtk::Label::builder()
+        .label(WAITING_TEXT)
+        .css_classes(["dim-label"])
+        .build();
+    spinner.set_visible(false);
+    label.set_visible(false);
+    waiting.append(&spinner);
+    waiting.append(&label);
+    holder.append(&waiting);
+    glib::timeout_add_local_once(
+        WAITING_SHOWN_AFTER,
+        glib::clone!(
+            #[weak]
+            spinner,
+            #[weak]
+            label,
+            move || {
+                spinner.set_visible(true);
+                label.set_visible(true);
+            }
+        ),
+    );
+    waiting.upcast()
 }
 
 /// Tests only: the program [`start_profile`] runs in place of the system `ssh`,

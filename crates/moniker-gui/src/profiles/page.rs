@@ -13,8 +13,11 @@
 //! ([`sequence_page`]) that opens over this one.
 //!
 //! The page never reads the keyring: it cannot show whether a password is
-//! stored. A Secret Service call on every selection would run on the main
-//! thread and could freeze or prompt with a locked keyring.
+//! stored. A Secret Service call on every selection could prompt with a
+//! locked keyring. What it does write there (a new password, removing the
+//! stored one, deleting the profile's) goes to the keyring worker
+//! ([`keyring::run`]), never the main thread, and the outcome is shown when it
+//! is back.
 //!
 //! Profile data (names, hosts, user names, sequence names, key-file paths) is
 //! shown with Pango markup off everywhere: it can come from another machine.
@@ -35,6 +38,7 @@ use zeroize::Zeroizing;
 use super::sequence_page;
 use crate::context::AppContext;
 use crate::form::{self, Field};
+use crate::keyring;
 
 /// The startup-sequence group's description: what can leak.
 pub(crate) const SECRETS_WARNING: &str = "\
@@ -375,21 +379,51 @@ impl Inner {
         }
     }
 
-    fn apply_password(&self) {
+    /// Store the typed password ([`form::apply_password`]: the keyring first,
+    /// then the profile file again) on the keyring worker. The row is off until
+    /// that is back; empty means keep the stored one, and nothing is done.
+    fn apply_password(self: &Rc<Self>) {
         // Copied once out of GTK into a wrapper that wipes it on drop.
         let typed = Zeroizing::new(self.password.text().to_string());
-        match form::apply_password(&self.ctx.store, self.ctx.secrets.as_ref(), &self.id, &typed) {
-            Ok(()) => {
-                self.clear_password();
-                if !typed.is_empty() {
-                    self.ctx.profiles_changed();
-                }
-            }
-            Err(message) => {
-                self.password.add_css_class("error");
-                self.ctx.notice.show_near(&self.password, &message);
-            }
+        if typed.is_empty() {
+            self.clear_password();
+            return;
         }
+        self.password.set_sensitive(false);
+        let store_path = self.ctx.store.borrow().path().to_path_buf();
+        let id = self.id.clone();
+        let ctx = Rc::clone(&self.ctx);
+        let weak = Rc::downgrade(self);
+        keyring::run(
+            &self.ctx,
+            move |secrets| {
+                let store = keyring::own_store(&store_path)?;
+                form::apply_password(&store, secrets, &id, &typed)
+            },
+            move |result| {
+                let result = result.unwrap_or_else(|| {
+                    Err(format!(
+                        "Could not store the password in the keyring: {}.",
+                        keyring::STOPPED
+                    ))
+                });
+                if result.is_ok() {
+                    // The file was written again, page or no page.
+                    ctx.profiles_changed();
+                }
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                inner.password.set_sensitive(true);
+                match result {
+                    Ok(()) => inner.clear_password(),
+                    Err(message) => {
+                        inner.password.add_css_class("error");
+                        inner.ctx.notice.show_near(&inner.password, &message);
+                    }
+                }
+            },
+        );
     }
 
     fn clear_password(&self) {
@@ -598,13 +632,35 @@ impl Inner {
         dialog.set_close_response("cancel");
         let weak = Rc::downgrade(self);
         dialog.connect_response(Some("remove"), move |_, _| {
-            if let Some(inner) = weak.upgrade()
-                && let Err(message) = form::remove_password(inner.ctx.secrets.as_ref(), &inner.id)
-            {
-                inner.ctx.notice.show_near(&inner.password, &message);
+            if let Some(inner) = weak.upgrade() {
+                inner.remove_password();
             }
         });
         dialog.present(Some(&self.password));
+    }
+
+    /// Remove the stored password ([`form::remove_password`]) on the keyring
+    /// worker; a failure is shown when it is back.
+    fn remove_password(&self) {
+        let id = self.id.clone();
+        let ctx = Rc::clone(&self.ctx);
+        // Held for the message: the page may have gone by then.
+        let near = self.password.clone();
+        keyring::run(
+            &self.ctx,
+            move |secrets| form::remove_password(secrets, &id),
+            move |result| {
+                let result = result.unwrap_or_else(|| {
+                    Err(format!(
+                        "Could not remove the stored password: {}.",
+                        keyring::STOPPED
+                    ))
+                });
+                if let Err(message) = result {
+                    ctx.notice.show_near(&near, &message);
+                }
+            },
+        );
     }
 
     /// Ask before deleting the profile, naming it literally.
@@ -640,32 +696,43 @@ impl Inner {
         dialog.present(Some(&self.name.row));
     }
 
-    /// Delete the password first, then the profile, so a profile that is gone
-    /// never leaves a password behind. A failure is shown and nothing further
-    /// is done.
+    /// Delete the password first (on the keyring worker), then, once that is
+    /// back, the profile, so a profile that is gone never leaves a password
+    /// behind. A failure is shown and nothing further is done.
     fn delete(&self) {
         // Hold on to a widget for the messages: refreshing may drop this page.
         let near = self.key_file.clone();
         let ctx = Rc::clone(&self.ctx);
-        if let Err(err) = ctx.secrets.delete(&password_key(&self.id)) {
-            ctx.notice.show_near(
-                &near,
-                &format!(
-                    "Could not delete the stored password: {err}. The profile was not deleted."
-                ),
-            );
-            return;
-        }
-        let result = ctx.store.borrow_mut().delete(&self.id);
-        if let Err(err) = result {
-            ctx.notice.show_near(
-                &near,
-                &format!(
-                    "Could not delete the profile: {err}. Its stored password has already been removed."
-                ),
-            );
-        }
-        ctx.profiles_changed();
+        let id = self.id.clone();
+        let key = password_key(&self.id);
+        keyring::run(
+            &self.ctx,
+            move |secrets| secrets.delete(&key).map_err(|err| err.to_string()),
+            move |result| {
+                let result = result.unwrap_or_else(|| Err(keyring::STOPPED.to_owned()));
+                if let Err(err) = result {
+                    ctx.notice.show_near(
+                        &near,
+                        &format!(
+                            "Could not delete the stored password: {err}. The profile was not \
+                             deleted."
+                        ),
+                    );
+                    return;
+                }
+                let result = ctx.store.borrow_mut().delete(&id);
+                if let Err(err) = result {
+                    ctx.notice.show_near(
+                        &near,
+                        &format!(
+                            "Could not delete the profile: {err}. Its stored password has \
+                             already been removed."
+                        ),
+                    );
+                }
+                ctx.profiles_changed();
+            },
+        );
     }
 }
 

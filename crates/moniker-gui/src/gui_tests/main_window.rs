@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -18,7 +19,7 @@ use gtk::{gdk, gio};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::profile::{Profile, StartupSequence};
-use moniker_core::secrets::MemorySecretStore;
+use moniker_core::secrets::{MemorySecretStore, SecretStore};
 use moniker_core::store::ProfileStore;
 
 use super::{
@@ -46,16 +47,21 @@ fn web() -> Profile {
 /// A context over a store in `dir` holding `profiles`, an in-memory keyring and
 /// a stand-in askpass helper.
 pub(super) fn ctx_with(dir: &Path, profiles: &[Profile]) -> Rc<AppContext> {
+    ctx_with_secrets(dir, profiles, Arc::new(MemorySecretStore::default()))
+}
+
+/// [`ctx_with`], with `secrets` as the keyring.
+pub(super) fn ctx_with_secrets(
+    dir: &Path,
+    profiles: &[Profile],
+    secrets: Arc<dyn SecretStore>,
+) -> Rc<AppContext> {
     fs::create_dir_all(dir).expect("dir");
     let mut store = ProfileStore::open(&dir.join("profiles.json")).expect("store");
     for p in profiles {
         store.upsert(p.clone()).expect("save");
     }
-    Rc::new(AppContext::with_parts(
-        store,
-        Rc::new(MemorySecretStore::default()),
-        make_helper(dir),
-    ))
+    Rc::new(AppContext::with_parts(store, secrets, make_helper(dir)))
 }
 
 /// A registered application to hang main windows on, as the real one does.
@@ -432,7 +438,7 @@ fn the_connect_time_choice_decides_whether_a_transcript_is_written(bin: &Path, d
 
         let fx = fixture();
         let page = new_holder_page(&fx.view, "x");
-        let mut launched = launch(&page, &p, sequence, record, &ctx, &case);
+        let mut launched = launch(&page, &p, sequence, record, &ctx, &case, false);
         launched.command.program = fake.clone();
         assert_eq!(launched.transcript.is_some(), expect_file);
 

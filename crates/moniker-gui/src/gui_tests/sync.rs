@@ -29,11 +29,11 @@ use super::{
     widgets_of_type,
 };
 use crate::context::AppContext;
-use crate::new_tab;
 use crate::profiles::{self, sync_page};
 use crate::settings::{self, GuiSettings};
 use crate::sync::{self, Runner, SyncInputs};
 use crate::window::{self, MainWindow};
+use crate::{keyring, new_tab};
 
 /// A sync key with spaces at both ends: it must be stored exactly as typed.
 const SYNC_KEY: &str = "  correct horse battery  ";
@@ -102,7 +102,7 @@ fn sync_ctx_counting(
     }
     let ctx = Rc::new(AppContext::with_parts(
         store,
-        Rc::new(Shared {
+        Arc::new(Shared {
             store: Arc::clone(&secrets),
             gets: Arc::clone(&reads.main),
         }),
@@ -229,6 +229,9 @@ fn sync_rig(dir: &Path, with_profile: bool, key: Option<&str>) -> SyncRig {
     });
     let window = open_sync_page(&app, &ctx);
     let page = page_in(&window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
     SyncRig {
         app,
         ctx,
@@ -371,6 +374,9 @@ pub(super) fn sync_page_key_and_availability(dir: &Path) {
     // Exactly 12 characters is accepted (and replaced below by SYNC_KEY).
     d.key_entry.set_text("twelve chars");
     d.key_entry.emit_by_name::<()>("apply", &[]);
+    pump_until("the key to be saved", || {
+        d.key_message.label() == "Sync key saved."
+    });
     assert_eq!(
         rig.secrets
             .get(SYNC_PASSPHRASE_KEY)
@@ -383,11 +389,16 @@ pub(super) fn sync_page_key_and_availability(dir: &Path) {
     rig.secrets.delete(SYNC_PASSPHRASE_KEY).unwrap();
     d.key_entry.emit_by_name::<()>("apply", &[]); // empty again: refused
     assert_eq!(d.key_message.label(), "The sync key must not be empty.");
-    assert_eq!(d.key_status.label(), "Sync key: not set");
+    pump_until("the status line to catch up", || {
+        d.key_status.label() == "Sync key: not set"
+    });
 
     // Saving stores it exactly as typed and clears the field.
     d.key_entry.set_text(SYNC_KEY);
     d.key_entry.emit_by_name::<()>("apply", &[]);
+    pump_until("the key to be saved and shown as set", || {
+        d.key_message.label() == "Sync key saved." && d.key_status.label() == "Sync key: set"
+    });
     let stored = rig
         .secrets
         .get(SYNC_PASSPHRASE_KEY)
@@ -408,6 +419,13 @@ pub(super) fn sync_page_key_and_availability(dir: &Path) {
     d.key_entry.set_text("second sync key");
     let text: gtk::Text = find_widget(&d.key_entry).expect("the field's text");
     text.emit_by_name::<()>("activate", &[]);
+    pump_until("the key to be replaced", || {
+        rig.secrets
+            .get(SYNC_PASSPHRASE_KEY)
+            .unwrap()
+            .is_some_and(|key| key.as_str() == "second sync key")
+            && d.key_entry.is_sensitive()
+    });
     let stored = rig
         .secrets
         .get(SYNC_PASSPHRASE_KEY)
@@ -1225,10 +1243,14 @@ pub(super) fn syncs_read_the_keyring_on_the_worker_only(dir: &Path) {
     crate::add_actions(&app, &ctx);
     let main = window::build(&app, &ctx);
     main.window.present();
-    // Opening the page shows whether a key is set: that reads the keyring,
-    // as the page always has. Count from here.
+    // Opening the page shows whether a key is set: that reads the keyring
+    // (through the context's store, on the keyring worker). Count from once
+    // it has.
     let profiles_window = open_sync_page(&app, &ctx);
     let page = page_in(&profiles_window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
     let main_reads = reads.main.load(Ordering::SeqCst);
 
     let check = |what: &str, start: &dyn Fn()| {
@@ -1264,4 +1286,40 @@ pub(super) fn syncs_read_the_keyring_on_the_worker_only(dir: &Path) {
     check("the sync on launch", &|| crate::launch(&app, &ctx));
     drop(page);
     close_all(&app);
+}
+
+/// The sync page calls the keyring on the keyring worker, never on the main
+/// thread (issue #4): opening it reads whether a sync key is set, and saving a
+/// key stores it. Each shows its outcome once the worker is back.
+pub(super) fn the_sync_page_uses_the_keyring_off_the_main_thread(dir: &Path) {
+    let before = keyring::main_thread_calls();
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    pump_until("the key's state", || {
+        rig.page.key_status.label() == "Sync key: set"
+    });
+    assert_eq!(
+        keyring::main_thread_calls(),
+        before,
+        "opening the sync page called the keyring on the main thread"
+    );
+    rig.page.key_entry.set_text("a brand new sync key");
+    rig.page.key_entry.emit_by_name::<()>("apply", &[]);
+    pump_until("the key to be saved", || {
+        rig.page.key_message.label() == "Sync key saved."
+    });
+    assert_eq!(
+        rig.secrets
+            .get(SYNC_PASSPHRASE_KEY)
+            .unwrap()
+            .expect("stored")
+            .as_str(),
+        "a brand new sync key"
+    );
+    assert_eq!(rig.page.key_entry.text(), "", "the field is cleared");
+    assert_eq!(
+        keyring::main_thread_calls(),
+        before,
+        "saving the sync key called the keyring on the main thread"
+    );
+    rig.finish();
 }

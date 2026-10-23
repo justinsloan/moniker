@@ -12,27 +12,28 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::gdk;
+use gtk::{gdk, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::profile::{Profile, StartupSequence};
-use moniker_core::secrets::MemorySecretStore;
+use moniker_core::secrets::{MemorySecretStore, SecretError, SecretStore, password_key};
 use moniker_core::store::ProfileStore;
 use moniker_core::transcript::default_dir;
 use vte4::prelude::*;
 
-use super::main_window::{choices_parts, ctx_with, press_key, test_app};
+use super::main_window::{choices_parts, ctx_with, ctx_with_secrets, press_key, test_app};
 use super::{
     MARKUP_NAME, all_widgets, close_popover, fake_command, fake_ssh, files_in, find_widget,
     labels_in, menu_button, open_popover, press_enter_in, profile, pump_for, pump_until,
-    wait_for_text,
+    wait_for_session, wait_for_text,
 };
 use crate::context::{AppContext, Notice};
 use crate::terminal_tab::{self, TranscriptSpec, open_command, tab_title, terminal_of};
-use crate::{connect_menu, new_tab, settings, window, zoom};
+use crate::{connect_menu, keyring, new_tab, settings, window, zoom};
 
 /// A presented main window with one local tab.
 pub(super) fn main_window(app: &adw::Application, ctx: &Rc<AppContext>) -> window::MainWindow {
@@ -260,7 +261,7 @@ pub(super) fn picking_a_profile_turns_the_tab_into_the_session(bin: &Path, dir: 
     let list = list_in(&page).expect("the list");
     list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
     assert_eq!(main.view.n_pages(), 2, "the same tab");
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     assert_eq!(page.title(), tab_title(&web));
     wait_for_text(&terminal, "FAKE-END");
     let text = terminal_tab::terminal_text(&terminal);
@@ -305,7 +306,7 @@ pub(super) fn picking_a_profile_turns_the_tab_into_the_session(bin: &Path, dir: 
     buttons[1].emit_clicked();
     pump_until("the popover to close", || !popover.is_visible());
     assert_eq!(main.view.n_pages(), 3);
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     wait_for_text(&terminal, "FAKE-END");
     let text = terminal_tab::terminal_text(&terminal);
     assert!(text.contains("uptime"), "the sequence: {text}");
@@ -320,7 +321,7 @@ pub(super) fn picking_a_profile_turns_the_tab_into_the_session(bin: &Path, dir: 
         visible_titles(&list) == [new_tab::LOCAL_LABEL, "NAS box"]
     });
     search.emit_activate();
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     assert_eq!(page.title(), "NAS box");
     wait_for_text(&terminal, "ARG:admin@nas.lan");
 
@@ -334,7 +335,7 @@ pub(super) fn picking_a_profile_turns_the_tab_into_the_session(bin: &Path, dir: 
         visible_titles(&list) == [new_tab::LOCAL_LABEL]
     });
     search.emit_activate();
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     pump_for(Duration::from_millis(300));
     assert!(
         !terminal_tab::terminal_text(&terminal).contains("ARG:"),
@@ -400,7 +401,7 @@ pub(super) fn the_new_tab_choices_reach_profiles_without_sequences(bin: &Path, d
     parts.buttons[0].emit_clicked();
     pump_until("the choices to close", || !popover.is_visible());
     assert_eq!(main.view.n_pages(), 2, "the same tab");
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     assert_eq!(page.title(), tab_title(&plain));
     wait_for_text(&terminal, "FAKE-END");
     let text = terminal_tab::terminal_text(&terminal);
@@ -437,7 +438,7 @@ pub(super) fn enter_right_after_typing_picks_the_typed_profile(bin: &Path, dir: 
     );
     search.set_text("zeta");
     press_enter_in(&search);
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     assert_eq!(page.title(), tab_title(&zeta), "zeta-db, not alpha-web");
     wait_for_text(&terminal, "FAKE-END");
     let text = terminal_tab::terminal_text(&terminal);
@@ -467,7 +468,7 @@ pub(super) fn enter_right_after_typing_picks_the_typed_profile(bin: &Path, dir: 
     let search: gtk::SearchEntry = find_widget(&page.child()).expect("the search entry");
     search.set_text("no such thing");
     press_enter_in(&search);
-    let terminal = terminal_of(&page).expect("the session");
+    let terminal = wait_for_session(&page);
     pump_for(Duration::from_millis(300));
     assert!(
         !terminal_tab::terminal_text(&terminal).contains("ARG:"),
@@ -947,6 +948,7 @@ pub(super) fn a_new_tab_starts_at_the_active_tabs_size(bin: &Path, dir: &Path) {
     pump_for(Duration::from_millis(300));
     let connected = main.view.selected_page().expect("the session tab");
     assert_ne!(connected, page);
+    wait_for_session(&connected);
     assert_eq!(drawn_scale(&connected), 1.5);
     terminal_tab::set_test_ssh_program(None);
 
@@ -1122,7 +1124,9 @@ pub(super) fn launch_starts_at_the_saved_size(bin: &Path, dir: &Path) {
     connect(&profile(&[]), None, false);
     pump_for(Duration::from_millis(400));
     let made = window::last_active(&app).expect("a window made for the session");
-    assert_eq!(drawn_scale(&made.view.selected_page().unwrap()), 0.8);
+    let connected = made.view.selected_page().expect("the session tab");
+    wait_for_session(&connected);
+    assert_eq!(drawn_scale(&connected), 0.8);
     terminal_tab::set_test_ssh_program(None);
     made.window.destroy();
     pump_for(Duration::from_millis(200));
@@ -1165,4 +1169,143 @@ pub(super) fn zoom_shortcuts_exist() {
             "the dialog lists the same keys for {action}"
         );
     }
+}
+
+/// An in-memory keyring whose reads wait while it is held: a locked keyring
+/// waiting for its unlock prompt.
+#[derive(Default)]
+struct HeldKeyring {
+    inner: MemorySecretStore,
+    held: Mutex<bool>,
+    released: Condvar,
+}
+
+impl HeldKeyring {
+    fn hold(&self) {
+        *self.held.lock().unwrap() = true;
+    }
+
+    fn release(&self) {
+        *self.held.lock().unwrap() = false;
+        self.released.notify_all();
+    }
+}
+
+impl SecretStore for HeldKeyring {
+    fn get(&self, key: &str) -> Result<Option<zeroize::Zeroizing<String>>, SecretError> {
+        let mut held = self.held.lock().unwrap();
+        while *held {
+            held = self.released.wait(held).unwrap();
+        }
+        drop(held);
+        self.inner.get(key)
+    }
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
+        self.inner.set(key, value)
+    }
+    fn delete(&self, key: &str) -> Result<(), SecretError> {
+        self.inner.delete(key)
+    }
+    fn probe(&self) -> Result<(), SecretError> {
+        self.inner.probe()
+    }
+}
+
+/// Connecting asks the keyring whether a password is stored on the keyring
+/// worker, never on the main thread (issue #4). While the keyring has not
+/// answered (locked, say) the tab waits without a terminal and the window
+/// keeps running; a second pick in the same tab starts nothing more, and a tab
+/// closed meanwhile starts nothing at all.
+pub(super) fn connecting_waits_for_the_keyring_off_the_main_thread(bin: &Path, dir: &Path) {
+    let started = dir.join("started");
+    let fake = fake_ssh(
+        bin,
+        "keyring-wait",
+        &format!(
+            "echo started >> '{}'\necho FAKE-END\nexec sleep 600",
+            started.display()
+        ),
+    );
+    let web = profile(&[]);
+    let keyring = Arc::new(HeldKeyring::default());
+    keyring
+        .inner
+        .set(&password_key(&web.id), "pw-web")
+        .expect("seed the password");
+    let ctx = ctx_with_secrets(dir, std::slice::from_ref(&web), Arc::clone(&keyring) as _);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    terminal_tab::set_test_ssh_program(Some(fake));
+    let before = keyring::main_thread_calls();
+
+    keyring.hold();
+    let page = new_tab::open(&main.view, &ctx);
+    pump_for(Duration::from_millis(200));
+    let list = list_in(&page).expect("the list");
+    list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
+    // The main loop runs on while the keyring is held.
+    let ticked = Rc::new(std::cell::Cell::new(false));
+    glib::timeout_add_local_once(Duration::from_millis(100), {
+        let ticked = Rc::clone(&ticked);
+        move || ticked.set(true)
+    });
+    pump_until("the main loop to run on", || ticked.get());
+    assert!(
+        terminal_of(&page).is_none(),
+        "no session before the keyring answers"
+    );
+    assert!(
+        list_in(&page).is_none(),
+        "the list is gone: the tab is taken"
+    );
+    list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
+    keyring.release();
+    pump_until("the session", || terminal_of(&page).is_some());
+    let terminal = wait_for_session(&page);
+    wait_for_text(&terminal, "FAKE-END");
+    let text = terminal_tab::terminal_text(&terminal);
+    assert!(
+        text.contains(&format!("SSH_ASKPASS={}", ctx.askpass_path.display())),
+        "the stored password is used: {text}"
+    );
+    pump_until("the keyring calls to come back", || keyring::pending() == 0);
+    pump_for(Duration::from_millis(200));
+    assert_eq!(
+        fs::read_to_string(&started)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1,
+        "one session for two picks"
+    );
+    assert_eq!(
+        keyring::main_thread_calls(),
+        before,
+        "connecting called the keyring on the main thread"
+    );
+
+    // A tab closed while the keyring is held starts nothing once it answers.
+    keyring.hold();
+    let page = new_tab::open(&main.view, &ctx);
+    pump_for(Duration::from_millis(200));
+    let list = list_in(&page).expect("the list");
+    list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
+    let open = main.view.n_pages();
+    main.view.close_page(&page);
+    pump_until("the tab to close", || main.view.n_pages() == open - 1);
+    keyring.release();
+    pump_until("the keyring calls to come back", || keyring::pending() == 0);
+    pump_for(Duration::from_millis(300));
+    assert_eq!(
+        fs::read_to_string(&started)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1,
+        "nothing started for the closed tab"
+    );
+
+    terminal_tab::set_test_ssh_program(None);
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
 }

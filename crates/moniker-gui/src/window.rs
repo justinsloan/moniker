@@ -515,7 +515,7 @@ pub fn connect_fn(app: &adw::Application, ctx: &Rc<AppContext>) -> profiles::Con
 pub(crate) fn connect_with(
     app: &adw::Application,
     ctx: &Rc<AppContext>,
-    open: impl Fn(&adw::TabView, &AppContext, &Profile, Option<usize>, bool) + 'static,
+    open: impl Fn(&adw::TabView, &Rc<AppContext>, &Profile, Option<usize>, bool) + 'static,
 ) -> profiles::ConnectFn {
     let app = app.downgrade();
     let ctx = Rc::clone(ctx);

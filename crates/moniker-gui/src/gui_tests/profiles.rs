@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -24,8 +25,8 @@ use super::{
     MARKUP_NAME, all_widgets, button_labeled, find_widget, make_helper, pump_for, pump_until,
 };
 use crate::context::AppContext;
-use crate::form;
 use crate::profiles::{self, ConnectFn};
+use crate::{form, keyring};
 
 /// An in-memory keyring that counts `get` calls: the profile page must never
 /// read the keyring.
@@ -71,7 +72,7 @@ type Connected = Rc<RefCell<Vec<(String, Option<usize>, bool)>>>;
 struct Setup {
     dir: PathBuf,
     ctx: Rc<AppContext>,
-    secrets: Rc<CountingSecrets>,
+    secrets: Arc<CountingSecrets>,
     window: adw::Window,
     connected: Connected,
     _app: adw::Application,
@@ -85,10 +86,10 @@ impl Setup {
         for p in profiles {
             store.upsert(p.clone()).expect("save");
         }
-        let secrets = Rc::new(CountingSecrets::default());
+        let secrets = Arc::new(CountingSecrets::default());
         let ctx = Rc::new(AppContext::with_parts(
             store,
-            Rc::clone(&secrets) as Rc<dyn SecretStore>,
+            Arc::clone(&secrets) as Arc<dyn SecretStore>,
             make_helper(dir),
         ));
         let app = adw::Application::builder()
@@ -1291,4 +1292,105 @@ pub(super) fn present_reuses_the_open_window(dir: &Path) {
     s.close();
     pump_for(Duration::from_millis(100));
     assert!(app.windows().is_empty());
+}
+
+/// The Connection Profiles window calls the keyring on the keyring worker,
+/// never on the main thread (issue #4): saving a password, removing the stored
+/// one, creating a profile with a password and deleting a profile. Each shows
+/// its outcome once the worker is back.
+pub(super) fn the_profile_window_uses_the_keyring_off_the_main_thread(dir: &Path) {
+    let p = web();
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    let before = keyring::main_thread_calls();
+    let still_free = |what: &str| {
+        assert_eq!(
+            keyring::main_thread_calls(),
+            before,
+            "{what} called the keyring on the main thread"
+        );
+    };
+    s.select(&p.id);
+
+    let password = s.entry("Password");
+    password.grab_focus();
+    password.set_text("pw-one");
+    apply(&password);
+    pump_until("the password to be stored and the field cleared", || {
+        s.secrets.password(&p.id).as_deref() == Some("pw-one") && password.text().is_empty()
+    });
+    still_free("saving a password");
+
+    let remove_row = all_widgets::<adw::ActionRow>(&s.window)
+        .into_iter()
+        .find(|r| r.title() == form::REMOVE_PASSWORD_LABEL)
+        .expect("the remove row");
+    button_labeled(&remove_row, "Remove")
+        .expect("the remove button")
+        .emit_clicked();
+    pump_until("the remove confirmation", || {
+        s.window.visible_dialog().is_some()
+    });
+    let dialog = s.window.visible_dialog().expect("the remove confirmation");
+    button_labeled(&dialog, "Remove")
+        .expect("the dialog's Remove button")
+        .emit_clicked();
+    pump_until("the password to be removed", || {
+        s.secrets.password(&p.id).is_none()
+    });
+    still_free("removing the stored password");
+
+    let add = all_widgets::<gtk::Button>(&s.window)
+        .into_iter()
+        .find(|b| b.tooltip_text().as_deref() == Some("Add Profile"))
+        .expect("the + button");
+    add.emit_clicked();
+    pump_until("the New Profile dialog", || {
+        s.window.visible_dialog().is_some()
+    });
+    let dialog = s.window.visible_dialog().expect("the New Profile dialog");
+    let field = |title: &str| {
+        all_widgets::<adw::EntryRow>(&dialog)
+            .into_iter()
+            .find(|r| r.title() == title)
+            .unwrap_or_else(|| panic!("no {title:?} row"))
+    };
+    field("Name").set_text("NAS");
+    field("Host").set_text("nas.lan");
+    field("Username").set_text("admin");
+    field("Password (optional)").set_text("nas-password");
+    button_labeled(&dialog, "Create")
+        .expect("the Create button")
+        .emit_clicked();
+    let created = || {
+        s.ctx
+            .store
+            .borrow()
+            .live()
+            .iter()
+            .find(|p| p.name == "NAS")
+            .map(|p| p.id.clone())
+    };
+    pump_until("the new profile", || {
+        created().is_some() && s.window.visible_dialog().is_none()
+    });
+    let nas = created().expect("the new profile");
+    assert_eq!(s.secrets.password(&nas).as_deref(), Some("nas-password"));
+    still_free("creating a profile with a password");
+
+    s.select(&nas);
+    button_labeled(&s.window, "Delete Profile")
+        .expect("the delete button")
+        .emit_clicked();
+    pump_until("the delete confirmation", || {
+        s.window.visible_dialog().is_some()
+    });
+    let dialog = s.window.visible_dialog().expect("the delete confirmation");
+    button_labeled(&dialog, "Delete")
+        .expect("the dialog's Delete button")
+        .emit_clicked();
+    pump_until("the profile and its password to go", || {
+        s.on_disk(&nas).is_none() && s.secrets.password(&nas).is_none()
+    });
+    still_free("deleting a profile");
+    s.close();
 }

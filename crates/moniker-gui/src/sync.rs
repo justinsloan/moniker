@@ -143,12 +143,22 @@ pub(crate) fn key_status_text(state: &KeyState) -> String {
     }
 }
 
-/// Store `typed` as the sync key, exactly as typed (no trimming). It must have
-/// at least [`moniker_core::secrets::MIN_SYNC_PASSPHRASE_CHARS`] characters; a
-/// key that is already stored with fewer keeps working. `Err` is a message for
-/// the sync page's inline line and never contains the key.
+/// The status line under "Sync key" while the keyring is being read.
+pub(crate) const KEY_CHECKING: &str = "Sync key: checking\u{2026}";
+
+/// Whether `typed` may be stored as the sync key: it must have at least
+/// [`moniker_core::secrets::MIN_SYNC_PASSPHRASE_CHARS`] characters (a key that is
+/// already stored with fewer keeps working). `Err` is a message for the sync
+/// page's inline line and never contains the key.
+pub(crate) fn check_sync_key(typed: &str) -> Result<(), String> {
+    check_sync_passphrase(typed).map_err(sentence)
+}
+
+/// Store `typed` as the sync key, exactly as typed (no trimming), once
+/// [`check_sync_key`] accepts it. `Err` is a message for the sync page's inline
+/// line and never contains the key.
 pub(crate) fn save_sync_key(secrets: &dyn SecretStore, typed: &str) -> Result<(), String> {
-    check_sync_passphrase(typed).map_err(sentence)?;
+    check_sync_key(typed)?;
     secrets
         .set(SYNC_PASSPHRASE_KEY, typed)
         .map_err(|err| format!("Could not save the sync key: {err}"))

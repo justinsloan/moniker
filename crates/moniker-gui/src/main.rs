@@ -18,6 +18,7 @@ mod context;
 mod form;
 #[cfg(test)]
 mod gui_tests;
+mod keyring;
 mod new_tab;
 mod notify;
 mod preferences;

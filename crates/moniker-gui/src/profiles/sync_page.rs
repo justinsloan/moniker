@@ -17,6 +17,10 @@
 //! The sync key is read from its field into a `Zeroizing` buffer, never shown
 //! again, and the field is emptied after a save and when the page goes. Every
 //! text is plain (Pango markup off): profile names come from other machines.
+//!
+//! The page's keyring calls (whether a key is stored, saving one) run on the
+//! keyring worker ([`keyring::run`]), never the main thread; until the answer
+//! is back the status line says the keyring is being read and Sync waits.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -29,6 +33,7 @@ use zeroize::Zeroizing;
 
 use crate::context::AppContext;
 use crate::form;
+use crate::keyring;
 use crate::settings;
 use crate::sync::{self, KeyState, SyncEvent, SyncFailure};
 
@@ -251,11 +256,26 @@ impl SyncPage {
         self.ids.borrow().get(usize::try_from(index).ok()?).cloned()
     }
 
-    /// Re-read the keyring and update the "Sync key: ..." line.
-    fn refresh_key_status(&self) {
-        let state = sync::key_state(self.ctx.secrets.as_ref());
-        self.key_status.set_label(&sync::key_status_text(&state));
-        self.key_set.set(state == KeyState::Set);
+    /// Ask the keyring (on its worker) whether a sync key is stored, and show
+    /// the answer in the "Sync key: ..." line when it is back. Until the first
+    /// answer the line says the keyring is being read, and Sync waits as for no
+    /// key; a later refresh keeps showing the previous answer until it has the
+    /// new one. Answers come back in the order they were asked for, so the last
+    /// one shown is the latest.
+    fn refresh_key_status(self: &Rc<Self>) {
+        if self.key_status.label().is_empty() {
+            self.key_status.set_label(sync::KEY_CHECKING);
+        }
+        let weak = Rc::downgrade(self);
+        keyring::run(&self.ctx, sync::key_state, move |state| {
+            let Some(page) = weak.upgrade() else {
+                return;
+            };
+            let state = state.unwrap_or_else(|| KeyState::Unreadable(keyring::STOPPED.to_owned()));
+            page.key_status.set_label(&sync::key_status_text(&state));
+            page.key_set.set(state == KeyState::Set);
+            page.refresh_controls();
+        });
     }
 
     /// Rebuild the profile choice from the store as it is now, keeping the
@@ -372,19 +392,44 @@ impl SyncPage {
         self.refresh_controls();
     }
 
-    /// Save what is in the key field as the sync key.
-    fn save_key(&self) {
+    /// Save what is in the key field as the sync key: checked at once (a key
+    /// that is too short is refused here), stored on the keyring worker. The
+    /// field is off until that is back.
+    fn save_key(self: &Rc<Self>) {
         // GTK's own copy of the text is out of our hands; ours is wiped on drop.
         let typed = Zeroizing::new(self.key_entry.text().to_string());
-        match sync::save_sync_key(self.ctx.secrets.as_ref(), &typed) {
-            Ok(()) => {
-                self.clear_secret();
-                show_message(&self.key_message, "Sync key saved.", false);
-            }
-            Err(message) => show_message(&self.key_message, &message, true),
+        if let Err(message) = sync::check_sync_key(&typed) {
+            show_message(&self.key_message, &message, true);
+            // The status line catches up with the keyring all the same.
+            self.refresh_key_status();
+            return;
         }
-        self.refresh_key_status();
-        self.refresh_controls();
+        self.key_entry.set_sensitive(false);
+        let weak = Rc::downgrade(self);
+        keyring::run(
+            &self.ctx,
+            move |secrets| sync::save_sync_key(secrets, &typed),
+            move |saved| {
+                let Some(page) = weak.upgrade() else {
+                    return;
+                };
+                page.key_entry.set_sensitive(true);
+                let saved = saved.unwrap_or_else(|| {
+                    Err(format!(
+                        "Could not save the sync key: {}.",
+                        keyring::STOPPED
+                    ))
+                });
+                match saved {
+                    Ok(()) => {
+                        page.clear_secret();
+                        show_message(&page.key_message, "Sync key saved.", false);
+                    }
+                    Err(message) => show_message(&page.key_message, &message, true),
+                }
+                page.refresh_key_status();
+            },
+        );
     }
 
     /// Show `text` as the result line (plain text), red for an error.

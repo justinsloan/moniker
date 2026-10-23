@@ -4,10 +4,13 @@
 //! page: name, host and username are required before anything validates. So
 //! ＋ asks for those (plus port and an optional password) in a small dialog,
 //! creates the profile with [`form::create_profile`] (password to the keyring
-//! first), and hands the new id back so the window selects it; everything
-//! else is edited on its page. Errors are shown inside the dialog, which stays
-//! open so they can be fixed, and never contain the password.
+//! first) on the keyring worker ([`keyring::run`], so a locked keyring never
+//! freezes the window), and hands the new id back so the window selects it;
+//! everything else is edited on its page. While the profile is being created,
+//! Create is off. Errors are shown inside the dialog, which stays open so they
+//! can be fixed, and never contain the password.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -18,6 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::context::AppContext;
 use crate::form::{self, NewProfile};
+use crate::keyring;
 
 /// The dialog's widgets.
 struct Fields {
@@ -28,14 +32,18 @@ struct Fields {
     password: adw::PasswordEntryRow,
     create: gtk::Button,
     error: gtk::Label,
+    /// The profile is being created: Create stays off until that is back.
+    busy: Cell<bool>,
 }
 
 impl Fields {
-    /// Create is offered once every required field has something in it.
+    /// Create is offered once every required field has something in it, and
+    /// no profile is being created.
     fn update_create(&self) {
         let filled = |row: &adw::EntryRow| !row.text().trim().is_empty();
-        self.create
-            .set_sensitive(filled(&self.name) && filled(&self.host) && filled(&self.username));
+        self.create.set_sensitive(
+            !self.busy.get() && filled(&self.name) && filled(&self.host) && filled(&self.username),
+        );
     }
 
     fn values(&self) -> NewProfile {
@@ -89,6 +97,7 @@ pub(super) fn show(
             .css_classes(["error"])
             .visible(false)
             .build(),
+        busy: Cell::new(false),
     });
 
     let group = adw::PreferencesGroup::new();
@@ -165,30 +174,59 @@ pub(super) fn show(
 
     let weak = Rc::downgrade(&fields);
     let ctx = Rc::clone(ctx);
+    let on_created = Rc::new(on_created);
     fields.create.connect_clicked(glib::clone!(
         #[weak]
         dialog,
-        move |button| {
+        move |_| {
             let Some(fields) = weak.upgrade() else {
                 return;
             };
+            if fields.busy.replace(true) {
+                return;
+            }
+            // A second click must not create a duplicate.
+            fields.update_create();
             // Copied once out of GTK into a wrapper that wipes it on drop.
             let typed = Zeroizing::new(fields.password.text().to_string());
-            let created =
-                form::create_profile(&ctx.store, ctx.secrets.as_ref(), &fields.values(), &typed);
-            match created {
-                Ok(id) => {
-                    // A second click while closing must not create a duplicate.
-                    button.set_sensitive(false);
-                    dialog.close();
-                    ctx.profiles_changed();
-                    on_created(&id);
-                }
-                Err(message) => {
-                    fields.error.set_label(&message);
-                    fields.error.set_visible(true);
-                }
-            }
+            let values = fields.values();
+            let store_path = ctx.store.borrow().path().to_path_buf();
+            let weak = Rc::downgrade(&fields);
+            let ctx = Rc::clone(&ctx);
+            let on_created = Rc::clone(&on_created);
+            let dialog = dialog.clone();
+            keyring::run(
+                &ctx.clone(),
+                move |secrets| {
+                    let store = keyring::own_store(&store_path)?;
+                    form::create_profile(&store, secrets, &values, &typed)
+                },
+                // Held strongly: a profile created after Cancel was pressed
+                // is still shown (the dialog is closed already then).
+                move |created| {
+                    let created = created.unwrap_or_else(|| {
+                        Err(format!(
+                            "Could not create the profile: {}.",
+                            keyring::STOPPED
+                        ))
+                    });
+                    match created {
+                        Ok(id) => {
+                            dialog.close();
+                            ctx.profiles_changed();
+                            on_created(&id);
+                        }
+                        Err(message) => {
+                            if let Some(fields) = weak.upgrade() {
+                                fields.busy.set(false);
+                                fields.update_create();
+                                fields.error.set_label(&message);
+                                fields.error.set_visible(true);
+                            }
+                        }
+                    }
+                },
+            );
         }
     ));
 
