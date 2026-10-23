@@ -80,7 +80,11 @@ pub(super) fn argv_and_environment_reach_the_child(bin: &Path) {
             &format!("SSH_ASKPASS={}", bin.join(HELPER).display()),
             "SSH_ASKPASS_REQUIRE=force",
             &format!("MONIKER_PROFILE_ID={}", p.id),
+            &format!("MONIKER_PID={}", std::process::id()),
             &format!("MONIKER_ASKPASS_TOKEN={token}"),
+            // ssh is a child of the Moniker process itself, which the askpass
+            // helper checks against MONIKER_PID (a hop's ssh is not).
+            &format!("PARENT={}", std::process::id()),
             "FAKE-END",
         ]
     );
@@ -133,7 +137,9 @@ pub(super) fn startup_sequence_is_one_literal_argument(bin: &Path) {
             "SSH_ASKPASS=unset",
             "SSH_ASKPASS_REQUIRE=unset",
             "MONIKER_PROFILE_ID=unset",
+            "MONIKER_PID=unset",
             "MONIKER_ASKPASS_TOKEN=unset",
+            &format!("PARENT={}", std::process::id()),
             "FAKE-END",
         ]
     );
@@ -396,6 +402,7 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
             "SSH_ASKPASS",
             "SSH_ASKPASS_REQUIRE",
             "MONIKER_PROFILE_ID",
+            "MONIKER_PID",
             "MONIKER_ASKPASS_TOKEN"
         ]
     );

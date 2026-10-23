@@ -87,8 +87,9 @@ fn pump_for(duration: Duration) {
 }
 
 /// Write an executable fake `ssh`: it prints each argument after `ARG:` (an
-/// argument holding newlines spreads over several lines), then the four
-/// variables Moniker sets for the askpass helper, then runs `tail`.
+/// argument holding newlines spreads over several lines), then the five
+/// variables Moniker sets for the askpass helper and its own parent's process
+/// id (`PARENT=`), then runs `tail`.
 fn fake_ssh(dir: &Path, name: &str, tail: &str) -> String {
     let path = dir.join(name);
     let script = format!(
@@ -97,7 +98,9 @@ fn fake_ssh(dir: &Path, name: &str, tail: &str) -> String {
          printf 'SSH_ASKPASS=%s\\n' \"${{SSH_ASKPASS-unset}}\"\n\
          printf 'SSH_ASKPASS_REQUIRE=%s\\n' \"${{SSH_ASKPASS_REQUIRE-unset}}\"\n\
          printf 'MONIKER_PROFILE_ID=%s\\n' \"${{MONIKER_PROFILE_ID-unset}}\"\n\
+         printf 'MONIKER_PID=%s\\n' \"${{MONIKER_PID-unset}}\"\n\
          printf 'MONIKER_ASKPASS_TOKEN=%s\\n' \"${{MONIKER_ASKPASS_TOKEN-unset}}\"\n\
+         printf 'PARENT=%s\\n' \"$PPID\"\n\
          {tail}\n"
     );
     fs::write(&path, script).expect("write the fake ssh");

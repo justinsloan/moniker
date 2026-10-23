@@ -1814,6 +1814,7 @@ mod tests {
                 "SSH_ASKPASS=/x/askpass".to_owned(),
                 "SSH_ASKPASS_REQUIRE=force".to_owned(),
                 format!("MONIKER_PROFILE_ID={}", p.id),
+                format!("MONIKER_PID={}", std::process::id()),
                 format!("MONIKER_ASKPASS_TOKEN={}", token.as_str()),
             ]
         );
@@ -2110,6 +2111,7 @@ mod tests {
                 format!("SSH_ASKPASS={}", h.path.display()),
                 "SSH_ASKPASS_REQUIRE=force".to_owned(),
                 format!("MONIKER_PROFILE_ID={}", p.id),
+                format!("MONIKER_PID={}", std::process::id()),
                 format!("MONIKER_ASKPASS_TOKEN={}", token.as_str()),
             ]
         );
@@ -2212,7 +2214,7 @@ mod tests {
         let link = link_dir.path().join("moniker-askpass");
         std::os::unix::fs::symlink(&h.path, &link).unwrap();
         let (ssh, token) = connection_command(&profile(), None, &link, true);
-        assert_eq!(ssh.env.len(), 4);
+        assert_eq!(ssh.env.len(), 5);
         assert!(token.is_some());
         // A dangling one is not.
         std::fs::remove_file(&h.path).unwrap();

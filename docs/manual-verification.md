@@ -175,3 +175,9 @@ Use the release build (`cargo build --release --workspace`, then `target/release
 ## Alpha 5: going back to the system font
 
 111. In Preferences, with no font chosen (a fresh config), the Font row shows the system monospace font and no reset button. Choose another font: a reset button (an undo arrow, tooltip "Use the System Font") appears beside the font button. Press it: every open terminal, in every window, goes back to the system monospace font at once, a new tab uses it, the font button shows it again, the reset button goes away and the keyboard focus is on the font button. In `~/.config/moniker/gui-settings.json`, `font` is `null`, and after a restart the terminals still use the system font.
+
+## Alpha 5: stored passwords through `~/.ssh/config`
+
+112. Make a profile whose host is an alias in `~/.ssh/config` (`Host myalias` with `HostName` the real server, and your user name and stored password in the profile). Connecting logs in by itself, as for a profile with the real host name. The same with `HostKeyAlias` set for that host.
+113. A profile for a host reached through `ProxyJump` (a jump host that asks for a password): the jump host's password prompt appears in the terminal and you type it; the target's prompt then gets the stored password by itself. The stored password never answers the jump host's prompt, even when you make the jump host's name the same as the target's (for example `HostKeyAlias` set to the jump host's name).
+114. Break the lookup: put `Match exec "sleep 10"` (with nothing under it) at the top of `~/.ssh/config`, then connect to the alias profile of check 112. ssh itself takes about 10 s to run the command; then the helper's lookup gives up after 5 s and the terminal asks for the password (the profile's own host, the alias, is expected and does not match the real host in the prompt). Remove the line afterwards.

@@ -8,26 +8,61 @@
 //! identity and prints the result.
 //!
 //! The environment carries only non-secret values: `SSH_ASKPASS_PROMPT` (set by
-//! `ssh`), `MONIKER_PROFILE_ID` and, for a terminal tab, `MONIKER_ASKPASS_TOKEN`
-//! (set by Moniker), and `XDG_RUNTIME_DIR` (where the token's one-time marker
-//! goes). With a token the stored password is sent at most once per connection;
-//! if no marker can be made the user is asked. The helper logs nothing: no
+//! `ssh`), `MONIKER_PROFILE_ID`, `MONIKER_PID` and, for a terminal tab,
+//! `MONIKER_ASKPASS_TOKEN` (set by Moniker), and `XDG_RUNTIME_DIR` (where the
+//! token's one-time marker goes). With a token the stored password is sent at
+//! most once per connection; if no marker can be made the user is asked.
+//!
+//! The stored password answers only a prompt from the `ssh` that Moniker
+//! started (its parent is `MONIKER_PID`; a ProxyJump or ProxyCommand hop's
+//! `ssh` is a child of that one), and only one that names the user and host
+//! this connection logs in as. Those come from `ssh -G` with the profile's own
+//! user, host, port and key file (run from argv, with `--` before the
+//! destination, within five seconds), which is how `~/.ssh/config` is taken
+//! into account: an alias, a `HostName`, a `HostKeyAlias`. If `ssh -G` fails or
+//! its answer is ambiguous, the profile's own user and host are expected, as
+//! before. The helper logs nothing: no
 //! prompt, no answer, no profile data. On failure stdout stays empty and stderr
 //! gets one generic line, and the exit status is 1.
 
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use moniker_cli::store_path;
-use moniker_core::askpass::{DevTty, OneTime, TOKEN_ENV, TtyPrompter, answer, claim_marker};
+use moniker_core::askpass::{
+    DevTty, OneTime, PID_ENV, TOKEN_ENV, TtyPrompter, answer, claim_marker, effective_identity,
+    parent_in_stat, started_by_moniker,
+};
+use moniker_core::profile::Profile;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore};
+use moniker_core::ssh::resolve_command;
 use moniker_core::store::ProfileStore;
 
 /// Why no answer was given. Deliberately generic: the prompt can name a key
 /// file or host, and the reason must never echo it.
 const NO_ANSWER: &str = "could not get an answer for ssh (is there a terminal to ask on?)";
+
+/// How long `ssh -G` may take before the profile's own host is expected
+/// instead. It normally answers in milliseconds; only a `Match exec` or host
+/// name canonicalization in `~/.ssh/config` can make it slower.
+const RESOLVE_LIMIT: Duration = Duration::from_secs(5);
+
+/// The most of `ssh -G`'s output that is read: it prints a few kilobytes.
+const RESOLVE_MAX_BYTES: u64 = 256 * 1024;
+
+/// The variables that lead `ssh` to this helper, kept from `ssh -G`.
+const HELPER_ENV: [&str; 5] = [
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "MONIKER_PROFILE_ID",
+    PID_ENV,
+    TOKEN_ENV,
+];
 
 fn main() -> ExitCode {
     // A panic message would print the panic's payload and location. Nothing here
@@ -57,7 +92,21 @@ fn run_from_environment() -> ExitCode {
     // lift the one-time limit.
     let token = std::env::var_os(TOKEN_ENV).map(|t| t.into_string().unwrap_or_default());
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-    let identity = profile_id.as_deref().and_then(identity_from_store);
+    // Only a question can get the stored password (a message or a yes/no
+    // question never does), and only one asked by the ssh Moniker started: the
+    // parent of this helper's parent, ssh, must be the Moniker process. A
+    // ProxyJump or ProxyCommand hop's ssh is a child of the first ssh, so its
+    // prompts go to the user whatever host they name.
+    let launcher = std::env::var(PID_ENV).ok();
+    let from_moniker = env_prompt.is_none()
+        && started_by_moniker(
+            launcher.as_deref(),
+            parent_of(std::os::unix::process::parent_id()),
+        );
+    let identity = profile_id
+        .as_deref()
+        .filter(|_| from_moniker)
+        .and_then(identity_from_store);
     let expected = identity
         .as_ref()
         .map(|(user, host)| (user.as_str(), host.as_str()));
@@ -148,14 +197,90 @@ fn respond(
 /// profile) is `None`, which makes the helper ask the user instead.
 fn identity_from_store(profile_id: &str) -> Option<(String, String)> {
     let store = ProfileStore::open(&store_path().ok()?).ok()?;
-    identity_of(&store, profile_id)
+    identity_of(&store, profile_id, resolve_with_ssh)
 }
 
-/// The identity `ssh` prints in a password prompt for this profile. `ssh`
-/// prints the host name lowercased, so the host is lowercased here.
-fn identity_of(store: &ProfileStore, profile_id: &str) -> Option<(String, String)> {
+/// The identity `ssh` names in a password prompt for the live profile
+/// `profile_id` of `store`: the user and host `ssh -G` reports for its
+/// connection (`resolve` runs it), so that `~/.ssh/config` is taken into account
+/// (a `HostName`, an alias, a `HostKeyAlias`), or, when that fails or is
+/// ambiguous (`askpass::effective_identity`), the profile's own user and host
+/// as `ssh` prints them: the host lowercased. `None` for no such profile.
+fn identity_of(
+    store: &ProfileStore,
+    profile_id: &str,
+    resolve: impl FnOnce(&Profile) -> Option<String>,
+) -> Option<(String, String)> {
     let profile = store.get(profile_id)?;
-    Some((profile.username.clone(), profile.host.to_ascii_lowercase()))
+    let resolved = resolve(profile).and_then(|dump| effective_identity(&dump, &profile.username));
+    Some(resolved.unwrap_or_else(|| (profile.username.clone(), profile.host.to_ascii_lowercase())))
+}
+
+/// What `ssh -G` prints for the connection to `profile`, if it answers within
+/// [`RESOLVE_LIMIT`].
+fn resolve_with_ssh(profile: &Profile) -> Option<String> {
+    output_within(resolve_process(profile), RESOLVE_LIMIT)
+}
+
+/// `ssh -G` for the connection to `p` (`ssh::resolve_command`), run from argv
+/// like every `ssh` Moniker starts, without the variables that lead `ssh` to
+/// this helper: it never prompts, and if it ever did, that must not come back
+/// here.
+fn resolve_process(p: &Profile) -> Command {
+    let ssh = resolve_command(p);
+    let mut command = Command::new(&ssh.program);
+    command.args(&ssh.args);
+    for name in HELPER_ENV {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// What `command` prints, if it exits successfully within `limit` and prints
+/// valid UTF-8 (at most [`RESOLVE_MAX_BYTES`] of it). It gets no input and its
+/// errors are discarded. A command still running at `limit` is killed; one
+/// that exits but leaves a process holding its output open is given up on at
+/// `limit` too.
+fn output_within(mut command: Command, limit: Duration) -> Option<String> {
+    let deadline = Instant::now() + limit;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let (sender, received) = mpsc::channel();
+    thread::spawn(move || {
+        let mut out = Vec::new();
+        let read = stdout.take(RESOLVE_MAX_BYTES).read_to_end(&mut out);
+        let _ = sender.send(read.map(|_| out));
+    });
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let out = received
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok()?
+        .ok()?;
+    String::from_utf8(out).ok()
+}
+
+/// The parent of process `pid`, from `/proc/<pid>/stat`.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parent_in_stat(&stat)
 }
 
 #[cfg(test)]
@@ -453,14 +578,20 @@ mod tests {
         (dir, store)
     }
 
+    /// A resolver for which `ssh -G` failed.
+    fn no_resolution(_: &Profile) -> Option<String> {
+        None
+    }
+
     #[test]
     fn identity_is_the_username_and_the_lowercased_host() {
-        // ssh prints the host name lowercased in its password prompt.
+        // Without `ssh -G`'s answer: ssh prints the host name lowercased in its
+        // password prompt.
         let mut p = Profile::new("web1", "Example.COM", "Admin");
         p.id = ID.to_owned();
         let (_dir, store) = store_with(p);
         assert_eq!(
-            identity_of(&store, ID),
+            identity_of(&store, ID, no_resolution),
             Some(("Admin".to_owned(), "example.com".to_owned()))
         );
     }
@@ -468,8 +599,8 @@ mod tests {
     #[test]
     fn identity_of_an_unknown_profile_is_none() {
         let (_dir, store) = store_with(Profile::new("web1", "example.com", "admin"));
-        assert_eq!(identity_of(&store, ID), None);
-        assert_eq!(identity_of(&store, ""), None);
+        assert_eq!(identity_of(&store, ID, no_resolution), None);
+        assert_eq!(identity_of(&store, "", no_resolution), None);
     }
 
     #[test]
@@ -478,6 +609,141 @@ mod tests {
         p.id = ID.to_owned();
         let (_dir, mut store) = store_with(p);
         store.delete(ID).unwrap();
-        assert_eq!(identity_of(&store, ID), None);
+        assert_eq!(identity_of(&store, ID, no_resolution), None);
+    }
+
+    #[test]
+    fn identity_follows_what_ssh_g_reports() {
+        // `~/.ssh/config` made `web` an alias of web1.example.com.
+        let mut p = Profile::new("web1", "web", "admin");
+        p.id = ID.to_owned();
+        p.port = 2222;
+        let (_dir, store) = store_with(p);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let identity = identity_of(&store, ID, |profile| {
+            asked
+                .borrow_mut()
+                .push((profile.id.clone(), profile.host.clone(), profile.port));
+            Some("user admin\nhostname web1.example.com\nport 2222\n".to_owned())
+        });
+        assert_eq!(
+            identity,
+            Some(("admin".to_owned(), "web1.example.com".to_owned()))
+        );
+        assert_eq!(*asked.borrow(), [(ID.to_owned(), "web".to_owned(), 2222)]);
+    }
+
+    #[test]
+    fn an_unusable_resolution_falls_back_to_the_profiles_own_host() {
+        let mut p = Profile::new("web1", "Web.Example.COM", "admin");
+        p.id = ID.to_owned();
+        let (_dir, store) = store_with(p);
+        for dump in [
+            "garbage",
+            "user someone-else\nhostname other.example.com\n",
+            "user admin\nhostname a.example.com\nhostname b.example.com\n",
+        ] {
+            assert_eq!(
+                identity_of(&store, ID, |_| Some(dump.to_owned())),
+                Some(("admin".to_owned(), "web.example.com".to_owned())),
+                "{dump:?}"
+            );
+        }
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[test]
+    fn a_quick_commands_output_is_read() {
+        assert_eq!(
+            output_within(
+                sh("printf 'user a\\nhostname b\\n'"),
+                Duration::from_secs(5)
+            )
+            .as_deref(),
+            Some("user a\nhostname b\n")
+        );
+    }
+
+    #[test]
+    fn a_failed_command_gives_nothing() {
+        assert_eq!(
+            output_within(sh("printf 'user a\\n'; exit 3"), Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            output_within(Command::new("/nonexistent/ssh"), Duration::from_secs(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_slow_command_is_given_up_on() {
+        let start = Instant::now();
+        assert_eq!(
+            output_within(sh("sleep 5"), Duration::from_millis(200)),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn output_held_open_by_a_leftover_process_is_given_up_on() {
+        // The command exits, but a process it left behind keeps its output open.
+        let start = Instant::now();
+        assert_eq!(
+            output_within(
+                sh("sleep 5 & printf 'user a\\n'"),
+                Duration::from_millis(300)
+            ),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn ssh_g_runs_from_argv_without_the_helpers_variables() {
+        let mut p = Profile::new("web1", "web", "admin");
+        p.port = 2222;
+        let command = resolve_process(&p);
+        assert_eq!(command.get_program(), "ssh");
+        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+        assert_eq!(args, ["-G", "-p", "2222", "--", "admin@web"]);
+        let removed: Vec<&std::ffi::OsStr> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        for name in [
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            "MONIKER_PROFILE_ID",
+            "MONIKER_PID",
+            "MONIKER_ASKPASS_TOKEN",
+        ] {
+            assert!(removed.contains(&std::ffi::OsStr::new(name)), "{name}");
+        }
+        assert!(command.get_envs().all(|(_, value)| value.is_none()));
+    }
+
+    #[test]
+    fn the_parent_is_read_from_proc() {
+        assert_eq!(
+            parent_of(std::process::id()),
+            Some(std::os::unix::process::parent_id())
+        );
+        assert_eq!(parent_of(0), None);
     }
 }

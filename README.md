@@ -214,11 +214,13 @@ Connecting with a stored password passes through these layers:
      │                        password in it. ~/.ssh/config, known_hosts and ssh-agent apply.
      ▼
  ② SSH_ASKPASS ───────────── ssh asks moniker-askpass. The environment carries only the
-     │                        profile id and a one-time token, never a secret.
+     │                        profile id, Moniker's process id and a one-time token, never
+     │                        a secret.
      ▼
- ③ Exact prompt match ────── The helper answers only the password prompt for exactly this
-     │                        profile's user@host. Host-key questions, key passphrases and
-     │                        ProxyJump hops go to you.
+ ③ Exact prompt match ────── The helper answers only the password prompt of the ssh that
+     │                        Moniker started, for exactly the user@host that `ssh -G`
+     │                        reports for the profile. Host-key questions, key passphrases
+     │                        and ProxyJump or ProxyCommand hops go to you.
      ▼
  ④ One-time marker ───────── At most one answer per connection: after a wrong stored
      │                        password, ssh asks you, and the stored one is never sent again.
@@ -310,7 +312,7 @@ The workflow runs every check, builds and install-tests both packages, and only 
 
 ## Known limitations
 
-- The stored password is used only when ssh's prompt names exactly the profile's user and host. A `HostName` alias in `~/.ssh/config` or a ProxyJump hop makes ssh show another name, and then you type the password.
+- The stored password is used only for the login of the `ssh` Moniker started, when ssh's prompt names exactly the user and host that `ssh -G` reports for the profile, so an alias, `HostName` or `HostKeyAlias` in `~/.ssh/config` is followed. A ProxyJump or ProxyCommand hop's password is always typed by you. If `ssh -G` fails or takes more than five seconds, the profile's own host is expected instead. An `ssh` on your `PATH` that is a wrapper script starting the real one as its child (not with `exec`) means you type the password.
 - A wrong stored password is tried once; then ssh asks in the terminal, as plain ssh does (three attempts in all). A sync has no terminal, so there a wrong stored password fails the sync.
 - Transcripts hold what VTE holds: content shown only on the alternate screen (htop, vim) is not in them, and a crash loses the transcript in progress.
 - Removing a stored password is local to that machine. Others keep theirs, and a later sync from one that still has it can bring it back.

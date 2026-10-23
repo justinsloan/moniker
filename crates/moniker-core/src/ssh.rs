@@ -7,9 +7,10 @@
 //! The builders take no password, so none can reach argv or the environment
 //! (both are visible through `/proc`). When a password is stored, `ssh` is
 //! pointed at the `moniker-askpass` helper through `SSH_ASKPASS`; only the
-//! non-secret profile id (and, for a terminal tab, the non-secret one-time
-//! token, see `crate::askpass`) travels in the environment, and the helper looks
-//! the password up in the keyring itself.
+//! non-secret profile id, the id of the Moniker process that starts `ssh`
+//! (and, for a terminal tab, the non-secret one-time token, see
+//! `crate::askpass`) travel in the environment, and the helper looks the
+//! password up in the keyring itself.
 //!
 //! The builders assume a validated live profile (see `Profile::validate`).
 //! The `--` separator before the destination is a second line of defense in
@@ -22,7 +23,7 @@
 
 use std::path::Path;
 
-use crate::askpass::{AskpassToken, TOKEN_ENV};
+use crate::askpass::{AskpassToken, PID_ENV, TOKEN_ENV};
 use crate::profile::{Profile, StartupSequence};
 
 /// The system `ssh` binary, found on `PATH` so ssh-agent, `known_hosts` and
@@ -78,9 +79,11 @@ pub fn remote_command(seq: Option<&StartupSequence>) -> Option<String> {
 ///
 /// With a `token` (a password is stored) the environment points `ssh` at the
 /// askpass helper: exactly `SSH_ASKPASS=<askpass>`, `SSH_ASKPASS_REQUIRE=force`,
-/// `MONIKER_PROFILE_ID=<profile id>` and `MONIKER_ASKPASS_TOKEN=<token>`, in
-/// that order. Without one it is empty. Neither the profile id nor the token is
-/// secret.
+/// `MONIKER_PROFILE_ID=<profile id>`, `MONIKER_PID=<this process's id>` and
+/// `MONIKER_ASKPASS_TOKEN=<token>`, in that order. Without one it is empty.
+/// None of them is secret. `MONIKER_PID` is the process that spawns `ssh`
+/// (VTE forks the child from it), which the helper checks is the parent of the
+/// `ssh` that prompts (`crate::askpass::started_by_moniker`).
 pub fn terminal_command(
     p: &Profile,
     seq: Option<&StartupSequence>,
@@ -124,8 +127,9 @@ pub fn terminal_command(
 /// network.
 ///
 /// With `has_password` the environment points `ssh` at the askpass helper:
-/// exactly `SSH_ASKPASS=<askpass>`, `SSH_ASKPASS_REQUIRE=force` and
-/// `MONIKER_PROFILE_ID=<profile id>`, in that order, and no one-time token: a
+/// exactly `SSH_ASKPASS=<askpass>`, `SSH_ASKPASS_REQUIRE=force`,
+/// `MONIKER_PROFILE_ID=<profile id>` and `MONIKER_PID=<this process's id>` (the
+/// caller must spawn `ssh` itself), in that order, and no one-time token: a
 /// sync has no terminal to fall back to, so `NumberOfPasswordPrompts=1` is what
 /// keeps a wrong stored password from being sent twice. Otherwise it is empty.
 pub fn sync_command(
@@ -146,6 +150,26 @@ pub fn sync_command(
         program: SSH_PROGRAM.to_string(),
         args,
         env: askpass_env(p, askpass, has_password),
+    }
+}
+
+/// `ssh -G` for the connection [`terminal_command`] and [`sync_command`] make
+/// to the profile: `ssh` prints the configuration it would use, after
+/// `~/.ssh/config`, and exits without connecting. The askpass helper reads from
+/// it the user and host that the password prompt will name
+/// (`crate::askpass::effective_identity`).
+///
+/// Arguments, in order: `-G`, `-p <port>`, `-i <key>` if the profile has a key
+/// file, `--`, `<username>@<host>`. No environment.
+pub fn resolve_command(p: &Profile) -> SshCommand {
+    debug_assert!(!p.deleted, "ssh command requested for a tombstone");
+    let mut args = vec!["-G".to_string()];
+    args.extend(connection_args(p));
+    push_destination(&mut args, p);
+    SshCommand {
+        program: SSH_PROGRAM.to_string(),
+        args,
+        env: Vec::new(),
     }
 }
 
@@ -174,8 +198,8 @@ fn push_destination(args: &mut Vec<String>, p: &Profile) {
 }
 
 /// The environment that makes `ssh` ask `moniker-askpass` for the password:
-/// empty when no password is stored. Carries only the non-secret profile id;
-/// [`terminal_command`] adds its token.
+/// empty when no password is stored. Carries only the non-secret profile id
+/// and this process's id; [`terminal_command`] adds its token.
 fn askpass_env(p: &Profile, askpass: &Path, has_password: bool) -> Vec<(String, String)> {
     if !has_password {
         return Vec::new();
@@ -187,6 +211,7 @@ fn askpass_env(p: &Profile, askpass: &Path, has_password: bool) -> Vec<(String, 
         ),
         ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
         ("MONIKER_PROFILE_ID".to_string(), p.id.clone()),
+        (PID_ENV.to_string(), std::process::id().to_string()),
     ]
 }
 
@@ -291,7 +316,8 @@ mod tests {
             let s = seq(&["uptime"]);
             let sync = sync_command(p, askpass(), false, "moniker-server");
             let term = terminal_command(p, Some(&s), askpass(), None);
-            for cmd in [&sync, &term] {
+            let resolve = resolve_command(p);
+            for cmd in [&sync, &term, &resolve] {
                 let dd = position(&cmd.args, "--");
                 assert!(
                     cmd.args[..dd].iter().all(|a| !a.contains("oProxyCommand")),
@@ -350,6 +376,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_command_asks_ssh_for_the_effective_configuration() {
+        let mut p = profile();
+        p.port = 2222;
+        p.key_file = Some("/k/id".into());
+        let cmd = resolve_command(&p);
+        assert_eq!(cmd.program, "ssh");
+        assert_eq!(
+            cmd.args,
+            strs(&["-G", "-p", "2222", "-i", "/k/id", "--", "alice@example.com"])
+        );
+        assert!(cmd.env.is_empty(), "{:?}", cmd.env);
+    }
+
+    #[test]
     fn default_port_without_key_file() {
         let cmd = terminal_command(&profile(), None, askpass(), None);
         assert_eq!(&cmd.args[..2], &strs(&["-p", "22"])[..]);
@@ -393,6 +433,7 @@ mod tests {
             ),
             ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
             ("MONIKER_PROFILE_ID".to_string(), p.id.clone()),
+            ("MONIKER_PID".to_string(), std::process::id().to_string()),
             ("MONIKER_ASKPASS_TOKEN".to_string(), t.as_str().to_string()),
         ];
         assert_eq!(
@@ -403,7 +444,8 @@ mod tests {
             terminal_command(&p, None, askpass(), Some(&t)).env,
             expected
         );
-        assert_eq!(expected[3].0, TOKEN_ENV);
+        assert_eq!(expected[3].0, PID_ENV);
+        assert_eq!(expected[4].0, TOKEN_ENV);
     }
 
     #[test]
@@ -440,6 +482,7 @@ mod tests {
                 ),
                 ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
                 ("MONIKER_PROFILE_ID".to_string(), p.id.clone()),
+                ("MONIKER_PID".to_string(), std::process::id().to_string()),
             ]
         );
         assert!(cmd.env.iter().all(|(k, _)| k != TOKEN_ENV));

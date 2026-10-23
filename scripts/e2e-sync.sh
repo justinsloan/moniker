@@ -247,6 +247,7 @@ FAILED=0
 REASON=""
 RC=0
 ASKPASS_ID=
+PW_PORT=
 KEYRING_PW=moniker-e2e-throwaway # protects only the throwaway keyring in $T
 # Display texts of moniker-core's SyncError::WrongSyncKey and ::ServerNotFound
 # (crates/moniker-core/src/sync.rs), and the CLI's own "no sync key" message
@@ -367,8 +368,11 @@ free_port() {
 # sshd_config for one throwaway server. B's environment is set with SetEnv, so
 # `moniker-server sync-serve` in the session is instance B on the private bus.
 write_sshd_config() { # write_sshd_config FILE PORT NAME REMOTE_PATH key|password
-    local auth="PasswordAuthentication no" pubkey="PubkeyAuthentication yes"
-    [ "$5" = password ] && { auth="PasswordAuthentication yes"; pubkey="PubkeyAuthentication no"; }
+    local auth="PasswordAuthentication no" pubkey="PubkeyAuthentication yes" penalties=""
+    # A user-level sshd cannot check passwords, so every password login fails;
+    # OpenSSH 9.8 and later then penalize the source address, 127.0.0.1, and
+    # drop the next checks' connections. The password server has none.
+    [ "$5" = password ] && { auth="PasswordAuthentication yes"; pubkey="PubkeyAuthentication no"; penalties="PerSourcePenalties no"; }
     cat >"$1" <<EOF
 Port $2
 ListenAddress 127.0.0.1
@@ -377,6 +381,7 @@ AuthorizedKeysFile $T/authorized_keys
 PidFile $T/sshd_$3.pid
 $auth
 $pubkey
+$penalties
 KbdInteractiveAuthentication no
 UsePAM no
 PermitUserRC no
@@ -600,17 +605,60 @@ check_server_not_on_path() {
 }
 
 # ssh asks for the password of USER@HOST while our askpass wrapper logs the
-# prompt text and the helper's exit status (never the answer).
+# prompt text and the helper's exit status (never the answer). The helper
+# answers only for an ssh whose parent is MONIKER_PID; with the wrapper between
+# ssh and the helper, the helper's grandparent is ssh itself, so the wrapper
+# names that (its own parent). The checks with askpass-exec.sh below keep the
+# real process tree instead.
 write_askpass_wrapper() {
     cat >"$T/askpass-wrap.sh" <<EOF
 #!/bin/sh
 { printf 'prompt=%s\n' "\$1"; printf 'kind=%s\n' "\${SSH_ASKPASS_PROMPT-}"; } >>"$T/askpass.log"
-"$BIN/moniker-askpass" "\$1" >/dev/null
+MONIKER_PID=\$PPID "$BIN/moniker-askpass" "\$1" >/dev/null
 code=\$?
 printf 'exit=%s\n' "\$code" >>"$T/askpass.log"
 exit "\$code"
 EOF
     chmod 700 "$T/askpass-wrap.sh"
+    # Logs the prompt, then becomes the helper: ssh -> helper, as with Moniker.
+    cat >"$T/askpass-exec.sh" <<EOF
+#!/bin/sh
+printf 'prompt=%s\n' "\$1" >>"$T/askpass.log"
+exec "$BIN/moniker-askpass" "\$1"
+EOF
+    chmod 700 "$T/askpass-exec.sh"
+}
+
+# An `ssh` first on PATH that reads $T/ssh_config instead of ~/.ssh/config:
+# every ssh of the askpass checks goes through it, the helper's own `ssh -G`
+# and a ProxyJump hop's ssh included, so they all see the same configuration
+# and the real one is never read. `web-alias` is rewritten by HostName;
+# `hopped` is reached through a ProxyJump hop whose prompt names the same
+# user@host as the target's: the target's prompt names its HostKeyAlias,
+# 127.0.0.1, the hop's its host, also 127.0.0.1 (OpenSSH refuses a jump to the
+# very host, port and user it connects to, hence the alias).
+write_ssh_shim() {
+    local real
+    real=$(command -v ssh) || return 1
+    mkdir -p "$T/shim" || return 1
+    cat >"$T/shim/ssh" <<EOF
+#!/bin/sh
+exec "$real" -F "$T/ssh_config" "\$@"
+EOF
+    chmod 700 "$T/shim/ssh"
+    cat >"$T/ssh_config" <<EOF
+Host web-alias
+  HostName 127.0.0.1
+Host hopped
+  HostName localhost
+  HostKeyAlias 127.0.0.1
+  ProxyJump $ME@127.0.0.1:$PW_PORT
+Host *
+  UserKnownHostsFile $T/kh
+  StrictHostKeyChecking accept-new
+  NumberOfPasswordPrompts 1
+  PubkeyAuthentication no
+EOF
 }
 
 # Seed a profile on A with a stored password; prints its id.
@@ -624,10 +672,21 @@ seed_password_profile() { # seed_password_profile NAME HOST
 # ssh to the password-only sshd with the wrapper as askpass and no controlling tty.
 ssh_with_wrapper() { # ssh_with_wrapper PROFILE_ID TARGET_HOST
     : >"$T/askpass.log"
-    capture A env SSH_ASKPASS="$T/askpass-wrap.sh" SSH_ASKPASS_REQUIRE=force MONIKER_PROFILE_ID="$1" \
-        setsid -w timeout 30 ssh -F /dev/null -p "$PW_PORT" -o UserKnownHostsFile="$T/kh" \
-        -o StrictHostKeyChecking=accept-new -o NumberOfPasswordPrompts=1 \
-        -o PubkeyAuthentication=no -- "$ME@$2" true
+    capture A env PATH="$T/shim:$PATH" SSH_ASKPASS="$T/askpass-wrap.sh" SSH_ASKPASS_REQUIRE=force \
+        MONIKER_PROFILE_ID="$1" setsid -w timeout 30 ssh -p "$PW_PORT" -- "$ME@$2" true
+}
+
+# The same with askpass-exec.sh and a one-time token, started the way Moniker
+# starts it: by a process (here a shell) whose id is MONIKER_PID, ssh being its
+# child. Whether the helper answered from the keyring shows in the token's
+# marker, which only an answering helper creates.
+ssh_like_moniker() { # ssh_like_moniker PROFILE_ID TARGET_HOST TOKEN
+    : >"$T/askpass.log"
+    # `exit $?` after ssh keeps the shell from exec'ing it: ssh stays its child.
+    # shellcheck disable=SC2016
+    capture A env PATH="$T/shim:$PATH" SSH_ASKPASS="$T/askpass-exec.sh" SSH_ASKPASS_REQUIRE=force \
+        MONIKER_PROFILE_ID="$1" MONIKER_ASKPASS_TOKEN="$3" setsid -w timeout 30 \
+        sh -c 'MONIKER_PID=$$; export MONIKER_PID; ssh -p "$1" -- "$2" true; exit $?' sh "$PW_PORT" "$ME@$2"
 }
 
 expect_askpass_log() { # expect_askpass_log CASE PROMPT EXIT
@@ -640,6 +699,7 @@ check_askpass_prompts() {
     start_sshd pwauth "$SYSTEM_PATH" password || { REASON="cannot start the password sshd"; return 1; }
     PW_PORT=$SSHD_PORT
     write_askpass_wrapper
+    write_ssh_shim || { REASON="cannot write the ssh shim"; return 1; }
     id_a=$(seed_password_profile askpass-a 127.0.0.1) &&
         id_b=$(seed_password_profile askpass-b LOCALHOST) &&
         id_c=$(seed_password_profile askpass-c jump.example.test) || { REASON="cannot seed the profiles"; return 1; }
@@ -653,6 +713,31 @@ check_askpass_prompts() {
     expect_askpass_log b "$ME@localhost's password: " 0 || return 1
     ssh_with_wrapper "$id_c" 127.0.0.1
     expect_askpass_log c "$ME@127.0.0.1's password: " 1
+}
+
+# The helper follows ~/.ssh/config (here $T/ssh_config) through `ssh -G`, and
+# never answers a ProxyJump hop's prompt, even one that names exactly the
+# target's user@host.
+check_askpass_follows_ssh_config() {
+    local id_d id_e token marker
+    [ -n "$PW_PORT" ] || { REASON="no password sshd (the previous check did not set it up)"; return 1; }
+    id_d=$(seed_password_profile askpass-d web-alias) &&
+        id_e=$(seed_password_profile askpass-e hopped) || { REASON="cannot seed the profiles"; return 1; }
+    # d: the profile's host is an alias that HostName rewrites; ssh's prompt
+    # names the real host, and the helper answers it from the keyring.
+    token=$(cat /proc/sys/kernel/random/uuid)
+    marker=$T/run/moniker/askpass/$token
+    ssh_like_moniker "$id_d" web-alias "$token"
+    grep -qxF "prompt=$ME@127.0.0.1's password: " "$T/askpass.log" || { REASON="case d: prompt not seen (log: $(tr '\n' '~' <"$T/askpass.log"); ssh: $(err_summary))"; return 1; }
+    [ -e "$marker" ] || { REASON="case d: the stored password was not sent for the alias"; return 1; }
+    rm -f -- "$marker"
+    # e: the hop's ssh prompts first, naming the same user@host as the target;
+    # it is not the ssh that was started, so it gets nothing.
+    token=$(cat /proc/sys/kernel/random/uuid)
+    marker=$T/run/moniker/askpass/$token
+    ssh_like_moniker "$id_e" hopped "$token"
+    grep -qxF "prompt=$ME@127.0.0.1's password: " "$T/askpass.log" || { REASON="case e: the hop's prompt not seen (log: $(tr '\n' '~' <"$T/askpass.log"); ssh: $(err_summary))"; return 1; }
+    [ ! -e "$marker" ] || { REASON="case e: the hop's prompt got the stored password"; return 1; }
 }
 
 check_host_key_not_auto_answered() {
@@ -697,6 +782,7 @@ inner_main() {
     run_check "idempotent" check_idempotent
     run_check "moniker-server not on remote PATH" check_server_not_on_path
     run_check "askpass prompt format with real OpenSSH" check_askpass_prompts
+    run_check "askpass follows the ssh config and skips ProxyJump hops" check_askpass_follows_ssh_config
     run_check "host key confirmation is never auto-answered" check_host_key_not_auto_answered
 
     say "== summary: $PASSED passed, $FAILED failed"

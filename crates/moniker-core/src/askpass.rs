@@ -13,15 +13,26 @@
 //!    keyring for the profile named by `MONIKER_PROFILE_ID`. That id arrives
 //!    through the environment, so it is only used if it is a canonical UUID and
 //!    so cannot address any other keyring entry. "For this profile's own login"
-//!    is decided by the prompt's identity: `ssh` puts the user and host it is
-//!    authenticating to in the prompt, so the caller passes the profile's
-//!    `(username, host)` and the prompt must be exactly
-//!    `<user>@<host>'s password:` (password authentication) or
-//!    `(<user>@<host>) Password:` (keyboard-interactive; the word is matched
-//!    without regard to case). The identity is compared literally and case
-//!    sensitively. Anything else, in particular a hop through a `ProxyJump`
-//!    host, which prompts with the jump host's name, a bare `Password:` or
-//!    `New password:`, never receives the stored password.
+//!    is decided twice:
+//!    * By who asks: only the `ssh` that Moniker started. The helper's caller
+//!      checks that the parent of the `ssh` running the helper is the Moniker
+//!      process named by [`PID_ENV`] ([`started_by_moniker`]) and passes no
+//!      identity otherwise. A `ProxyJump` or `ProxyCommand` hop runs its own
+//!      `ssh` as a child of the first one, so a hop's prompt never qualifies,
+//!      whatever host it names.
+//!    * By the prompt's identity: `ssh` puts the user and host it is
+//!      authenticating to in the prompt, so the caller passes the identity
+//!      this connection logs in as and the prompt must be exactly
+//!      `<user>@<host>'s password:` (password authentication) or
+//!      `(<user>@<host>) Password:` (keyboard-interactive; the word is matched
+//!      without regard to case). The identity is what `ssh -G` reports for the
+//!      profile's connection ([`effective_identity`]: after `~/.ssh/config`,
+//!      so an alias, a `HostName` or a `HostKeyAlias` is followed), or the
+//!      profile's own `(username, host)` if that fails or is ambiguous. It is
+//!      compared literally and case sensitively.
+//!
+//!    Anything else, in particular a hop's prompt, another host's, a bare
+//!    `Password:` or `New password:`, never receives the stored password.
 //! 4. Anything else is put to the user.
 //!
 //! Rule 3 has a second condition in a terminal tab: the stored password is
@@ -43,10 +54,11 @@
 //! has no terminal to fall back to: it passes no token ([`OneTime::NotUsed`])
 //! and `ssh` itself allows it one password prompt.
 //!
-//! Known limit of rule 3: `ssh` prints the host name it connects to, so when
-//! `~/.ssh/config` rewrites it with `HostName`, or the user or host is longer
-//! than `ssh` prints in full, the identity does not match and the user types
-//! the password at the terminal. That is a safe degradation, not a failure.
+//! Known limits of rule 3: when `ssh -G` cannot say (it fails, takes too long
+//! or reports something ambiguous), or the user or host is longer than `ssh`
+//! prints in full, the identity does not match and the user types the password
+//! at the terminal; so does an `ssh` on `PATH` that is a wrapper starting the
+//! real one as its child. That is a safe degradation, not a failure.
 //!
 //! "The user" means `/dev/tty` ([`DevTty`]). It exists when `ssh` runs inside
 //! the terminal widget. A headless `ssh` (sync) has no controlling terminal, so
@@ -79,6 +91,12 @@ const TTY_PATH: &str = "/dev/tty";
 /// The environment variable that carries a connection's [`AskpassToken`] to
 /// the helper.
 pub const TOKEN_ENV: &str = "MONIKER_ASKPASS_TOKEN";
+
+/// The environment variable that carries the process id of the Moniker
+/// process that starts `ssh` (the GUI, or `moniker-server` for a sync from the
+/// command line). The helper answers only for an `ssh` whose parent that is
+/// ([`started_by_moniker`]). Not a secret.
+pub const PID_ENV: &str = "MONIKER_PID";
 
 /// The directory of Moniker's files in the runtime directory, and the one of
 /// the markers in it: `<runtime>/moniker/askpass`.
@@ -326,6 +344,76 @@ fn has_word(lower: &str, word: &str) -> bool {
     lower
         .split(|c: char| !c.is_alphanumeric())
         .any(|w| w == word)
+}
+
+/// The `(user, host)` that `ssh`'s password prompt names for a connection,
+/// read from what `ssh -G` printed for it (`crate::ssh::resolve_command`):
+/// the `user`, and the `hostkeyalias` if there is one (the prompt names it),
+/// else the `hostname`, as `ssh` prints them (it lowercases both host names).
+/// This is the identity after `~/.ssh/config` is applied, so a profile whose
+/// host is an alias, or is rewritten by `HostName`, still matches its prompt.
+///
+/// `None`, and the caller keeps to the profile's own host, unless the dump is
+/// unambiguous: `user` and `hostname` present, each of the three keys at most
+/// once, every value one word with no whitespace or control characters, and
+/// the user the profile's own `username` (`ssh` prefers the user on its
+/// command line to the configuration's, so another one means something is
+/// off).
+pub fn effective_identity(dump: &str, username: &str) -> Option<(String, String)> {
+    let (mut user, mut hostname, mut alias) = (None, None, None);
+    for line in dump.lines() {
+        let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+        let slot = match key {
+            "user" => &mut user,
+            "hostname" => &mut hostname,
+            "hostkeyalias" => &mut alias,
+            _ => continue,
+        };
+        if slot.replace(value).is_some() {
+            return None;
+        }
+    }
+    let word = |v: &&str| !v.is_empty() && !v.chars().any(|c| c.is_whitespace() || c.is_control());
+    let user = user.filter(word)?;
+    let hostname = hostname.filter(word)?;
+    let host = match alias {
+        None => hostname,
+        Some(alias) => Some(alias).filter(word)?,
+    };
+    (user == username).then(|| (user.to_owned(), host.to_owned()))
+}
+
+/// The parent process id in `stat`, the text of a `/proc/<pid>/stat` file: the
+/// fourth field, the second after the command name. The command name is in
+/// parentheses and may hold spaces and parentheses itself, so it ends at the
+/// last `)`. `None` if there is no such field or it is not a plain number.
+pub fn parent_in_stat(stat: &str) -> Option<u32> {
+    let (_, after_name) = stat.rsplit_once(')')?;
+    let mut fields = after_name.split_ascii_whitespace();
+    let _state = fields.next()?;
+    plain_number(fields.next()?)
+}
+
+/// Whether the `ssh` that runs the helper was started by Moniker itself:
+/// `prompting_ssh_parent` (the parent of the helper's parent, read from
+/// `/proc`) is the process id Moniker put in [`PID_ENV`], passed here as
+/// `launcher`. A `ProxyJump` or `ProxyCommand` hop runs its own `ssh` as a
+/// child of the first one, so a hop's prompt never passes, whatever host it
+/// names. Neither id may be missing, and `launcher` must be a plain number
+/// above 1: an `ssh` whose parent has gone is adopted by init (or a
+/// subreaper), which is never Moniker.
+pub fn started_by_moniker(launcher: Option<&str>, prompting_ssh_parent: Option<u32>) -> bool {
+    launcher
+        .and_then(plain_number)
+        .is_some_and(|launcher| launcher > 1 && prompting_ssh_parent == Some(launcher))
+}
+
+/// `text` as a number if it is only ASCII digits (no sign, no spaces).
+fn plain_number(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// The real [`TtyPrompter`]: talks to `/dev/tty`, which it opens afresh for each
@@ -1593,6 +1681,124 @@ mod tests {
     fn read_line_at_end_of_input_is_an_error() {
         let err = read_line(&mut Cursor::new(Vec::new())).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    // ----- The effective identity (`ssh -G`) -----
+
+    /// Part of what `ssh -G -p 22 -- alice@web` prints, as OpenSSH 10.2 does:
+    /// lowercase keys, the host lowercased, some keys repeated.
+    const DUMP: &str = "user alice\nhostname web1.example.com\nport 22\n\
+        identityfile ~/.ssh/id_rsa\nidentityfile ~/.ssh/id_ed25519\nsendenv LANG\n\
+        sendenv LC_*\n";
+
+    #[test]
+    fn the_effective_identity_is_the_user_and_host_ssh_prints() {
+        assert_eq!(
+            effective_identity(DUMP, "alice"),
+            Some(("alice".to_owned(), "web1.example.com".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_host_key_alias_is_the_host_the_prompt_names() {
+        let dump = format!("{DUMP}hostkeyalias myalias\n");
+        assert_eq!(
+            effective_identity(&dump, "alice"),
+            Some(("alice".to_owned(), "myalias".to_owned()))
+        );
+    }
+
+    #[test]
+    fn another_user_than_the_profiles_is_not_trusted() {
+        let dump = DUMP.replace("user alice", "user bob");
+        assert_eq!(effective_identity(&dump, "alice"), None);
+    }
+
+    #[test]
+    fn a_dump_without_its_user_or_host_is_not_trusted() {
+        assert_eq!(effective_identity("", "alice"), None);
+        assert_eq!(effective_identity("user alice\nport 22\n", "alice"), None);
+        assert_eq!(
+            effective_identity("hostname web1\nport 22\n", "alice"),
+            None
+        );
+        // Keys are matched whole and as ssh prints them, in lowercase.
+        assert_eq!(
+            effective_identity("user alice\nhostnames web1\n", "alice"),
+            None
+        );
+        assert_eq!(
+            effective_identity("user alice\nHostName web1\n", "alice"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_repeated_identity_key_is_ambiguous() {
+        for extra in [
+            "hostname other.example.com",
+            "user alice",
+            "hostkeyalias a\nhostkeyalias b",
+        ] {
+            let dump = format!("{DUMP}{extra}\n");
+            assert_eq!(effective_identity(&dump, "alice"), None, "{extra}");
+        }
+    }
+
+    #[test]
+    fn odd_identity_values_are_not_trusted() {
+        for host in ["web1 example.com", "web1\u{7}", "", " web1", "web1\t"] {
+            let dump = format!("user alice\nhostname {host}\n");
+            assert_eq!(effective_identity(&dump, "alice"), None, "{host:?}");
+        }
+        assert_eq!(effective_identity("user alice\nhostname\n", "alice"), None);
+        let dump = format!("{DUMP}hostkeyalias my alias\n");
+        assert_eq!(effective_identity(&dump, "alice"), None);
+    }
+
+    // ----- Who is asking -----
+
+    #[test]
+    fn the_parent_is_the_fourth_field_of_a_stat_line() {
+        assert_eq!(
+            parent_in_stat("4321 (ssh) S 1234 4321 4321 0 -1 4194560\n"),
+            Some(1234)
+        );
+        // The command name may hold spaces and parentheses; only the last `)` ends it.
+        assert_eq!(parent_in_stat("4321 (a) b) S 9 (c) R 77 1 1\n"), Some(77));
+        assert_eq!(parent_in_stat("4321 (we ird) R 77 1 1\n"), Some(77));
+        for bad in [
+            "",
+            "garbage",
+            "4321 (ssh) S",
+            "4321 (ssh) S -5 1",
+            "4321 (ssh) S x 1",
+        ] {
+            assert_eq!(parent_in_stat(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_ssh_moniker_started_is_trusted() {
+        assert!(started_by_moniker(Some("1234"), Some(1234)));
+        // A ProxyJump or ProxyCommand hop's ssh is a child of the first ssh.
+        assert!(!started_by_moniker(Some("1234"), Some(1240)));
+        assert!(!started_by_moniker(None, Some(1234)));
+        assert!(!started_by_moniker(Some("1234"), None));
+        // An orphaned ssh's parent is init (or a subreaper): never Moniker.
+        for odd in [
+            "0",
+            "1",
+            "",
+            "+1234",
+            " 1234",
+            "1234 ",
+            "12a",
+            "99999999999",
+        ] {
+            let parent = odd.trim().parse::<u32>().ok();
+            assert!(!started_by_moniker(Some(odd), parent), "{odd:?}");
+        }
     }
 
     #[test]
