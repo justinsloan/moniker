@@ -70,6 +70,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -663,33 +664,65 @@ pub fn sync_over_ssh(
     local: &mut dyn SyncTarget,
     cmd: &SshCommand,
     passphrase: &str,
+    terminal: SshTerminal,
 ) -> Result<SyncOutcome, SyncError> {
-    sync_over_ssh_with_timeout(local, cmd, passphrase, SYNC_TIMEOUT)
+    sync_over_ssh_with_timeout(local, cmd, passphrase, terminal, SYNC_TIMEOUT)
+}
+
+/// Whether the `ssh` of a sync keeps the controlling terminal of this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshTerminal {
+    /// It keeps it, so `ssh` can ask there (a key passphrase, a ProxyJump
+    /// hop's password, a password when none is stored): `moniker-server sync`,
+    /// which a person runs in a terminal.
+    Inherit,
+    /// It runs in a session of its own with no controlling terminal, so such a
+    /// question fails at once instead of appearing in whatever terminal this
+    /// process was started from, where nobody is looking: the GUI's syncs, the
+    /// one at launch included. The stored password still reaches `ssh` through
+    /// the askpass helper, and `ssh` is still a child of this process (the
+    /// helper checks that). With no password stored, `ssh` may still show the
+    /// desktop's own graphical ssh-askpass if one is installed, as it always
+    /// did for a Moniker started from the desktop.
+    Detached,
 }
 
 fn sync_over_ssh_with_timeout(
     local: &mut dyn SyncTarget,
     cmd: &SshCommand,
     passphrase: &str,
+    terminal: SshTerminal,
     timeout: Duration,
 ) -> Result<SyncOutcome, SyncError> {
     check_passphrase(passphrase)?;
     // No point connecting if received passwords could not be stored.
     local.ready()?;
     let deadline = Instant::now() + timeout;
-    let child = Command::new(&cmd.program)
+    let mut command = Command::new(&cmd.program);
+    command
         .args(&cmd.args)
         .envs(cmd.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            SyncError::Io(io::Error::new(
-                e.kind(),
-                format!("could not start {}: {e}", cmd.program),
-            ))
-        })?;
+        .stderr(Stdio::piped());
+    if terminal == SshTerminal::Detached {
+        // SAFETY: the closure runs in the child between fork and exec, where
+        // only async-signal-safe calls may be made. It makes one system call,
+        // setsid (rustix calls it directly and allocates nothing), and turns a
+        // failure's errno into an `io::Error`, which allocates nothing either.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::process::setsid()?;
+                Ok(())
+            });
+        }
+    }
+    let child = command.spawn().map_err(|e| {
+        SyncError::Io(io::Error::new(
+            e.kind(),
+            format!("could not start {}: {e}", cmd.program),
+        ))
+    })?;
     // From here on the child is killed and reaped on every path, panics included.
     let mut child = Reaped(child);
     let (stdin, stdout, stderr) = match (
@@ -1436,13 +1469,15 @@ mod tests {
         let mut a = side(&[(prof("one"), Some("pw-one"))]);
         let a_file = file_of(&a.path);
 
-        let err = sync_over_ssh(&mut a.state, &sh("exit 127"), PASS).unwrap_err();
+        let err =
+            sync_over_ssh(&mut a.state, &sh("exit 127"), PASS, SshTerminal::Inherit).unwrap_err();
         assert!(matches!(err, SyncError::ServerNotFound), "got {err:?}");
 
         let err = sync_over_ssh(
             &mut a.state,
             &sh(r#"echo "Host key verification failed." >&2; exit 255"#),
             PASS,
+            SshTerminal::Inherit,
         )
         .unwrap_err();
         assert!(matches!(err, SyncError::HostKeyUnknown), "got {err:?}");
@@ -1451,7 +1486,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh(r#"printf 'early noise\nssh: connect to host x: \033[31mrefused\a\n' >&2; exit 255"#),
-            PASS,
+            PASS, SshTerminal::Inherit
         )
         .unwrap_err();
         let SyncError::Remote(msg) = &err else {
@@ -1465,7 +1500,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh("i=0; while [ $i -lt 400 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxx' >&2; i=$((i+1)); done; exit 3"),
-            PASS,
+            PASS, SshTerminal::Inherit
         )
         .unwrap_err();
         let SyncError::Remote(msg) = &err else {
@@ -1474,7 +1509,8 @@ mod tests {
         assert!(msg.len() <= 400, "{} bytes", msg.len());
 
         // Exit 0 without speaking the protocol keeps the protocol error.
-        let err = sync_over_ssh(&mut a.state, &sh("exit 0"), PASS).unwrap_err();
+        let err =
+            sync_over_ssh(&mut a.state, &sh("exit 0"), PASS, SshTerminal::Inherit).unwrap_err();
         assert!(matches!(err, SyncError::Io(_)), "got {err:?}");
 
         // A program that does not exist.
@@ -1483,11 +1519,69 @@ mod tests {
             args: vec![],
             env: vec![],
         };
-        let err = sync_over_ssh(&mut a.state, &missing, PASS).unwrap_err();
+        let err = sync_over_ssh(&mut a.state, &missing, PASS, SshTerminal::Inherit).unwrap_err();
         assert!(matches!(err, SyncError::Io(_)), "got {err:?}");
 
         assert_eq!(file_of(&a.path), a_file);
         assert_eq!(a.secrets.writes(), 0);
+    }
+
+    // ----- where ssh may ask -----
+
+    /// `(pid, parent, session)` of the `ssh` a sync starts, as the child itself
+    /// reads them from `/proc`, for a sync run with `terminal`. The child then
+    /// exits 127, like a remote without moniker-server.
+    fn ids_of_the_sync_ssh(terminal: SshTerminal) -> (String, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("ids");
+        let cmd = SshCommand {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                r#"out=$1; set -- $(cat /proc/$$/stat); printf '%s %s %s' "$1" "$4" "$6" > "$out"; exit 127"#
+                    .to_string(),
+                "sh".to_string(),
+                out.to_str().unwrap().to_string(),
+            ],
+            env: vec![],
+        };
+        let mut a = side(&[]);
+        let err = sync_over_ssh(&mut a.state, &cmd, PASS, terminal).unwrap_err();
+        assert!(matches!(err, SyncError::ServerNotFound), "got {err:?}");
+        let ids = fs::read_to_string(&out).unwrap();
+        let mut ids = ids.split(' ').map(str::to_owned);
+        (
+            ids.next().unwrap(),
+            ids.next().unwrap(),
+            ids.next().unwrap(),
+        )
+    }
+
+    /// The session of this test process, from `/proc/self/stat`.
+    fn own_session() -> String {
+        let stat = fs::read_to_string("/proc/self/stat").unwrap();
+        let after_name = stat.rsplit_once(')').unwrap().1;
+        after_name.split_whitespace().nth(3).unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_detached_sync_runs_ssh_in_a_session_of_its_own() {
+        let (pid, parent, session) = ids_of_the_sync_ssh(SshTerminal::Detached);
+        // A session leader with no controlling terminal: a prompt ssh would
+        // put on /dev/tty fails at once instead of showing up in the terminal
+        // this process was started from.
+        assert_eq!(session, pid, "the session leader");
+        assert_ne!(session, own_session());
+        // Still this process's own child, which the askpass helper checks.
+        assert_eq!(parent, std::process::id().to_string());
+    }
+
+    #[test]
+    fn an_inheriting_sync_keeps_ssh_in_this_session() {
+        let (pid, parent, session) = ids_of_the_sync_ssh(SshTerminal::Inherit);
+        assert_eq!(session, own_session());
+        assert_ne!(session, pid);
+        assert_eq!(parent, std::process::id().to_string());
     }
 
     // ----- rulings -----
@@ -1510,7 +1604,7 @@ mod tests {
             env: vec![("MONIKER_TEST_VAR".to_string(), "v1".to_string())],
         };
         let mut a = side(&[]);
-        let err = sync_over_ssh(&mut a.state, &cmd, PASS).unwrap_err();
+        let err = sync_over_ssh(&mut a.state, &cmd, PASS, SshTerminal::Inherit).unwrap_err();
         assert!(matches!(err, SyncError::ServerNotFound), "got {err:?}");
         assert_eq!(fs::read_to_string(&out).unwrap(), "2|a 'b' \"c\"; $(x)|v1");
     }
@@ -1533,7 +1627,7 @@ mod tests {
             no_secret_store: true,
             ..Stub::default()
         };
-        let err = sync_over_ssh(&mut stub, &cmd, PASS).unwrap_err();
+        let err = sync_over_ssh(&mut stub, &cmd, PASS, SshTerminal::Inherit).unwrap_err();
         assert!(matches!(err, SyncError::NoSecretStore), "{err:?}");
         assert!(!marker.exists(), "ssh must not be started");
         assert!(stub.applied.is_none());
@@ -1578,7 +1672,7 @@ mod tests {
             ],
             env: vec![],
         };
-        let out = sync_over_ssh(&mut a.state, &cmd, PASS).unwrap();
+        let out = sync_over_ssh(&mut a.state, &cmd, PASS, SshTerminal::Inherit).unwrap();
         assert_eq!(out.added, 1);
         let (served, b_secrets, _b_dir) = server.join().unwrap();
         assert_eq!(served.unwrap().added, 1);
@@ -2098,7 +2192,7 @@ mod tests {
             ],
             env: vec![],
         };
-        let err = sync_over_ssh(&mut a.state, &cmd, "").unwrap_err();
+        let err = sync_over_ssh(&mut a.state, &cmd, "", SshTerminal::Inherit).unwrap_err();
         assert!(matches!(err, SyncError::EmptyPassphrase), "{err:?}");
         assert!(!marker.exists());
         assert_eq!(a.secrets.writes(), 0);
@@ -2121,8 +2215,14 @@ mod tests {
             env: vec![],
         };
         let start = Instant::now();
-        let err = sync_over_ssh_with_timeout(&mut a.state, &cmd, PASS, Duration::from_secs(1))
-            .unwrap_err();
+        let err = sync_over_ssh_with_timeout(
+            &mut a.state,
+            &cmd,
+            PASS,
+            SshTerminal::Inherit,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
         let elapsed = start.elapsed();
         assert!(matches!(err, SyncError::Timeout), "got {err:?}");
         assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");

@@ -41,7 +41,7 @@ use moniker_core::secrets::{
 };
 use moniker_core::ssh::{SERVER_PROGRAM, SshCommand, sync_command};
 use moniker_core::store::ProfileStore;
-use moniker_core::sync::{LocalState, SyncError, SyncOutcome, sync_over_ssh};
+use moniker_core::sync::{LocalState, SshTerminal, SyncError, SyncOutcome, sync_over_ssh};
 use zeroize::Zeroizing;
 
 use crate::context::AppContext;
@@ -85,6 +85,12 @@ pub(crate) fn explain(err: &SyncError) -> String {
         }
         SyncError::VersionMismatch => {
             "The other machine runs an incompatible version of Moniker.".to_owned()
+        }
+        // ssh's login failed. It cannot ask anyone (it has no terminal), so a
+        // password that is not stored, or a key that needs its passphrase,
+        // ends here too.
+        SyncError::Remote(text) if text.contains("Permission denied") => {
+            format!("{err} {CANNOT_ASK}")
         }
         // Timeout and everything else: core's own text, which carries no
         // passphrase, password or profile data (text from the other side has
@@ -279,6 +285,11 @@ pub(crate) fn failure_text(failure: &SyncFailure) -> String {
     }
 }
 
+/// What to do when ssh's login failed during a sync, which has no terminal to
+/// ask on.
+const CANNOT_ASK: &str = "A sync cannot ask for a password or a key passphrase: store the \
+profile's password, or add the key to ssh-agent.";
+
 /// Why a sync cannot run without a key.
 pub(crate) const NO_SYNC_KEY: &str = "Set a sync key first.";
 
@@ -301,7 +312,9 @@ pub(crate) fn run_with(
         SERVER_PROGRAM,
     );
     tweak(&mut cmd);
-    sync_over_ssh(&mut local, &cmd, &inputs.passphrase)
+    // In a session of its own: a question ssh would ask on a terminal fails at
+    // once instead of waiting in the terminal Moniker was started from.
+    sync_over_ssh(&mut local, &cmd, &inputs.passphrase, SshTerminal::Detached)
 }
 
 // ----- the worker thread -----
@@ -1034,8 +1047,9 @@ mod tests {
 
     // ----- run_with: the real worker flow, with a fake ssh -----
 
-    /// A fake `ssh`: records its arguments and the askpass variables to
-    /// `record`, then exits 127 like a shell that cannot find `moniker-server`.
+    /// A fake `ssh`: records its arguments, the askpass variables and whether
+    /// it leads a session of its own (`SESSION-LEADER`) to `record`, then exits
+    /// 127 like a shell that cannot find `moniker-server`.
     fn fake_ssh(dir: &Path) -> PathBuf {
         let path = dir.join("fake-ssh");
         let record = dir.join("record");
@@ -1045,6 +1059,8 @@ mod tests {
              for a in \"$@\"; do printf 'ARG:%s\\n' \"$a\"; done\n\
              printf 'SSH_ASKPASS=%s\\n' \"${{SSH_ASKPASS-unset}}\"\n\
              printf 'MONIKER_PROFILE_ID=%s\\n' \"${{MONIKER_PROFILE_ID-unset}}\"\n\
+             set -- $(cat /proc/$$/stat)\n\
+             [ \"$1\" = \"$6\" ] && echo SESSION-LEADER\n\
              }} > '{}'\n\
              exit 127\n",
             record.display()
@@ -1095,6 +1111,30 @@ mod tests {
             !record.contains("correct horse"),
             "the key is never in argv or env"
         );
+        // No controlling terminal: ssh cannot ask in the terminal Moniker was
+        // started from.
+        assert!(lines.contains(&"SESSION-LEADER"), "{lines:?}");
+    }
+
+    #[test]
+    fn a_refused_login_says_a_sync_cannot_ask() {
+        let refused = SyncError::Remote(
+            "ssh exited with status 255: alice@app.example.test: Permission denied \
+             (publickey,password)."
+                .to_owned(),
+        );
+        let text = explain(&refused);
+        assert!(text.starts_with(&refused.to_string()), "{text}");
+        assert!(
+            text.ends_with(
+                "A sync cannot ask for a password or a key passphrase: store the profile's \
+                 password, or add the key to ssh-agent."
+            ),
+            "{text}"
+        );
+        // Other remote failures are not given the hint.
+        let other = SyncError::Remote("ssh exited with status 255: Connection refused".to_owned());
+        assert_eq!(explain(&other), other.to_string());
     }
 
     #[test]

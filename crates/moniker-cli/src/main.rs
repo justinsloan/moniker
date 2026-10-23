@@ -22,7 +22,7 @@ use moniker_core::secrets::{
 };
 use moniker_core::ssh::{SERVER_PROGRAM, sync_command};
 use moniker_core::store::ProfileStore;
-use moniker_core::sync::{LocalState, serve, sync_over_ssh};
+use moniker_core::sync::{LocalState, SshTerminal, serve, sync_over_ssh};
 use zeroize::Zeroizing;
 
 /// What `moniker-server sync` says when this machine has no sync key.
@@ -162,7 +162,8 @@ fn sync(name: &str) -> Result<(), String> {
     let cmd = sync_command(&profile, &askpass, has_password, SERVER_PROGRAM);
 
     let mut local = LocalState::new(store, Box::new(secrets));
-    let outcome = sync_over_ssh(&mut local, &cmd, &passphrase).map_err(|e| e.to_string())?;
+    let outcome = sync_over_ssh(&mut local, &cmd, &passphrase, SshTerminal::Inherit)
+        .map_err(|e| e.to_string())?;
     print_stdout(&format!(
         "added {}, updated {}, removed {}\n",
         outcome.added, outcome.updated, outcome.removed
