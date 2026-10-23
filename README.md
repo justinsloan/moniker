@@ -1,353 +1,308 @@
-# Moniker
+<h1 align="center">Moniker</h1>
 
-Moniker is a GTK4 and libadwaita terminal emulator for Linux built around saved
-SSH connections. It opens to a local terminal; a saved profile is one click away
-in the new-tab list. A profile holds a host, user name, port, an optional key file
-and a password; choosing it opens a logged-in tab, optionally running a fixed
-startup sequence such as `apt update`. Sessions, local ones too, can be saved as
-plain-text transcripts, which the Transcripts window lists, searches and shows.
-The terminal itself is VTE, so rendering of htop, tmux and the like is VTE's.
-This is alpha 4 (version 0.4.0).
+<p align="center">
+  <strong>A Linux terminal built around saved SSH connections.</strong><br>
+  One click to a logged-in shell, startup commands that run by themselves, and credential sync between your own machines with no server in the middle.
+</p>
 
-Profiles and their passwords can be synced between your own machines, with no
-server of anyone's: Moniker runs `moniker-server sync-serve` on the other
-machine over plain `ssh` and exchanges one bundle encrypted with a shared sync
-key. There are no split panes, no terminal search and no color settings (the
-terminal colors follow the system light or dark style; Preferences has the font,
-the scrollback and the transcripts). Moniker is released under the MIT license
-(see `LICENSE`), copyright 2026 Justin M. Sloan.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
+  <a href="https://github.com/justinsloan/moniker/releases/latest"><img src="https://img.shields.io/github/v/release/justinsloan/moniker?label=release" alt="Latest release"></a>
+  <a href="https://github.com/justinsloan/moniker/actions/workflows/ci.yml"><img src="https://github.com/justinsloan/moniker/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
+  <img src="https://img.shields.io/badge/rust-1.92%2B-orange.svg?logo=rust&logoColor=white" alt="Rust 1.92+">
+  <img src="https://img.shields.io/badge/GTK%204-libadwaita-4A86CF.svg?logo=gnome&logoColor=white" alt="GTK 4 and libadwaita">
+  <img src="https://img.shields.io/badge/platform-linux-lightgrey.svg?logo=linux&logoColor=white" alt="Platform: Linux">
+</p>
 
-Three programs are built: `moniker` (the terminal app), `moniker-server` (the
-command line for sync and for headless machines, no GTK) and `moniker-askpass`
-(the password helper ssh calls).
+---
 
-## Build and run
+## Why Moniker?
 
-Needs a Rust toolchain (1.92 or newer for the GUI; the core and
-`moniker-server` build with 1.89), a C compiler, pkg-config, GTK 4.18+, VTE 0.76+
-and libadwaita 1.9+ with development files. On Ubuntu/Debian:
+If you log in to the same machines many times a day, an ordinary terminal has you:
 
+- **Typing the same login again and again.** Host, user name and password, every time.
+- **Repeating the same commands after every login**, such as `apt update`.
+- **Keeping hosts and passwords in step by hand** across a laptop and a desktop, or handing them to a vendor's cloud to sync them for you, usually behind a subscription.
+
+Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, renders htop, tmux and vim, and Moniker adds no per-frame work on top of it. Next to that, a saved **connection profile** is one click from a logged-in shell, and profiles sync between your own machines over plain SSH, encrypted with a key that only those machines hold.
+
+> [!NOTE]
+> Moniker is alpha software (0.4.0, alpha 4). Expect rough edges, and see the [known limitations](#known-limitations).
+
+## Features
+
+- 🔑 **One click to a logged-in shell.** A profile holds the host, user name, port, an optional key file and a password. Pick it in the new-tab list and the tab logs in with no typing. The password lives in the system keyring and reaches `ssh` through a helper that answers only that host's password prompt, never through a file, the command line or the environment.
+- ▶️ **Startup sequences.** Give a profile as many named command lists as you like ("update", "tail the logs"). Connect with one and its commands run after login, then you are left in your normal interactive shell.
+- 🔄 **Sync with no server.** Profiles and passwords sync between your own machines over plain SSH. The bundle is encrypted with a shared sync key (Argon2id, XChaCha20-Poly1305) before it leaves the machine, and the key itself is never sent. Changes merge both ways: profiles added on either side are kept, the newest edit of a profile wins and deletions propagate. Once set up, Moniker syncs in the background at every launch.
+- 📝 **Transcripts.** Save a plain-text transcript of any session, remote or local: per profile, per connection, or of every session. The Transcripts window lists them by day, filters by host, searches across all of them, and exports or deletes them. Transcripts never leave the machine.
+- 🖥️ **A real terminal.** Tabs, several windows, tabs dragged from one window to another, a text size per tab, and copy and paste with bracketed paste. Moniker keeps only a handful of [shortcuts](#keyboard-shortcuts); every other key, Ctrl+Tab and F10 included, goes to the program in the terminal.
+- 🎨 **The modern GNOME look.** libadwaita, following the system light or dark style, terminal colors close to GNOME Console's, and a Connection Profiles window laid out like GNOME Settings.
+- 🗄️ **Headless machines too.** `moniker-server` is a command line with no GTK, for a server that only takes part in sync.
+- 🚫 **No cloud, no account, no telemetry.** The only network traffic is your own `ssh` connections.
+
+## Getting started
+
+### Download
+
+`.deb` and `.rpm` packages for x86-64 are on the [Releases page](https://github.com/justinsloan/moniker/releases/latest). They need **Ubuntu 26.04** or **Fedora 44** or newer, the first releases with libadwaita 1.9. Each release has two packages: `moniker`, the terminal app, and `moniker-server`, the command line and the password helper, which `moniker` depends on.
+
+```sh
+# Ubuntu
+sudo apt install ./moniker_0.4.0_amd64.deb ./moniker-server_0.4.0_amd64.deb
+# Fedora
+sudo dnf install ./moniker-0.4.0-1.fc44.x86_64.rpm ./moniker-server-0.4.0-1.fc44.x86_64.rpm
 ```
-sudo apt install libvte-2.91-gtk4-dev libadwaita-1-dev
-git clone https://github.com/justinsloan/moniker
+
+A headless machine that only syncs needs just `moniker-server`. Passwords and the sync key are kept in the system keyring (a Secret Service such as GNOME Keyring), which must be running and unlocked.
+
+To check a download against the release's `SHA256SUMS`, and, with GitHub CLI 2.49 or newer (Ubuntu 26.04's own `gh` package is 2.46), that GitHub Actions built it from this repository:
+
+```sh
+sha256sum --ignore-missing -c SHA256SUMS
+gh attestation verify moniker_0.4.0_amd64.deb --repo justinsloan/moniker
+```
+
+### Run from source
+
+Requires Rust 1.92 or newer (the core and `moniker-server` build with 1.89), a C compiler, pkg-config, and the development files of GTK 4.18+, VTE 0.76+ and libadwaita 1.9+.
+
+```sh
+sudo apt install build-essential pkg-config libadwaita-1-dev libvte-2.91-gtk4-dev   # Ubuntu
+sudo dnf install gcc pkgconf-pkg-config libadwaita-devel vte291-gtk4-devel           # Fedora
+git clone https://github.com/justinsloan/moniker.git
 cd moniker
 cargo build --workspace
 target/debug/moniker
 ```
 
-`cargo build --workspace` is required, not just `cargo run -p moniker-gui`: the
-password helper `moniker-askpass` must sit next to `moniker` (and
-`moniker-server`). Without it, stored passwords are not used and Moniker says
-so.
+Build with `--workspace`, not just `cargo run -p moniker-gui`: the password helper `moniker-askpass` must sit next to `moniker`. Without it Moniker cannot use stored passwords, and it says so. On a headless machine, `cargo build --release -p moniker-cli` builds only `moniker-server` and `moniker-askpass`, with no GTK.
 
-`bash scripts/build-deb.sh` builds two Debian packages into `target/debian/`:
-`moniker-server` (`moniker-server` and `moniker-askpass`, no GTK, for every
-machine that syncs) and `moniker` (the terminal app, which depends on it). Each
-carries the MIT license and the copyright line in its `copyright` file. Both
-list Justin Sloan as Maintainer (the address comes from `git config user.email`)
-and the repository as Homepage, and the `moniker` package carries AppStream
-metadata (`data/org.moniker.Moniker.metainfo.xml`) that names the same
-developer, which App Center's page for the installed app and GNOME Software
-should show as the publisher (not yet confirmed on a desktop).
+## Using Moniker
 
-`bash scripts/build-rpm.sh` builds the same two packages as RPMs into
-`target/rpm/`, for Fedora 44 or newer (the first Fedora with libadwaita 1.9).
-Run it on the Fedora release the packages are for; it needs `rpm-build`. Vendor
-is Justin Sloan and Packager the same name with the `git config user.email`
-address.
+Moniker opens with one local terminal: your login shell, in your home directory. The header bar has **＋** for a new tab and **☰** for everything else.
 
-Passwords and the sync key live in the system keyring (Secret Service, e.g.
-GNOME Keyring), which must be running and unlocked. The CLI and core need no GTK
-or VTE, so a headless machine can build just `cargo build --release -p moniker-cli`.
+| Action | How |
+|---|---|
+| **New tab** | **＋** or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> shows a searchable list: **Local terminal**, then every profile. What you pick turns that same tab into the session. |
+| **Connect** | Click a profile, or press <kbd>Enter</kbd> on it. It logs in and leaves you in the normal shell. |
+| **Connect with options** | **›** on a row (or <kbd>→</kbd>): **Just connect**, each startup sequence by name, and a **Save transcript** box for this one connection. Local terminal has a **›** too. |
+| **Add or edit profiles** | **☰ → Connection Profiles**. Double-click a profile there, or press its **Connect** button, to open a session in the main window you used last. |
+| **Read transcripts** | **☰ → Transcripts**. |
+| **Sync** | **☰ → Sync Now**, once sync is set up (see [Syncing two machines](#syncing-two-machines)). |
+| **Rename a tab** | Double-click it, or right-click it, then **Rename…**. |
+| **New window** | **☰ → New Window**, or drag a tab out of the tab bar. A tab can also be dragged into another Moniker window. |
+| **Text size** | The row at the top of **☰** (− 100% +), or the keys below. |
 
-## Releases
+### Keyboard shortcuts
 
-Released packages are built by GitHub Actions (`.github/workflows/ci.yml`), each
-in a container of the distribution it is for: the `.deb` on Ubuntu 26.04 and
-the `.rpm` on Fedora 44, so they install on those releases or newer. To make a
-release, raise `version` in `Cargo.toml`, add the version to the release list
-in `data/org.moniker.Moniker.metainfo.xml`, commit, and push a tag named after
-it:
+| Keys | Action |
+|---|---|
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> | New tab / close tab |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> | New window |
+| <kbd>Ctrl</kbd>+<kbd>PgUp</kbd> / <kbd>Ctrl</kbd>+<kbd>PgDn</kbd> | Previous / next tab |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> | Copy / paste |
+| <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>Ctrl</kbd>+<kbd>−</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | Larger / smaller / normal text, in this tab |
+| <kbd>Ctrl</kbd>+<kbd>,</kbd> | Preferences |
 
+Every other key, <kbd>Ctrl</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>Tab</kbd> and <kbd>F10</kbd> included, goes to the program in the terminal. Larger text also answers to <kbd>Ctrl</kbd>+<kbd>=</kbd>, and all three text size keys work on the keypad. One trade-off: <kbd>Ctrl</kbd>+<kbd>−</kbd> no longer reaches the program; readline's undo is still on <kbd>Ctrl</kbd>+<kbd>_</kbd>. **☰ → Keyboard Shortcuts** shows the same list.
+
+### Tabs and windows
+
+- With one tab there is no tab bar. A remote tab is named after its profile, and the remote shell cannot change that; a local tab follows its shell's title until you rename it.
+- Closing a tab or a window hangs up whatever runs in it: the `ssh`, or the shell and its job. Closing the last window quits.
+- Each tab has its own text size, from 50% to 300%. A new tab starts at the size of the tab you were in, and the size of the last window's active tab is remembered for the next launch.
+- While a dialog such as Rename, About or Preferences is open, the tab, copy, paste and text size keys leave the tab behind it alone, so <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> pastes into the dialog's field.
+- **Copy and paste:** select with the mouse and press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>; <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> pastes. Right-click a terminal for a menu with Copy and Paste. When the program is using the mouse (htop, mc, tmux with mouse on), a plain right-click goes to the program and <kbd>Shift</kbd>+right-click opens the menu. A multi-line paste reaches a shell that supports bracketed paste as one block instead of running line by line. Middle-click still pastes the selection.
+
+### Profiles and startup sequences
+
+- **Editing saves field by field.** A changed text field shows a ✓, and the value is saved only when you press ✓ or <kbd>Enter</kbd>; leave the field without that and the edit is dropped. Switches, the port and the key file save when changed. A mistake, such as an empty host, marks the field and a notification says why, and nothing is saved.
+- **Passwords:** the password field is empty unless you type a new one, and leaving it empty keeps the stored password. **Remove stored password** deletes it from this machine only.
+- **Startup sequences** are listed on the profile page, one row each. Open one to name it and type its commands, one per line, then Save or Cancel; Move Up and Move Down set the order of the Connect choices. A profile with no sequences gives a plain shell.
+- Narrow the Connection Profiles window and it shows one pane at a time, with a back button.
+
+### Transcripts
+
+A transcript is the plain text of a session, written when its tab ends or closes, to `~/.local/share/moniker/transcripts/<host>_<date>-<time>.txt` (UTC, mode 0600) unless Preferences chose another folder. A local terminal's transcript is named after this computer. Whether a session is saved is decided before its tab opens:
+
+| Setting | Where | Effect |
+|---|---|---|
+| **Save transcript** switch | A profile's page | Every connection to that profile is saved. |
+| **Save transcript** box | The **›** choices of a profile or of Local terminal | Overrides the setting for this one session, in either direction. |
+| **Save transcripts of all sessions** | Preferences (off to start with) | Every new tab is saved, the first one at launch included, whatever the profile says. The box under **›** then starts checked. |
+
+The **Transcripts window** lists them under day headings (Today, Yesterday, then dates) with the host and the local start time. Sort Newest first or Oldest first, narrow the list to one host, or type in the search entry to keep only the transcripts that contain the text, each with its match count. Choosing one shows its whole text, read-only, with a search bar of its own that highlights every match: <kbd>Enter</kbd> or <kbd>↓</kbd> for the next, <kbd>↑</kbd> for the previous, <kbd>Ctrl</kbd>+<kbd>F</kbd> to focus it. **Export…** saves a copy (mode 0600, like the original) and **Delete** asks, then removes the file. The list follows the folder live, so a session that ends while the window is open appears in it.
+
+Only files named the way Moniker names transcripts are listed; anything else in the folder is never read, searched or offered for deletion, so a folder you also use for other things is safe to choose. A line longer than 2,000 characters is shown broken into lines of 2,000, so that a transcript of one enormous line opens quickly. The file keeps the original text, search finds a match across a break, and copying a selection gives the original text, without the added breaks.
+
+> [!WARNING]
+> Transcripts record whatever appears in the terminal, and startup sequences are stored as plain text. Both can hold secrets you type or paste. Keep passwords out of them. Transcripts are never synced.
+
+### Preferences
+
+**☰ → Preferences** or <kbd>Ctrl</kbd>+<kbd>,</kbd>. Each change is saved at once and stays local to this machine.
+
+| Group | Setting | Notes |
+|---|---|---|
+| Terminal | **Font** | Monospace fonts only. Applies to every open terminal at once. |
+| Terminal | **Scrollback** | 1,000 to 1,000,000 lines (10,000 to start with), for tabs opened after the change. A tab that saves a transcript keeps all of its scrollback. |
+| Transcripts | **Save transcripts of all sessions** | See [Transcripts](#transcripts). |
+| Transcripts | **Transcripts folder** | **Choose…** picks another folder and moves the transcripts into it (below). |
+| Sync | **Sync settings** | **Open** shows the Sync page of the Connection Profiles window. |
+
+**Changing the transcripts folder** moves the old folder's transcripts into the new one, in the background. Files are renamed into place, or copied and then removed when the folders are on different file systems. A name already taken gets a number (`-2`, `-3`) and nothing is ever overwritten. Only files named like Moniker's transcripts move: any other file stays where it is and the message counts it, so choosing your home folder once cannot take your documents with it. A session saving a transcript meanwhile saves it into the new folder. When it is done, a message says how many were moved and, if anything stayed behind, names the old folder.
+
+### Messages
+
+What needs your attention (a transcript that could not be saved, `moniker-askpass` missing, the result of a sync, an export or a failed delete) appears as a notification at the top center of the window, just below the header bar. Notifications wrap onto several lines, fade after about 8 seconds (a little longer for a long one) and come one after another. They cannot be dismissed, so for that time one covers whatever is under it. While a dialog is open the window's notifications wait until it closes; Preferences shows its own at the bottom of the dialog. A message with no window left to show it goes to the standard error of the `moniker` process.
+
+### Where Moniker keeps things
+
+| What | Where | Synced |
+|---|---|---|
+| Passwords and the sync key | The system keyring (Secret Service) | Passwords yes, the sync key never |
+| Profiles, no secrets | `~/.config/moniker/profiles.json` (mode 0600) | Yes |
+| Sync partner, automatic sync, text size for the next launch, Preferences | `~/.config/moniker/gui-settings.json` (mode 0600) | No |
+| Transcripts | `~/.local/share/moniker/transcripts/`, or the folder chosen in Preferences | No |
+
+If `gui-settings.json` is damaged, Moniker uses the defaults and leaves the file as it is instead of overwriting it; a Preferences change then says it cannot be saved.
+
+## Syncing two machines
+
+1. **Install Moniker on both.** The other machine needs only `moniker-server`: install its package, or run `cargo build --release -p moniker-cli` and then `sudo install -m 755 target/release/moniker-server target/release/moniker-askpass /usr/local/bin/`.
+2. **Set the same sync key on every machine**, at least 12 characters, with `moniker-server sync-key set` (it asks twice and does not echo; `--stdin` reads it from a pipe) or on the Sync page of the Connection Profiles window. It is stored in the keyring and never sent.
+3. **Make sure the other machine has an unlocked Secret Service** that a non-interactive ssh session can reach: received passwords are stored there. Without one the sync fails with a message and changes nothing.
+4. **Save a profile for the other machine and connect to it once from a tab** to accept its host key. Sync never asks about host keys; it refuses unknown ones.
+5. **Sync** from the Sync page of the Connection Profiles window, after choosing the other machine's profile there, or with `moniker-server sync <profile name>` (the name must be unique).
+6. **From then on it is automatic.** Once a sync from the Sync page has succeeded, that profile is your sync partner: Moniker syncs with it at each launch, in the background (the terminal never waits, and a success is silent), and **☰ → Sync Now** syncs on request. A failure is one notification. The Sync page has a switch to turn the launch sync off.
+
+> [!IMPORTANT]
+> `moniker-server` must be on the other machine's *non-interactive* `PATH`, and `~/.cargo/bin` usually is not. Install it in `/usr/local/bin` or `~/.local/bin` (the packages put it in `/usr/bin`), then check that `ssh other-machine which moniker-server` prints a path.
+
+## How it keeps your passwords safe
+
+Connecting with a stored password passes through these layers:
+
+```text
+ you pick a profile
+     │
+     ▼
+ ① The system's own ssh ──── Started with an argument list, never a shell string, and no
+     │                        password in it. ~/.ssh/config, known_hosts and ssh-agent apply.
+     ▼
+ ② SSH_ASKPASS ───────────── ssh asks moniker-askpass. The environment carries only the
+     │                        profile id and a one-time token, never a secret.
+     ▼
+ ③ Exact prompt match ────── The helper answers only the password prompt for exactly this
+     │                        profile's user@host. Host-key questions, key passphrases and
+     │                        ProxyJump hops go to you.
+     ▼
+ ④ One-time marker ───────── At most one answer per connection: after a wrong stored
+     │                        password, ssh asks you, and the stored one is never sent again.
+     ▼
+ ⑤ System keyring ────────── The password is read from the Secret Service at that moment.
+                              It is never written to a file.
 ```
+
+A sync exchanges sealed bundles over ssh. The sync key never goes on the wire:
+
+```text
+ this machine                                           the other machine
+ moniker ─────── ssh -T, StrictHostKeyChecking=yes ───▶ moniker-server sync-serve
+    │                                                      │
+    │  HELLO ───────────────────────────────────────────▶  │  sync key set? Secret Service?
+    │  ◀─────────────────────────────────────────── HELLO  │
+    │  sealed profiles and passwords ───────────────────▶  │  open, validate every entry,
+    │                                                      │  merge, apply
+    │  ◀───────────────────────────── sealed merged set    │
+    ▼                                                      ▼
+ open, validate, apply                                  done
+```
+
+*Sealed* means encrypted and authenticated with XChaCha20-Poly1305, under a key that Argon2id derives from the sync key. Each side changes its own state only after reading the whole bundle from the other, and stores passwords before the profile file, so a failure part-way never leaves a profile without its password, and the next sync catches up.
+
+- **A machine holding your sync key is trusted.** It sees every password in the bundle and can add, change or delete your profiles. What it sends is still checked at the edge: ids must be canonical UUIDs, host and user names are restricted, control characters are refused, and one bad entry rejects the whole sync.
+- **Use a long sync key.** The client sends its bundle once the other end has answered, but before it has shown that it knows the key.
+- **Names stay plain text.** Profile names, hosts and tab titles are never shown as markup, and a remote shell cannot retitle its tab to look like another host.
+- **Files are private.** Config, transcript and exported transcript files are mode 0600, and a transcripts folder Moniker creates is 0700.
+- **No other traffic.** Moniker makes no network connections other than your ssh sessions.
+
+## Building packages
+
+```sh
+bash scripts/build-deb.sh   # → target/debian/
+bash scripts/build-rpm.sh   # → target/rpm/ (on Fedora 44 or newer, needs rpm-build)
+```
+
+| File | Contents |
+|---|---|
+| `target/debian/moniker_<version>_amd64.deb` | The terminal app; depends on `moniker-server` |
+| `target/debian/moniker-server_<version>_amd64.deb` | `moniker-server` and `moniker-askpass`, no GTK |
+| `target/rpm/moniker-<version>-1.fc<NN>.x86_64.rpm` | The terminal app |
+| `target/rpm/moniker-server-<version>-1.fc<NN>.x86_64.rpm` | `moniker-server` and `moniker-askpass`, no GTK |
+
+Build each package on the distribution it is for, so that it links that distribution's libraries. Both scripts take the maintainer's address from `git config user.email` and refuse to build without it. The packages name Justin Sloan as maintainer, carry the MIT license and give the repository as their homepage, and the `moniker` package includes AppStream metadata (`data/org.moniker.Moniker.metainfo.xml`), from which App Center and GNOME Software take the publisher's name.
+
+## Development
+
+```text
+crates/
+├── moniker-core/    GTK-free library: profiles, storage, keyring, crypto, merge, sync,
+│                    ssh command lines, the askpass logic, transcripts
+├── moniker-cli/     moniker-server (profiles, sync key, sync) and moniker-askpass
+└── moniker-gui/     moniker: the GTK 4 / libadwaita / VTE app and its window tests
+data/                Desktop file and AppStream metadata
+scripts/             Package builds, test runners, the CI install test
+docs/                Hands-on checks that need a real desktop and a real host
+```
+
+The core and the CLI must not depend on GTK or VTE, because a sync partner may be a headless server; `scripts/check-no-gtk.sh` enforces it.
+
+### Tests
+
+```sh
+cargo test --workspace
+bash scripts/check-no-gtk.sh   # core and CLI must not depend on GTK, VTE or libadwaita
+bash scripts/gui-tests.sh      # the window tests, under a virtual display
+bash scripts/e2e-sync.sh       # two instances over a real sshd, with a private bus and keyring
+```
+
+The window tests open real GTK windows and run real terminals with a fake `ssh`. `cargo test` skips them (they are `#[ignore]`d), and they need `xvfb-run` (`apt install xvfb`). `docs/manual-verification.md` lists what needs a real desktop and a real host.
+
+> [!IMPORTANT]
+> Run the window tests only through `scripts/gui-tests.sh [name filter]`. It runs the test binary with an empty environment, a throwaway `HOME` and `XDG_*` directories, a private virtual display and a session bus address that points nowhere, so the tests cannot reach your desktop, your keyring or your files; it starts no bus or keyring and kills nothing. `scripts/e2e-sync.sh` is the only script that starts a bus, a keyring and an `sshd`, all private, and it fails if your real session files change. Its "`moniker-server` not on remote PATH" check fails on a machine that has `moniker-server` installed in `/usr/bin`.
+
+### Continuous integration and releases
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request. In an Ubuntu 26.04 container it checks formatting, runs clippy, `cargo test`, `check-no-gtk.sh` and the window tests, and validates the desktop file and the AppStream metadata. It then builds the `.deb` on Ubuntu 26.04 and the `.rpm` on Fedora 44, and installs and starts each in a fresh container (`scripts/install-test.sh`, which installs packages as root and so runs only in a throwaway container). `e2e-sync.sh` is not run there yet.
+
+To make a release, raise `version` in `Cargo.toml`, add the version to the release list in `data/org.moniker.Moniker.metainfo.xml`, commit, and push a tag named after it:
+
+```sh
 git tag v0.5.0
 git push origin v0.5.0
 ```
 
-The workflow runs every check (below), builds both packages, installs each in a
-fresh container and starts it there, and only then makes a **draft** release
-with the four packages, `SHA256SUMS` and a build-provenance attestation for
-each package. A draft is not public: download its packages, try them, and
-publish it on GitHub when they are good. A tag that does not match the version
-in `Cargo.toml` makes no release. To check a downloaded package against
-`SHA256SUMS`, and, with GitHub CLI 2.49 or newer (Ubuntu 26.04's own `gh`
-package is 2.46), that GitHub built it from this repository:
+The workflow runs every check, builds and install-tests both packages, and only then makes a **draft** release with the four packages, `SHA256SUMS` and a build-provenance attestation for each package. A draft is not public: download its packages, try them, and publish it on GitHub when they are good. A tag that does not match the version in `Cargo.toml` makes no release.
 
-```
-sha256sum --ignore-missing -c SHA256SUMS
-gh attestation verify moniker_0.5.0_amd64.deb --repo justinsloan/moniker
-```
+## Known limitations
 
-## Using Moniker
-
-* **Launch** opens a window with one local terminal (your login shell, in your
-  home directory). With one tab there is no tab bar.
-* **Header bar**: **＋** opens a new tab, and **☰** holds a text size row, New
-  Window, Connection Profiles, Transcripts, Sync Now (once sync is set up),
-  Preferences, Keyboard Shortcuts and About. The window title is the tab's title.
-  There is no Connect button: you connect from the new-tab list or the
-  Connection Profiles window.
-* **New tab** (＋ or Ctrl+Shift+T) shows a searchable list: **Local terminal**
-  first, then every profile. Press Enter on Local terminal for a shell at once;
-  pick a profile and that same tab becomes its session. The **›** on Local
-  terminal shows its choices: Open, and a "Save transcript" box.
-* **Connect** to a profile by clicking it in the new-tab list or pressing Enter:
-  that logs in and gives you the normal shell, saving a transcript if the profile
-  is set to (or if "Save transcripts of all sessions" is on, see Preferences).
-  The **›** on a row (or Right arrow) shows the choices for that profile instead:
-  "Just connect", one entry per startup sequence, and a "Save transcript" box
-  that starts as the profile's setting (checked when every session is saved) and
-  overrides it for that connection, in either direction.
-* **Tabs**: Ctrl+Shift+T new, Ctrl+Shift+W close, Ctrl+PgUp / Ctrl+PgDn switch,
-  Ctrl+Shift+N new window. Every other key, Ctrl+Tab and F10 included, goes to
-  the program in the terminal (Ctrl+C is still interrupt), apart from the copy,
-  paste and text size keys below and Ctrl+comma for Preferences. Double-click a
-  tab (or right-click it, then Rename…) to rename it. A remote tab is named after
-  its profile and the remote shell cannot change that; a local tab follows its
-  shell's title until you rename it. Drag a tab out of the bar to make a window
-  of it, or into another Moniker window. Closing the last tab closes the window,
-  and closing the last window quits (a move of transcripts in progress, see
-  Preferences, finishes first). Closing a tab or a window hangs up whatever runs
-  in it: the `ssh`, or the shell and its job. While a dialog such as Rename,
-  About or Preferences is open, the tab, copy, paste and text size keys leave the
-  tab behind it alone (Ctrl+Shift+V pastes into the dialog's field).
-* **Copy and paste**: select text with the mouse, then Ctrl+Shift+C copies it
-  and Ctrl+Shift+V pastes the clipboard (Ctrl+C stays interrupt, and
-  Ctrl+Shift+C with nothing selected does nothing). Right-click in a terminal
-  for a menu with Copy and Paste; when the program in the terminal is using the
-  mouse (htop, mc, tmux with mouse on), a plain right-click goes to the program
-  and Shift+right-click opens the menu. A multi-line paste reaches a shell that
-  supports bracketed paste as one block instead of running line by line.
-  Middle-click still pastes the selection.
-* **Text size**: Ctrl+plus (also Ctrl+= and keypad +) makes the text larger,
-  Ctrl+minus (keypad −) smaller and Ctrl+0 returns to normal, from 50% to 300%.
-  The ☰ menu has the same as − 100% +. Each tab has its own size, and a new tab
-  starts at the size of the tab you were in. When you close the last window, the
-  size of its active tab is remembered for the next launch's first tab. (Ctrl+minus
-  no longer reaches programs in the terminal; readline's undo is still on
-  Ctrl+_.)
-* **Connection Profiles** (☰ → Connection Profiles) opens a separate window laid
-  out like GNOME Settings: a sidebar of profiles (＋ adds one, the magnifier
-  searches) and the selected profile's page. Double-click or Enter on a profile,
-  or the page's Connect button, opens a session in the main window you used last.
-  Narrow the window and it shows one pane at a time with a back button.
-* **Editing a profile** saves field by field: a text field shows a ✓ when you
-  change it, and the value is saved only when you press ✓ or Enter. Leave the
-  field without that and your edit is dropped. Switches, the port and the key
-  file save when changed. A mistake (an empty host, say) marks the field and
-  a notification says why; nothing is saved and the field keeps what you typed.
-  The password field is empty unless you type a new one, and an empty field keeps
-  the stored password; "Remove stored password" deletes it from this machine only.
-* **Startup sequences** are listed on the profile page, one row each. Open one to
-  name it, type its commands (one per line) and Save or Cancel; Move Up and Move
-  Down set the order they appear in the Connect choices. The commands run on the
-  remote after login, then you get your normal shell. A profile with no sequences
-  gives a plain shell.
-* **Transcripts** are the plain text of a session, written to
-  `~/.local/share/moniker/transcripts/<host>_<date>-<time>.txt` (UTC, mode 0600)
-  when the tab ends or closes, once, wherever the tab is by then. A local
-  terminal's transcript is named after this computer. Whether a session is saved
-  is decided before its tab opens: a profile has a "Save transcript" switch, the
-  **›** choices of a profile and of Local terminal have a "Save transcript" box,
-  and Preferences has "Save transcripts of all sessions" (off to start with),
-  which saves every new tab, the first tab at launch included, whatever the
-  profile says; the box under **›** then starts checked, and unchecking it skips
-  that one session. Transcripts are never synced. The folder is chosen in
-  Preferences.
-* **Transcripts window** (☰ → Transcripts) opens a window, laid out like the
-  Connection Profiles window, that looks back at your transcripts. The sidebar
-  lists every transcript under day headings (Today, Yesterday, then dates) with
-  its host and local start time; choose Newest first or Oldest first, narrow it
-  to one host, or type in the search entry to keep only the transcripts that
-  contain the text, each shown with its match count. Only files named the way
-  Moniker names transcripts (`<host>_<date>-<time>.txt`) are listed; anything
-  else in the folder is ignored (never read, searched or offered for deletion),
-  so a folder you also use for other things is safe to choose. Choosing a
-  transcript shows its whole text, read-only. Its own search bar highlights
-  every match: Enter or ↓ goes to the next, ↑ to the previous, and Ctrl+F
-  focuses it. **Export…** saves a copy wherever you choose (mode 0600, like the
-  original; exporting onto the transcript itself is refused), and **Delete**
-  asks, then removes the file. A transcript finished while the window is open
-  appears in the list, and the window follows the folder if you change it in
-  Preferences. Transcripts hold whatever was on screen, which may include
-  secrets, and the window says so. A line of more than 2,000 characters is
-  shown broken into lines of 2,000, so that a transcript of one enormous line
-  opens quickly; the file and Export keep the original text and search finds a
-  match across a break. Copying a selection (Ctrl+C or Copy in the right-click
-  menu) gives the original text, without those added line breaks; a
-  middle-click paste or a drag of the selection still carries them, and Export
-  gives the exact file.
-* **Preferences** (☰ → Preferences, or Ctrl+comma) opens a dialog.
-  **Terminal**: the **font** (a chooser that offers monospace fonts only; it
-  applies to every open terminal at once) and the **scrollback**, 1,000 to
-  1,000,000 lines (10,000 to start with), for tabs opened after the change; a tab
-  that saves a transcript keeps all its scrollback. **Transcripts**: "Save
-  transcripts of all sessions" and the **transcripts folder** with a Choose…
-  button. Choosing another folder **moves the transcripts in the old one into
-  it**, in the background: files are renamed into place, or copied and then
-  removed when the folders are on different file systems; a name already taken
-  gets a number (`-2`, `-3`) and nothing is overwritten; and a message says how
-  many were moved and, if anything stayed behind, names the old folder. Only
-  files named like Moniker's transcripts move. Any other file in the old folder
-  stays, and the message counts them, so choosing your home folder once cannot
-  take your documents with it. A session that is saving a transcript meanwhile
-  saves it into the new folder. **Sync**: Open shows the Sync page of the
-  Connection Profiles window. Each change is saved at once and is local to this
-  machine, and a message about one that could not be saved appears in the
-  dialog.
-* Startup commands are stored as plain text, and transcripts record whatever
-  appears in the terminal, including what you type or paste. Keep passwords out
-  of both. The profile page and Preferences say so.
-* **Messages** appear as notifications at the top center of the window, just
-  below the header bar: they wrap onto several lines, fade after a few seconds
-  (a little longer for a long message) and come one after another if there are
-  several. For that time one covers whatever is under it, such as the top of the
-  terminal. They say, for instance, that a transcript could not be saved or that
-  `moniker-askpass` is missing, give the result of a sync, and in the Transcripts
-  window the result of an export or a failed delete. While a dialog is open the
-  window's messages wait and appear when it closes; Preferences shows its own
-  in the dialog, at the bottom. A message with no window left to show it (a
-  transcripts move that ends after the last window closed) is written to the
-  standard error of the `moniker` process instead.
-
-Profile data (no secrets) is in `~/.config/moniker/profiles.json`. Which profile
-is your sync partner, whether to sync automatically, the text size the next
-launch starts at and the Preferences (font, scrollback, saving all transcripts,
-the transcripts folder) are in `~/.config/moniker/gui-settings.json` (also local
-to this machine, mode 0600). If that file is damaged, Moniker uses the defaults
-and, when it quits, leaves the file as it is instead of overwriting it; a
-Preferences change then says it cannot be saved and leaves it too.
-
-## Syncing two machines
-
-1. **Install Moniker on both.** The other machine needs only the CLI:
-   `cargo build --release -p moniker-cli`, then
-   `sudo install -m 755 target/release/moniker-server target/release/moniker-askpass /usr/local/bin/`.
-   `moniker-server` must be on the remote's *non-interactive* `PATH`;
-   `~/.cargo/bin` usually is not. Put it in `/usr/local/bin` or `~/.local/bin`
-   and check that `ssh remote-host which moniker-server` prints a path.
-2. **Set the same sync key on every machine**, at least 12 characters, with
-   `moniker-server sync-key set` (asks twice, no echo; `--stdin` reads it from a
-   pipe) or on the Sync page of the Connection Profiles window. It is stored in
-   the keyring and never sent.
-3. **The other machine needs an unlocked Secret Service** that a non-interactive
-   ssh session can reach, because received passwords are stored there. Without
-   one the sync fails with a message and changes nothing.
-4. **Save a profile for the other machine** and **connect to it once from a tab**
-   to accept its host key. Sync never asks about host keys; it refuses unknown ones.
-5. **Sync**: the Sync button on the Sync page of the Connection Profiles window
-   (choose the other machine's profile there), or
-   `moniker-server sync <profile name>` (names must be unique). Profiles added on
-   either side are kept, the newest edit of a profile wins, and deletions
-   propagate.
-6. **Automatic sync**: once a sync from the Sync page has succeeded, that profile
-   is your sync partner. From then on Moniker syncs with it each time it launches
-   (in the background; the terminal never waits, and a success is silent), and
-   ☰ → Sync Now does it on request. A failure is one notification. The Sync page
-   has a switch to turn the launch sync off. It never asks anything in a Moniker
-   tab and never accepts a host key; see the known limits for a prompt that can
-   still appear in the shell that started `moniker`.
-
-## Security model
-
-* Passwords and the sync key are kept in the keyring, never in a file, in `argv`
-  or in the environment. `ssh` is pointed at `moniker-askpass`, which reads the
-  keyring itself and answers only a password prompt that names exactly that
-  profile's user and host, and only once per connection (a one-time marker file
-  in your runtime directory); host-key and key-passphrase prompts, and any
-  second password prompt, go to you.
-* The sync bundle is encrypted (Argon2id, XChaCha20-Poly1305) with the sync key
-  before it leaves the machine; ssh is only the transport. The client sends its
-  bundle before the other end has shown it knows the key, so use a long key.
-* A machine holding your sync key is trusted: it sees every password in the
-  bundle and can add, change or delete your profiles. Received profiles are
-  validated (host and user names are restricted, control characters refused).
-* Config, transcript and exported transcript files are mode 0600 (a transcripts
-  folder Moniker creates is 0700). Moniker makes no network connections other
-  than your ssh sessions.
-
-## Known limits
-
-* The stored password is used only when ssh's prompt names exactly the profile's
-  user and host. A `HostName` alias in `~/.ssh/config` or a ProxyJump hop makes
-  ssh show another name, and then you type the password.
-* A wrong stored password is tried once; then ssh asks for the password in the
-  terminal, as plain ssh does (three attempts in all). The stored password is
-  never sent twice in one connection. A sync has no terminal: a wrong stored
-  password fails the sync.
-* Transcripts hold what VTE holds: content shown only on the alternate screen
-  (htop, vim) is not in them, and a crash loses the transcript in progress.
-* Removing a stored password on the profile page is local to that machine; others
-  keep theirs, and a later sync from one that still has it can bring it back.
-* The text size is saved when the last window is closed. If Moniker is killed, or
-  the session ends without closing its windows, the previously saved size stays.
-* Closing a tab hangs up its process. One that ignores the hang-up keeps running,
-  and its terminal is kept until it exits.
-* The Transcripts window reads a transcript whole to show or search it (off the
-  UI thread), so a very large transcript, or a very large folder searched at
-  once, takes time and memory. It lists only files named like transcripts, so a
-  transcript you renamed no longer appears in it (the file stays where it is).
-  If an export onto an existing file fails part-way, that file is left partly
-  written.
-* Changing the transcripts folder moves only files named like transcripts. When
-  the folders are on different file systems each file is copied, then removed;
-  Moniker waits for the move to end before it quits, but a kill or a logout in
-  the middle can leave a truncated copy in the new folder (the original is still
-  whole in the old one).
-* Preferences cannot go back to the system monospace font once a font is chosen;
-  removing `font` from `gui-settings.json` does it.
-* Some keyring calls run on the UI thread (opening the Sync page, saving a sync
-  key, connecting, saving a password on the profile page, removing a stored
-  password, deleting a profile, and creating a profile with a password); with a
-  locked keyring the window can freeze briefly. A sync reads the keyring on its
-  own thread.
-* A sync's `ssh` has no `BatchMode`, so when you start `moniker` from a shell, a
-  key-passphrase, ProxyJump or password prompt for a sync (the automatic one at
-  launch too) can appear in that shell's terminal.
-* Sync needs a Secret Service on the remote machine; there is no fallback store.
+- The stored password is used only when ssh's prompt names exactly the profile's user and host. A `HostName` alias in `~/.ssh/config` or a ProxyJump hop makes ssh show another name, and then you type the password.
+- A wrong stored password is tried once; then ssh asks in the terminal, as plain ssh does (three attempts in all). A sync has no terminal, so there a wrong stored password fails the sync.
+- Transcripts hold what VTE holds: content shown only on the alternate screen (htop, vim) is not in them, and a crash loses the transcript in progress.
+- Removing a stored password is local to that machine. Others keep theirs, and a later sync from one that still has it can bring it back.
+- The text size is saved when the last window closes. If Moniker is killed, or the session ends without closing its windows, the previously saved size stays.
+- A process that ignores the hang-up keeps running after its tab closes, and its terminal is kept until it exits.
+- The Transcripts window reads a transcript whole to show or search it (off the UI thread), so a very large transcript, or searching a very large folder, takes time and memory. A transcript you renamed is no longer listed (the file stays where it is). If an export onto an existing file fails part-way, that file is left partly written.
+- Moving the transcripts folder across file systems copies each file, then removes it. Moniker waits for the move to end before it quits, but a kill or a logout in the middle can leave a truncated copy in the new folder; the original is still whole in the old one.
+- Preferences cannot go back to the system monospace font once a font is chosen; removing `font` from `gui-settings.json` does it.
+- Some keyring calls still run on the UI thread (opening the Sync page, saving a sync key, connecting, saving or removing a password on the profile page, deleting a profile, creating a profile with a password), so with a locked keyring the window can freeze briefly. A sync reads the keyring on its own thread.
+- A sync's `ssh` has no `BatchMode`, so when you start `moniker` from a shell, a key-passphrase, ProxyJump or password prompt for a sync (the automatic one at launch too) can appear in that shell's terminal.
+- Sync needs a Secret Service on the other machine; there is no fallback store.
+- Not there yet: split panes, search in the terminal and color settings (the terminal colors follow the system light or dark style). The packages are for x86-64 only.
 
 ## License
 
-Moniker is released under the MIT license; see `LICENSE`. Copyright 2026 Justin
-M. Sloan.
+Copyright © 2026 Justin M. Sloan. Released under the [MIT License](LICENSE).
 
-## Tests
-
-```
-cargo test --workspace
-bash scripts/check-no-gtk.sh      # core and CLI must not depend on GTK, VTE or libadwaita
-bash scripts/gui-tests.sh         # the window tests, under a virtual display
-bash scripts/e2e-sync.sh          # two instances over real sshd, private bus/keyring
-```
-
-The window tests open real GTK windows and run real terminals with a fake `ssh`,
-so `cargo test` skips them (they are `#[ignore]`d) and they need `xvfb-run`
-(`apt install xvfb`). Run them only with `scripts/gui-tests.sh [name filter]`: it
-builds the test binary and runs it with an empty environment, a throwaway `HOME`
-and `XDG_*` directories, a private virtual display and a session bus address that
-points nowhere, so it cannot reach your desktop, your keyring or your files. It
-starts no bus or keyring and kills nothing.
-
-`scripts/e2e-sync.sh` is the only thing that starts a bus, a keyring and an
-`sshd`, all private, and it fails if your real session files change. Its
-"`moniker-server` not on remote PATH" check fails on a machine that has
-`moniker-server` installed in `/usr/bin`.
-
-GitHub Actions runs the formatting and clippy checks, `cargo test`,
-`check-no-gtk.sh`, `gui-tests.sh` and a validation of the desktop file and the
-AppStream metadata on every push and pull request, in an Ubuntu 26.04
-container, and builds and install-tests both packages (`scripts/install-test.sh`,
-which installs packages as root and so runs only in a throwaway container).
-`e2e-sync.sh` is not run there yet.
-
-`docs/manual-verification.md` lists what needs a real desktop and a real host.
+The binaries include Rust crates (gtk4-rs, vte4, keyring, clap, argon2, chacha20poly1305 and their dependencies) under their own permissive licenses, MIT or Apache-2.0 for almost all of them. GTK, libadwaita and VTE are not bundled; they come from your system, under the LGPL.
