@@ -261,10 +261,13 @@ pub trait TtyPrompter {
 /// * `prompt`: the text `ssh` passed as the helper's argument.
 /// * `askpass_prompt_env`: the value of `SSH_ASKPASS_PROMPT`, if set.
 /// * `profile_id`: the value of `MONIKER_PROFILE_ID`, if set.
-/// * `expected`: the `(username, host)` of the profile `profile_id` names, if
-///   the caller could look it up. The stored password is only ever used for a
-///   prompt that names exactly this user and host (module docs, rule 3), so a
-///   `ProxyJump` hop cannot receive it. `None` means no prompt is answered
+/// * `expected`: the `(user, host)` this connection logs in as, if the caller
+///   could tell: what `ssh -G` reports for the profile `profile_id` names, or
+///   the profile's own user and host ([`effective_identity`]); `None` when the
+///   prompting `ssh` is not the one Moniker started ([`started_by_moniker`]),
+///   which is what keeps a `ProxyJump` or `ProxyCommand` hop from it. The
+///   stored password is only ever used for a prompt that names exactly this
+///   user and host (module docs, rule 3). `None` means no prompt is answered
 ///   automatically.
 /// * `once`: whether the stored password is limited to one use per connection
 ///   ([`OneTime::Claim`], terminal tabs) or not ([`OneTime::NotUsed`], sync).
@@ -381,6 +384,24 @@ pub fn effective_identity(dump: &str, username: &str) -> Option<(String, String)
         Some(alias) => Some(alias).filter(word)?,
     };
     (user == username).then(|| (user.to_owned(), host.to_owned()))
+}
+
+/// Whether `prompt` could be the password prompt of logging in as `user`, before
+/// the host is known: it starts with `<user>@` or `(<user>@`, and, apart from
+/// trailing whitespace, ends in `password:` in any case. A first look that
+/// saves running `ssh -G` for a key passphrase, a code or another user's
+/// prompt; [`answer`] makes the exact match. An empty `user` matches nothing.
+pub fn could_be_login_prompt(prompt: &str, user: &str) -> bool {
+    if user.is_empty() {
+        return false;
+    }
+    let prompt = prompt.trim_end();
+    let identity_first = prompt
+        .strip_prefix('(')
+        .unwrap_or(prompt)
+        .strip_prefix(user)
+        .is_some_and(|rest| rest.starts_with('@'));
+    identity_first && prompt.to_lowercase().ends_with("password:")
 }
 
 /// The parent process id in `stat`, the text of a `/proc/<pid>/stat` file: the
@@ -1754,6 +1775,31 @@ mod tests {
         assert_eq!(effective_identity("user alice\nhostname\n", "alice"), None);
         let dump = format!("{DUMP}hostkeyalias my alias\n");
         assert_eq!(effective_identity(&dump, "alice"), None);
+    }
+
+    #[test]
+    fn a_login_prompt_is_told_apart_before_the_host_is_known() {
+        for prompt in [
+            "alice@web1.example.com's password: ",
+            "(alice@web1.example.com) Password: ",
+            "alice@another.example.com's password:",
+            "(alice@x) PASSWORD:  ",
+        ] {
+            assert!(could_be_login_prompt(prompt, USER), "{prompt:?}");
+        }
+        for prompt in [
+            PASSPHRASE_PROMPT,
+            HOST_KEY_PROMPT,
+            "Password: ",
+            "bob@web1.example.com's password: ",
+            "alicex@web1.example.com's password: ",
+            "alice@web1.example.com's password: and more",
+            "Verification code: ",
+            "(alice@web1.example.com) Verification code: ",
+        ] {
+            assert!(!could_be_login_prompt(prompt, USER), "{prompt:?}");
+        }
+        assert!(!could_be_login_prompt("@web1's password: ", ""));
     }
 
     // ----- Who is asking -----

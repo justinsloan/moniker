@@ -18,10 +18,12 @@
 //! `ssh` is a child of that one), and only one that names the user and host
 //! this connection logs in as. Those come from `ssh -G` with the profile's own
 //! user, host, port and key file (run from argv, with `--` before the
-//! destination, within five seconds), which is how `~/.ssh/config` is taken
-//! into account: an alias, a `HostName`, a `HostKeyAlias`. If `ssh -G` fails or
-//! its answer is ambiguous, the profile's own user and host are expected, as
-//! before. The helper logs nothing: no
+//! destination, within five seconds, and only for a prompt that could be that
+//! login's), which is how `~/.ssh/config` is taken into account: an alias, a
+//! `HostName`, a `HostKeyAlias`. If `ssh -G` fails or its answer is ambiguous,
+//! the profile's own user and host are expected, as before. `ssh -G` sees no
+//! remote command, so a `Match sessiontype` or `Match command` block (OpenSSH
+//! 10.0 and later) is judged as for a plain login. The helper logs nothing: no
 //! prompt, no answer, no profile data. On failure stdout stays empty and stderr
 //! gets one generic line, and the exit status is 1.
 
@@ -35,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use moniker_cli::store_path;
 use moniker_core::askpass::{
-    DevTty, OneTime, PID_ENV, TOKEN_ENV, TtyPrompter, answer, claim_marker, effective_identity,
-    parent_in_stat, started_by_moniker,
+    DevTty, OneTime, PID_ENV, TOKEN_ENV, TtyPrompter, answer, claim_marker, could_be_login_prompt,
+    effective_identity, parent_in_stat, started_by_moniker,
 };
 use moniker_core::profile::Profile;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore};
@@ -98,15 +100,13 @@ fn run_from_environment() -> ExitCode {
     // ProxyJump or ProxyCommand hop's ssh is a child of the first ssh, so its
     // prompts go to the user whatever host they name.
     let launcher = std::env::var(PID_ENV).ok();
-    let from_moniker = env_prompt.is_none()
-        && started_by_moniker(
-            launcher.as_deref(),
-            parent_of(std::os::unix::process::parent_id()),
-        );
-    let identity = profile_id
-        .as_deref()
-        .filter(|_| from_moniker)
-        .and_then(identity_from_store);
+    let asked = Asked {
+        prompt_kind: env_prompt.as_deref(),
+        profile_id: profile_id.as_deref(),
+        launcher: launcher.as_deref(),
+        prompting_ssh_parent: prompting_ssh_parent(),
+    };
+    let identity = expected_identity(&asked, |id| identity_from_store(id, &prompt));
     let expected = identity
         .as_ref()
         .map(|(user, host)| (user.as_str(), host.as_str()));
@@ -195,9 +195,49 @@ fn respond(
 /// The `(username, host)` of the profile `profile_id` names, read from the
 /// profile file. Any failure (no config directory, unreadable store, no such
 /// profile) is `None`, which makes the helper ask the user instead.
-fn identity_from_store(profile_id: &str) -> Option<(String, String)> {
+fn identity_from_store(profile_id: &str, prompt: &str) -> Option<(String, String)> {
     let store = ProfileStore::open(&store_path().ok()?).ok()?;
-    identity_of(&store, profile_id, resolve_with_ssh)
+    identity_of(&store, profile_id, prompt, resolve_with_ssh)
+}
+
+/// What decides whether the stored password may be looked for at all.
+struct Asked<'a> {
+    /// `SSH_ASKPASS_PROMPT`: `confirm`, `none` or unset.
+    prompt_kind: Option<&'a str>,
+    /// `MONIKER_PROFILE_ID`.
+    profile_id: Option<&'a str>,
+    /// `MONIKER_PID`: the Moniker process that started `ssh`.
+    launcher: Option<&'a str>,
+    /// The parent of the `ssh` that runs this helper ([`prompting_ssh_parent`]).
+    prompting_ssh_parent: Option<u32>,
+}
+
+/// The identity a prompt may be answered for, as `lookup` gives it for the
+/// profile, or `None` without calling `lookup`. Only a question (not a message
+/// or a yes/no question) asked by the `ssh` Moniker started gets one: its
+/// parent must be `MONIKER_PID` (`askpass::started_by_moniker`). A ProxyJump or
+/// ProxyCommand hop's `ssh` is a child of the first `ssh`, so its prompts go to
+/// the user whatever host they name.
+fn expected_identity(
+    asked: &Asked,
+    lookup: impl FnOnce(&str) -> Option<(String, String)>,
+) -> Option<(String, String)> {
+    let from_moniker = asked.prompt_kind.is_none()
+        && started_by_moniker(asked.launcher, asked.prompting_ssh_parent);
+    asked.profile_id.filter(|_| from_moniker).and_then(lookup)
+}
+
+/// The parent of the `ssh` that runs this helper (the helper's own parent), or
+/// `None` if that `ssh` went while it was read: a new process that took its
+/// id must not pass for it, and once `ssh` has gone the helper's parent is
+/// another process.
+fn prompting_ssh_parent() -> Option<u32> {
+    let ssh = std::os::unix::process::parent_id();
+    let parent = parent_of(ssh);
+    if std::os::unix::process::parent_id() != ssh {
+        return None;
+    }
+    parent
 }
 
 /// The identity `ssh` names in a password prompt for the live profile
@@ -206,14 +246,30 @@ fn identity_from_store(profile_id: &str) -> Option<(String, String)> {
 /// (a `HostName`, an alias, a `HostKeyAlias`), or, when that fails or is
 /// ambiguous (`askpass::effective_identity`), the profile's own user and host
 /// as `ssh` prints them: the host lowercased. `None` for no such profile.
+///
+/// `ssh -G` is not run (the profile's own identity stands) for a `prompt` that
+/// cannot be this profile's login prompt (`askpass::could_be_login_prompt`: a
+/// key passphrase, a code, another user's), which it would only delay and whose
+/// `Match exec` commands it would run again, nor for a key file whose path
+/// holds a control character: `ssh -G` prints the path as it is, and a newline
+/// in it would add a line of its own to what is read.
 fn identity_of(
     store: &ProfileStore,
     profile_id: &str,
+    prompt: &str,
     resolve: impl FnOnce(&Profile) -> Option<String>,
 ) -> Option<(String, String)> {
     let profile = store.get(profile_id)?;
+    let own = (profile.username.clone(), profile.host.to_ascii_lowercase());
+    let plain_key_file = profile
+        .key_file
+        .as_ref()
+        .is_none_or(|key| !key.to_string_lossy().chars().any(char::is_control));
+    if !could_be_login_prompt(prompt, &profile.username) || !plain_key_file {
+        return Some(own);
+    }
     let resolved = resolve(profile).and_then(|dump| effective_identity(&dump, &profile.username));
-    Some(resolved.unwrap_or_else(|| (profile.username.clone(), profile.host.to_ascii_lowercase())))
+    Some(resolved.unwrap_or(own))
 }
 
 /// What `ssh -G` prints for the connection to `profile`, if it answers within
@@ -237,7 +293,8 @@ fn resolve_process(p: &Profile) -> Command {
 }
 
 /// What `command` prints, if it exits successfully within `limit` and prints
-/// valid UTF-8 (at most [`RESOLVE_MAX_BYTES`] of it). It gets no input and its
+/// valid UTF-8, at most [`RESOLVE_MAX_BYTES`] of it (more is not trusted: a
+/// dump cut short could hide a repeated key). It gets no input and its
 /// errors are discarded. A command still running at `limit` is killed; one
 /// that exits but leaves a process holding its output open is given up on at
 /// `limit` too.
@@ -253,7 +310,8 @@ fn output_within(mut command: Command, limit: Duration) -> Option<String> {
     let (sender, received) = mpsc::channel();
     thread::spawn(move || {
         let mut out = Vec::new();
-        let read = stdout.take(RESOLVE_MAX_BYTES).read_to_end(&mut out);
+        // One byte more than the limit, to tell a full dump from a long one.
+        let read = stdout.take(RESOLVE_MAX_BYTES + 1).read_to_end(&mut out);
         let _ = sender.send(read.map(|_| out));
     });
     let status = loop {
@@ -274,6 +332,9 @@ fn output_within(mut command: Command, limit: Duration) -> Option<String> {
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .ok()?
         .ok()?;
+    if out.len() as u64 > RESOLVE_MAX_BYTES {
+        return None;
+    }
     String::from_utf8(out).ok()
 }
 
@@ -591,7 +652,7 @@ mod tests {
         p.id = ID.to_owned();
         let (_dir, store) = store_with(p);
         assert_eq!(
-            identity_of(&store, ID, no_resolution),
+            identity_of(&store, ID, "", no_resolution),
             Some(("Admin".to_owned(), "example.com".to_owned()))
         );
     }
@@ -599,8 +660,8 @@ mod tests {
     #[test]
     fn identity_of_an_unknown_profile_is_none() {
         let (_dir, store) = store_with(Profile::new("web1", "example.com", "admin"));
-        assert_eq!(identity_of(&store, ID, no_resolution), None);
-        assert_eq!(identity_of(&store, "", no_resolution), None);
+        assert_eq!(identity_of(&store, ID, "", no_resolution), None);
+        assert_eq!(identity_of(&store, "", "", no_resolution), None);
     }
 
     #[test]
@@ -609,7 +670,7 @@ mod tests {
         p.id = ID.to_owned();
         let (_dir, mut store) = store_with(p);
         store.delete(ID).unwrap();
-        assert_eq!(identity_of(&store, ID, no_resolution), None);
+        assert_eq!(identity_of(&store, ID, "", no_resolution), None);
     }
 
     #[test]
@@ -620,12 +681,17 @@ mod tests {
         p.port = 2222;
         let (_dir, store) = store_with(p);
         let asked = std::cell::RefCell::new(Vec::new());
-        let identity = identity_of(&store, ID, |profile| {
-            asked
-                .borrow_mut()
-                .push((profile.id.clone(), profile.host.clone(), profile.port));
-            Some("user admin\nhostname web1.example.com\nport 2222\n".to_owned())
-        });
+        let identity = identity_of(
+            &store,
+            ID,
+            "admin@web1.example.com's password: ",
+            |profile| {
+                asked
+                    .borrow_mut()
+                    .push((profile.id.clone(), profile.host.clone(), profile.port));
+                Some("user admin\nhostname web1.example.com\nport 2222\n".to_owned())
+            },
+        );
         assert_eq!(
             identity,
             Some(("admin".to_owned(), "web1.example.com".to_owned()))
@@ -644,7 +710,9 @@ mod tests {
             "user admin\nhostname a.example.com\nhostname b.example.com\n",
         ] {
             assert_eq!(
-                identity_of(&store, ID, |_| Some(dump.to_owned())),
+                identity_of(&store, ID, "admin@web.example.com's password: ", |_| {
+                    Some(dump.to_owned())
+                }),
                 Some(("admin".to_owned(), "web.example.com".to_owned())),
                 "{dump:?}"
             );
@@ -745,5 +813,124 @@ mod tests {
             Some(std::os::unix::process::parent_id())
         );
         assert_eq!(parent_of(0), None);
+    }
+
+    // ----- whether the identity is looked up at all -----
+
+    /// What the helper is asked, by `ssh` with `prompt_kind`, from a process
+    /// whose parent is `parent`, with `launcher` as `MONIKER_PID`.
+    fn asked<'a>(
+        prompt_kind: Option<&'a str>,
+        launcher: Option<&'a str>,
+        parent: Option<u32>,
+    ) -> Asked<'a> {
+        Asked {
+            prompt_kind,
+            profile_id: Some(ID),
+            launcher,
+            prompting_ssh_parent: parent,
+        }
+    }
+
+    #[test]
+    fn only_a_question_of_the_ssh_moniker_started_looks_up_the_identity() {
+        let lookups = std::cell::Cell::new(0);
+        let lookup = || {
+            |id: &str| {
+                lookups.set(lookups.get() + 1);
+                assert_eq!(id, ID);
+                Some(("admin".to_owned(), "web1.example.com".to_owned()))
+            }
+        };
+        assert_eq!(
+            expected_identity(&asked(None, Some("4242"), Some(4242)), lookup()),
+            Some(("admin".to_owned(), "web1.example.com".to_owned()))
+        );
+        assert_eq!(lookups.get(), 1);
+        let mut no_profile = asked(None, Some("4242"), Some(4242));
+        no_profile.profile_id = None;
+        for (what, asked) in [
+            // A ProxyJump or ProxyCommand hop: its ssh's parent is the first ssh.
+            ("a hop", asked(None, Some("4242"), Some(4300))),
+            ("a message", asked(Some("none"), Some("4242"), Some(4242))),
+            (
+                "a yes/no question",
+                asked(Some("confirm"), Some("4242"), Some(4242)),
+            ),
+            ("no MONIKER_PID", asked(None, None, Some(4242))),
+            ("an orphaned ssh", asked(None, Some("1"), Some(1))),
+            ("an unreadable parent", asked(None, Some("4242"), None)),
+            ("no profile", no_profile),
+        ] {
+            assert_eq!(expected_identity(&asked, lookup()), None, "{what}");
+        }
+        assert_eq!(lookups.get(), 1, "nothing else was looked up");
+    }
+
+    #[test]
+    fn ssh_g_runs_only_for_a_prompt_that_could_get_the_password() {
+        let mut p = Profile::new("web1", "web", "admin");
+        p.id = ID.to_owned();
+        let (_dir, store) = store_with(p);
+        let runs = std::cell::Cell::new(0);
+        let resolve = |_: &Profile| {
+            runs.set(runs.get() + 1);
+            Some("user admin\nhostname web1.example.com\n".to_owned())
+        };
+        for prompt in [
+            "Enter passphrase for key '/home/admin/.ssh/id_ed25519': ",
+            "Verification code: ",
+            "root@web1.example.com's password: ",
+        ] {
+            assert_eq!(
+                identity_of(&store, ID, prompt, resolve),
+                Some(("admin".to_owned(), "web".to_owned())),
+                "{prompt:?}"
+            );
+        }
+        assert_eq!(runs.get(), 0, "ssh -G was not run");
+        assert_eq!(
+            identity_of(&store, ID, "(admin@web1.example.com) Password: ", resolve),
+            Some(("admin".to_owned(), "web1.example.com".to_owned()))
+        );
+        assert_eq!(runs.get(), 1);
+    }
+
+    #[test]
+    fn a_key_file_with_control_characters_is_not_resolved() {
+        // ssh -G prints the path as it is: a newline in it would add a line,
+        // `hostkeyalias evil` say, to what is parsed.
+        let mut p = Profile::new("web1", "web", "admin");
+        p.id = ID.to_owned();
+        p.key_file = Some("/home/admin/x\nhostkeyalias evil".into());
+        let (_dir, store) = store_with(p);
+        let runs = std::cell::Cell::new(0);
+        let identity = identity_of(&store, ID, "admin@evil's password: ", |_| {
+            runs.set(runs.get() + 1);
+            Some("user admin\nhostname web\nhostkeyalias evil\n".to_owned())
+        });
+        assert_eq!(identity, Some(("admin".to_owned(), "web".to_owned())));
+        assert_eq!(runs.get(), 0);
+    }
+
+    #[test]
+    fn output_beyond_the_limit_is_not_trusted() {
+        // A dump cut short could hide a repeated key.
+        let print = |n: u64| sh(&format!("head -c {n} /dev/zero | tr '\\0' x"));
+        assert_eq!(
+            output_within(print(RESOLVE_MAX_BYTES + 1), Duration::from_secs(5)),
+            None
+        );
+        assert_eq!(
+            output_within(print(RESOLVE_MAX_BYTES), Duration::from_secs(5)).map(|out| out.len()),
+            Some(RESOLVE_MAX_BYTES as usize)
+        );
+    }
+
+    #[test]
+    fn the_prompting_ssh_parent_is_this_process_grandparent() {
+        let parent = std::os::unix::process::parent_id();
+        assert_eq!(prompting_ssh_parent(), parent_of(parent));
+        assert!(prompting_ssh_parent().is_some());
     }
 }
