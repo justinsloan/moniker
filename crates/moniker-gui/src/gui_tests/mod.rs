@@ -45,6 +45,7 @@ use crate::terminal_tab::{
 };
 use crate::{form, new_tab, window};
 
+mod hosts;
 mod main_window;
 mod notifications;
 mod preferences;
@@ -276,6 +277,9 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    hosts::both_lists_mark_each_hosts_status(&tmp.path().join("p-both"));
+    hosts::a_mark_waits_for_its_check_and_keeps_its_state(&tmp.path().join("p-wait"));
+    hosts::turned_off_there_is_no_mark_and_no_ping(&tmp.path().join("p-off"));
     // Issue #4 first: they fail fast when a keyring call is on the main thread.
     sync::the_sync_page_uses_the_keyring_off_the_main_thread(&tmp.path().join("k-sync"));
     profiles::the_profile_window_uses_the_keyring_off_the_main_thread(&tmp.path().join("k-prof"));

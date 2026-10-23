@@ -13,7 +13,7 @@ argon2 = { version = "0.6.0", default-features = false, features = ["zeroize"] }
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
 getrandom = "0.4.3"
 keyring = "4.2.0"
-rustix = { version = "1.1.5", features = ["fs", "process", "termios"] }
+rustix = { version = "1.1.5", features = ["fs", "net", "process", "termios"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"

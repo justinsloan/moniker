@@ -443,6 +443,8 @@ fn profile_row(chooser: &Rc<Chooser>, list: &gtk::ListBox, profile: &Profile) ->
         .subtitle_lines(1)
         .activatable(true)
         .build();
+    // Whether the host answers a ping (`crate::hosts`), before the name.
+    row.add_prefix(&chooser.ctx.hosts.mark(profile));
     row.add_suffix(&more);
     row
 }

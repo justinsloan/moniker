@@ -79,6 +79,10 @@ pub struct GuiSettings {
     /// file is JSON, so only a path that is valid UTF-8 can be saved (saving
     /// any other fails).
     pub transcripts_dir: Option<PathBuf>,
+    /// Ping the saved hosts to show in the profile lists whether each answers
+    /// (`crate::hosts`; the Preferences switch, on by default). Off, no ping is
+    /// sent and no mark is shown.
+    pub ping_hosts: bool,
 }
 
 /// The scrollback of an ordinary tab unless the person changes it.
@@ -136,6 +140,10 @@ impl GuiSettings {
                 .and_then(Value::as_str)
                 .map(PathBuf::from)
                 .filter(|dir| dir.is_absolute()),
+            ping_hosts: fields
+                .get("ping_hosts")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.ping_hosts),
         })
     }
 }
@@ -169,6 +177,7 @@ impl Default for GuiSettings {
             scrollback_lines: SCROLLBACK_DEFAULT,
             font: None,
             transcripts_dir: None,
+            ping_hosts: true,
         }
     }
 }
@@ -314,6 +323,7 @@ mod tests {
             scrollback_lines: 250_000,
             font: Some("Monospace Bold 12".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/transcripts")),
+            ping_hosts: false,
         };
         save(&path, &settings).unwrap();
         assert_eq!(load(&path), settings);
@@ -485,6 +495,7 @@ mod tests {
             scrollback_lines: 5_000,
             font: Some("Monospace 11".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/transcripts")),
+            ping_hosts: false,
         };
         save(&path, &before).unwrap();
         save_font_scale(&path, 1.5).unwrap();
@@ -625,13 +636,30 @@ mod tests {
             assert_eq!(loaded.scrollback_lines, 10_000, "{text}");
             assert_eq!(loaded.font, None, "{text}");
             assert_eq!(loaded.transcripts_dir, None, "{text}");
+            assert!(loaded.ping_hosts, "{text}: on unless turned off");
         }
         let default = GuiSettings::default();
+        assert!(default.ping_hosts);
         assert!(!default.save_all_transcripts);
         assert_eq!(default.scrollback_lines, 10_000);
         assert_eq!(default.font, None);
         assert_eq!(default.transcripts_dir, None);
         assert_eq!(load(&dir.path().join("none.json")), default);
+    }
+
+    #[test]
+    fn host_pings_are_off_only_when_the_file_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        for (text, want) in [
+            (r#"{"ping_hosts": false}"#, false),
+            (r#"{"ping_hosts": true}"#, true),
+            (r#"{"ping_hosts": "no"}"#, true),
+            (r#"{"ping_hosts": null}"#, true),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(load(&path).ping_hosts, want, "{text}");
+        }
     }
 
     #[test]
@@ -781,6 +809,7 @@ mod tests {
             scrollback_lines: 20_000,
             font: Some("Monospace 11".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/t")),
+            ping_hosts: false,
         };
         save(&path, &before).unwrap();
 

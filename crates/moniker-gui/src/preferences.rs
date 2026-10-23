@@ -9,6 +9,9 @@
 //!   scrollback of ordinary tabs, 1,000 to 1,000,000 lines, for tabs opened
 //!   after the change (`terminal_tab::set_scrollback`). Tabs that save a
 //!   transcript keep unlimited scrollback whatever it says.
+//! * **Connection Profiles**: "Show whether hosts are reachable" (on by
+//!   default), the pings behind the marks in the profile lists
+//!   (`crate::hosts`). Off, no ping is sent and no mark is shown.
 //! * **Transcripts**, under the warning that transcripts can hold secrets:
 //!   "Save transcripts of all sessions", and the transcripts folder with a
 //!   Choose… button ([`change_folder`]).
@@ -65,6 +68,9 @@ const SAVE_ALL_TITLE: &str = "Save transcripts of all sessions";
 const SAVE_ALL_SUBTITLE: &str = "Every new tab, including the first at launch. Tabs that save a \
 transcript keep all their scrollback.";
 const SYNC_SUBTITLE: &str = "Sync key, the other machine, automatic sync";
+const PING_TITLE: &str = "Show whether hosts are reachable";
+const PING_SUBTITLE: &str = "Pings each saved host from this machine now and then, and \
+marks it in the lists. Turned off, no pings are sent.";
 
 /// The font a font setting of `None` stands for, when nothing else says: the
 /// family VTE uses by default, at a common size.
@@ -199,6 +205,7 @@ fn build(app: &adw::Application, ctx: &Rc<AppContext>) -> adw::PreferencesDialog
     let now = ctx.settings();
     let page = adw::PreferencesPage::new();
     page.add(&terminal_group(ctx, &now));
+    page.add(&profiles_group(ctx, &now));
     page.add(&transcripts_group(app, ctx, &now));
     page.add(&sync_group(app, ctx));
     let dialog = adw::PreferencesDialog::builder()
@@ -404,6 +411,39 @@ fn scrollback_row(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::SpinRow {
         }
     ));
     row
+}
+
+// ----- Connection Profiles -----
+
+fn profiles_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Connection Profiles")
+        .build();
+    let pings = adw::SwitchRow::builder()
+        .title(PING_TITLE)
+        .subtitle(PING_SUBTITLE)
+        .use_markup(false)
+        .active(now.ping_hosts)
+        .build();
+    let saved = Rc::new(Cell::new(now.ping_hosts));
+    pings.connect_active_notify(glib::clone!(
+        #[strong]
+        ctx,
+        move |row| {
+            let on = row.is_active();
+            if on == saved.get() {
+                return;
+            }
+            if save(&ctx, row, |s| s.ping_hosts = on) {
+                saved.set(on);
+                ctx.hosts.set_enabled(on);
+            } else {
+                row.set_active(saved.get());
+            }
+        }
+    ));
+    group.add(&pings);
+    group
 }
 
 // ----- Transcripts -----

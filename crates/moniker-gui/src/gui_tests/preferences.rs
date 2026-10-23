@@ -242,7 +242,26 @@ pub(super) fn preferences_has_the_four_settings_and_sync(dir: &Path) {
         .iter()
         .map(|g| g.title().to_string())
         .collect();
-    assert_eq!(titles, ["Terminal", "Transcripts", "Sync"]);
+    assert_eq!(
+        titles,
+        ["Terminal", "Connection Profiles", "Transcripts", "Sync"]
+    );
+
+    // Connection Profiles: the switch for the host marks' pings, on.
+    let pings = all_widgets::<adw::SwitchRow>(&group(&dialog, "Connection Profiles"))
+        .into_iter()
+        .next()
+        .expect("the ping switch");
+    assert_eq!(pings.title(), "Show whether hosts are reachable");
+    assert_eq!(
+        pings.subtitle().as_deref(),
+        Some(
+            "Pings each saved host from this machine now and then, and marks it in the \
+             lists. Turned off, no pings are sent."
+        )
+    );
+    assert!(pings.is_active(), "on by default");
+    assert!(!pings.uses_markup());
 
     close_dialog(&main, &dialog);
     assert!(

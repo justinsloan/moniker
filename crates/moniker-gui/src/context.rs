@@ -71,6 +71,21 @@ fn live_calls<F: ?Sized>(listeners: &RefCell<Vec<Listener<F>>>) -> Vec<Rc<F>> {
 #[cfg(test)]
 pub(crate) type MakeRunner = Box<dyn Fn() -> crate::sync::Runner>;
 
+/// What checks a host for the lists' marks: the real check (`ssh -G`, then
+/// pings).
+#[cfg(not(test))]
+fn host_check() -> crate::hosts::Check {
+    Arc::new(crate::hosts::check_host)
+}
+
+/// What checks a host for the lists' marks. In tests, never a real ping: a
+/// check that decides nothing, unless a test sets its own
+/// (`hosts::Hosts::set_check`).
+#[cfg(test)]
+fn host_check() -> crate::hosts::Check {
+    Arc::new(|_| crate::hosts::Reach::Unknown)
+}
+
 /// State shared by every window and dialog of the application.
 pub struct AppContext {
     pub store: RefCell<ProfileStore>,
@@ -107,6 +122,9 @@ pub struct AppContext {
     /// starts a sync must set it.
     #[cfg(test)]
     pub(crate) sync_secrets: RefCell<Option<crate::sync::OpenSecrets>>,
+    /// Whether each saved host answers a ping, for the marks in the profile
+    /// lists: one status per host for the whole app.
+    pub(crate) hosts: Rc<crate::hosts::Hosts>,
     /// The watch on the profile file's directory, kept alive here.
     monitor: RefCell<Option<gio::FileMonitor>>,
     /// A reload is already scheduled by the file watch.
@@ -175,7 +193,9 @@ impl AppContext {
         settings_path: PathBuf,
         runtime_dir: Option<PathBuf>,
     ) -> AppContext {
+        let pings = settings::load(&settings_path).ping_hosts;
         AppContext {
+            hosts: crate::hosts::Hosts::new(pings, host_check()),
             store: RefCell::new(store),
             secrets,
             askpass_path,

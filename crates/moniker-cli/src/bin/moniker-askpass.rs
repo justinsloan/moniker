@@ -18,8 +18,8 @@
 //! `ssh` is a child of that one), and only one that names the user and host
 //! this connection logs in as. Those come from `ssh -G` with the profile's own
 //! user, host, port and key file (run from argv, with `--` before the
-//! destination, within five seconds, and only for a prompt that could be that
-//! login's), which is how `~/.ssh/config` is taken into account: an alias, a
+//! destination, within five seconds: `moniker_core::ssh_config`, and only for a
+//! prompt that could be that login's), which is how `~/.ssh/config` is taken into account: an alias, a
 //! `HostName`, a `HostKeyAlias`. If `ssh -G` fails or its answer is ambiguous,
 //! the profile's own user and host are expected, as before. `ssh -G` sees no
 //! remote command, so a `Match sessiontype` or `Match command` block (OpenSSH
@@ -27,13 +27,10 @@
 //! prompt, no answer, no profile data. On failure stdout stays empty and stderr
 //! gets one generic line, and the exit status is 1.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::panic;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::ExitCode;
 
 use moniker_cli::store_path;
 use moniker_core::askpass::{
@@ -42,29 +39,12 @@ use moniker_core::askpass::{
 };
 use moniker_core::profile::Profile;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore};
-use moniker_core::ssh::resolve_command;
+use moniker_core::ssh_config::effective_config;
 use moniker_core::store::ProfileStore;
 
 /// Why no answer was given. Deliberately generic: the prompt can name a key
 /// file or host, and the reason must never echo it.
 const NO_ANSWER: &str = "could not get an answer for ssh (is there a terminal to ask on?)";
-
-/// How long `ssh -G` may take before the profile's own host is expected
-/// instead. It normally answers in milliseconds; only a `Match exec` or host
-/// name canonicalization in `~/.ssh/config` can make it slower.
-const RESOLVE_LIMIT: Duration = Duration::from_secs(5);
-
-/// The most of `ssh -G`'s output that is read: it prints a few kilobytes.
-const RESOLVE_MAX_BYTES: u64 = 256 * 1024;
-
-/// The variables that lead `ssh` to this helper, kept from `ssh -G`.
-const HELPER_ENV: [&str; 5] = [
-    "SSH_ASKPASS",
-    "SSH_ASKPASS_REQUIRE",
-    "MONIKER_PROFILE_ID",
-    PID_ENV,
-    TOKEN_ENV,
-];
 
 fn main() -> ExitCode {
     // A panic message would print the panic's payload and location. Nothing here
@@ -197,7 +177,7 @@ fn respond(
 /// profile) is `None`, which makes the helper ask the user instead.
 fn identity_from_store(profile_id: &str, prompt: &str) -> Option<(String, String)> {
     let store = ProfileStore::open(&store_path().ok()?).ok()?;
-    identity_of(&store, profile_id, prompt, resolve_with_ssh)
+    identity_of(&store, profile_id, prompt, effective_config)
 }
 
 /// What decides whether the stored password may be looked for at all.
@@ -270,72 +250,6 @@ fn identity_of(
     }
     let resolved = resolve(profile).and_then(|dump| effective_identity(&dump, &profile.username));
     Some(resolved.unwrap_or(own))
-}
-
-/// What `ssh -G` prints for the connection to `profile`, if it answers within
-/// [`RESOLVE_LIMIT`].
-fn resolve_with_ssh(profile: &Profile) -> Option<String> {
-    output_within(resolve_process(profile), RESOLVE_LIMIT)
-}
-
-/// `ssh -G` for the connection to `p` (`ssh::resolve_command`), run from argv
-/// like every `ssh` Moniker starts, without the variables that lead `ssh` to
-/// this helper: it never prompts, and if it ever did, that must not come back
-/// here.
-fn resolve_process(p: &Profile) -> Command {
-    let ssh = resolve_command(p);
-    let mut command = Command::new(&ssh.program);
-    command.args(&ssh.args);
-    for name in HELPER_ENV {
-        command.env_remove(name);
-    }
-    command
-}
-
-/// What `command` prints, if it exits successfully within `limit` and prints
-/// valid UTF-8, at most [`RESOLVE_MAX_BYTES`] of it (more is not trusted: a
-/// dump cut short could hide a repeated key). It gets no input and its
-/// errors are discarded. A command still running at `limit` is killed; one
-/// that exits but leaves a process holding its output open is given up on at
-/// `limit` too.
-fn output_within(mut command: Command, limit: Duration) -> Option<String> {
-    let deadline = Instant::now() + limit;
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let stdout = child.stdout.take()?;
-    let (sender, received) = mpsc::channel();
-    thread::spawn(move || {
-        let mut out = Vec::new();
-        // One byte more than the limit, to tell a full dump from a long one.
-        let read = stdout.take(RESOLVE_MAX_BYTES + 1).read_to_end(&mut out);
-        let _ = sender.send(read.map(|_| out));
-    });
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    if !status.success() {
-        return None;
-    }
-    let out = received
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .ok()?
-        .ok()?;
-    if out.len() as u64 > RESOLVE_MAX_BYTES {
-        return None;
-    }
-    String::from_utf8(out).ok()
 }
 
 /// The parent of process `pid`, from `/proc/<pid>/stat`.
@@ -719,93 +633,6 @@ mod tests {
         }
     }
 
-    fn sh(script: &str) -> Command {
-        let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg(script);
-        command
-    }
-
-    #[test]
-    fn a_quick_commands_output_is_read() {
-        assert_eq!(
-            output_within(
-                sh("printf 'user a\\nhostname b\\n'"),
-                Duration::from_secs(5)
-            )
-            .as_deref(),
-            Some("user a\nhostname b\n")
-        );
-    }
-
-    #[test]
-    fn a_failed_command_gives_nothing() {
-        assert_eq!(
-            output_within(sh("printf 'user a\\n'; exit 3"), Duration::from_secs(5)),
-            None
-        );
-        assert_eq!(
-            output_within(Command::new("/nonexistent/ssh"), Duration::from_secs(5)),
-            None
-        );
-    }
-
-    #[test]
-    fn a_slow_command_is_given_up_on() {
-        let start = Instant::now();
-        assert_eq!(
-            output_within(sh("sleep 5"), Duration::from_millis(200)),
-            None
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn output_held_open_by_a_leftover_process_is_given_up_on() {
-        // The command exits, but a process it left behind keeps its output open.
-        let start = Instant::now();
-        assert_eq!(
-            output_within(
-                sh("sleep 5 & printf 'user a\\n'"),
-                Duration::from_millis(300)
-            ),
-            None
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(3),
-            "{:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn ssh_g_runs_from_argv_without_the_helpers_variables() {
-        let mut p = Profile::new("web1", "web", "admin");
-        p.port = 2222;
-        let command = resolve_process(&p);
-        assert_eq!(command.get_program(), "ssh");
-        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
-        assert_eq!(args, ["-G", "-p", "2222", "--", "admin@web"]);
-        let removed: Vec<&std::ffi::OsStr> = command
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(name, _)| name)
-            .collect();
-        for name in [
-            "SSH_ASKPASS",
-            "SSH_ASKPASS_REQUIRE",
-            "MONIKER_PROFILE_ID",
-            "MONIKER_PID",
-            "MONIKER_ASKPASS_TOKEN",
-        ] {
-            assert!(removed.contains(&std::ffi::OsStr::new(name)), "{name}");
-        }
-        assert!(command.get_envs().all(|(_, value)| value.is_none()));
-    }
-
     #[test]
     fn the_parent_is_read_from_proc() {
         assert_eq!(
@@ -911,20 +738,6 @@ mod tests {
         });
         assert_eq!(identity, Some(("admin".to_owned(), "web".to_owned())));
         assert_eq!(runs.get(), 0);
-    }
-
-    #[test]
-    fn output_beyond_the_limit_is_not_trusted() {
-        // A dump cut short could hide a repeated key.
-        let print = |n: u64| sh(&format!("head -c {n} /dev/zero | tr '\\0' x"));
-        assert_eq!(
-            output_within(print(RESOLVE_MAX_BYTES + 1), Duration::from_secs(5)),
-            None
-        );
-        assert_eq!(
-            output_within(print(RESOLVE_MAX_BYTES), Duration::from_secs(5)).map(|out| out.len()),
-            Some(RESOLVE_MAX_BYTES as usize)
-        );
     }
 
     #[test]

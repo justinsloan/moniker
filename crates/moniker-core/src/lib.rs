@@ -3,9 +3,11 @@
 pub mod askpass;
 pub mod bundle;
 pub mod crypto;
+pub mod ping;
 pub mod profile;
 pub mod secrets;
 pub mod ssh;
+pub mod ssh_config;
 pub mod store;
 pub mod sync;
 pub mod transcript;

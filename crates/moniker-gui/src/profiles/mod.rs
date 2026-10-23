@@ -634,6 +634,8 @@ impl State {
                 .subtitle_lines(1)
                 .activatable(true)
                 .build();
+            // Whether the host answers a ping (`crate::hosts`), before the name.
+            row.add_prefix(&self.ctx.hosts.mark(&profile));
             self.list.append(&row);
             if selected.as_deref() == Some(profile.id.as_str()) {
                 self.list.select_row(Some(&row));
