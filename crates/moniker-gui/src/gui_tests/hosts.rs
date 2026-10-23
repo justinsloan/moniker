@@ -15,7 +15,7 @@ use super::main_window::{ctx_with, test_app};
 use super::windows::{list_in, main_window, row};
 use super::{all_widgets, pump_for, pump_until};
 use crate::context::AppContext;
-use crate::hosts::{MARK_CLASS, Reach};
+use crate::hosts::{Check, MARK_CLASS, Reach};
 use crate::{new_tab, preferences, profiles, window};
 
 /// The host mark in `root` (a row), if it has one.
@@ -53,12 +53,13 @@ fn scripted(ctx: &AppContext) -> Arc<Mutex<Vec<String>>> {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&asked);
     ctx.hosts
-        .set_check(Arc::new(move |p: &Profile, _: &dyn Fn() -> bool| {
+        .set_check(Check::new(move |p: &Profile, _: &dyn Fn() -> bool| {
             let host = p.host.to_ascii_lowercase();
             record.lock().unwrap().push(host.clone());
             match host.as_str() {
                 "up.example.test" => Reach::Answers,
                 "down.example.test" => Reach::NoReply,
+                "nowhere.example.test" => Reach::NotFound,
                 "hop.example.test" => Reach::Proxied,
                 _ => Reach::NotAllowed,
             }
@@ -72,8 +73,8 @@ fn up() -> Profile {
 
 /// Both lists show a mark before each profile's name: a filled dot in the
 /// success color for a host that answers, a ring in the error color for one
-/// that does not, a dimmed dash for one that is not pinged, each with its
-/// text. Local terminal and the Sync entry have none. One status per host for
+/// that does not or whose name is not found, a dimmed dash for one that is not
+/// pinged, each with its text. Local terminal and the Sync entry have none. One status per host for
 /// the whole app: two profiles on one host, shown in two lists, are one check.
 pub(super) fn both_lists_mark_each_hosts_status(dir: &Path) {
     let up = up();
@@ -81,7 +82,17 @@ pub(super) fn both_lists_mark_each_hosts_status(dir: &Path) {
     let twin = Profile::new("Twin", "up.example.test", "bob");
     let down = Profile::new("Down", "down.example.test", "alice");
     let hop = Profile::new("Hop", "hop.example.test", "alice");
-    let ctx = ctx_with(dir, &[up.clone(), twin.clone(), down.clone(), hop.clone()]);
+    let nowhere = Profile::new("Nowhere", "nowhere.example.test", "alice");
+    let ctx = ctx_with(
+        dir,
+        &[
+            up.clone(),
+            twin.clone(),
+            down.clone(),
+            hop.clone(),
+            nowhere.clone(),
+        ],
+    );
     let asked = scripted(&ctx);
     let app = test_app();
     let main = main_window(&app, &ctx);
@@ -104,6 +115,13 @@ pub(super) fn both_lists_mark_each_hosts_status(dir: &Path) {
     assert_eq!(
         shown(&mark(&down)),
         showing("no-reply", "error", "No reply to ping")
+    );
+    pump_until("the unknown name's mark", || {
+        shown(&mark(&nowhere)).0 == "no-reply"
+    });
+    assert_eq!(
+        shown(&mark(&nowhere)),
+        showing("no-reply", "error", "Name not found")
     );
     pump_until("the proxied host's mark", || {
         shown(&mark(&hop)).2.contains("another host")
@@ -184,7 +202,12 @@ pub(super) fn both_lists_mark_each_hosts_status(dir: &Path) {
     asked.sort();
     assert_eq!(
         asked,
-        ["down.example.test", "hop.example.test", "up.example.test"],
+        [
+            "down.example.test",
+            "hop.example.test",
+            "nowhere.example.test",
+            "up.example.test"
+        ],
         "each host once, for two profiles and two lists"
     );
     profiles_window.destroy();
@@ -201,7 +224,7 @@ pub(super) fn a_mark_waits_for_its_check_and_keeps_its_state(dir: &Path) {
     let (answer, answers) = mpsc::channel::<Reach>();
     let answers = Arc::new(Mutex::new(answers));
     ctx.hosts
-        .set_check(Arc::new(move |_: &Profile, _: &dyn Fn() -> bool| {
+        .set_check(Check::new(move |_: &Profile, _: &dyn Fn() -> bool| {
             answers.lock().unwrap().recv().unwrap_or(Reach::Unknown)
         }));
     let app = test_app();
@@ -314,7 +337,7 @@ pub(super) fn turning_off_calls_off_a_check_under_way(dir: &Path) {
     let gate = Arc::new(Mutex::new(gate));
     let (told, still_going) = mpsc::channel::<bool>();
     let told = Arc::new(Mutex::new(told));
-    ctx.hosts.set_check(Arc::new(
+    ctx.hosts.set_check(Check::new(
         move |_: &Profile, keep_going: &dyn Fn() -> bool| {
             let _ = gate.lock().unwrap().recv();
             let _ = told.lock().unwrap().send(keep_going());

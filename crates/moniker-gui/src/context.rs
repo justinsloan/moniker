@@ -83,7 +83,7 @@ fn host_check() -> crate::hosts::Check {
 /// (`hosts::Hosts::set_check`).
 #[cfg(test)]
 fn host_check() -> crate::hosts::Check {
-    Arc::new(|_, _| crate::hosts::Reach::Unknown)
+    crate::hosts::Check::new(|_, _| crate::hosts::Reach::Unknown)
 }
 
 /// State shared by every window and dialog of the application.

@@ -21,6 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::askpass::{PID_ENV, TOKEN_ENV};
+use crate::ping::Family;
 use crate::profile::Profile;
 use crate::ssh::resolve_command;
 
@@ -106,8 +107,9 @@ fn output_within(mut command: Command, limit: Duration) -> Option<String> {
 /// Where a ping for a profile goes, as `ssh -G` says ([`ping_target`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PingTarget {
-    /// This host, which the connection goes to directly.
-    Host(String),
+    /// This host, which the connection goes to directly, at the addresses
+    /// `family` (ssh's `AddressFamily`) allows.
+    Host { name: String, family: Family },
     /// The connection goes through another host (`ProxyJump` or
     /// `ProxyCommand`): this machine may not reach the host itself, so a ping
     /// from here says nothing about it.
@@ -116,18 +118,32 @@ pub enum PingTarget {
 
 /// Where a ping for a connection goes, read from what `ssh -G` printed for it
 /// ([`effective_config`]): the `hostname` (after `HostName` and aliases; a
-/// `HostKeyAlias` changes nothing), unless a `proxyjump` or `proxycommand`
-/// other than `none` sends the connection through another host. `None` if the
-/// dump does not say: no `hostname`, more than one, or one that is not a single
-/// word without control characters.
+/// `HostKeyAlias` changes nothing) at the addresses its `addressfamily` allows
+/// (`any` if it says nothing), unless a `proxyjump` or `proxycommand` other
+/// than `none` sends the connection through another host. `None` if the dump
+/// does not say: no `hostname`, more than one, or one that is not a single word
+/// without control characters; an `addressfamily` given twice, or other than
+/// `any`, `inet` or `inet6`.
 pub fn ping_target(dump: &str) -> Option<PingTarget> {
     let mut hostname = None;
+    let mut family = None;
     let mut through = false;
     for line in dump.lines() {
         let (key, value) = line.split_once(' ').unwrap_or((line, ""));
         match key {
             "hostname" => {
                 if hostname.replace(value).is_some() {
+                    return None;
+                }
+            }
+            "addressfamily" => {
+                let value = match value {
+                    "any" => Family::Any,
+                    "inet" => Family::Inet,
+                    "inet6" => Family::Inet6,
+                    _ => return None,
+                };
+                if family.replace(value).is_some() {
                     return None;
                 }
             }
@@ -141,7 +157,10 @@ pub fn ping_target(dump: &str) -> Option<PingTarget> {
     Some(if through {
         PingTarget::ThroughAnotherHost
     } else {
-        PingTarget::Host(hostname.to_owned())
+        PingTarget::Host {
+            name: hostname.to_owned(),
+            family: family.unwrap_or(Family::Any),
+        }
     })
 }
 
@@ -258,24 +277,35 @@ mod tests {
     const DUMP: &str = "user alice\nhostname web1.example.com\nport 22\n\
         identityfile ~/.ssh/id_ed25519\nsendenv LANG\n";
 
+    fn web1(family: Family) -> Option<PingTarget> {
+        Some(PingTarget::Host {
+            name: "web1.example.com".to_owned(),
+            family,
+        })
+    }
+
     #[test]
     fn a_ping_goes_to_the_host_ssh_connects_to() {
-        assert_eq!(
-            ping_target(DUMP),
-            Some(PingTarget::Host("web1.example.com".to_owned()))
-        );
+        assert_eq!(ping_target(DUMP), web1(Family::Any));
         // A HostKeyAlias names the host key, not where ssh connects.
         let dump = format!("{DUMP}hostkeyalias myalias\n");
-        assert_eq!(
-            ping_target(&dump),
-            Some(PingTarget::Host("web1.example.com".to_owned()))
-        );
+        assert_eq!(ping_target(&dump), web1(Family::Any));
         // `none` is no proxy.
         let dump = format!("{DUMP}proxyjump none\nproxycommand none\n");
-        assert_eq!(
-            ping_target(&dump),
-            Some(PingTarget::Host("web1.example.com".to_owned()))
-        );
+        assert_eq!(ping_target(&dump), web1(Family::Any));
+    }
+
+    #[test]
+    fn a_ping_goes_to_the_addresses_ssh_would_use() {
+        // As OpenSSH 10.2 prints `AddressFamily`, `-4` and `-6`.
+        for (value, family) in [
+            ("any", Family::Any),
+            ("inet", Family::Inet),
+            ("inet6", Family::Inet6),
+        ] {
+            let dump = format!("{DUMP}addressfamily {value}\n");
+            assert_eq!(ping_target(&dump), web1(family), "{value}");
+        }
     }
 
     #[test]
@@ -303,6 +333,9 @@ mod tests {
             "hostname web1 example.com\n",
             "hostname\n",
             "hostname web1\u{7}\n",
+            "hostname a.example.com\naddressfamily inet\naddressfamily inet6\n",
+            "hostname a.example.com\naddressfamily ipx\n",
+            "hostname a.example.com\naddressfamily\n",
         ] {
             assert_eq!(ping_target(dump), None, "{dump:?}");
         }

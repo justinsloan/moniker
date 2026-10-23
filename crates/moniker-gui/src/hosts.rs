@@ -8,9 +8,10 @@
 //!   every host again. Hosts are told apart by the profile's host, lowercased.
 //! * **The mark** ([`Hosts::mark`]): a filled dot in the `success` color when
 //!   the host answered, a ring in the `error` color when three pings got no
-//!   reply, a short dimmed dash until a check has decided, and for a host that
-//!   is not pinged (one reached through another host, one whose `ssh`
-//!   configuration could not be read, or a system that does not allow pings).
+//!   reply or its name was not found, a short dimmed dash until a check has
+//!   decided, and for a host that is not pinged (one reached through another
+//!   host, one whose `ssh` configuration could not be read, or a system that
+//!   does not allow pings).
 //!   Different in shape as well as color, about the size of a lowercase letter
 //!   (sized in `em`, so it follows the text size), no click of its own, no
 //!   animation; its tooltip and accessible name say what it means
@@ -21,17 +22,19 @@
 //!   (`moniker_core::ssh_config`, asked again at most every [`TARGET_FRESH`]
 //!   per host, so `Match exec` commands in `~/.ssh/config` do not run every
 //!   minute); a host reached through `ProxyJump` or `ProxyCommand`, or one
-//!   `ssh -G` cannot tell about, is not pinged; then up to three pings
-//!   (`moniker_core::ping`). On a worker thread, at most [`AT_ONCE`] at a
-//!   time. A host keeps what its mark shows until a check decides, so nothing
-//!   flickers.
+//!   `ssh -G` cannot tell about, is not pinged; then up to three pings to an
+//!   address ssh's `AddressFamily` allows, and three to one of the other kind
+//!   if the first gets no reply (`moniker_core::ping`). On a worker thread, at
+//!   most [`AT_ONCE`] at a time. A host keeps what its mark shows until a
+//!   check decides, so nothing flickers.
 //! * **When.** A mark that comes into view asks for a check of its host unless
 //!   one decided less than [`FRESH`] ago; while any mark is in view, its hosts
 //!   are checked again every [`INTERVAL`]. Nothing runs per frame.
 //! * **Off** (the Preferences switch, `settings::GuiSettings::ping_hosts`): no
 //!   mark is shown and no check starts; a check under way is called off before
 //!   its next ping, and what it found is ignored; what was known is forgotten,
-//!   so turning it on again starts from "not checked yet".
+//!   what `ssh -G` said included ([`Check`]), so turning it on again starts
+//!   from "not checked yet" and asks `ssh -G` again.
 //!
 //! The pings are the one network traffic Moniker makes besides the `ssh`
 //! connections themselves, and they carry nothing from Moniker.
@@ -87,6 +90,9 @@ pub(crate) enum Reach {
     Answers,
     /// Three pings got no reply.
     NoReply,
+    /// The host's name could not be resolved (or has no address of the kind
+    /// ssh would use): nothing was sent, and it cannot be reached from here.
+    NotFound,
     /// The connection goes through another host: not pinged.
     Proxied,
     /// `ssh -G` could not say where the connection goes: not pinged.
@@ -102,6 +108,7 @@ impl Reach {
             Reach::Unknown => "Not checked yet",
             Reach::Answers => "Answers ping",
             Reach::NoReply => "No reply to ping",
+            Reach::NotFound => "Name not found",
             Reach::Proxied => "Not checked: reached through another host",
             Reach::Unclear => "Not checked: could not read the ssh configuration",
             Reach::NotAllowed => "Not checked: this system does not allow pings",
@@ -112,7 +119,7 @@ impl Reach {
     pub(crate) fn shape(self) -> &'static str {
         match self {
             Reach::Answers => "answers",
-            Reach::NoReply => "no-reply",
+            Reach::NoReply | Reach::NotFound => "no-reply",
             Reach::Unknown | Reach::Proxied | Reach::Unclear | Reach::NotAllowed => "unknown",
         }
     }
@@ -121,16 +128,47 @@ impl Reach {
     fn color(self) -> &'static str {
         match self {
             Reach::Answers => "success",
-            Reach::NoReply => "error",
+            Reach::NoReply | Reach::NotFound => "error",
             Reach::Unknown | Reach::Proxied | Reach::Unclear | Reach::NotAllowed => "dim-label",
         }
     }
 }
 
-/// What a check finds for a profile's host. It runs on a worker thread, and
-/// asks the function it is given before each step that sends something
-/// whether to go on (the checks may have been turned off meanwhile).
-pub(crate) type Check = Arc<dyn Fn(&Profile, &dyn Fn() -> bool) -> Reach + Send + Sync>;
+/// What a check finds for a profile's host (`find`), and how it forgets what
+/// it remembers from one check to the next (`forget`, when the checks are
+/// turned off). `find` runs on a worker thread, and asks the function it is
+/// given before each step that sends something whether to go on (the checks
+/// may have been turned off meanwhile).
+#[derive(Clone)]
+pub(crate) struct Check {
+    find: Arc<Find>,
+    forget: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// What a check does for one profile's host ([`Check`]).
+type Find = dyn Fn(&Profile, &dyn Fn() -> bool) -> Reach + Send + Sync;
+
+impl Check {
+    /// Tests: a check that remembers nothing.
+    #[cfg(test)]
+    pub(crate) fn new(
+        find: impl Fn(&Profile, &dyn Fn() -> bool) -> Reach + Send + Sync + 'static,
+    ) -> Check {
+        Check::remembering(find, || {})
+    }
+
+    /// A check that remembers something from one check to the next, which
+    /// `forget` forgets.
+    fn remembering(
+        find: impl Fn(&Profile, &dyn Fn() -> bool) -> Reach + Send + Sync + 'static,
+        forget: impl Fn() + Send + Sync + 'static,
+    ) -> Check {
+        Check {
+            find: Arc::new(find),
+            forget: Arc::new(forget),
+        }
+    }
+}
 
 /// Where the connection to each host goes, as `ssh -G` said, and when.
 type Targets = Mutex<HashMap<String, (Instant, Option<PingTarget>)>>;
@@ -140,32 +178,47 @@ type Targets = Mutex<HashMap<String, (Instant, Option<PingTarget>)>>;
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn real_check() -> Check {
     let targets: Arc<Targets> = Arc::default();
-    Arc::new(move |profile, keep_going| {
-        if !ping::allowed() {
-            return Reach::NotAllowed;
-        }
-        let target = target_of(&targets, profile, Instant::now(), &|p| {
-            ssh_config::effective_config(p)
-        });
-        match target {
-            None => Reach::Unclear,
-            Some(PingTarget::ThroughAnotherHost) => Reach::Proxied,
-            Some(PingTarget::Host(host)) => match ping::ping(&host, keep_going) {
-                Ping::Answered => Reach::Answers,
-                Ping::NoReply => Reach::NoReply,
-                Ping::NotAllowed => Reach::NotAllowed,
-            },
-        }
-    })
+    let remembered = Arc::clone(&targets);
+    Check::remembering(
+        move |profile, keep_going| {
+            if !ping::allowed() {
+                return Reach::NotAllowed;
+            }
+            let target = target_of(&targets, profile, Instant::now(), keep_going, &|p| {
+                ssh_config::effective_config(p)
+            });
+            match target {
+                None => Reach::Unclear,
+                Some(PingTarget::ThroughAnotherHost) => Reach::Proxied,
+                Some(PingTarget::Host { name, family }) => {
+                    match ping::ping(&name, family, keep_going) {
+                        Ping::Answered => Reach::Answers,
+                        Ping::NoReply => Reach::NoReply,
+                        Ping::NameNotFound => Reach::NotFound,
+                        Ping::NotAllowed => Reach::NotAllowed,
+                    }
+                }
+            }
+        },
+        move || {
+            remembered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        },
+    )
 }
 
 /// Where the connection to `profile`'s host goes: what `resolve` (`ssh -G`)
 /// said about it less than [`TARGET_FRESH`] before `now`, or what it says now.
 /// A host `ssh -G` could not tell about is not asked again before then either.
+/// A check called off (`keep_going`) does not run `ssh -G`, and keeps nothing
+/// it said: the checks were turned off, and what was kept forgotten.
 fn target_of(
     targets: &Targets,
     profile: &Profile,
     now: Instant,
+    keep_going: &dyn Fn() -> bool,
     resolve: &dyn Fn(&Profile) -> Option<String>,
 ) -> Option<PingTarget> {
     let key = host_key(&profile.host);
@@ -178,11 +231,16 @@ fn target_of(
     if let Some(target) = known {
         return target;
     }
+    if !keep_going() {
+        return None;
+    }
     let target = resolve(profile).and_then(|dump| ssh_config::ping_target(&dump));
-    targets
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(key, (now, target.clone()));
+    // Asked under the lock, which forgetting takes too: once the checks are
+    // turned off, nothing found before is kept.
+    let mut targets = targets.lock().unwrap_or_else(PoisonError::into_inner);
+    if keep_going() {
+        targets.insert(key, (now, target.clone()));
+    }
     target
 }
 
@@ -243,7 +301,10 @@ impl Hosts {
             return;
         }
         if !on {
+            // Calls off the checks under way first, so that none of them
+            // keeps anything once the check has forgotten.
             self.generation.fetch_add(1, Ordering::SeqCst);
+            (self.check.borrow().forget)();
             self.queue.borrow_mut().clear();
             for host in self.hosts.borrow_mut().values_mut() {
                 host.reach = Reach::Unknown;
@@ -420,7 +481,7 @@ impl Hosts {
             let Some(profile) = self.hosts.borrow().get(&key).map(|h| h.profile.clone()) else {
                 continue;
             };
-            let check = Arc::clone(&self.check.borrow());
+            let check = self.check.borrow().clone();
             let generation = Arc::clone(&self.generation);
             let started_in = generation.load(Ordering::SeqCst);
             let (sender, received) = async_channel::bounded::<Reach>(1);
@@ -428,7 +489,7 @@ impl Hosts {
                 .name("moniker-ping".to_owned())
                 .spawn(move || {
                     let keep_going = || generation.load(Ordering::SeqCst) == started_in;
-                    let _ = sender.send_blocking(check(&profile, &keep_going));
+                    let _ = sender.send_blocking((check.find)(&profile, &keep_going));
                 });
             if spawned.is_err() {
                 // Asked again the next time it is wanted.
@@ -533,6 +594,13 @@ mod tests {
         // Shape as well as color: the three shapes, and a text for each.
         assert_eq!(Reach::Answers.shape(), "answers");
         assert_eq!(Reach::NoReply.shape(), "no-reply");
+        assert_eq!(Reach::Answers.color(), "success");
+        assert_eq!(Reach::NoReply.color(), "error");
+        // A name that is not found cannot be reached from here: the ring, with
+        // its own text.
+        assert_eq!(Reach::NotFound.shape(), "no-reply");
+        assert_eq!(Reach::NotFound.color(), "error");
+        assert_eq!(Reach::NotFound.text(), "Name not found");
         for reach in [
             Reach::Unknown,
             Reach::Proxied,
@@ -540,6 +608,7 @@ mod tests {
             Reach::NotAllowed,
         ] {
             assert_eq!(reach.shape(), "unknown", "{reach:?}");
+            assert_eq!(reach.color(), "dim-label", "{reach:?}");
         }
         assert_eq!(Reach::Answers.text(), "Answers ping");
         assert_eq!(Reach::NoReply.text(), "No reply to ping");
@@ -562,16 +631,20 @@ mod tests {
         };
         let web = Profile::new("web", "Web", "alice");
         let start = Instant::now();
-        let target = Some(PingTarget::Host("web1.example.com".to_owned()));
-        assert_eq!(target_of(&targets, &web, start, &resolve), target);
+        let target = Some(PingTarget::Host {
+            name: "web1.example.com".to_owned(),
+            family: ping::Family::Any,
+        });
+        let on = || true;
+        assert_eq!(target_of(&targets, &web, start, &on, &resolve), target);
         // The same host, spelled otherwise, a minute later: not asked again.
         let twin = Profile::new("twin", "WEB", "bob");
         let later = start + Duration::from_secs(60);
-        assert_eq!(target_of(&targets, &twin, later, &resolve), target);
+        assert_eq!(target_of(&targets, &twin, later, &on, &resolve), target);
         assert_eq!(asked.get(), 1);
         // After TARGET_FRESH it is asked again.
         let much_later = start + TARGET_FRESH + Duration::from_secs(1);
-        assert_eq!(target_of(&targets, &web, much_later, &resolve), target);
+        assert_eq!(target_of(&targets, &web, much_later, &on, &resolve), target);
         assert_eq!(asked.get(), 2);
     }
 
@@ -585,11 +658,57 @@ mod tests {
         };
         let web = Profile::new("web", "web", "alice");
         let start = Instant::now();
-        assert_eq!(target_of(&targets, &web, start, &fails), None);
+        let on = || true;
+        assert_eq!(target_of(&targets, &web, start, &on, &fails), None);
         assert_eq!(
-            target_of(&targets, &web, start + Duration::from_secs(60), &fails),
+            target_of(&targets, &web, start + Duration::from_secs(60), &on, &fails),
             None
         );
         assert_eq!(asked.get(), 1);
+    }
+
+    #[test]
+    fn a_check_called_off_does_not_ask_ssh_g_or_remember_its_answer() {
+        let targets = Targets::default();
+        let asked = std::cell::Cell::new(0);
+        let resolve = |_: &Profile| {
+            asked.set(asked.get() + 1);
+            Some("hostname web1.example.com\n".to_owned())
+        };
+        let web = Profile::new("web", "web", "alice");
+        let now = Instant::now();
+        // Called off before it began: ssh -G is not run.
+        assert_eq!(target_of(&targets, &web, now, &|| false, &resolve), None);
+        assert_eq!(asked.get(), 0);
+        // Called off while ssh -G ran: its answer is not kept.
+        let calls = std::cell::Cell::new(0);
+        let until_ssh_g_ran = || {
+            calls.set(calls.get() + 1);
+            calls.get() == 1
+        };
+        assert!(target_of(&targets, &web, now, &until_ssh_g_ran, &resolve).is_some());
+        assert_eq!(asked.get(), 1);
+        assert!(target_of(&targets, &web, now, &|| true, &resolve).is_some());
+        assert_eq!(asked.get(), 2, "asked again");
+    }
+
+    #[test]
+    fn turning_the_checks_off_forgets_what_they_remember() {
+        let forgot = Arc::new(AtomicU64::new(0));
+        let count = Arc::clone(&forgot);
+        let check = Check::remembering(
+            |_, _| Reach::Unknown,
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let hosts = Hosts::new(true, check);
+        hosts.set_enabled(true);
+        assert_eq!(forgot.load(Ordering::SeqCst), 0, "still on");
+        hosts.set_enabled(false);
+        assert_eq!(forgot.load(Ordering::SeqCst), 1);
+        hosts.set_enabled(false);
+        hosts.set_enabled(true);
+        assert_eq!(forgot.load(Ordering::SeqCst), 1, "only when turned off");
     }
 }

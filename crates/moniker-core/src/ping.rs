@@ -9,15 +9,22 @@
 //! program is run and no privilege is needed; where the kernel refuses the
 //! socket, the answer is [`Ping::NotAllowed`] and nothing is sent.
 //!
-//! [`ping`] sends up to [`ATTEMPTS`] requests, [`WAIT`] apart, and stops at
-//! the first reply: one is enough. It asks its caller before each request
-//! whether to go on, so a check called off (the person turned the pings off)
-//! sends nothing more. The requests carry nothing from Moniker: the payload is
-//! zeros. Only the first address the system gives for a name is pinged.
-//! Blocking: run it off the main thread.
+//! [`ping`] sends up to [`ATTEMPTS`] requests to an address, [`WAIT`] apart,
+//! and stops at the first reply: one is enough. It asks its caller before each
+//! request whether to go on, so a check called off (the person turned the
+//! pings off) sends nothing more. The requests carry nothing from Moniker: the
+//! payload is zeros.
+//!
+//! Which addresses: only those ssh's `AddressFamily` allows ([`Family`]), and
+//! of those the first the system gives for the name; if it gets no reply, the
+//! first of the other kind (IPv4 after IPv6, or the other way round) when both
+//! are allowed. `ssh` tries a name's addresses in turn too, so a host whose
+//! IPv6 address does not answer but whose IPv4 one does counts as answering.
+//! A name with no such address is [`Ping::NameNotFound`]. Blocking: run it off
+//! the main thread.
 
 use std::io;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::OwnedFd;
 use std::time::{Duration, Instant};
 
@@ -48,28 +55,96 @@ const ECHO_REPLY_V6: u8 = 129;
 pub enum Ping {
     /// A reply came back.
     Answered,
-    /// No reply to any request (or the name could not be resolved, the
-    /// address cannot be pinged, or the check was called off).
+    /// No reply to any request (or the address cannot be pinged, or the check
+    /// was called off).
     NoReply,
+    /// The name could not be resolved, or has no address of the kind asked
+    /// for: nothing was sent.
+    NameNotFound,
     /// This system does not let this user open an ICMP datagram socket:
     /// nothing was sent.
     NotAllowed,
 }
 
-/// Ping `host` (a name or an address) from this machine (module docs), asking
-/// `keep_going` before each request. Resolving the name is the system's own
-/// (`getaddrinfo`); its first address is pinged.
-pub fn ping(host: &str, keep_going: &dyn Fn() -> bool) -> Ping {
+/// Which of a name's addresses may be pinged: ssh's `AddressFamily`, as
+/// `ssh -G` reports it, so that a ping goes where `ssh` would connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+    /// IPv4 or IPv6 (`any`, ssh's default).
+    Any,
+    /// IPv4 only (`inet`).
+    Inet,
+    /// IPv6 only (`inet6`).
+    Inet6,
+}
+
+/// Ping `host` (a name or an address) from this machine at the addresses
+/// `family` allows (module docs), asking `keep_going` before each request.
+/// Resolving the name is the system's own (`getaddrinfo`).
+pub fn ping(host: &str, family: Family, keep_going: &dyn Fn() -> bool) -> Ping {
     if !keep_going() {
         return Ping::NoReply;
     }
-    let Some(address) = (host, 0)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addresses| addresses.next())
-    else {
-        return Ping::NoReply;
+    let addresses = match (host, 0).to_socket_addrs() {
+        Ok(resolved) => to_try(resolved, family),
+        Err(_) => Vec::new(),
     };
+    in_turn(&addresses, keep_going, &mut |address| {
+        ping_address(address, keep_going)
+    })
+}
+
+/// The addresses to ping, from those the system gave for a name (`resolved`,
+/// in its order of preference): the first one `family` allows, then the first
+/// of the other kind if `family` allows both.
+fn to_try(resolved: impl IntoIterator<Item = SocketAddr>, family: Family) -> Vec<SocketAddr> {
+    let mut chosen: Vec<SocketAddr> = Vec::new();
+    for address in resolved {
+        let allowed = match family {
+            Family::Any => true,
+            Family::Inet => address.is_ipv4(),
+            Family::Inet6 => address.is_ipv6(),
+        };
+        // At most one of each kind.
+        if allowed && chosen.iter().all(|c| c.is_ipv6() != address.is_ipv6()) {
+            chosen.push(address);
+        }
+    }
+    chosen
+}
+
+/// Ping `addresses` in turn with `ping_address` until one answers, asking
+/// `keep_going` before each: [`Ping::NameNotFound`] if there is none,
+/// [`Ping::NotAllowed`] only if every one was refused, else [`Ping::NoReply`].
+fn in_turn(
+    addresses: &[SocketAddr],
+    keep_going: &dyn Fn() -> bool,
+    ping_address: &mut dyn FnMut(&SocketAddr) -> Ping,
+) -> Ping {
+    if addresses.is_empty() {
+        return Ping::NameNotFound;
+    }
+    let mut refused = 0;
+    for address in addresses {
+        if !keep_going() {
+            return Ping::NoReply;
+        }
+        match ping_address(address) {
+            Ping::Answered => return Ping::Answered,
+            Ping::NotAllowed => refused += 1,
+            Ping::NoReply | Ping::NameNotFound => {}
+        }
+    }
+    if refused == addresses.len() {
+        Ping::NotAllowed
+    } else {
+        Ping::NoReply
+    }
+}
+
+/// Ping one address: up to [`ATTEMPTS`] requests, asking `keep_going` before
+/// each.
+fn ping_address(address: &SocketAddr, keep_going: &dyn Fn() -> bool) -> Ping {
     let v6 = address.is_ipv6();
     let socket = match icmp_socket(v6) {
         Ok(socket) => socket,
@@ -78,7 +153,7 @@ pub fn ping(host: &str, keep_going: &dyn Fn() -> bool) -> Ping {
     };
     // A refusal here is about the address (a broadcast one, say), not about
     // pings being allowed; nothing has been sent.
-    if connect(&socket, &address).is_err() {
+    if connect(&socket, address).is_err() {
         return Ping::NoReply;
     }
     let mut echo = SocketEcho { socket };
@@ -402,7 +477,7 @@ mod tests {
         assert!(!exchange(&mut net, false, 3, WAIT, &keep_going));
         assert_eq!(net.sent.len(), 1, "only the request sent before");
         assert_eq!(
-            ping("127.0.0.1", &|| false),
+            ping("127.0.0.1", Family::Any, &|| false),
             Ping::NoReply,
             "nothing is sent at all"
         );
@@ -411,12 +486,12 @@ mod tests {
     #[test]
     fn this_machine_answers_its_own_ping() {
         // Loopback only: nothing leaves the machine.
-        match ping("127.0.0.1", &|| true) {
+        match ping("127.0.0.1", Family::Any, &|| true) {
             Ping::Answered => {}
             Ping::NotAllowed => {
                 eprintln!("skipped: this system does not allow ICMP datagram sockets here");
             }
-            Ping::NoReply => panic!("127.0.0.1 did not answer"),
+            other => panic!("127.0.0.1 did not answer: {other:?}"),
         }
     }
 
@@ -429,12 +504,123 @@ mod tests {
         } else {
             Ping::NotAllowed
         };
-        assert_eq!(ping("255.255.255.255", &|| true), expected);
+        assert_eq!(ping("255.255.255.255", Family::Any, &|| true), expected);
     }
 
     #[test]
-    fn a_name_that_does_not_resolve_is_no_reply() {
+    fn a_name_that_does_not_resolve_is_name_not_found() {
         // Refused by the resolver at once: nothing is sent, not even a query.
-        assert_eq!(ping("", &|| true), Ping::NoReply);
+        assert_eq!(ping("", Family::Any, &|| true), Ping::NameNotFound);
+    }
+
+    #[test]
+    fn an_address_of_a_kind_ssh_would_not_use_is_not_pinged() {
+        // Literal addresses: nothing is looked up and nothing is sent.
+        assert_eq!(
+            ping("127.0.0.1", Family::Inet6, &|| true),
+            Ping::NameNotFound
+        );
+        assert_eq!(ping("::1", Family::Inet, &|| true), Ping::NameNotFound);
+    }
+
+    // ----- which addresses, in turn -----
+
+    fn v4(last: u8) -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, last], 0))
+    }
+
+    fn v6(last: u16) -> SocketAddr {
+        SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, last], 0))
+    }
+
+    #[test]
+    fn the_first_address_and_the_first_of_the_other_kind_are_tried() {
+        assert_eq!(
+            to_try([v6(1), v6(2), v4(1), v4(2)], Family::Any),
+            [v6(1), v4(1)]
+        );
+        assert_eq!(to_try([v4(1), v6(1), v4(2)], Family::Any), [v4(1), v6(1)]);
+        // One kind only: its first address.
+        assert_eq!(to_try([v4(1), v4(2)], Family::Any), [v4(1)]);
+        assert_eq!(to_try([], Family::Any), []);
+    }
+
+    #[test]
+    fn only_the_kind_ssh_would_use_is_tried() {
+        let both = [v6(1), v4(1), v6(2), v4(2)];
+        assert_eq!(to_try(both, Family::Inet), [v4(1)]);
+        assert_eq!(to_try(both, Family::Inet6), [v6(1)]);
+        assert_eq!(to_try([v4(1)], Family::Inet6), []);
+    }
+
+    /// `in_turn` over `addresses`, the n-th address pinged finding
+    /// `found[n]`: what it says, and the addresses it pinged.
+    fn in_turn_finding(
+        addresses: &[SocketAddr],
+        found: &[Ping],
+        keep_going: &dyn Fn() -> bool,
+    ) -> (Ping, Vec<SocketAddr>) {
+        let mut pinged = Vec::new();
+        let ping = in_turn(addresses, keep_going, &mut |address| {
+            pinged.push(*address);
+            found[pinged.len() - 1]
+        });
+        (ping, pinged)
+    }
+
+    #[test]
+    fn the_next_address_is_tried_only_after_no_reply() {
+        let both = [v6(1), v4(1)];
+        assert_eq!(
+            in_turn_finding(&both, &[Ping::Answered], &|| true),
+            (Ping::Answered, vec![v6(1)])
+        );
+        assert_eq!(
+            in_turn_finding(&both, &[Ping::NoReply, Ping::Answered], &|| true),
+            (Ping::Answered, both.to_vec())
+        );
+        assert_eq!(
+            in_turn_finding(&both, &[Ping::NoReply, Ping::NoReply], &|| true),
+            (Ping::NoReply, both.to_vec())
+        );
+    }
+
+    #[test]
+    fn not_allowed_only_when_every_address_was_refused() {
+        // IPv6 sockets refused (IPv6 off in this kernel, say), IPv4 fine.
+        let both = [v6(1), v4(1)];
+        let found = |found: &[Ping]| in_turn_finding(&both, found, &|| true).0;
+        assert_eq!(found(&[Ping::NotAllowed, Ping::Answered]), Ping::Answered);
+        assert_eq!(found(&[Ping::NotAllowed, Ping::NoReply]), Ping::NoReply);
+        assert_eq!(found(&[Ping::NoReply, Ping::NotAllowed]), Ping::NoReply);
+        assert_eq!(
+            found(&[Ping::NotAllowed, Ping::NotAllowed]),
+            Ping::NotAllowed
+        );
+    }
+
+    #[test]
+    fn no_address_is_name_not_found() {
+        assert_eq!(
+            in_turn_finding(&[], &[], &|| true),
+            (Ping::NameNotFound, vec![])
+        );
+    }
+
+    #[test]
+    fn a_check_called_off_tries_no_further_address() {
+        let asked = std::cell::Cell::new(0);
+        let keep_going = || {
+            asked.set(asked.get() + 1);
+            asked.get() == 1
+        };
+        assert_eq!(
+            in_turn_finding(
+                &[v6(1), v4(1)],
+                &[Ping::NoReply, Ping::Answered],
+                &keep_going
+            ),
+            (Ping::NoReply, vec![v6(1)])
+        );
     }
 }
