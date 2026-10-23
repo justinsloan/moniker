@@ -14,6 +14,10 @@
   <img src="https://img.shields.io/badge/platform-linux-lightgrey.svg?logo=linux&logoColor=white" alt="Platform: Linux">
 </p>
 
+<p align="center">
+  <img src="docs/screenshots/startup-sequence.png" alt="Moniker with three tabs; the web-01 tab has logged in, run its Update startup sequence (apt update) and left a shell prompt" width="900">
+</p>
+
 ---
 
 ## Why Moniker?
@@ -39,6 +43,25 @@ Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, 
 - 🎨 **The modern GNOME look.** libadwaita, following the system light or dark style, terminal colors close to GNOME Console's, and a Connection Profiles window laid out like GNOME Settings.
 - 🗄️ **Headless machines too.** `moniker-server` is a command line with no GTK, for a server that only takes part in sync.
 - 🚫 **No cloud, no account, no telemetry.** The only network traffic is your own `ssh` connections.
+
+## Screenshots
+
+<table>
+  <tr>
+    <th>New-tab list</th>
+    <th>Connect choices</th>
+  </tr>
+  <tr>
+    <td><img src="docs/screenshots/new-tab.png" alt="The new-tab list: Local terminal, then the saved profiles with their user and host" width="440"></td>
+    <td><img src="docs/screenshots/connect-choices.png" alt="The choices behind a profile's arrow: Just connect, each startup sequence by name, and a Save transcript box" width="440"></td>
+  </tr>
+  <tr>
+    <th colspan="2">htop over SSH, started by a startup sequence</th>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><img src="docs/screenshots/htop.png" alt="The db-01 tab running htop on a PostgreSQL server" width="890"></td>
+  </tr>
+</table>
 
 ## Getting started
 
@@ -253,7 +276,7 @@ crates/
 └── moniker-gui/     moniker: the GTK 4 / libadwaita / VTE app and its window tests
 data/                Desktop file and AppStream metadata
 scripts/             Package builds, test runners, the CI install test
-docs/                Hands-on checks that need a real desktop and a real host
+docs/                Screenshots, and hands-on checks for a real desktop and host
 ```
 
 The core and the CLI must not depend on GTK or VTE, because a sync partner may be a headless server; `scripts/check-no-gtk.sh` enforces it.
