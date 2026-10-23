@@ -52,16 +52,17 @@ fn showing(shape: &str, color: &str, text: &str) -> (String, String, String) {
 fn scripted(ctx: &AppContext) -> Arc<Mutex<Vec<String>>> {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&asked);
-    ctx.hosts.set_check(Arc::new(move |p: &Profile| {
-        let host = p.host.to_ascii_lowercase();
-        record.lock().unwrap().push(host.clone());
-        match host.as_str() {
-            "up.example.test" => Reach::Answers,
-            "down.example.test" => Reach::NoReply,
-            "hop.example.test" => Reach::Proxied,
-            _ => Reach::NotAllowed,
-        }
-    }));
+    ctx.hosts
+        .set_check(Arc::new(move |p: &Profile, _: &dyn Fn() -> bool| {
+            let host = p.host.to_ascii_lowercase();
+            record.lock().unwrap().push(host.clone());
+            match host.as_str() {
+                "up.example.test" => Reach::Answers,
+                "down.example.test" => Reach::NoReply,
+                "hop.example.test" => Reach::Proxied,
+                _ => Reach::NotAllowed,
+            }
+        }));
     asked
 }
 
@@ -115,17 +116,42 @@ pub(super) fn both_lists_mark_each_hosts_status(dir: &Path) {
             "Not checked: reached through another host"
         )
     );
-    assert!(
-        mark(&up).is_visible() && !mark(&up).can_target(),
-        "shown, not clickable"
-    );
+    // The pointer over the mark is over the mark, so its tooltip shows.
+    let window = main.window.upcast_ref::<gtk::Widget>();
+    let up_mark = mark(&up);
+    let center = up_mark
+        .compute_point(
+            window,
+            &gtk::graphene::Point::new(up_mark.width() as f32 / 2.0, up_mark.height() as f32 / 2.0),
+        )
+        .expect("the mark is in the window");
+    let under = window
+        .pick(
+            f64::from(center.x()),
+            f64::from(center.y()),
+            gtk::PickFlags::INSENSITIVE,
+        )
+        .expect("something under the pointer");
+    assert_eq!(&under, up_mark.upcast_ref::<gtk::Widget>(), "the mark");
     assert!(
         mark_in(&row(&list, new_tab::LOCAL_ROW)).is_none(),
         "no mark on Local terminal"
     );
 
     let profiles_window = window::open_profiles(&app, &ctx);
-    pump_for(Duration::from_millis(300));
+    let sidebar_list = || {
+        all_widgets::<gtk::ListBox>(&profiles_window)
+            .into_iter()
+            .find(|list| list.widget_name() == profiles::SIDEBAR_NAME)
+    };
+    pump_until("the sidebar's marks to be in view", || {
+        sidebar_list().is_some_and(|list| {
+            all_widgets::<gtk::Box>(&list)
+                .iter()
+                .filter(|b| b.has_css_class(MARK_CLASS))
+                .all(|b| b.is_mapped())
+        })
+    });
     let sidebar = all_widgets::<gtk::ListBox>(&profiles_window)
         .into_iter()
         .find(|list| list.widget_name() == profiles::SIDEBAR_NAME)
@@ -174,9 +200,10 @@ pub(super) fn a_mark_waits_for_its_check_and_keeps_its_state(dir: &Path) {
     let ctx = ctx_with(dir, std::slice::from_ref(&up));
     let (answer, answers) = mpsc::channel::<Reach>();
     let answers = Arc::new(Mutex::new(answers));
-    ctx.hosts.set_check(Arc::new(move |_: &Profile| {
-        answers.lock().unwrap().recv().unwrap_or(Reach::Unknown)
-    }));
+    ctx.hosts
+        .set_check(Arc::new(move |_: &Profile, _: &dyn Fn() -> bool| {
+            answers.lock().unwrap().recv().unwrap_or(Reach::Unknown)
+        }));
     let app = test_app();
     let main = main_window(&app, &ctx);
     let page = new_tab::open(&main.view, &ctx);
@@ -238,6 +265,7 @@ pub(super) fn turned_off_there_is_no_mark_and_no_ping(dir: &Path) {
     switch.set_active(false);
     assert!(!ctx.settings().ping_hosts, "saved");
     assert!(!first_mark.is_visible(), "no mark");
+    assert!(!ctx.hosts.timer_runs(), "no re-checks either");
     dialog.force_close();
     pump_until("the dialog to close", || {
         main.window.visible_dialog().is_none()
@@ -273,6 +301,52 @@ pub(super) fn turned_off_there_is_no_mark_and_no_ping(dir: &Path) {
     assert!(second_mark.is_visible());
     pump_until("a new check", || asked.lock().unwrap().len() > checks);
     pump_until("it to decide", || shown(&second_mark).0 == "answers");
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Turning the pings off calls off a check under way: it is told to stop
+/// before its next ping, and what it found is not shown.
+pub(super) fn turning_off_calls_off_a_check_under_way(dir: &Path) {
+    let up = up();
+    let ctx = ctx_with(dir, std::slice::from_ref(&up));
+    let (go, gate) = mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(gate));
+    let (told, still_going) = mpsc::channel::<bool>();
+    let told = Arc::new(Mutex::new(told));
+    ctx.hosts.set_check(Arc::new(
+        move |_: &Profile, keep_going: &dyn Fn() -> bool| {
+            let _ = gate.lock().unwrap().recv();
+            let _ = told.lock().unwrap().send(keep_going());
+            Reach::Answers
+        },
+    ));
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = new_tab::open(&main.view, &ctx);
+    let list = list_in(&page).expect("the list");
+    let mark = mark_in(&row(&list, &up.id)).expect("a mark");
+    pump_until("the check to start", || ctx.hosts.running() == 1);
+
+    ctx.hosts.set_enabled(false);
+    go.send(()).unwrap();
+    assert_eq!(
+        still_going.recv_timeout(super::WAIT),
+        Ok(false),
+        "the check is told to stop"
+    );
+    pump_until("the check to end", || ctx.hosts.running() == 0);
+    assert!(!mark.is_visible());
+    ctx.hosts.set_enabled(true);
+    assert_eq!(
+        shown(&mark),
+        showing("unknown", "dim-label", "Not checked yet"),
+        "what the called-off check found is not shown"
+    );
+    // The check asked for when it came back on: let it end.
+    go.send(()).unwrap();
+    let _ = still_going.recv_timeout(super::WAIT);
+    pump_until("the new check to end", || ctx.hosts.running() == 0);
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }

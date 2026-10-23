@@ -19,8 +19,8 @@
 //! this connection logs in as. Those come from `ssh -G` with the profile's own
 //! user, host, port and key file (run from argv, with `--` before the
 //! destination, within five seconds: `moniker_core::ssh_config`, and only for a
-//! prompt that could be that login's), which is how `~/.ssh/config` is taken into account: an alias, a
-//! `HostName`, a `HostKeyAlias`. If `ssh -G` fails or its answer is ambiguous,
+//! prompt that could be that login's), which is how `~/.ssh/config` is taken
+//! into account: an alias, a `HostName`, a `HostKeyAlias`. If `ssh -G` fails or its answer is ambiguous,
 //! the profile's own user and host are expected, as before. `ssh -G` sees no
 //! remote command, so a `Match sessiontype` or `Match command` block (OpenSSH
 //! 10.0 and later) is judged as for a plain login. The helper logs nothing: no

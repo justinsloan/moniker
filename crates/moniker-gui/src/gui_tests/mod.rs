@@ -367,6 +367,7 @@ fn gui_integration() {
     hosts::both_lists_mark_each_hosts_status(&tmp.path().join("p-both"));
     hosts::a_mark_waits_for_its_check_and_keeps_its_state(&tmp.path().join("p-wait"));
     hosts::turned_off_there_is_no_mark_and_no_ping(&tmp.path().join("p-off"));
+    hosts::turning_off_calls_off_a_check_under_way(&tmp.path().join("p-call-off"));
     // Issue #4 first: they fail fast when a keyring call is on the main thread.
     sync::the_sync_page_uses_the_keyring_off_the_main_thread(&tmp.path().join("k-sync"));
     sync::the_sync_page_waits_for_the_keyring(&tmp.path().join("k-sync-wait"));

@@ -252,7 +252,7 @@ A sync exchanges sealed bundles over ssh. The sync key never goes on the wire:
 - **Use a long sync key.** The client sends its bundle once the other end has answered, but before it has shown that it knows the key.
 - **Names stay plain text.** Profile names, hosts and tab titles are never shown as markup, and a remote shell cannot retitle its tab to look like another host.
 - **Files are private.** Config, transcript and exported transcript files are mode 0600, and a transcripts folder Moniker creates is 0700.
-- **No other traffic.** Moniker makes no network connections other than your ssh sessions.
+- **No other traffic, but the pings.** Moniker makes no network connections other than your ssh sessions, except the pings behind the host marks (ICMP echo requests with a payload of zeros to each saved host, and the DNS lookups of their names), which Preferences turns off. Finding where a profile really connects runs `ssh -G`, which runs your `Match exec` commands too, at most every five minutes per host.
 
 ## Building packages
 
@@ -324,7 +324,7 @@ The workflow runs every check, builds and install-tests both packages, and only 
 - Moving the transcripts folder across file systems copies each file, then removes it. Moniker waits for the move to end before it quits, but a kill or a logout in the middle can leave a truncated copy in the new folder; the original is still whole in the old one.
 - With the keyring locked, whatever needs it waits for it to be unlocked: a new tab says "Waiting for the keyring…", and saving a password or a sync key finishes once it is. The windows and the other terminals keep working meanwhile, with one exception: a sync stores the passwords it receives while it holds the profile file, so a profile change saved during a sync that waits for the keyring waits for that sync, and the window with it. Moniker waits for a keyring change in progress before it quits.
 - A sync cannot ask you anything: its `ssh` runs without a terminal (even when you start `moniker` from a shell), so a key that needs its passphrase, a ProxyJump hop's password or a password that is not stored makes the sync fail at once, and the message says so. Add the key to `ssh-agent` or store the password. `moniker-server sync` in a terminal can still ask there.
-- The host marks: a host reached through ProxyJump or ProxyCommand is never pinged (its mark stays a gray dash), and a host that drops pings shows a red ring though `ssh` may still reach it. Finding where a profile really connects runs `ssh -G`, so your `Match exec` commands run then too. Your network and its DNS see the names of the hosts pinged.
+- The host marks: a host reached through ProxyJump or ProxyCommand, or one `ssh -G` cannot tell about, is never pinged (its mark stays a gray dash); a host that drops pings shows a red ring though `ssh` may still reach it; only the first address the system gives for a name is pinged, so a host whose IPv6 address does not answer shows a red ring even if ssh gets through over IPv4. Finding where a profile really connects runs `ssh -G` (your `Match exec` commands then run too), at most every five minutes per host. Your network and its DNS see the names of the hosts pinged.
 - Sync needs a Secret Service on the other machine; there is no fallback store.
 - Not there yet: split panes, search in the terminal and color settings (the terminal colors follow the system light or dark style). The packages are for x86-64 only.
 

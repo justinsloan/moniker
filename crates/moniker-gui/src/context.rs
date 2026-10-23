@@ -75,7 +75,7 @@ pub(crate) type MakeRunner = Box<dyn Fn() -> crate::sync::Runner>;
 /// pings).
 #[cfg(not(test))]
 fn host_check() -> crate::hosts::Check {
-    Arc::new(crate::hosts::check_host)
+    crate::hosts::real_check()
 }
 
 /// What checks a host for the lists' marks. In tests, never a real ping: a
@@ -83,7 +83,7 @@ fn host_check() -> crate::hosts::Check {
 /// (`hosts::Hosts::set_check`).
 #[cfg(test)]
 fn host_check() -> crate::hosts::Check {
-    Arc::new(|_| crate::hosts::Reach::Unknown)
+    Arc::new(|_, _| crate::hosts::Reach::Unknown)
 }
 
 /// State shared by every window and dialog of the application.
