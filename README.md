@@ -167,7 +167,7 @@ Only files named the way Moniker names transcripts are listed; anything else in 
 
 | Group | Setting | Notes |
 |---|---|---|
-| Terminal | **Font** | Monospace fonts only. Applies to every open terminal at once. |
+| Terminal | **Font** | Monospace fonts only. Applies to every open terminal at once. The reset button beside it (**Use the System Font**) goes back to the system monospace font. |
 | Terminal | **Scrollback** | 1,000 to 1,000,000 lines (10,000 to start with), for tabs opened after the change. A tab that saves a transcript keeps all of its scrollback. |
 | Transcripts | **Save transcripts of all sessions** | See [Transcripts](#transcripts). |
 | Transcripts | **Transcripts folder** | **Choose…** picks another folder and moves the transcripts into it (below). |
@@ -318,7 +318,6 @@ The workflow runs every check, builds and install-tests both packages, and only 
 - A process that ignores the hang-up keeps running after its tab closes, and its terminal is kept until it exits.
 - The Transcripts window reads a transcript whole to show or search it (off the UI thread), so a very large transcript, or searching a very large folder, takes time and memory. A transcript you renamed is no longer listed (the file stays where it is). If an export onto an existing file fails part-way, that file is left partly written.
 - Moving the transcripts folder across file systems copies each file, then removes it. Moniker waits for the move to end before it quits, but a kill or a logout in the middle can leave a truncated copy in the new folder; the original is still whole in the old one.
-- Preferences cannot go back to the system monospace font once a font is chosen; removing `font` from `gui-settings.json` does it.
 - Some keyring calls still run on the UI thread (opening the Sync page, saving a sync key, connecting, saving or removing a password on the profile page, deleting a profile, creating a profile with a password), so with a locked keyring the window can freeze briefly. A sync reads the keyring on its own thread.
 - A sync's `ssh` has no `BatchMode`, so when you start `moniker` from a shell, a key-passphrase, ProxyJump or password prompt for a sync (the automatic one at launch too) can appear in that shell's terminal.
 - Sync needs a Secret Service on the other machine; there is no fallback store.

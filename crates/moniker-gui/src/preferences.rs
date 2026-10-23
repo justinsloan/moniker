@@ -3,8 +3,9 @@
 //! dialog, it pauses that window's tab and terminal shortcuts while it is open.
 //!
 //! * **Terminal**: the font (a font chooser that offers monospace fonts only;
-//!   with none chosen the button shows the system monospace font), used at once
-//!   by every open terminal and by new ones (`terminal_tab::apply_font`); and the
+//!   with none chosen the button shows the system monospace font, and while one
+//!   is chosen a reset button beside it goes back to that), used at once by
+//!   every open terminal and by new ones (`terminal_tab::apply_font`); and the
 //!   scrollback of ordinary tabs, 1,000 to 1,000,000 lines, for tabs opened
 //!   after the change (`terminal_tab::set_scrollback`). Tabs that save a
 //!   transcript keep unlimited scrollback whatever it says.
@@ -54,7 +55,11 @@ const DIALOG_NAME: &str = "moniker-preferences";
 const FOLDER_ROW_NAME: &str = "preferences-folder";
 const CHOOSE_NAME: &str = "preferences-choose-folder";
 
+/// Widget name of the Font row's reset button, how the tests find it.
+const FONT_RESET_NAME: &str = "preferences-font-reset";
+
 const FONT_SUBTITLE: &str = "Used by every terminal; changes apply at once";
+const FONT_RESET_TOOLTIP: &str = "Use the System Font";
 const SCROLLBACK_SUBTITLE: &str = "Lines kept for scrolling back in ordinary tabs";
 const SAVE_ALL_TITLE: &str = "Save transcripts of all sessions";
 const SAVE_ALL_SUBTITLE: &str = "Every new tab, including the first at launch. Tabs that save a \
@@ -300,6 +305,16 @@ fn font_row(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::ActionRow {
         .valign(gtk::Align::Center)
         .build();
     button.set_font_desc(&shown_font(now.font.as_deref(), &row));
+    // Back to the system monospace font; only there while a font is chosen.
+    let reset = gtk::Button::builder()
+        .name(FONT_RESET_NAME)
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text(FONT_RESET_TOOLTIP)
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .visible(now.font.is_some())
+        .build();
+    row.add_suffix(&reset);
     row.add_suffix(&button);
     row.set_activatable_widget(Some(&button));
 
@@ -308,6 +323,10 @@ fn font_row(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::ActionRow {
     button.connect_font_desc_notify(glib::clone!(
         #[strong]
         ctx,
+        #[strong]
+        last,
+        #[weak]
+        reset,
         move |button| {
             let Some(font) = button.font_desc() else {
                 return;
@@ -319,6 +338,7 @@ fn font_row(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::ActionRow {
             if save(&ctx, button, |s| s.font = Some(text)) {
                 terminal_tab::apply_font(Some(&font));
                 last.replace(Some(font));
+                reset.set_visible(true);
             } else {
                 // Cloned out: putting it back notifies, which borrows `last`.
                 let previous = last.borrow().clone();
@@ -326,6 +346,28 @@ fn font_row(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::ActionRow {
                     button.set_font_desc(&previous);
                 }
             }
+        }
+    ));
+    reset.connect_clicked(glib::clone!(
+        #[strong]
+        ctx,
+        #[weak]
+        button,
+        #[weak]
+        row,
+        move |reset| {
+            if !save(&ctx, reset, |s| s.font = None) {
+                return;
+            }
+            terminal_tab::apply_font(None);
+            let system = shown_font(None, &row);
+            // Recorded first: showing it on the button notifies, and the
+            // system font must not then be saved as a chosen one.
+            last.replace(Some(system.clone()));
+            button.set_font_desc(&system);
+            // The focus goes to the font button rather than nowhere.
+            button.grab_focus();
+            reset.set_visible(false);
         }
     ));
     row
@@ -489,6 +531,12 @@ pub(crate) fn change_folder(
     let row = named::<adw::ActionRow>(dialog, FOLDER_ROW_NAME).expect("the folder row");
     let choose = named::<gtk::Button>(dialog, CHOOSE_NAME).expect("the Choose… button");
     folder_chosen(app, ctx, &row, &choose, folder);
+}
+
+/// The Font row's reset button in `dialog`.
+#[cfg(test)]
+pub(crate) fn font_reset_button(dialog: &adw::PreferencesDialog) -> gtk::Button {
+    named(dialog, FONT_RESET_NAME).expect("the font reset button")
 }
 
 /// Say that the folder chosen cannot be used, and why (a reason, never the

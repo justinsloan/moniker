@@ -328,6 +328,93 @@ pub(super) fn changing_the_font_applies_to_open_terminals(dir: &Path) {
     pump_for(Duration::from_millis(200));
 }
 
+/// The Font row's reset button, shown only while a font is chosen, goes back to
+/// the system monospace font: every open terminal and new tabs use it at once,
+/// the setting is removed, the button shows the system font again and the reset
+/// button hides. A reset that cannot be saved (a damaged settings file) changes
+/// nothing: the notice says why and the chosen font stays.
+pub(super) fn the_font_can_go_back_to_the_system_font(dir: &Path) {
+    const CHOSEN: &str = "DejaVu Sans Mono 13";
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let open_terminal = terminal_of(&main.view.selected_page().expect("a tab")).expect("a shell");
+    let system = family_of(&open_terminal);
+    assert_ne!(system, "DejaVu Sans Mono");
+
+    let dialog = open(&app, &ctx, &main);
+    let reset = preferences::font_reset_button(&dialog);
+    assert!(
+        !reset.is_visible(),
+        "nothing to reset while no font is chosen"
+    );
+    font_button(&dialog).set_font_desc(&pango::FontDescription::from_string(CHOSEN));
+    pump_for(Duration::from_millis(100));
+    assert!(reset.is_visible(), "a chosen font can be reset");
+    assert!(
+        reset.is_ancestor(&action_row(&group(&dialog, "Terminal"), "Font")),
+        "on the Font row"
+    );
+    assert_eq!(reset.tooltip_text().as_deref(), Some("Use the System Font"));
+
+    // A reset that cannot be saved changes nothing.
+    let damaged = damage_settings(&ctx);
+    let shown = ctx.notice.delivered();
+    reset.emit_clicked();
+    pump_for(Duration::from_millis(100));
+    assert_notice_starts(&ctx, "Could not save the preferences: ");
+    assert_eq!(ctx.notice.delivered(), shown + 1, "one notice");
+    assert_eq!(
+        family_of(&open_terminal),
+        "DejaVu Sans Mono",
+        "still chosen"
+    );
+    assert_eq!(
+        font_button(&dialog)
+            .font_desc()
+            .map(|f| f.to_str().to_string()),
+        Some(CHOSEN.to_owned()),
+        "the button still shows the chosen font"
+    );
+    assert!(reset.is_visible(), "still something to reset");
+    assert_eq!(
+        fs::read_to_string(&ctx.settings_path).unwrap(),
+        damaged,
+        "the damaged file is left as it is"
+    );
+
+    // Repaired, the reset goes through.
+    fs::remove_file(&ctx.settings_path).expect("remove the damaged file");
+    settings::update(&ctx.settings_path, |s| s.font = Some(CHOSEN.to_owned()))
+        .expect("write the settings");
+    reset.emit_clicked();
+    pump_for(Duration::from_millis(100));
+    assert_eq!(family_of(&open_terminal), system, "an open terminal");
+    let new_tab = open_local_shell(&main.view, zoom::DEFAULT, None);
+    assert_eq!(family_of(&new_tab), system, "a new tab");
+    assert_eq!(ctx.settings().font, None, "the setting is removed");
+    let shown = font_button(&dialog).font_desc().expect("a font is shown");
+    assert!(
+        shown
+            .family()
+            .is_some_and(|f| f.eq_ignore_ascii_case("monospace")),
+        "the button shows the system monospace font: {shown}"
+    );
+    assert!(!reset.is_visible(), "nothing left to reset");
+
+    // Choosing a font afterwards is saved as before.
+    font_button(&dialog).set_font_desc(&pango::FontDescription::from_string(CHOSEN));
+    pump_for(Duration::from_millis(100));
+    assert_eq!(ctx.settings().font.as_deref(), Some(CHOSEN), "saved");
+    assert_eq!(family_of(&new_tab), "DejaVu Sans Mono");
+    assert!(reset.is_visible());
+
+    close_dialog(&main, &dialog);
+    terminal_tab::apply_font(None);
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
 /// A transcript spec for a test session saving into `dir`.
 fn spec(ctx: &AppContext, dir: &Path) -> TranscriptSpec {
     TranscriptSpec {

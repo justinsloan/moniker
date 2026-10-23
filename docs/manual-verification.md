@@ -171,3 +171,7 @@ Use the release build (`cargo build --release --workspace`, then `target/release
 
 109. `bash scripts/build-deb.sh` makes `target/debian/moniker_0.4.0_amd64.deb` and `moniker-server_0.4.0_amd64.deb`. `dpkg-deb -f` of each shows `Maintainer: Justin Sloan <your address>` and `Homepage: https://github.com/justinsloan/moniker` and, for `moniker`, `Depends` with `libadwaita-1-0 (>= 1.9)` and `libvte-2.91-gtk4-0 (>= 0.76)`; `dpkg-deb -c` of `moniker` lists `/usr/share/metainfo/org.moniker.Moniker.metainfo.xml`.
 110. After installing the packages yourself: open Moniker's page in App Center (or GNOME Software, Installed): the publisher or developer reads "Justin Sloan". `apt show moniker` shows the Maintainer as Justin Sloan. Opening the .deb file itself in App Center shows only the package name and no publisher: that is App Center's own page and no package can change it.
+
+## Alpha 5: going back to the system font
+
+111. In Preferences, with no font chosen (a fresh config), the Font row shows the system monospace font and no reset button. Choose another font: a reset button (an undo arrow, tooltip "Use the System Font") appears beside the font button. Press it: every open terminal, in every window, goes back to the system monospace font at once, a new tab uses it, the font button shows it again, the reset button goes away and the keyboard focus is on the font button. In `~/.config/moniker/gui-settings.json`, `font` is `null`, and after a restart the terminals still use the system font.
