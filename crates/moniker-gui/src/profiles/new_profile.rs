@@ -4,7 +4,7 @@
 //! page: name, host and username are required before anything validates. So
 //! ＋ asks for those (plus port and an optional password) in a small dialog,
 //! creates the profile with [`form::create_profile`] (password to the keyring
-//! first) on the keyring worker ([`keyring::run`], so a locked keyring never
+//! first) on the keyring worker ([`keyring::change`], so a locked keyring never
 //! freezes the window), and hands the new id back so the window selects it;
 //! everything else is edited on its page. While the profile is being created,
 //! Create is off. Errors are shown inside the dialog, which stays open so they
@@ -175,6 +175,13 @@ pub(super) fn show(
     let weak = Rc::downgrade(&fields);
     let ctx = Rc::clone(ctx);
     let on_created = Rc::new(on_created);
+    // Whether the dialog is still up: a creation that ends after Cancel must
+    // not close it again.
+    let open = Rc::new(std::cell::Cell::new(true));
+    dialog.connect_closed({
+        let open = Rc::clone(&open);
+        move |_| open.set(false)
+    });
     fields.create.connect_clicked(glib::clone!(
         #[weak]
         dialog,
@@ -195,7 +202,8 @@ pub(super) fn show(
             let ctx = Rc::clone(&ctx);
             let on_created = Rc::clone(&on_created);
             let dialog = dialog.clone();
-            keyring::run(
+            let open = Rc::clone(&open);
+            keyring::change(
                 &ctx.clone(),
                 move |secrets| {
                     let store = keyring::own_store(&store_path)?;
@@ -212,18 +220,22 @@ pub(super) fn show(
                     });
                     match created {
                         Ok(id) => {
-                            dialog.close();
+                            if open.get() {
+                                dialog.close();
+                            }
                             ctx.profiles_changed();
                             on_created(&id);
                         }
-                        Err(message) => {
-                            if let Some(fields) = weak.upgrade() {
+                        Err(message) => match weak.upgrade().filter(|_| open.get()) {
+                            Some(fields) => {
                                 fields.busy.set(false);
                                 fields.update_create();
                                 fields.error.set_label(&message);
                                 fields.error.set_visible(true);
                             }
-                        }
+                            // Closed meanwhile: the failure is still told.
+                            None => ctx.notice.show(&message),
+                        },
                     }
                 },
             );

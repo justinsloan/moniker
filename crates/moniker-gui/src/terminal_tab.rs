@@ -1368,7 +1368,13 @@ fn begin_session(page: &adw::TabPage, title: TabTitle) -> (TabHolder, Terminal) 
     let terminal = new_terminal();
     terminal.set_font_scale(holder.scale().get());
     holder.append(&terminal);
-    terminal.grab_focus();
+    // Only into the tab the person is looking at: a session that starts late
+    // (it waited for the keyring) must not take the keyboard from another tab,
+    // whose keys would then go to this host, or from a dialog. The tab view
+    // gives it the focus when its tab is selected.
+    if in_front(page) {
+        terminal.grab_focus();
+    }
     // Connected first, so it is known before anything else hears of the exit.
     terminal.connect_child_exited(glib::clone!(
         #[weak]
@@ -1381,6 +1387,20 @@ fn begin_session(page: &adw::TabPage, title: TabTitle) -> (TabHolder, Terminal) 
         sync_window_actions(&view);
     }
     (holder, terminal)
+}
+
+/// Whether `page` is the selected tab of its view, in a window that shows no
+/// dialog.
+fn in_front(page: &adw::TabPage) -> bool {
+    let Some(view) = view_of(page) else {
+        return false;
+    };
+    if view.selected_page().as_ref() != Some(page) {
+        return false;
+    }
+    view.root()
+        .and_downcast::<adw::ApplicationWindow>()
+        .is_none_or(|window| window.visible_dialog().is_none())
 }
 
 /// Start `argv` (program first) in `terminal`, in `dir` if given, adding `envv`
@@ -1641,7 +1661,7 @@ pub fn open_profile(
 /// [`open_profile`] in the page `page`, which [`new_holder_page`] made.
 ///
 /// Whether a password is stored is asked on the keyring worker
-/// (`crate::keyring::run`), never on the main thread: a locked keyring waits
+/// (`crate::keyring::read`), never on the main thread: a locked keyring waits
 /// for its unlock prompt, and the window must not freeze meanwhile. Until the
 /// answer is back the tab waits ([`show_waiting`]); then the session starts,
 /// unless the tab was closed meanwhile (its window too), which starts nothing.
@@ -1668,7 +1688,7 @@ pub(crate) fn start_profile(
     let profile = profile.clone();
     let page = page.downgrade();
     let ctx_done = Rc::clone(ctx);
-    crate::keyring::run(
+    crate::keyring::read(
         ctx,
         move |secrets| has_stored_password(&asked, secrets),
         move |has_password| {

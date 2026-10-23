@@ -22,7 +22,8 @@ use moniker_core::store::ProfileStore;
 use zeroize::Zeroizing;
 
 use super::{
-    MARKUP_NAME, all_widgets, button_labeled, find_widget, make_helper, pump_for, pump_until,
+    HeldKeyring, MARKUP_NAME, all_widgets, button_labeled, find_widget, make_helper, pump_for,
+    pump_until,
 };
 use crate::context::AppContext;
 use crate::profiles::{self, ConnectFn};
@@ -81,6 +82,16 @@ struct Setup {
 impl Setup {
     /// Open the window over a store holding `profiles`.
     fn open(dir: &Path, profiles: &[Profile]) -> Setup {
+        Setup::open_with(dir, profiles, |secrets| secrets)
+    }
+
+    /// [`Setup::open`], with the context's keyring made by `keyring` around the
+    /// counting one (which the test keeps reading without counting).
+    fn open_with(
+        dir: &Path,
+        profiles: &[Profile],
+        keyring: impl FnOnce(Arc<dyn SecretStore>) -> Arc<dyn SecretStore>,
+    ) -> Setup {
         fs::create_dir_all(dir).expect("dir");
         let mut store = ProfileStore::open(&dir.join("profiles.json")).expect("store");
         for p in profiles {
@@ -89,7 +100,7 @@ impl Setup {
         let secrets = Arc::new(CountingSecrets::default());
         let ctx = Rc::new(AppContext::with_parts(
             store,
-            Arc::clone(&secrets) as Arc<dyn SecretStore>,
+            keyring(Arc::clone(&secrets) as Arc<dyn SecretStore>),
             make_helper(dir),
         ));
         let app = adw::Application::builder()
@@ -1392,5 +1403,71 @@ pub(super) fn the_profile_window_uses_the_keyring_off_the_main_thread(dir: &Path
         s.on_disk(&nas).is_none() && s.secrets.password(&nas).is_none()
     });
     still_free("deleting a profile");
+    s.close();
+}
+
+/// What the keyring worker says comes through even when the page that asked
+/// has gone (issue #4): a password the keyring refused to store is told,
+/// although the person moved on to another profile while it waited. And
+/// deleting a profile is one step on the worker: a password saved for it while
+/// the deletion waits for the keyring is not kept for a profile that is gone.
+pub(super) fn the_keyring_workers_answers_are_never_lost(dir: &Path) {
+    let p = web();
+    let q = Profile::new("nas", "nas.lan", "admin");
+    let held = Rc::new(std::cell::RefCell::new(None::<Arc<HeldKeyring>>));
+    let s = Setup::open_with(dir, &[p.clone(), q.clone()], |inner| {
+        let keyring = Arc::new(HeldKeyring::new(inner));
+        held.replace(Some(Arc::clone(&keyring)));
+        keyring
+    });
+    let keyring = held.borrow().clone().expect("the held keyring");
+
+    // A refused password, told after the page went.
+    keyring.hold();
+    keyring.refuse_changes(true);
+    s.select(&p.id);
+    let password = s.entry("Password");
+    password.grab_focus();
+    password.set_text("pw-refused");
+    apply(&password);
+    s.select(&q.id);
+    keyring.release();
+    pump_until("the refusal to be told", || {
+        s.ctx
+            .notice
+            .last_text()
+            .is_some_and(|t| t.starts_with("Could not store the password in the keyring"))
+    });
+    assert_eq!(s.secrets.password(&p.id), None);
+    keyring.refuse_changes(false);
+
+    // A password saved while the profile is being deleted.
+    keyring.hold();
+    s.select(&p.id);
+    button_labeled(&s.window, "Delete Profile")
+        .expect("the delete button")
+        .emit_clicked();
+    pump_until("the delete confirmation", || {
+        s.window.visible_dialog().is_some()
+    });
+    let dialog = s.window.visible_dialog().expect("the delete confirmation");
+    button_labeled(&dialog, "Delete")
+        .expect("the dialog's Delete button")
+        .emit_clicked();
+    pump_until("the confirmation to close", || {
+        s.window.visible_dialog().is_none()
+    });
+    let password = s.entry("Password");
+    password.grab_focus();
+    password.set_text("pw-late");
+    apply(&password);
+    keyring.release();
+    pump_until("the keyring calls to come back", || keyring::pending() == 0);
+    assert!(s.on_disk(&p.id).is_none(), "the profile is deleted");
+    assert_eq!(
+        s.secrets.password(&p.id),
+        None,
+        "no password left for a profile that is gone"
+    );
     s.close();
 }

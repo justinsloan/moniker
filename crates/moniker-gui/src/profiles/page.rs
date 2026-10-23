@@ -16,7 +16,7 @@
 //! stored. A Secret Service call on every selection could prompt with a
 //! locked keyring. What it does write there (a new password, removing the
 //! stored one, deleting the profile's) goes to the keyring worker
-//! ([`keyring::run`]), never the main thread, and the outcome is shown when it
+//! ([`keyring::change`]), never the main thread, and the outcome is shown when it
 //! is back.
 //!
 //! Profile data (names, hosts, user names, sequence names, key-file paths) is
@@ -394,7 +394,7 @@ impl Inner {
         let id = self.id.clone();
         let ctx = Rc::clone(&self.ctx);
         let weak = Rc::downgrade(self);
-        keyring::run(
+        keyring::change(
             &self.ctx,
             move |secrets| {
                 let store = keyring::own_store(&store_path)?;
@@ -412,6 +412,11 @@ impl Inner {
                     ctx.profiles_changed();
                 }
                 let Some(inner) = weak.upgrade() else {
+                    // The page has gone (the person moved on while the
+                    // keyring waited): a failure is still told.
+                    if let Err(message) = result {
+                        ctx.notice.show(&message);
+                    }
                     return;
                 };
                 inner.password.set_sensitive(true);
@@ -646,7 +651,7 @@ impl Inner {
         let ctx = Rc::clone(&self.ctx);
         // Held for the message: the page may have gone by then.
         let near = self.password.clone();
-        keyring::run(
+        keyring::change(
             &self.ctx,
             move |secrets| form::remove_password(secrets, &id),
             move |result| {
@@ -696,39 +701,41 @@ impl Inner {
         dialog.present(Some(&self.name.row));
     }
 
-    /// Delete the password first (on the keyring worker), then, once that is
-    /// back, the profile, so a profile that is gone never leaves a password
-    /// behind. A failure is shown and nothing further is done.
+    /// Delete the password, then the profile, in one call on the keyring
+    /// worker, so a profile that is gone never leaves a password behind: a
+    /// password saved for it meanwhile (queued after this call) finds the
+    /// profile gone and is not stored. A failure is shown and nothing further
+    /// is done.
     fn delete(&self) {
         // Hold on to a widget for the messages: refreshing may drop this page.
         let near = self.key_file.clone();
         let ctx = Rc::clone(&self.ctx);
         let id = self.id.clone();
-        let key = password_key(&self.id);
-        keyring::run(
+        let store_path = self.ctx.store.borrow().path().to_path_buf();
+        keyring::change(
             &self.ctx,
-            move |secrets| secrets.delete(&key).map_err(|err| err.to_string()),
+            move |secrets| {
+                secrets.delete(&password_key(&id)).map_err(|err| {
+                    format!(
+                        "Could not delete the stored password: {err}. The profile was not \
+                         deleted."
+                    )
+                })?;
+                let removed =
+                    |err: String| format!("{err} Its stored password has already been removed.");
+                let store = keyring::own_store(&store_path).map_err(removed)?;
+                let deleted = store.borrow_mut().delete(&id);
+                deleted.map_err(|err| removed(format!("Could not delete the profile: {err}.")))
+            },
             move |result| {
-                let result = result.unwrap_or_else(|| Err(keyring::STOPPED.to_owned()));
-                if let Err(err) = result {
-                    ctx.notice.show_near(
-                        &near,
-                        &format!(
-                            "Could not delete the stored password: {err}. The profile was not \
-                             deleted."
-                        ),
-                    );
-                    return;
-                }
-                let result = ctx.store.borrow_mut().delete(&id);
-                if let Err(err) = result {
-                    ctx.notice.show_near(
-                        &near,
-                        &format!(
-                            "Could not delete the profile: {err}. Its stored password has \
-                             already been removed."
-                        ),
-                    );
+                let result = result.unwrap_or_else(|| {
+                    Err(format!(
+                        "Could not delete the profile: {}.",
+                        keyring::STOPPED
+                    ))
+                });
+                if let Err(message) = result {
+                    ctx.notice.show_near(&near, &message);
                 }
                 ctx.profiles_changed();
             },

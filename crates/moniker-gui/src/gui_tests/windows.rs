@@ -12,7 +12,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -20,16 +20,16 @@ use gtk::{gdk, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::profile::{Profile, StartupSequence};
-use moniker_core::secrets::{MemorySecretStore, SecretError, SecretStore, password_key};
+use moniker_core::secrets::{MemorySecretStore, SecretStore, password_key};
 use moniker_core::store::ProfileStore;
 use moniker_core::transcript::default_dir;
 use vte4::prelude::*;
 
 use super::main_window::{choices_parts, ctx_with, ctx_with_secrets, press_key, test_app};
 use super::{
-    MARKUP_NAME, all_widgets, close_popover, fake_command, fake_ssh, files_in, find_widget,
-    labels_in, menu_button, open_popover, press_enter_in, profile, pump_for, pump_until,
-    wait_for_session, wait_for_text,
+    HeldKeyring, MARKUP_NAME, all_widgets, close_popover, fake_command, fake_ssh, files_in,
+    find_widget, labels_in, menu_button, open_popover, press_enter_in, profile, pump_for,
+    pump_until, wait_for_session, wait_for_text,
 };
 use crate::context::{AppContext, Notice};
 use crate::terminal_tab::{self, TranscriptSpec, open_command, tab_title, terminal_of};
@@ -1171,67 +1171,21 @@ pub(super) fn zoom_shortcuts_exist() {
     }
 }
 
-/// An in-memory keyring whose reads wait while it is held: a locked keyring
-/// waiting for its unlock prompt.
-#[derive(Default)]
-struct HeldKeyring {
-    inner: MemorySecretStore,
-    held: Mutex<bool>,
-    released: Condvar,
-}
-
-impl HeldKeyring {
-    fn hold(&self) {
-        *self.held.lock().unwrap() = true;
-    }
-
-    fn release(&self) {
-        *self.held.lock().unwrap() = false;
-        self.released.notify_all();
-    }
-}
-
-impl SecretStore for HeldKeyring {
-    fn get(&self, key: &str) -> Result<Option<zeroize::Zeroizing<String>>, SecretError> {
-        let mut held = self.held.lock().unwrap();
-        while *held {
-            held = self.released.wait(held).unwrap();
-        }
-        drop(held);
-        self.inner.get(key)
-    }
-    fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
-        self.inner.set(key, value)
-    }
-    fn delete(&self, key: &str) -> Result<(), SecretError> {
-        self.inner.delete(key)
-    }
-    fn probe(&self) -> Result<(), SecretError> {
-        self.inner.probe()
-    }
-}
-
 /// Connecting asks the keyring whether a password is stored on the keyring
 /// worker, never on the main thread (issue #4). While the keyring has not
 /// answered (locked, say) the tab waits without a terminal and the window
-/// keeps running; a second pick in the same tab starts nothing more, and a tab
-/// closed meanwhile starts nothing at all.
+/// keeps running; a second pick in the same tab asks nothing more; a session
+/// that starts after the person moved to another tab does not take the
+/// keyboard focus from it (keys typed there must not reach the other host);
+/// and a tab closed meanwhile starts nothing at all.
 pub(super) fn connecting_waits_for_the_keyring_off_the_main_thread(bin: &Path, dir: &Path) {
-    let started = dir.join("started");
-    let fake = fake_ssh(
-        bin,
-        "keyring-wait",
-        &format!(
-            "echo started >> '{}'\necho FAKE-END\nexec sleep 600",
-            started.display()
-        ),
-    );
+    let fake = fake_ssh(bin, "keyring-wait", "echo FAKE-END\nexec sleep 600");
     let web = profile(&[]);
-    let keyring = Arc::new(HeldKeyring::default());
-    keyring
-        .inner
+    let seeded = Arc::new(MemorySecretStore::default());
+    seeded
         .set(&password_key(&web.id), "pw-web")
         .expect("seed the password");
+    let keyring = Arc::new(HeldKeyring::new(seeded));
     let ctx = ctx_with_secrets(dir, std::slice::from_ref(&web), Arc::clone(&keyring) as _);
     let app = test_app();
     let main = main_window(&app, &ctx);
@@ -1240,7 +1194,6 @@ pub(super) fn connecting_waits_for_the_keyring_off_the_main_thread(bin: &Path, d
 
     keyring.hold();
     let page = new_tab::open(&main.view, &ctx);
-    pump_for(Duration::from_millis(200));
     let list = list_in(&page).expect("the list");
     list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
     // The main loop runs on while the keyring is held.
@@ -1258,26 +1211,33 @@ pub(super) fn connecting_waits_for_the_keyring_off_the_main_thread(bin: &Path, d
         list_in(&page).is_none(),
         "the list is gone: the tab is taken"
     );
+    assert_eq!(page.title(), tab_title(&web), "named at once");
+    let asked = keyring::pending();
     list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
+    assert_eq!(keyring::pending(), asked, "a second pick asks nothing more");
+
+    // The person moves on to another tab and types there meanwhile.
+    let other = terminal_tab::open_local_shell(&main.view, zoom::DEFAULT, None);
+    pump_until("the other tab's shell to have the focus", || {
+        other.has_focus()
+    });
     keyring.release();
-    pump_until("the session", || terminal_of(&page).is_some());
     let terminal = wait_for_session(&page);
+    pump_until("the keyring calls to come back", || keyring::pending() == 0);
+    assert!(
+        other.has_focus(),
+        "the session that started late took the focus from the tab in use"
+    );
+    assert!(!terminal.has_focus());
     wait_for_text(&terminal, "FAKE-END");
     let text = terminal_tab::terminal_text(&terminal);
     assert!(
         text.contains(&format!("SSH_ASKPASS={}", ctx.askpass_path.display())),
         "the stored password is used: {text}"
     );
-    pump_until("the keyring calls to come back", || keyring::pending() == 0);
-    pump_for(Duration::from_millis(200));
-    assert_eq!(
-        fs::read_to_string(&started)
-            .unwrap_or_default()
-            .lines()
-            .count(),
-        1,
-        "one session for two picks"
-    );
+    // Back on its tab, the session has the focus.
+    main.view.set_selected_page(&page);
+    pump_until("the session to have the focus", || terminal.has_focus());
     assert_eq!(
         keyring::main_thread_calls(),
         before,
@@ -1287,7 +1247,6 @@ pub(super) fn connecting_waits_for_the_keyring_off_the_main_thread(bin: &Path, d
     // A tab closed while the keyring is held starts nothing once it answers.
     keyring.hold();
     let page = new_tab::open(&main.view, &ctx);
-    pump_for(Duration::from_millis(200));
     let list = list_in(&page).expect("the list");
     list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
     let open = main.view.n_pages();
@@ -1295,13 +1254,8 @@ pub(super) fn connecting_waits_for_the_keyring_off_the_main_thread(bin: &Path, d
     pump_until("the tab to close", || main.view.n_pages() == open - 1);
     keyring.release();
     pump_until("the keyring calls to come back", || keyring::pending() == 0);
-    pump_for(Duration::from_millis(300));
-    assert_eq!(
-        fs::read_to_string(&started)
-            .unwrap_or_default()
-            .lines()
-            .count(),
-        1,
+    assert!(
+        terminal_of(&page).is_none(),
         "nothing started for the closed tab"
     );
 

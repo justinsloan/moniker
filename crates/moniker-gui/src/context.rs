@@ -90,7 +90,7 @@ fn host_check() -> crate::hosts::Check {
 pub struct AppContext {
     pub store: RefCell<ProfileStore>,
     /// The keyring. The GUI calls it only on the keyring worker
-    /// (`crate::keyring::run`), never on the main thread.
+    /// (`crate::keyring::read` and `change`), never on the main thread.
     pub secrets: Arc<dyn SecretStore>,
     /// The `moniker-askpass` helper that sits next to this executable.
     pub askpass_path: PathBuf,

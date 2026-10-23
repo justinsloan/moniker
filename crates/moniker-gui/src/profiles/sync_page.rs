@@ -19,7 +19,7 @@
 //! text is plain (Pango markup off): profile names come from other machines.
 //!
 //! The page's keyring calls (whether a key is stored, saving one) run on the
-//! keyring worker ([`keyring::run`]), never the main thread; until the answer
+//! keyring worker ([`keyring::read`], [`keyring::change`]), never the main thread; until the answer
 //! is back the status line says the keyring is being read and Sync waits.
 
 use std::cell::{Cell, RefCell};
@@ -75,6 +75,8 @@ pub(crate) struct SyncPage {
     /// Profile id of each `machine` entry, by position.
     ids: RefCell<Vec<String>>,
     key_set: Cell<bool>,
+    /// The keyring has said whether a key is stored, once.
+    key_known: Cell<bool>,
     /// The switch is being set to what the settings file says, not by the
     /// person.
     loading: Cell<bool>,
@@ -166,6 +168,7 @@ impl SyncPage {
             result,
             ids: RefCell::new(Vec::new()),
             key_set: Cell::new(false),
+            key_known: Cell::new(false),
             loading: Cell::new(false),
         });
         page.wire();
@@ -267,13 +270,14 @@ impl SyncPage {
             self.key_status.set_label(sync::KEY_CHECKING);
         }
         let weak = Rc::downgrade(self);
-        keyring::run(&self.ctx, sync::key_state, move |state| {
+        keyring::read(&self.ctx, sync::key_state, move |state| {
             let Some(page) = weak.upgrade() else {
                 return;
             };
             let state = state.unwrap_or_else(|| KeyState::Unreadable(keyring::STOPPED.to_owned()));
             page.key_status.set_label(&sync::key_status_text(&state));
             page.key_set.set(state == KeyState::Set);
+            page.key_known.set(true);
             page.refresh_controls();
         });
     }
@@ -357,16 +361,22 @@ impl SyncPage {
         }
     }
 
-    /// Enable or disable the controls and show why Sync is unavailable.
+    /// Enable or disable the controls and show why Sync is unavailable. Until
+    /// the keyring has said whether a key is stored, nothing is promised: no
+    /// hint, and Sync waits; it waits too while a new key is being saved.
     fn refresh_controls(&self) {
         let profiles = self.ids.borrow().len();
-        let hint = sync::sync_hint(self.key_set.get(), profiles);
+        let known = self.key_known.get();
+        let hint = known
+            .then(|| sync::sync_hint(self.key_set.get(), profiles))
+            .flatten();
         self.hint.set_label(hint.unwrap_or(""));
         self.hint.set_visible(hint.is_some());
+        let ready = known && hint.is_none() && self.key_entry.is_sensitive();
         let idle = !self.ctx.sync_running.get();
         // The whole "Other machine" part waits for what the hint asks for.
-        self.machine.set_sensitive(idle && hint.is_none());
-        self.sync_button.set_sensitive(idle && hint.is_none());
+        self.machine.set_sensitive(idle && ready);
+        self.sync_button.set_sensitive(idle && ready);
     }
 
     /// Any sync of the app started or ended.
@@ -404,22 +414,29 @@ impl SyncPage {
             self.refresh_key_status();
             return;
         }
+        // Sync waits too: it would use the key being replaced.
         self.key_entry.set_sensitive(false);
+        self.refresh_controls();
         let weak = Rc::downgrade(self);
-        keyring::run(
+        let ctx = Rc::clone(&self.ctx);
+        keyring::change(
             &self.ctx,
             move |secrets| sync::save_sync_key(secrets, &typed),
             move |saved| {
-                let Some(page) = weak.upgrade() else {
-                    return;
-                };
-                page.key_entry.set_sensitive(true);
                 let saved = saved.unwrap_or_else(|| {
                     Err(format!(
                         "Could not save the sync key: {}.",
                         keyring::STOPPED
                     ))
                 });
+                let Some(page) = weak.upgrade() else {
+                    // The page has gone: a failure is still told.
+                    if let Err(message) = saved {
+                        ctx.notice.show(&message);
+                    }
+                    return;
+                };
+                page.key_entry.set_sensitive(true);
                 match saved {
                     Ok(()) => {
                         page.clear_secret();

@@ -3,10 +3,10 @@
 //! A Secret Service call can take long. A locked keyring shows its unlock
 //! prompt and waits for the person, and a slow or stuck service answers late.
 //! On the main thread that would freeze every window and stop every terminal
-//! from redrawing, so every keyring call of the GUI goes through [`run`]: the
-//! call runs on one worker thread with the app's secret store, and what it
-//! returns comes back to a callback on the main thread, from the GLib main
-//! loop. (A sync's worker reads the keyring on its own thread: `crate::sync`.)
+//! from redrawing, so every keyring call of the GUI goes through [`read`] or
+//! [`change`]: the call runs on one worker thread with the app's secret store,
+//! and what it returns comes back to a callback on the main thread, from the
+//! GLib main loop. (A sync's worker reads the keyring on its own thread: `crate::sync`.)
 //!
 //! * **One thread, in order.** The calls run one after another, in the order
 //!   they were asked for: a password saved and then removed ends up removed,
@@ -18,9 +18,13 @@
 //!   locked read-modify-writes (`moniker_core::store`), so this handle and the
 //!   main thread's never lose each other's changes; the callback reloads the
 //!   main thread's snapshot (`AppContext::profiles_changed`).
-//! * **The app waits for a call under way.** It is held until the callback has
-//!   run, so closing the last window does not cut a save short between the
-//!   keyring and the file, or between a deleted password and its profile.
+//! * **The app waits for a change under way** ([`change`], not [`read`]). It is
+//!   held until the callback has run, so closing the last window does not cut
+//!   a save short between the keyring and the file. A read stuck at an unlock
+//!   prompt does not keep a windowless process alive.
+//! * **A callback still says what went wrong when the page that asked has
+//!   gone** (the person moved on while the keyring waited): its message goes
+//!   to the window's notifications instead.
 //!
 //! The values a call carries (a typed password) are `Zeroizing`, moved into
 //! the call and wiped when it drops; nothing is logged.
@@ -55,17 +59,37 @@ thread_local! {
     static PENDING: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Run `work` with the app's secret store on the keyring worker (module docs),
-/// then `done` on the main thread with what it returned, or with `None` if it
-/// did not come back (the worker could not be started, or `work` panicked;
-/// [`STOPPED`] says so). Never blocks the caller.
+/// Run `work`, which only reads the keyring, with the app's secret store on
+/// the keyring worker (module docs), then `done` on the main thread with what
+/// it returned, or with `None` if it did not come back (the worker could not
+/// be started, or `work` panicked; [`STOPPED`] says so). Never blocks the
+/// caller.
 ///
 /// `done` runs from the main loop, never inside this call, even when the work
 /// could not be queued. Must be called from the thread that runs the main loop.
-pub(crate) fn run<R: Send + 'static>(
+pub(crate) fn read<R: Send + 'static>(
     ctx: &AppContext,
     work: impl FnOnce(&dyn SecretStore) -> R + Send + 'static,
     done: impl FnOnce(Option<R>) + 'static,
+) {
+    run(ctx, work, done, false);
+}
+
+/// [`read`] for `work` that changes the keyring (and perhaps the profile file):
+/// the application is held until `done` has run.
+pub(crate) fn change<R: Send + 'static>(
+    ctx: &AppContext,
+    work: impl FnOnce(&dyn SecretStore) -> R + Send + 'static,
+    done: impl FnOnce(Option<R>) + 'static,
+) {
+    run(ctx, work, done, true);
+}
+
+fn run<R: Send + 'static>(
+    ctx: &AppContext,
+    work: impl FnOnce(&dyn SecretStore) -> R + Send + 'static,
+    done: impl FnOnce(Option<R>) + 'static,
+    hold: bool,
 ) {
     let secrets = Arc::clone(&ctx.secrets);
     let (sender, received) = async_channel::bounded::<R>(1);
@@ -74,7 +98,9 @@ pub(crate) fn run<R: Send + 'static>(
         let _ = sender.send_blocking(work(secrets.as_ref()));
     });
     // Dropped once `done` has run (module docs).
-    let hold = gio::Application::default().map(|app| app.hold());
+    let hold = gio::Application::default()
+        .filter(|_| hold)
+        .map(|app| app.hold());
     PENDING.set(PENDING.get() + 1);
     // A job that cannot be queued is dropped here, with its sender, so the
     // receive below ends at once with nothing.

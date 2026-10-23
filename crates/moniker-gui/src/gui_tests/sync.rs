@@ -25,8 +25,8 @@ use zeroize::Zeroizing;
 
 use super::main_window::test_app;
 use super::{
-    WAIT, all_widgets, button_labeled, find_widget, labels_in, make_helper, pump_for, pump_until,
-    widgets_of_type,
+    HeldKeyring, WAIT, all_widgets, button_labeled, find_widget, labels_in, make_helper, pump_for,
+    pump_until, widgets_of_type,
 };
 use crate::context::AppContext;
 use crate::profiles::{self, sync_page};
@@ -1322,4 +1322,56 @@ pub(super) fn the_sync_page_uses_the_keyring_off_the_main_thread(dir: &Path) {
         "saving the sync key called the keyring on the main thread"
     );
     rig.finish();
+}
+
+/// While the sync page waits for the keyring it promises nothing: until the
+/// first answer the status says the keyring is being read, no hint says to set
+/// a key, and Sync is off; while a new key is being saved, Sync is off too, so
+/// that no sync starts with the key being replaced.
+pub(super) fn the_sync_page_waits_for_the_keyring(dir: &Path) {
+    fs::create_dir_all(dir).expect("dir");
+    let mut store = ProfileStore::open(&dir.join("profiles.json")).expect("open the store");
+    let profile = Profile::new(NAME, "app.example.test", "alice");
+    store.upsert(profile).expect("save the profile");
+    let seeded = Arc::new(MemorySecretStore::default());
+    seeded
+        .set(SYNC_PASSPHRASE_KEY, SYNC_KEY)
+        .expect("set the key");
+    let keyring = Arc::new(HeldKeyring::new(seeded));
+    let ctx = Rc::new(AppContext::with_parts(
+        store,
+        Arc::clone(&keyring) as Arc<dyn SecretStore>,
+        make_helper(dir),
+    ));
+    let app = test_app();
+
+    keyring.hold();
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    assert_eq!(page.key_status.label(), sync::KEY_CHECKING);
+    assert!(
+        !page.hint.is_visible(),
+        "no hint before the keyring answers"
+    );
+    assert!(!page.sync_button.is_sensitive());
+    keyring.release();
+    pump_until("the key's state", || {
+        page.key_status.label() == "Sync key: set"
+    });
+    assert!(page.sync_button.is_sensitive());
+
+    keyring.hold();
+    page.key_entry.set_text("a replacement sync key");
+    page.key_entry.emit_by_name::<()>("apply", &[]);
+    assert!(
+        !page.sync_button.is_sensitive(),
+        "no sync while the key is being saved"
+    );
+    keyring.release();
+    pump_until("the key to be saved", || {
+        page.key_message.label() == "Sync key saved."
+    });
+    pump_until("Sync to be on again", || page.sync_button.is_sensitive());
+    window.destroy();
+    pump_for(Duration::from_millis(100));
 }

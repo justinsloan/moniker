@@ -64,6 +64,93 @@ pub(crate) const MARKUP_NAME: &str = "<b>x</b> &amp;";
 /// How long to wait for the main loop to produce something.
 const WAIT: Duration = Duration::from_secs(15);
 
+/// A keyring around `inner` that can be held, as a locked keyring waiting for
+/// its unlock prompt is: every call waits until it is released. It can also
+/// refuse every change. It panics when called on the thread that made it (the
+/// main thread, in the window tests) instead of waiting there forever: the GUI
+/// must never call the keyring on the main thread (issue #4).
+pub(crate) struct HeldKeyring {
+    inner: Arc<dyn SecretStore>,
+    main: std::thread::ThreadId,
+    held: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+    refuse_changes: std::sync::atomic::AtomicBool,
+}
+
+impl HeldKeyring {
+    pub(crate) fn new(inner: Arc<dyn SecretStore>) -> HeldKeyring {
+        HeldKeyring {
+            inner,
+            main: std::thread::current().id(),
+            held: std::sync::Mutex::new(false),
+            released: std::sync::Condvar::new(),
+            refuse_changes: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn hold(&self) {
+        *self.held.lock().unwrap() = true;
+    }
+
+    pub(crate) fn release(&self) {
+        *self.held.lock().unwrap() = false;
+        self.released.notify_all();
+    }
+
+    /// Make every `set` and `delete` fail (or succeed again).
+    pub(crate) fn refuse_changes(&self, refuse: bool) {
+        self.refuse_changes
+            .store(refuse, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn wait(&self) {
+        assert_ne!(
+            std::thread::current().id(),
+            self.main,
+            "the keyring was called on the main thread"
+        );
+        let mut held = self.held.lock().unwrap();
+        while *held {
+            held = self.released.wait(held).unwrap();
+        }
+    }
+
+    fn change(&self) -> Result<(), moniker_core::secrets::SecretError> {
+        self.wait();
+        if self
+            .refuse_changes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(moniker_core::secrets::SecretError::Backend(
+                "the keyring is locked".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl SecretStore for HeldKeyring {
+    fn get(
+        &self,
+        key: &str,
+    ) -> Result<Option<zeroize::Zeroizing<String>>, moniker_core::secrets::SecretError> {
+        self.wait();
+        self.inner.get(key)
+    }
+    fn set(&self, key: &str, value: &str) -> Result<(), moniker_core::secrets::SecretError> {
+        self.change()?;
+        self.inner.set(key, value)
+    }
+    fn delete(&self, key: &str) -> Result<(), moniker_core::secrets::SecretError> {
+        self.change()?;
+        self.inner.delete(key)
+    }
+    fn probe(&self) -> Result<(), moniker_core::secrets::SecretError> {
+        self.wait();
+        self.inner.probe()
+    }
+}
+
 /// Run the main loop until `done` returns true; panic after [`WAIT`].
 fn pump_until(what: &str, mut done: impl FnMut() -> bool) {
     let context = glib::MainContext::default();
@@ -282,7 +369,9 @@ fn gui_integration() {
     hosts::turned_off_there_is_no_mark_and_no_ping(&tmp.path().join("p-off"));
     // Issue #4 first: they fail fast when a keyring call is on the main thread.
     sync::the_sync_page_uses_the_keyring_off_the_main_thread(&tmp.path().join("k-sync"));
+    sync::the_sync_page_waits_for_the_keyring(&tmp.path().join("k-sync-wait"));
     profiles::the_profile_window_uses_the_keyring_off_the_main_thread(&tmp.path().join("k-prof"));
+    profiles::the_keyring_workers_answers_are_never_lost(&tmp.path().join("k-lost"));
     windows::connecting_waits_for_the_keyring_off_the_main_thread(
         &bin,
         &tmp.path().join("k-connect"),
