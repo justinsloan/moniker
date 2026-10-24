@@ -1,10 +1,15 @@
 //! Terminal tabs: the local shell and SSH connections made from profiles.
 //!
 //! The tabs are the pages of an `adw::TabView`; [`setup_tab_view`] and
-//! [`setup_tab_bar`] wire one up. A page starts as a holder ([`new_holder_page`]),
-//! an empty box that later receives a chooser or a session: [`start_local_shell`],
-//! [`start_profile`] and [`start_command`] put a terminal in it, and the
-//! `open_*` functions are a new holder page followed by one of those.
+//! [`setup_tab_bar`] wire one up. A tab holds one pane or several
+//! (`crate::panes`), and each pane one session: its holder ([`PaneHolder`]), an
+//! empty box that later receives a chooser or a session. A page starts with one
+//! empty pane ([`new_holder_page`]); [`start_local_shell`], [`start_profile`]
+//! and [`start_command`] put a terminal in a pane, and the `open_*` functions
+//! are a new holder page followed by one of those. Everything below that is
+//! said of a tab holds for each pane of a tab with several: its own session,
+//! title, text size, transcript and askpass marker. The tab, the window's
+//! actions and the ☰ menu go by the tab's focused pane.
 //!
 //! [`open_profile`] turns a profile into an `ssh` command with
 //! `moniker_core::ssh::terminal_command` and runs it in a VTE tab. The command
@@ -13,10 +18,10 @@
 //! that must reach the remote shell untouched. VTE adds the entries to the
 //! inherited environment; it does not replace it.
 //!
-//! When a connection ends with a clean exit its tab closes. After a failure
-//! (non-zero status, or a signal) the tab stays open with a short note, so
-//! the `ssh` error message can still be read. Closing the last tab of a window
-//! closes the window.
+//! When a connection ends with a clean exit its pane closes ([`close_pane`]:
+//! the tab, when it was its only pane). After a failure (non-zero status, or a
+//! signal) the pane stays open with a short note, so the `ssh` error message
+//! can still be read. Closing the last tab of a window closes the window.
 //!
 //! # Stored passwords
 //!
@@ -43,7 +48,9 @@
 //! Ctrl+C and interrupt the program. Every terminal also has a right-click menu
 //! ([`terminal_menu`]): Paste is `win.paste`, and Copy is the terminal's own
 //! `term.copy`, which follows that terminal's selection, so the menu shows it
-//! insensitive without one.
+//! insensitive without one. Its Paste is the terminal's own `term.paste`, so a
+//! right click in a pane that does not have the focus pastes there, and its
+//! Split Right and Split Down split that pane.
 //!
 //! # Text size
 //!
@@ -126,9 +133,9 @@ use vte4::{Format, PtyFlags, Terminal};
 
 use crate::context::{AppContext, Notice};
 use crate::settings::{self, GuiSettings};
-use crate::{theme, zoom};
+use crate::{panes, theme, zoom};
 
-use self::holder::TabHolder;
+pub(crate) use self::holder::PaneHolder;
 
 /// Tab title for a profile whose name has nothing printable in it.
 const FALLBACK_TITLE: &str = "Session";
@@ -258,10 +265,10 @@ impl TabTitle {
     }
 }
 
-/// The widget that is the child of every page made by [`new_holder_page`]: an
-/// empty box that fills the page, which later receives a chooser or a terminal.
-/// It also keeps the page's [`TabTitle`] and text size, so they move with the page
-/// when it is dragged into another window.
+/// The holder of one pane's session: an empty box that fills the pane, which
+/// later receives a chooser or a terminal. It also keeps the pane's
+/// [`TabTitle`], text size and askpass marker, so they move with the pane when
+/// it or its tab is dragged elsewhere.
 mod holder {
     use std::cell::{Cell, RefCell};
 
@@ -275,7 +282,7 @@ mod holder {
     mod imp {
         use super::*;
 
-        pub struct TabHolder {
+        pub struct PaneHolder {
             pub(super) title: RefCell<TabTitle>,
             /// The session's one-time askpass marker, until its child exits.
             pub(super) marker: RefCell<Option<OneTimeMarker>>,
@@ -286,9 +293,9 @@ mod holder {
             pub(super) scale: Cell<f64>,
         }
 
-        impl Default for TabHolder {
+        impl Default for PaneHolder {
             fn default() -> Self {
-                TabHolder {
+                PaneHolder {
                     title: RefCell::new(TabTitle::remote(FALLBACK_TITLE.to_owned())),
                     marker: RefCell::new(None),
                     child_gone: Cell::new(false),
@@ -298,27 +305,27 @@ mod holder {
         }
 
         #[glib::object_subclass]
-        impl ObjectSubclass for TabHolder {
-            const NAME: &'static str = "MonikerTabHolder";
-            type Type = super::TabHolder;
+        impl ObjectSubclass for PaneHolder {
+            const NAME: &'static str = "MonikerPaneHolder";
+            type Type = super::PaneHolder;
             type ParentType = gtk::Box;
         }
 
-        impl ObjectImpl for TabHolder {}
-        impl WidgetImpl for TabHolder {}
-        impl BoxImpl for TabHolder {}
+        impl ObjectImpl for PaneHolder {}
+        impl WidgetImpl for PaneHolder {}
+        impl BoxImpl for PaneHolder {}
     }
 
     glib::wrapper! {
-        pub struct TabHolder(ObjectSubclass<imp::TabHolder>)
+        pub struct PaneHolder(ObjectSubclass<imp::PaneHolder>)
             @extends gtk::Box, gtk::Widget,
             @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget, gtk::Orientable;
     }
 
-    impl TabHolder {
-        /// An empty holder whose tab is titled `title`, at text size `scale`.
-        pub(super) fn new(title: TabTitle, scale: f64) -> TabHolder {
-            let holder: TabHolder = glib::Object::new();
+    impl PaneHolder {
+        /// An empty holder whose pane is titled `title`, at text size `scale`.
+        pub(crate) fn new(title: TabTitle, scale: f64) -> PaneHolder {
+            let holder: PaneHolder = glib::Object::new();
             holder.set_orientation(gtk::Orientation::Vertical);
             holder.set_hexpand(true);
             holder.set_vexpand(true);
@@ -327,8 +334,8 @@ mod holder {
             holder
         }
 
-        /// The tab's title, to read or change.
-        pub(super) fn title(&self) -> &RefCell<TabTitle> {
+        /// The pane's title, to read or change.
+        pub(crate) fn title(&self) -> &RefCell<TabTitle> {
             &self.imp().title
         }
 
@@ -342,63 +349,79 @@ mod holder {
             &self.imp().child_gone
         }
 
-        /// The tab's text size.
-        pub(super) fn scale(&self) -> &Cell<f64> {
+        /// The pane's text size.
+        pub(crate) fn scale(&self) -> &Cell<f64> {
             &self.imp().scale
         }
     }
 }
 
-/// The holder inside `page`, if the page was made by [`new_holder_page`].
-fn holder_of(page: &adw::TabPage) -> Option<TabHolder> {
-    page.child().downcast().ok()
+/// The holder of the focused pane of `page` (its only pane, in a tab with one),
+/// if the page was made by [`new_holder_page`].
+pub(crate) fn holder_of(page: &adw::TabPage) -> Option<PaneHolder> {
+    panes::layout_of_page(page)?.focused_holder()
 }
 
-/// The tab view that shows `page`, unless the page is not in one right now (it
-/// was closed, or it is being dragged between windows).
-fn view_of(page: &adw::TabPage) -> Option<adw::TabView> {
-    page.child()
-        .ancestor(adw::TabView::static_type())
-        .and_downcast()
+/// The terminal in `holder`, if its pane shows a session.
+pub(crate) fn terminal_in(holder: &PaneHolder) -> Option<Terminal> {
+    holder.first_child().and_downcast()
 }
 
-/// Show `title` as the title of `page`, with its tooltip. The tooltip is markup
-/// for GTK, so the title is escaped: a name with `<b>` in it stays literal.
-fn show_title(page: &adw::TabPage, title: &str) {
-    page.set_title(title);
-    page.set_tooltip(&glib::markup_escape_text(title));
+/// What the pane of `holder` is called now.
+pub(crate) fn shown_title(holder: &PaneHolder) -> String {
+    holder.title().borrow().shown().to_owned()
 }
 
-/// Apply the page's [`TabTitle`] to the tab.
-fn refresh_title(page: &adw::TabPage, holder: &TabHolder) {
-    show_title(page, holder.title().borrow().shown());
-}
-
-/// Rename the tab of `page` to `name`: the tab shows it, with its tooltip, and
-/// keeps it. A name with nothing in it restores the automatic title. Does nothing
-/// for a page that [`new_holder_page`] did not make.
-pub fn rename_page(page: &adw::TabPage, name: &str) {
-    if let Some(holder) = holder_of(page) {
-        holder.title().borrow_mut().rename(name);
-        refresh_title(page, &holder);
+/// Apply the [`TabTitle`] of `holder` to its pane's header, and to its tab
+/// (which is titled after its focused pane, and lists every pane's title in
+/// its tooltip). The tooltip is markup for GTK, so titles are escaped there: a
+/// name with `<b>` in it stays literal.
+fn refresh_title(holder: &PaneHolder) {
+    if let Some(layout) = panes::layout_of(holder) {
+        panes::refresh(&layout);
     }
 }
 
-/// Ask the person for a new name for the tab of `page` ("Rename Tab"). The field
-/// starts out as the title shown now; Rename applies it with [`rename_page`]. A
-/// name left as it was changes nothing: renaming is what freezes an automatic
-/// title, and that should not happen by pressing Rename without typing.
+/// Rename the focused pane of `page` (its only pane, in a tab with one) to
+/// `name` ([`rename_pane`]). Does nothing for a page that [`new_holder_page`]
+/// did not make. (The app renames through [`ask_rename_pane`].)
+#[cfg(test)]
+pub fn rename_page(page: &adw::TabPage, name: &str) {
+    if let Some(holder) = holder_of(page) {
+        rename_pane(&holder, name);
+    }
+}
+
+/// Rename the pane of `holder` to `name`: its header and, while it is the
+/// focused pane, its tab show it, and it keeps it. A name with nothing in it
+/// restores the automatic title.
+pub(crate) fn rename_pane(holder: &PaneHolder, name: &str) {
+    holder.title().borrow_mut().rename(name);
+    refresh_title(holder);
+}
+
+/// Ask the person for a new name for the focused pane of `page`
+/// ([`ask_rename_pane`]): what the tab is called.
 pub fn ask_rename(page: &adw::TabPage) {
-    let Some(holder) = holder_of(page) else {
-        return;
-    };
-    let current = holder.title().borrow().shown().to_owned();
+    if let Some(holder) = holder_of(page) {
+        ask_rename_pane(&holder);
+    }
+}
+
+/// Ask the person for a new name for the pane of `holder` ("Rename Tab" when it
+/// is the only pane of its tab, "Rename Pane" otherwise). The field starts out
+/// as the title shown now; Rename applies it with [`rename_pane`]. A name left
+/// as it was changes nothing: renaming is what freezes an automatic title, and
+/// that should not happen by pressing Rename without typing.
+pub(crate) fn ask_rename_pane(holder: &PaneHolder) {
+    let current = shown_title(holder);
+    let alone = panes::layout_of(holder).is_none_or(|layout| layout.panes().len() <= 1);
     let entry = gtk::Entry::builder()
         .text(current.as_str())
         .activates_default(true)
         .build();
     let dialog = adw::AlertDialog::builder()
-        .heading("Rename Tab")
+        .heading(if alone { "Rename Tab" } else { "Rename Pane" })
         .extra_child(&entry)
         .focus_widget(&entry)
         .default_response("rename")
@@ -407,17 +430,17 @@ pub fn ask_rename(page: &adw::TabPage) {
     dialog.add_responses(&[("cancel", "Cancel"), ("rename", "Rename")]);
     dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
     dialog.choose(
-        Some(&page.child()),
+        Some(holder),
         gio::Cancellable::NONE,
         glib::clone!(
             #[weak]
-            page,
+            holder,
             #[weak]
             entry,
             move |response| {
                 let name = entry.text();
                 if response == "rename" && name != current {
-                    rename_page(&page, &name);
+                    rename_pane(&holder, &name);
                 }
             }
         ),
@@ -516,38 +539,49 @@ fn tab_menu() -> gio::Menu {
 /// programs in the terminal: Ctrl+Tab, Alt+1…9 and Alt+0 (irssi, weechat, mc),
 /// Ctrl+Home/End and their Shift variants (editors), and so on. The terminal
 /// keeps every key except the accelerators in `main.rs`'s `SHORTCUTS`, which
-/// the Keyboard Shortcuts dialog lists: Ctrl+Shift+T/W/N (new tab, close tab,
+/// the Keyboard Shortcuts dialog lists: Ctrl+Shift+T/W/N (new tab, close pane,
 /// new window), Ctrl+Page Up/Down (switching tabs, `win.previous-tab` and
-/// `win.next-tab`), Ctrl+Shift+C/V (copy and paste) and Ctrl+plus, Ctrl+minus
-/// and Ctrl+0 (the text size).
+/// `win.next-tab`), Ctrl+Shift+R/D (splitting), Ctrl+Shift+arrows (going to
+/// another pane, in a tab with several), Ctrl+Shift+C/V (copy and paste) and
+/// Ctrl+plus, Ctrl+minus and Ctrl+0 (the text size).
 const TAB_VIEW_SHORTCUTS: adw::TabViewShortcuts = adw::TabViewShortcuts::NONE;
 
 /// Set up `view` as the tabs of a window: the tab menu, the tab view's own
 /// shortcuts ([`TAB_VIEW_SHORTCUTS`]), what closing a tab does, and closing the
 /// window with its last tab.
 ///
-/// * Closing a page writes its transcript (once), closes it, and ends its
-///   session ([`end_session`]): the child is hung up, and the session's
-///   one-time askpass marker is removed once the child has exited.
+/// * Closing a page writes the transcripts of its panes (once each), closes it,
+///   and ends their sessions ([`end_session`]): each child is hung up, and its
+///   one-time askpass marker is removed once it has exited.
 /// * The menu's "Rename…" is the action `tab.rename`, on the page the menu was
 ///   opened for.
 /// * When the last page goes the window closes. A page leaving for another
-///   window (`page-detached`) writes nothing and keeps its askpass marker: its
-///   session carries on over there.
+///   window (`page-detached`) writes nothing and keeps its askpass markers: its
+///   sessions carry on over there.
+/// * A page whose panes a drop on a pane took comes back empty and is closed
+///   (`crate::panes::page_attached`).
+/// * A tab that is selected never leaves the keyboard focus in another tab
+///   (`crate::panes::keep_focus_in_selected`): the focus it remembers may have
+///   moved there with a pane.
 pub fn setup_tab_view(view: &adw::TabView) {
     view.set_menu_model(Some(&tab_menu()));
     view.set_shortcuts(TAB_VIEW_SHORTCUTS);
 
     view.connect_close_page(|view, page| {
-        if let Some(terminal) = terminal_of(page) {
+        let holders = panes::layout_of_page(page)
+            .map(|layout| layout.holders())
+            .unwrap_or_default();
+        for terminal in holders.iter().filter_map(terminal_in) {
             write_transcript_of(&terminal);
         }
         view.close_page_finish(page, true);
-        if let Some(holder) = holder_of(page) {
-            end_session(&holder);
+        for holder in &holders {
+            end_session(holder);
         }
         glib::Propagation::Stop
     });
+    view.connect_page_attached(|view, page, _| panes::page_attached(view, page));
+    view.connect_selected_page_notify(panes::keep_focus_in_selected);
 
     view.connect_n_pages_notify(|view| {
         if view.n_pages() == 0
@@ -595,12 +629,14 @@ pub fn setup_tab_view(view: &adw::TabView) {
     view.connect_root_notify(install);
 }
 
-/// Let a double click on a tab's title in `bar` rename the tab.
+/// Let a double click on a tab's title in `bar` rename the tab, and let a pane
+/// dropped on a tab become a tab of its own (`crate::panes::setup_tab_bar`).
 ///
 /// The first click of the double click has already selected the tab, so it is the
 /// selected page that is renamed. Clicks on a button in a tab (close) or beside
 /// the tabs do nothing, so closing tabs in quick succession never asks anything.
 pub fn setup_tab_bar(bar: &adw::TabBar) {
+    panes::setup_tab_bar(bar);
     let double_click = gtk::GestureClick::builder()
         .button(gtk::gdk::BUTTON_PRIMARY)
         .propagation_phase(gtk::PropagationPhase::Capture)
@@ -868,10 +904,19 @@ fn pages_of(view: &adw::TabView) -> Vec<adw::TabPage> {
         .collect()
 }
 
+/// The holders of every pane of every tab of `view`.
+fn holders_in(view: &adw::TabView) -> Vec<PaneHolder> {
+    pages_of(view)
+        .iter()
+        .filter_map(panes::layout_of_page)
+        .flat_map(|layout| layout.holders())
+        .collect()
+}
+
 /// Write the transcript of every recording session shown in `view`.
 /// Sessions that already wrote theirs are skipped.
 pub fn write_transcripts(view: &adw::TabView) {
-    let holders: Vec<gtk::Widget> = pages_of(view).iter().map(adw::TabPage::child).collect();
+    let holders: Vec<gtk::Widget> = holders_in(view).into_iter().map(Cast::upcast).collect();
     // Collect first: writing a transcript borrows the registry again.
     let open: Vec<Rc<Session>> = SESSIONS.with_borrow(|open| {
         open.iter()
@@ -905,10 +950,8 @@ pub fn end_sessions_on_close(window: &impl IsA<gtk::Window>, view: &adw::TabView
         glib::Propagation::Proceed,
         move |_| {
             write_transcripts(&view);
-            for page in pages_of(&view) {
-                if let Some(holder) = holder_of(&page) {
-                    end_session(&holder);
-                }
+            for holder in holders_in(&view) {
+                end_session(&holder);
             }
             glib::Propagation::Proceed
         }
@@ -960,10 +1003,10 @@ pub(crate) fn set_scrollback(lines: i64) {
     SCROLLBACK.set(c_long::try_from(lines).unwrap_or(c_long::MAX));
 }
 
-/// A terminal that fills its tab, in the colors of the current light or dark
+/// A terminal that fills its pane, in the colors of the current light or dark
 /// style and the font of the Preferences, with the Preferences' scrollback (a
-/// tab that saves a transcript then gets unlimited scrollback instead) and the
-/// Copy and Paste menu ([`terminal_menu`]).
+/// session that saves a transcript then gets unlimited scrollback instead) and
+/// its right-click menu ([`terminal_menu`]).
 fn new_terminal() -> Terminal {
     let terminal = Terminal::new();
     terminal.set_hexpand(true);
@@ -974,18 +1017,18 @@ fn new_terminal() -> Terminal {
             terminal.set_font(Some(font));
         }
     });
-    add_menu_copy_action(&terminal);
+    add_menu_actions(&terminal);
     terminal.set_context_menu_model(Some(&terminal_menu()));
     theme::follow_style(&terminal);
     terminal
 }
 
-/// Names of the main window's tab actions (`win.new-tab`, `win.close-tab`,
-/// `win.next-tab`, `win.previous-tab`: Ctrl+Shift+T, Ctrl+Shift+W, Ctrl+Page
-/// Down and Ctrl+Page Up, and the ＋ button). `window.rs` defines them; the
-/// accelerators are in `main.rs`'s `SHORTCUTS`.
+/// Names of the main window's tab actions (`win.new-tab`, `win.next-tab`,
+/// `win.previous-tab`: Ctrl+Shift+T, Ctrl+Page Down and Ctrl+Page Up, and the
+/// ＋ button). `window.rs` defines them; the accelerators are in `main.rs`'s
+/// `SHORTCUTS`. The pane actions (Ctrl+Shift+W closes the focused pane) are
+/// named in `crate::panes`.
 pub(crate) const NEW_TAB_ACTION: &str = "new-tab";
-pub(crate) const CLOSE_TAB_ACTION: &str = "close-tab";
 pub(crate) const NEXT_TAB_ACTION: &str = "next-tab";
 pub(crate) const PREVIOUS_TAB_ACTION: &str = "previous-tab";
 
@@ -1006,7 +1049,7 @@ pub(crate) const ZOOM_OUT_ACTION: &str = "zoom-out";
 pub(crate) const ZOOM_RESET_ACTION: &str = "zoom-reset";
 
 /// The action group each terminal has for itself (`term.`), holding
-/// [`MENU_COPY_ACTION`].
+/// [`MENU_COPY_ACTION`] and [`MENU_PASTE_ACTION`].
 const TERMINAL_ACTIONS: &str = "term";
 
 /// The terminal's own Copy (`term.copy`), the one in its right-click menu. It
@@ -1016,10 +1059,16 @@ const TERMINAL_ACTIONS: &str = "term";
 /// Ctrl+Shift+C never reaches the program ([`copy_selection`]).
 const MENU_COPY_ACTION: &str = "copy";
 
-/// Give `terminal` its `term.copy` action ([`MENU_COPY_ACTION`]). The terminal
-/// owns the action group and the group's closures hold the terminal weakly, so
-/// nothing keeps the terminal alive.
-fn add_menu_copy_action(terminal: &Terminal) {
+/// The terminal's own Paste (`term.paste`), the one in its right-click menu: it
+/// pastes into that terminal, which a right click does not give the focus, so
+/// in a tab with several panes `win.paste` would paste into the focused one.
+const MENU_PASTE_ACTION: &str = "paste";
+
+/// Give `terminal` its `term.copy` and `term.paste` actions
+/// ([`MENU_COPY_ACTION`], [`MENU_PASTE_ACTION`]). The terminal owns the action
+/// group and the group's closures hold the terminal weakly, so nothing keeps
+/// the terminal alive.
+fn add_menu_actions(terminal: &Terminal) {
     let copy = gio::SimpleAction::new(MENU_COPY_ACTION, None);
     copy.set_enabled(false);
     copy.connect_activate(glib::clone!(
@@ -1032,15 +1081,23 @@ fn add_menu_copy_action(terminal: &Terminal) {
         copy,
         move |terminal| copy.set_enabled(terminal.has_selection())
     ));
+    let paste = gio::SimpleAction::new(MENU_PASTE_ACTION, None);
+    paste.connect_activate(glib::clone!(
+        #[weak]
+        terminal,
+        move |_, _| terminal.paste_clipboard()
+    ));
     let actions = gio::SimpleActionGroup::new();
     actions.add_action(&copy);
+    actions.add_action(&paste);
     terminal.insert_action_group(TERMINAL_ACTIONS, Some(&actions));
 }
 
 /// The menu a terminal shows on right-click: Copy (`term.copy`, insensitive
-/// without a selection) and Paste (`win.paste`). VTE shows it on a plain
-/// right-click, and on Shift+right-click when the program has turned on mouse
-/// reporting (htop, mc, tmux with mouse on), which then gets the plain
+/// without a selection) and Paste (`term.paste`), then Split Right and Split
+/// Down, which split this terminal's pane (`crate::panes`). VTE shows it on a
+/// plain right-click, and on Shift+right-click when the program has turned on
+/// mouse reporting (htop, mc, tmux with mouse on), which then gets the plain
 /// right-click itself.
 pub(crate) fn terminal_menu() -> gio::Menu {
     let menu = gio::Menu::new();
@@ -1048,13 +1105,23 @@ pub(crate) fn terminal_menu() -> gio::Menu {
         Some("Copy"),
         Some(&format!("{TERMINAL_ACTIONS}.{MENU_COPY_ACTION}")),
     );
-    menu.append(Some("Paste"), Some(&format!("win.{PASTE_ACTION}")));
+    menu.append(
+        Some("Paste"),
+        Some(&format!("{TERMINAL_ACTIONS}.{MENU_PASTE_ACTION}")),
+    );
+    menu.append_section(None, &panes::split_menu_section());
     menu
 }
 
-/// The terminal of `view`'s selected tab, if that tab shows a session.
+/// The terminal of the focused pane of `view`'s selected tab, if that pane
+/// shows a session.
 fn selected_terminal(view: &adw::TabView) -> Option<Terminal> {
     terminal_of(&view.selected_page()?)
+}
+
+/// The holder of the focused pane of `view`'s selected tab.
+pub(crate) fn selected_holder(view: &adw::TabView) -> Option<PaneHolder> {
+    holder_of(&view.selected_page()?)
 }
 
 /// Copy `terminal`'s selection to the clipboard as plain text; nothing
@@ -1065,7 +1132,7 @@ fn copy_selection_of(terminal: &Terminal) {
     }
 }
 
-/// Copy the selected tab's selection to the clipboard (the action behind
+/// Copy the focused pane's selection to the clipboard (the action behind
 /// Ctrl+Shift+C). With no selection it does nothing, and still counts as
 /// handled: the action is enabled whenever there is a terminal, because a
 /// disabled one would leave the key to the terminal, where Ctrl+Shift+C may
@@ -1076,8 +1143,8 @@ pub(crate) fn copy_selection(view: &adw::TabView) {
     }
 }
 
-/// Paste the clipboard into the selected tab's terminal (the action behind
-/// Ctrl+Shift+V and the menu's Paste). It is VTE's own paste, so a program
+/// Paste the clipboard into the focused pane's terminal (the action behind
+/// Ctrl+Shift+V). It is VTE's own paste, as the menu's is, so a program
 /// that asked for bracketed paste (shells with it do) gets a multi-line paste
 /// as one block instead of running it line by line.
 pub(crate) fn paste_clipboard(view: &adw::TabView) {
@@ -1086,13 +1153,29 @@ pub(crate) fn paste_clipboard(view: &adw::TabView) {
     }
 }
 
-/// The main window's actions that act on its tabs, enabled whenever no dialog
-/// is open over the window ([`sync_window_actions`]).
-const TAB_WINDOW_ACTIONS: [&str; 4] = [
+/// The main window's actions that act on its tabs and panes, enabled whenever
+/// no dialog is open over the window ([`sync_window_actions`]).
+const TAB_WINDOW_ACTIONS: [&str; 6] = [
     NEW_TAB_ACTION,
-    CLOSE_TAB_ACTION,
+    panes::CLOSE_PANE_ACTION,
     NEXT_TAB_ACTION,
     PREVIOUS_TAB_ACTION,
+    panes::SPLIT_RIGHT_ACTION,
+    panes::SPLIT_DOWN_ACTION,
+];
+
+/// The main window's actions that act among the panes of the selected tab
+/// (going to another one, moving one out), enabled while no dialog is open and
+/// the tab has two panes or more ([`sync_window_actions`]). Disabled, the
+/// arrows' keys reach the terminal, where VTE scrolls with them
+/// (Ctrl+Shift+Up/Down a line, Ctrl+Shift+Left/Right to a prompt).
+const SPLIT_WINDOW_ACTIONS: [&str; 6] = [
+    panes::PANE_LEFT_ACTION,
+    panes::PANE_RIGHT_ACTION,
+    panes::PANE_UP_ACTION,
+    panes::PANE_DOWN_ACTION,
+    panes::TO_TAB_ACTION,
+    panes::TO_WINDOW_ACTION,
 ];
 
 /// The main window's actions on the selected tab's terminal (Copy, Paste and the
@@ -1111,7 +1194,9 @@ const TERMINAL_WINDOW_ACTIONS: [&str; 5] = [
 /// a tab, and when a dialog opens or closes over the window.
 ///
 /// * The terminal actions (Copy, Paste and the three text size actions) are
-///   enabled with a terminal in the selected tab.
+///   enabled with a terminal in the focused pane of the selected tab.
+/// * The actions among panes (going to another, moving one out) are enabled
+///   while the selected tab has two panes or more.
 /// * While a dialog is open over the window (Rename, About, Keyboard Shortcuts, a
 ///   confirmation), every one of these actions is disabled, the tab actions
 ///   (new, close, next, previous) as well. GTK runs application accelerators from
@@ -1130,8 +1215,10 @@ pub(crate) fn sync_window_actions(view: &adw::TabView) {
     };
     let free = window.visible_dialog().is_none();
     let on_terminal = free && selected_terminal(view).is_some();
+    let split = free && panes::selected_is_split(view);
     let actions = [
         (&TAB_WINDOW_ACTIONS[..], free),
+        (&SPLIT_WINDOW_ACTIONS[..], split),
         (&TERMINAL_WINDOW_ACTIONS[..], on_terminal),
     ];
     for (names, enabled) in actions {
@@ -1146,20 +1233,22 @@ pub(crate) fn sync_window_actions(view: &adw::TabView) {
     }
 }
 
-/// The text size of the tab of `page`, if it was made by [`new_holder_page`]:
-/// the font scale its terminal has, or will have once it shows a session.
+/// The text size of the focused pane of `page`, if it was made by
+/// [`new_holder_page`]: the font scale its terminal has, or will have once it
+/// shows a session.
 pub(crate) fn scale_of(page: &adw::TabPage) -> Option<f64> {
     Some(holder_of(page)?.scale().get())
 }
 
-/// Change the text size of the selected tab of `view` from the size it has
-/// now, within the range `crate::zoom` allows. Does nothing for a tab that shows
-/// no terminal (the new-tab list): the actions are disabled then.
+/// Change the text size of the focused pane of `view`'s selected tab from the
+/// size it has now, within the range `crate::zoom` allows. Does nothing for a
+/// pane that shows no terminal (the new-tab list): the actions are disabled
+/// then.
 pub(crate) fn zoom_selected(view: &adw::TabView, change: fn(f64) -> f64) {
-    let Some(page) = view.selected_page() else {
+    let Some(holder) = selected_holder(view) else {
         return;
     };
-    let (Some(holder), Some(terminal)) = (holder_of(&page), terminal_of(&page)) else {
+    let Some(terminal) = terminal_in(&holder) else {
         return;
     };
     let scale = zoom::clamp(change(holder.scale().get()));
@@ -1174,13 +1263,13 @@ pub(crate) fn new_holder_page(view: &adw::TabView, title: &str) -> adw::TabPage 
     new_holder_page_at(view, title, || zoom::DEFAULT)
 }
 
-/// A new, selected page of `view` called `title` that holds nothing yet: its
-/// child is an empty box which a chooser or a session ([`start_local_shell`],
-/// [`start_profile`], [`start_command`]) later fills. The tab starts at the
-/// text size of the tab that is selected in `view` now, or at what
-/// `fallback_scale` returns if there is none. (A function, so that the saved
-/// size is read from its file only for a window that has no tab to take the
-/// size from, not for every tab opened.)
+/// A new, selected page of `view` called `title` that holds nothing yet: one
+/// pane, whose holder ([`holder_of`]) a chooser or a session
+/// ([`start_local_shell`], [`start_profile`], [`start_command`]) later fills.
+/// The tab starts at the text size of the focused pane of the tab that is
+/// selected in `view` now, or at what `fallback_scale` returns if there is
+/// none. (A function, so that the saved size is read from its file only for a
+/// window that has no tab to take the size from, not for every tab opened.)
 pub(crate) fn new_holder_page_at(
     view: &adw::TabView,
     title: &str,
@@ -1191,28 +1280,29 @@ pub(crate) fn new_holder_page_at(
         .selected_page()
         .and_then(|page| scale_of(&page))
         .unwrap_or_else(fallback_scale);
-    let holder = TabHolder::new(TabTitle::remote(title.to_owned()), scale);
-    let page = view.append(&holder);
-    refresh_title(&page, &holder);
+    let holder = PaneHolder::new(TabTitle::remote(title.to_owned()), scale);
+    let layout = panes::new_layout(&holder);
+    let page = view.append(&layout);
     view.set_selected_page(&page);
+    panes::refresh(&layout);
     page
 }
 
-/// Show `chooser` in `page`, a fresh page made by [`new_holder_page`] that holds
-/// nothing yet: what the tab shows until a session replaces it (the new-tab
-/// list).
-pub(crate) fn show_chooser(page: &adw::TabPage, chooser: &impl IsA<gtk::Widget>) {
-    let holder = holder_of(page).expect("choosers go in pages made by new_holder_page");
-    debug_assert!(holder.first_child().is_none(), "a fresh page");
+/// Show `chooser` in `holder`, a fresh pane that holds nothing yet: what the
+/// pane shows until a session replaces it (the new-tab list).
+pub(crate) fn show_chooser(holder: &PaneHolder, chooser: &impl IsA<gtk::Widget>) {
+    debug_assert!(holder.first_child().is_none(), "a fresh pane");
     holder.append(chooser);
 }
 
-/// The terminal of `page`, if it holds a session.
+/// The terminal of the focused pane of `page` (its only pane, in a tab with
+/// one), if it holds a session.
 pub fn terminal_of(page: &adw::TabPage) -> Option<Terminal> {
-    holder_of(page)?.first_child().and_downcast()
+    terminal_in(&holder_of(page)?)
 }
 
-/// End the session shown in `holder`, whose tab (or window) has closed: take
+/// End the session shown in `holder`, whose pane (or tab, or window) has
+/// closed: take
 /// its terminal out, hang up its child ([`hang_up`]) if it is still running,
 /// and keep the terminal ([`park`]) until the child's exit is seen, which is
 /// when the one-time askpass marker is removed.
@@ -1224,7 +1314,7 @@ pub fn terminal_of(page: &adw::TabPage) -> Option<Terminal> {
 /// hangup alone: a child that ignores `SIGHUP` (Moniker started under `nohup`)
 /// would live on, and a later prompt of its connection must not find the
 /// marker gone. A child that has already exited released its marker then.
-fn end_session(holder: &TabHolder) {
+fn end_session(holder: &PaneHolder) {
     let marker = holder.marker().take();
     let terminal = holder.first_child().and_downcast::<Terminal>();
     while let Some(child) = holder.first_child() {
@@ -1346,33 +1436,47 @@ fn signal_target(raw: c_int) -> Option<Pid> {
     (!ours).then_some(id)
 }
 
-/// Close `page`'s tab, as the close button does: its transcript is written and
-/// the window closes if it was the last tab.
-fn close_page(page: &adw::TabPage) {
-    if let Some(view) = view_of(page) {
-        view.close_page(page);
+/// Close the pane of `holder`, as its close button and Ctrl+Shift+W do. The
+/// only pane of a tab is the tab: that closes as its close button does (every
+/// transcript written, every session ended, the window closed with its last
+/// tab). A pane among others writes its transcript, ends its session
+/// ([`end_session`]) and leaves its room to the others (`crate::panes`).
+pub(crate) fn close_pane(holder: &PaneHolder) {
+    let Some(layout) = panes::layout_of(holder) else {
+        return;
+    };
+    if layout.panes().len() <= 1 {
+        if let Some((view, page)) = panes::page_of(&layout) {
+            view.close_page(&page);
+        }
+        return;
     }
+    if let Some(terminal) = terminal_in(holder) {
+        write_transcript_of(&terminal);
+    }
+    end_session(holder);
+    panes::take_out(holder);
 }
 
-/// Empty the holder of `page` and put a new terminal in it, with the automatic
-/// title `title` (a name the person gave the tab is kept). The terminal has the
-/// focus. Only for a page that has not run a session yet (empty, or showing a
-/// chooser): a session replaced here would lose its unwritten transcript.
-fn begin_session(page: &adw::TabPage, title: TabTitle) -> (TabHolder, Terminal) {
-    let holder = holder_of(page).expect("session tabs are made by new_holder_page");
+/// Empty `holder` and put a new terminal in it, with the automatic title
+/// `title` (a name the person gave the pane is kept). The terminal has the
+/// focus if its pane is in front ([`in_front`]). Only for a pane that has not
+/// run a session yet (empty, or showing a chooser): a session replaced here
+/// would lose its unwritten transcript.
+fn begin_session(holder: &PaneHolder, title: TabTitle) -> Terminal {
     holder.title().borrow_mut().adopt(title);
-    refresh_title(page, &holder);
+    refresh_title(holder);
     while let Some(old) = holder.first_child() {
         holder.remove(&old);
     }
     let terminal = new_terminal();
     terminal.set_font_scale(holder.scale().get());
     holder.append(&terminal);
-    // Only into the tab the person is looking at: a session that starts late
-    // (it waited for the keyring) must not take the keyboard from another tab,
-    // whose keys would then go to this host, or from a dialog. The tab view
-    // gives it the focus when its tab is selected.
-    if in_front(page) {
+    // Only into the pane the person is looking at: a session that starts late
+    // (it waited for the keyring) must not take the keyboard from another tab
+    // or pane, whose keys would then go to this host, or from a dialog. The
+    // tab view gives it the focus when its tab is selected.
+    if in_front(holder) {
         terminal.grab_focus();
     }
     // Connected first, so it is known before anything else hears of the exit.
@@ -1381,21 +1485,26 @@ fn begin_session(page: &adw::TabPage, title: TabTitle) -> (TabHolder, Terminal) 
         holder,
         move |_, _| holder.child_gone().set(true)
     ));
-    // A tab that showed a chooser has a terminal now (Copy, Paste and the
+    // A pane that showed a chooser has a terminal now (Copy, Paste and the
     // text size actions apply).
-    if let Some(view) = view_of(page) {
+    if let Some((view, _)) = panes::layout_of(holder).as_ref().and_then(panes::page_of) {
         sync_window_actions(&view);
     }
-    (holder, terminal)
+    terminal
 }
 
-/// Whether `page` is the selected tab of its view, in a window that shows no
-/// dialog.
-fn in_front(page: &adw::TabPage) -> bool {
-    let Some(view) = view_of(page) else {
+/// Whether the pane of `holder` is the focused pane of the selected tab of its
+/// view, in a window that shows no dialog.
+fn in_front(holder: &PaneHolder) -> bool {
+    let Some(layout) = panes::layout_of(holder) else {
         return false;
     };
-    if view.selected_page().as_ref() != Some(page) {
+    let Some((view, page)) = panes::page_of(&layout) else {
+        return false;
+    };
+    if view.selected_page().as_ref() != Some(&page)
+        || layout.focused_holder().as_ref() != Some(holder)
+    {
         return false;
     }
     view.root()
@@ -1439,7 +1548,7 @@ fn spawn(terminal: &Terminal, dir: Option<&str>, argv: &[String], envv: &[String
                 if let Some(terminal) = weak.upgrade() {
                     show_note(&terminal, &format!("[could not start {program}: {reason}]"));
                     // No child: nothing to wait for when the tab closes.
-                    if let Some(holder) = terminal.parent().and_downcast::<TabHolder>() {
+                    if let Some(holder) = terminal.parent().and_downcast::<PaneHolder>() {
                         holder.child_gone().set(true);
                     }
                     unpark(&terminal);
@@ -1470,38 +1579,40 @@ pub fn open_local_shell(
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
     let page = new_holder_page_at(view, LOCAL_TITLE, || fallback_scale);
-    start_local_shell(&page, transcript)
+    let holder = holder_of(&page).expect("a new page has its pane");
+    start_local_shell(&holder, transcript)
 }
 
-/// Run the person's shell in `page`, in their home directory. The tab is called
-/// after what the shell says its title is, and closes when the shell exits. With
-/// a `transcript` its text is saved when the shell exits or the tab or window
-/// closes.
+/// Run the person's shell in `holder`'s pane, in their home directory. The pane
+/// is called after what the shell says its title is, and closes when the shell
+/// exits. With a `transcript` its text is saved when the shell exits or the
+/// pane, tab or window closes.
 pub(crate) fn start_local_shell(
-    page: &adw::TabPage,
+    holder: &PaneHolder,
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
     let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
-    start_shell_in(page, &shell, &glib::home_dir(), transcript)
+    start_shell_in(holder, &shell, &glib::home_dir(), transcript)
 }
 
 /// [`start_local_shell`] with the shell and the directory given (the tests run a
 /// stand-in shell). A directory that is not there leaves the shell in the
 /// directory Moniker was started in.
 pub(crate) fn start_shell_in(
-    page: &adw::TabPage,
+    holder: &PaneHolder,
     shell: &str,
     dir: &Path,
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
-    let (holder, terminal) = begin_session(page, TabTitle::local());
-    // A shell that exits closes its tab, and closing a tab writes the transcript
-    // (`setup_tab_view`), so there is nothing more to do when it exits.
+    let terminal = begin_session(holder, TabTitle::local());
+    // A shell that exits closes its pane, and closing a pane or a tab writes
+    // the transcript ([`close_pane`], `setup_tab_view`), so there is nothing
+    // more to do when it exits.
     start_recording(&terminal, transcript);
     terminal.connect_child_exited(glib::clone!(
         #[weak]
-        page,
-        move |_, _status| close_page(&page)
+        holder,
+        move |_, _status| close_pane(&holder)
     ));
     // The shell's own title, e.g. "alice@desktop: ~". Remote tabs never get here:
     // what a remote host says about itself is not to be believed. (VTE 0.78
@@ -1510,13 +1621,11 @@ pub(crate) fn start_shell_in(
     // 0.76; the property is still kept up to date, as the tests check.)
     terminal.connect_window_title_notify(glib::clone!(
         #[weak]
-        page,
-        #[weak]
         holder,
         move |terminal| {
             let raw = terminal.window_title().unwrap_or_default();
             holder.title().borrow_mut().set_terminal_title(&raw);
-            refresh_title(&page, &holder);
+            refresh_title(&holder);
         }
     ));
     let dir = dir.is_dir().then(|| dir.to_str()).flatten();
@@ -1608,16 +1717,16 @@ pub(crate) struct Launch {
     pub(crate) marker: Option<OneTimeMarker>,
 }
 
-/// Work out the tab for connecting to `profile` with its startup sequence number
-/// `sequence`: its title, the `ssh` command and the transcript settings. `record`
-/// says whether the session is recorded (see [`transcript_spec`]), and
+/// Work out the pane for connecting to `profile` with its startup sequence
+/// number `sequence`: its title, the `ssh` command and the transcript settings.
+/// `record` says whether the session is recorded (see [`transcript_spec`]), and
 /// `has_password` whether a password is stored for it (the keyring worker's
 /// answer, [`has_stored_password`]). Shows a note as a notification if the
-/// stored password cannot be used, in the window of `page`, the tab being
+/// stored password cannot be used, in the window of `holder`, the pane being
 /// opened: a connection started from the Connection Profiles window opens its
 /// tab in a main window, and that is where the note belongs.
 pub(crate) fn launch(
-    page: &adw::TabPage,
+    holder: &PaneHolder,
     profile: &Profile,
     sequence: Option<usize>,
     record: bool,
@@ -1626,7 +1735,7 @@ pub(crate) fn launch(
     has_password: bool,
 ) -> Launch {
     if let Some(note) = askpass_notice(has_password, &ctx.askpass_path) {
-        ctx.notice.show_near(&page.child(), note);
+        ctx.notice.show_near(holder, note);
     }
     let (command, token) = connection_command(profile, sequence, &ctx.askpass_path, has_password);
     let marker = token
@@ -1655,18 +1764,19 @@ pub fn open_profile(
     record: bool,
 ) {
     let page = new_holder_page_at(view, &tab_title(profile), || ctx.saved_font_scale());
-    start_profile(&page, ctx, profile, sequence, record);
+    let holder = holder_of(&page).expect("a new page has its pane");
+    start_profile(&holder, ctx, profile, sequence, record);
 }
 
-/// [`open_profile`] in the page `page`, which [`new_holder_page`] made.
+/// [`open_profile`] in the pane of `holder`, which has not run a session yet.
 ///
 /// Whether a password is stored is asked on the keyring worker
 /// (`crate::keyring::read`), never on the main thread: a locked keyring waits
 /// for its unlock prompt, and the window must not freeze meanwhile. Until the
-/// answer is back the tab waits ([`show_waiting`]); then the session starts,
-/// unless the tab was closed meanwhile (its window too), which starts nothing.
-/// A tab dragged to another window meanwhile starts there. A keyring worker
-/// that stopped counts as no stored password: ssh asks in the terminal.
+/// answer is back the pane waits ([`show_waiting`]); then the session starts,
+/// unless the pane was closed meanwhile (its tab or window too), which starts
+/// nothing. A pane or tab dragged elsewhere meanwhile starts there. A keyring
+/// worker that stopped counts as no stored password: ssh asks in the terminal.
 ///
 /// The session uses the profile as the window holds it when the answer is
 /// back, not as it was when it was picked: saves asked for before (a host or
@@ -1674,38 +1784,34 @@ pub fn open_profile(
 /// window has read the file again by then (issue #7). The startup sequence is
 /// the one the person picked, as they saw it.
 pub(crate) fn start_profile(
-    page: &adw::TabPage,
+    holder: &PaneHolder,
     ctx: &Rc<AppContext>,
     profile: &Profile,
     sequence: Option<usize>,
     record: bool,
 ) {
-    let waiting = show_waiting(page);
+    let waiting = show_waiting(holder);
     // Named after the profile at once, while it waits (a name the person gave
-    // the tab is kept).
-    if let Some(holder) = holder_of(page) {
-        holder
-            .title()
-            .borrow_mut()
-            .adopt(TabTitle::remote(tab_title(profile)));
-        refresh_title(page, &holder);
-    }
+    // the pane is kept).
+    holder
+        .title()
+        .borrow_mut()
+        .adopt(TabTitle::remote(tab_title(profile)));
+    refresh_title(holder);
     let asked = profile.clone();
     let profile = profile.clone();
-    let page = page.downgrade();
+    let holder = holder.downgrade();
     let ctx_done = Rc::clone(ctx);
     crate::keyring::read(
         ctx,
         move |secrets| has_stored_password(&asked, secrets),
         move |has_password| {
             let ctx = ctx_done;
-            let Some(page) = page.upgrade() else {
+            let Some(holder) = holder.upgrade() else {
                 return;
             };
-            // Closing the tab or its window emptied the holder.
-            let still_waiting = holder_of(&page)
-                .and_then(|holder| holder.first_child())
-                .is_some_and(|child| child == waiting);
+            // Closing the pane, its tab or its window emptied the holder.
+            let still_waiting = holder.first_child().is_some_and(|child| child == waiting);
             if !still_waiting {
                 return;
             }
@@ -1724,7 +1830,7 @@ pub(crate) fn start_profile(
                 transcript,
                 marker,
             } = launch(
-                &page,
+                &holder,
                 &profile,
                 sequence,
                 record,
@@ -1733,7 +1839,7 @@ pub(crate) fn start_profile(
                 has_password.unwrap_or(false),
             );
             start_command(
-                &page,
+                &holder,
                 &title,
                 test_hook::command(command),
                 transcript,
@@ -1750,13 +1856,12 @@ const WAITING_SHOWN_AFTER: Duration = Duration::from_millis(400);
 /// What the tab says while it waits for the keyring.
 pub(crate) const WAITING_TEXT: &str = "Waiting for the keyring\u{2026}";
 
-/// Show in `page` (which has not run a session yet) that it waits for the
+/// Show in `holder` (which has not run a session yet) that it waits for the
 /// keyring before its session starts, in place of whatever it showed (the
 /// new-tab list, so that a second pick there starts nothing), and return
 /// what it shows now. The spinner and its line appear only after
 /// [`WAITING_SHOWN_AFTER`].
-fn show_waiting(page: &adw::TabPage) -> gtk::Widget {
-    let holder = holder_of(page).expect("session tabs are made by new_holder_page");
+fn show_waiting(holder: &PaneHolder) -> gtk::Widget {
     while let Some(old) = holder.first_child() {
         holder.remove(&old);
     }
@@ -1843,28 +1948,29 @@ pub(crate) fn open_command(
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
     let page = new_holder_page(view, title);
-    start_command(&page, title, cmd, transcript, None)
+    let holder = holder_of(&page).expect("a new page has its pane");
+    start_command(&holder, title, cmd, transcript, None)
 }
 
-/// [`open_command`] in the page `page`, which [`new_holder_page`] made. The tab
-/// is called `title` and never takes another from the program it runs.
+/// [`open_command`] in the pane of `holder`, which has not run a session yet.
+/// The pane is called `title` and never takes another from the program it
+/// runs.
 ///
-/// `marker` is the connection's one-time askpass marker: the tab keeps it and
-/// removes it when the child exits or the tab or window closes (module docs).
+/// `marker` is the connection's one-time askpass marker: the pane keeps it and
+/// removes it when the child exits or the pane, tab or window closes (module
+/// docs).
 pub(crate) fn start_command(
-    page: &adw::TabPage,
+    holder: &PaneHolder,
     title: &str,
     cmd: SshCommand,
     transcript: Option<TranscriptSpec>,
     marker: Option<OneTimeMarker>,
 ) -> Terminal {
-    let (holder, terminal) = begin_session(page, TabTitle::remote(title.to_owned()));
+    let terminal = begin_session(holder, TabTitle::remote(title.to_owned()));
     holder.marker().replace(marker);
     let session = start_recording(&terminal, transcript);
 
     terminal.connect_child_exited(glib::clone!(
-        #[weak]
-        page,
         #[weak]
         holder,
         #[strong]
@@ -1878,7 +1984,7 @@ pub(crate) fn start_command(
                 session.write_transcript_once();
             }
             match exit_action(status) {
-                ExitAction::Close => close_page(&page),
+                ExitAction::Close => close_pane(&holder),
                 ExitAction::Keep { note } => show_note(terminal, &note),
             }
         }

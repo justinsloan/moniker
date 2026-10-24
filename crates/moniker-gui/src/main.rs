@@ -22,6 +22,7 @@ mod hosts;
 mod keyring;
 mod new_tab;
 mod notify;
+mod panes;
 mod preferences;
 mod profiles;
 mod recordings;
@@ -70,6 +71,13 @@ pub(crate) type Shortcut = (&'static str, &'static str, &'static str);
 /// key). Ctrl+minus therefore no longer reaches programs in the terminal
 /// (readline's undo; Ctrl+_ still does). The tab view's own shortcuts are
 /// trimmed to match (`terminal_tab::setup_tab_view`).
+///
+/// Splitting is Ctrl+Shift+R (right) and Ctrl+Shift+D (down), letters that say
+/// the direction. Ctrl+Shift+W closes the focused pane, which in a tab with one
+/// pane is the tab. Ctrl+Shift+arrows go to another pane, and only in a tab
+/// with two panes or more (`crate::panes`): elsewhere their actions are
+/// disabled and VTE has them (Ctrl+Shift+Up/Down scroll a line, Left/Right
+/// jump to the previous or next prompt).
 pub(crate) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
     (
         "General",
@@ -79,9 +87,32 @@ pub(crate) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
         "Tabs",
         &[
             ("New Tab", "win.new-tab", "<Control><Shift>t"),
-            ("Close Tab", "win.close-tab", "<Control><Shift>w"),
             ("Next Tab", "win.next-tab", "<Control>Page_Down"),
             ("Previous Tab", "win.previous-tab", "<Control>Page_Up"),
+        ],
+    ),
+    (
+        "Panes",
+        &[
+            ("Split Right", "win.split-right", "<Control><Shift>r"),
+            ("Split Down", "win.split-down", "<Control><Shift>d"),
+            ("Close Pane", "win.close-pane", "<Control><Shift>w"),
+            (
+                "Go to the Pane on the Left",
+                "win.pane-left",
+                "<Control><Shift>Left",
+            ),
+            (
+                "Go to the Pane on the Right",
+                "win.pane-right",
+                "<Control><Shift>Right",
+            ),
+            ("Go to the Pane Above", "win.pane-up", "<Control><Shift>Up"),
+            (
+                "Go to the Pane Below",
+                "win.pane-down",
+                "<Control><Shift>Down",
+            ),
         ],
     ),
     (

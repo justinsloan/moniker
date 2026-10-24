@@ -23,7 +23,7 @@ use vte4::prelude::*;
 use super::main_window::{ctx_with, menu_items, test_app};
 use super::{
     HELPER, MARKUP_NAME, all_widgets, button_labeled, fake_command, fake_shell, fake_ssh, files_in,
-    find_widget, fixture, labels_in, launch_ctx, make_helper, page_of, profile, pump_for,
+    find_widget, fixture, labels_in, launch_ctx, make_helper, page_of, pane, profile, pump_for,
     pump_until, shown, tab_window, wait_for_session, wait_for_text, widgets_of_type,
 };
 use crate::context::{AppContext, Notice};
@@ -375,7 +375,7 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
     // one (ssh asks in the terminal) and a notification says why, in the tab's
     // window.
     let (ctx, _attached, _secrets) = launch_ctx(dir, dir.join("no-such-helper"));
-    let launched = launch(&page, &p, None, false, &ctx, &transcripts, true);
+    let launched = launch(&pane(&page), &p, None, false, &ctx, &transcripts, true);
     assert!(
         launched.command.env.is_empty(),
         "{:?}",
@@ -388,7 +388,7 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
 
     // The helper is there: ssh is pointed at it and nothing is said.
     let (ctx, _area, _secrets) = launch_ctx(dir, make_helper(dir));
-    let launched = launch(&page, &p, None, false, &ctx, &transcripts, true);
+    let launched = launch(&pane(&page), &p, None, false, &ctx, &transcripts, true);
     let names: Vec<&str> = launched
         .command
         .env
@@ -413,7 +413,7 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
 
     // No password stored and no helper: nothing to explain.
     let (ctx, _area, _secrets) = launch_ctx(dir, dir.join("no-such-helper"));
-    let launched = launch(&page, &p, None, false, &ctx, &transcripts, false);
+    let launched = launch(&pane(&page), &p, None, false, &ctx, &transcripts, false);
     assert!(launched.command.env.is_empty());
     assert!(launched.marker.is_none());
     assert_eq!(ctx.notice.last_text(), None);
@@ -458,7 +458,15 @@ pub(super) fn the_marker_is_released_when_the_session_ends(bin: &Path, dir: &Pat
     let connect = |view: &adw::TabView, name: &str, then: &str| -> (Terminal, PathBuf) {
         let fake = fake_ssh(bin, name, &format!("echo FAKE-END\n{then}"));
         let page = new_holder_page(view, "x");
-        let mut launched = launch(&page, &p, None, false, &ctx, &dir.join("transcripts"), true);
+        let mut launched = launch(
+            &pane(&page),
+            &p,
+            None,
+            false,
+            &ctx,
+            &dir.join("transcripts"),
+            true,
+        );
         launched.command.program = fake;
         let token = launched
             .command
@@ -471,7 +479,7 @@ pub(super) fn the_marker_is_released_when_the_session_ends(bin: &Path, dir: &Pat
         assert!(claim_marker(&runtime, &token).unwrap());
         let marker = marker_dir(&runtime).join(&token);
         let terminal = start_command(
-            &page,
+            &pane(&page),
             &launched.title,
             launched.command,
             launched.transcript,
@@ -603,7 +611,7 @@ pub(super) fn a_closed_local_tab_hangs_up_its_shell_and_its_job(bin: &Path, dir:
     );
     let fx = fixture();
     let page = new_holder_page(&fx.view, "x");
-    let terminal = start_shell_in(&page, &shell, dir, None);
+    let terminal = start_shell_in(&pane(&page), &shell, dir, None);
     drop(page);
     wait_for_text(&terminal, "JOB-READY");
     let weak = terminal.downgrade();
@@ -636,7 +644,7 @@ pub(super) fn the_missing_helper_notification_lands_in_the_tabs_window(bin: &Pat
 
     set_test_ssh_program(Some(fake));
     let page = new_holder_page(&view, "x");
-    start_profile(&page, &ctx, &p, None, false);
+    start_profile(&pane(&page), &ctx, &p, None, false);
     let terminal = wait_for_session(&page);
     set_test_ssh_program(None);
 
@@ -694,12 +702,12 @@ pub(super) fn local_shell_starts_in_home(bin: &Path, dir: &Path) {
     let shell = fake_shell(bin, "pwd-shell", "echo \"CWD:$(pwd -P)\"\nexec sleep 600");
 
     let page = new_holder_page(&fx.view, "x");
-    let terminal = start_shell_in(&page, &shell, &home, None);
+    let terminal = start_shell_in(&pane(&page), &shell, &home, None);
     wait_for_text(&terminal, &format!("CWD:{home_path}"));
     fx.click_close(&terminal);
 
     let page = new_holder_page(&fx.view, "x");
-    let terminal = start_shell_in(&page, &shell, &dir.join("no-such-home"), None);
+    let terminal = start_shell_in(&pane(&page), &shell, &dir.join("no-such-home"), None);
     wait_for_text(&terminal, &format!("CWD:{here}"));
     fx.click_close(&terminal);
 
@@ -726,7 +734,7 @@ pub(super) fn a_local_tab_follows_its_shell_until_renamed(bin: &Path) {
          printf '\\033]0;later\\007'\necho DONE\nexec sleep 600",
     );
     let page = new_holder_page(&fx.view, "x");
-    let terminal = start_shell_in(&page, &shell, Path::new("/"), None);
+    let terminal = start_shell_in(&pane(&page), &shell, Path::new("/"), None);
     assert_eq!(page.title(), "Local terminal", "until the shell says");
     pump_until("the shell's title", || page.title() == "from the shell");
     assert_eq!(page.tooltip().as_deref(), Some("from the shell"));
@@ -903,7 +911,7 @@ pub(super) fn renaming_an_unchanged_title_keeps_following_the_shell(bin: &Path) 
          printf '\\033]0;two\\007'\necho DONE\nexec sleep 600",
     );
     let page = new_holder_page(&fx.view, "x");
-    let terminal = start_shell_in(&page, &shell, Path::new("/"), None);
+    let terminal = start_shell_in(&pane(&page), &shell, Path::new("/"), None);
     pump_until("the shell's title", || page.title() == "one");
 
     ask_rename(&page);
@@ -966,7 +974,7 @@ pub(super) fn the_tab_menu_renames_the_tab_it_was_opened_for() {
 pub(super) fn the_tab_menus_rename_puts_the_cursor_in_the_name_field() {
     let fx = fixture();
     let page = new_holder_page(&fx.view, "Named");
-    let terminal = start_shell_in(&page, "/bin/sh", Path::new("/"), None);
+    let terminal = start_shell_in(&pane(&page), "/bin/sh", Path::new("/"), None);
     pump_for(Duration::from_millis(300));
     terminal.grab_focus();
 
@@ -1019,7 +1027,7 @@ pub(super) fn the_tab_menus_rename_puts_the_cursor_in_the_name_field() {
 pub(super) fn opening_after_the_menu_waits_for_the_focus_to_leave_it() {
     let fx = fixture();
     let page = new_holder_page(&fx.view, "Named");
-    let terminal = start_shell_in(&page, "/bin/sh", Path::new("/"), None);
+    let terminal = start_shell_in(&pane(&page), "/bin/sh", Path::new("/"), None);
     pump_for(Duration::from_millis(300));
     let menu = gtk::PopoverMenu::from_model(fx.view.menu_model().as_ref());
     menu.set_parent(&fx.bar);
@@ -1222,7 +1230,7 @@ fn main_window_with_shell(
     main.window.present();
     pump_for(Duration::from_millis(300));
     let page = new_holder_page(&main.view, "x");
-    let terminal = start_shell_in(&page, &fake_shell(bin, name, body), dir, None);
+    let terminal = start_shell_in(&pane(&page), &fake_shell(bin, name, body), dir, None);
     (app, main, terminal)
 }
 
@@ -1350,7 +1358,14 @@ pub(super) fn the_copy_key_is_handled_without_a_selection(bin: &Path, dir: &Path
 /// The main window's actions on its tabs, and on the selected tab's terminal.
 /// (Spelled out here, not taken from `terminal_tab`: the test checks the names
 /// the accelerators are bound to.)
-const TAB_ACTIONS: [&str; 4] = ["new-tab", "close-tab", "next-tab", "previous-tab"];
+const TAB_ACTIONS: [&str; 6] = [
+    "new-tab",
+    "close-pane",
+    "next-tab",
+    "previous-tab",
+    "split-right",
+    "split-down",
+];
 const TERMINAL_ACTIONS: [&str; 5] = ["copy", "paste", "zoom-in", "zoom-out", "zoom-reset"];
 
 /// Assert that the tab actions of `window` are all enabled or all disabled
@@ -1421,7 +1436,7 @@ pub(super) fn the_window_actions_wait_while_a_dialog_is_open(bin: &Path, dir: &P
     );
     let _ = WidgetExt::activate_action(&main.window, "win.zoom-in", None);
     assert_eq!(terminal.font_scale(), scale, "the text size changed");
-    let _ = WidgetExt::activate_action(&main.window, "win.close-tab", None);
+    let _ = WidgetExt::activate_action(&main.window, "win.close-pane", None);
     pump_for(Duration::from_millis(200));
     assert_eq!(main.view.n_pages(), pages, "a tab was closed");
 
@@ -1519,14 +1534,17 @@ pub(super) fn the_window_actions_wait_while_a_dialog_is_open(bin: &Path, dir: &P
     pump_for(Duration::from_millis(200));
 }
 
-/// Every terminal has the right-click menu: Copy, the terminal's own action,
-/// and Paste, the window's.
+/// Every terminal has the right-click menu: Copy and Paste, the terminal's own
+/// actions (a right click does not focus its pane, so the window's Paste would
+/// go to another pane), and Split Right and Split Down, its pane's.
 pub(super) fn terminals_have_the_copy_paste_menu(bin: &Path, dir: &Path) {
     let (_app, main, terminal) =
         main_window_with_shell(bin, dir, "menu-shell", "echo MENU\nexec sleep 600");
     let expected = [
         ("Copy".to_owned(), "term.copy".to_owned()),
-        ("Paste".to_owned(), "win.paste".to_owned()),
+        ("Paste".to_owned(), "term.paste".to_owned()),
+        ("Split Right".to_owned(), "pane.split-right".to_owned()),
+        ("Split Down".to_owned(), "pane.split-down".to_owned()),
     ];
     let menu = terminal.context_menu_model().expect("a context menu");
     assert_eq!(menu_items(&menu), expected);

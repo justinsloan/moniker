@@ -755,9 +755,15 @@ pub(super) fn shortcut_actions_exist(dir: &Path) {
     }
     for action in [
         "win.new-tab",
-        "win.close-tab",
+        "win.close-pane",
         "win.next-tab",
         "win.previous-tab",
+        "win.split-right",
+        "win.split-down",
+        "win.pane-left",
+        "win.pane-right",
+        "win.pane-up",
+        "win.pane-down",
         "win.copy",
         "win.paste",
         "win.zoom-in",
@@ -784,11 +790,12 @@ pub(super) fn shortcut_actions_exist(dir: &Path) {
     assert_eq!(main.view.selected_page().as_ref(), Some(&first));
     WidgetExt::activate_action(&main.window, "win.next-tab", None).unwrap();
     assert_eq!(main.view.selected_page().as_ref(), Some(&second));
-    WidgetExt::activate_action(&main.window, "win.close-tab", None).unwrap();
+    // Closing the only pane of a tab closes the tab.
+    WidgetExt::activate_action(&main.window, "win.close-pane", None).unwrap();
     pump_for(Duration::from_millis(200));
     assert_eq!(main.view.n_pages(), 1);
     assert_eq!(main.view.selected_page().as_ref(), Some(&first));
-    WidgetExt::activate_action(&main.window, "win.close-tab", None).unwrap();
+    WidgetExt::activate_action(&main.window, "win.close-pane", None).unwrap();
     pump_until("the window to close with its last tab", || {
         !main.window.is_visible()
     });
@@ -827,7 +834,7 @@ fn zoom_to(main: &window::MainWindow, scale: f64) {
 
 /// The percent button of the zoom row in the ☰ menu of `main`, and the − and
 /// + buttons beside it.
-fn zoom_buttons(main: &window::MainWindow) -> (gtk::Button, gtk::Button, gtk::Button) {
+pub(super) fn zoom_buttons(main: &window::MainWindow) -> (gtk::Button, gtk::Button, gtk::Button) {
     let popover = menu_button(&main.window, "Main Menu")
         .popover()
         .expect("the ☰ popover");
@@ -1063,12 +1070,12 @@ pub(super) fn quitting_saves_the_last_windows_active_tab(dir: &Path) {
     act(&c, "zoom-out");
     act(&c, "zoom-out");
     assert_eq!(drawn_scale(&c.view.selected_page().unwrap()), 1.3);
-    act(&c, "close-tab");
+    act(&c, "close-pane");
     pump_for(Duration::from_millis(300));
     assert_eq!(c.view.n_pages(), 1);
     assert!(c.window.is_visible());
     assert_eq!(settings::load(&path).font_scale, 1.5, "not saved before");
-    act(&c, "close-tab");
+    act(&c, "close-pane");
     pump_until("the window to close with its last tab", || {
         !c.window.is_visible()
     });

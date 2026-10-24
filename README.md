@@ -39,7 +39,7 @@ Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, 
 - ▶️ **Startup sequences.** Give a profile as many named command lists as you like ("update", "tail the logs"). Connect with one and its commands run after login, then you are left in your normal interactive shell.
 - 🔄 **Sync with no server.** Profiles and passwords sync between your own machines over plain SSH. The bundle is encrypted with a shared sync key (Argon2id, XChaCha20-Poly1305) before it leaves the machine, and the key itself is never sent. Changes merge both ways: profiles added on either side are kept, the newest edit of a profile wins and deletions propagate. Once set up, Moniker syncs in the background at every launch.
 - 📝 **Transcripts.** Save a plain-text transcript of any session, remote or local: per profile, per connection, or of every session. The Transcripts window lists them by day, filters by host, searches across all of them, and exports or deletes them. Transcripts never leave the machine.
-- 🖥️ **A real terminal.** Tabs, several windows, tabs dragged from one window to another, a text size per tab, and copy and paste with bracketed paste. Moniker keeps only a handful of [shortcuts](#keyboard-shortcuts); every other key, Ctrl+Tab and F10 included, goes to the program in the terminal.
+- 🖥️ **A real terminal.** Tabs, panes side by side or one above the other in any arrangement (to compare two servers, say), several windows, tabs and panes dragged from one window to another, a text size per pane, and copy and paste with bracketed paste. Moniker keeps only a handful of [shortcuts](#keyboard-shortcuts); every other key, Ctrl+Tab and F10 included, goes to the program in the terminal.
 - 🎨 **The modern GNOME look.** libadwaita, following the system light or dark style, terminal colors close to GNOME Console's, and a Connection Profiles window laid out like GNOME Settings.
 - 🟢 **Which hosts answer.** A small mark before each profile's name, in the new-tab list and the Connection Profiles window, says whether its host answers a ping from this machine right now: a green dot if it does, a red ring if three pings got no reply or its name is not found, a gray dash until it is known. Hover it for the words. Turn it off in Preferences.
 - 🗄️ **Headless machines too.** `moniker-server` is a command line with no GTK, for a server that only takes part in sync.
@@ -113,6 +113,7 @@ Moniker opens with one local terminal: your login shell, in your home directory.
 | **Add or edit profiles** | **☰ → Connection Profiles**. Double-click a profile there, or press its **Connect** button, to open a session in the main window you used last. |
 | **Read transcripts** | **☰ → Transcripts**. |
 | **Sync** | **☰ → Sync Now**, once sync is set up (see [Syncing two machines](#syncing-two-machines)). |
+| **Split a tab** | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> puts a new pane on the right, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> one below (also **Split Right** and **Split Down** when you right-click a terminal). The new pane shows the same list as a new tab. See [Panes](#panes). |
 | **Rename a tab** | Double-click it, or right-click it, then **Rename…**. |
 | **New window** | **☰ → New Window**, or drag a tab out of the tab bar. A tab can also be dragged into another Moniker window. |
 | **Text size** | The row at the top of **☰** (− 100% +), or the keys below. |
@@ -121,22 +122,35 @@ Moniker opens with one local terminal: your login shell, in your home directory.
 
 | Keys | Action |
 |---|---|
-| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> | New tab / close tab |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> | New tab |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> | Split right / split down |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> | Close the pane (in a tab with one pane, the tab) |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> | Go to the pane that way (in a tab with several panes) |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> | New window |
 | <kbd>Ctrl</kbd>+<kbd>PgUp</kbd> / <kbd>Ctrl</kbd>+<kbd>PgDn</kbd> | Previous / next tab |
 | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> | Copy / paste |
-| <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>Ctrl</kbd>+<kbd>−</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | Larger / smaller / normal text, in this tab |
+| <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>Ctrl</kbd>+<kbd>−</kbd> / <kbd>Ctrl</kbd>+<kbd>0</kbd> | Larger / smaller / normal text, in this pane |
 | <kbd>Ctrl</kbd>+<kbd>,</kbd> | Preferences |
 
-Every other key, <kbd>Ctrl</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>Tab</kbd> and <kbd>F10</kbd> included, goes to the program in the terminal. Larger text also answers to <kbd>Ctrl</kbd>+<kbd>=</kbd>, and all three text size keys work on the keypad. One trade-off: <kbd>Ctrl</kbd>+<kbd>−</kbd> no longer reaches the program; readline's undo is still on <kbd>Ctrl</kbd>+<kbd>_</kbd>. **☰ → Keyboard Shortcuts** shows the same list.
+Every other key, <kbd>Ctrl</kbd>+<kbd>C</kbd>, <kbd>Ctrl</kbd>+<kbd>Tab</kbd> and <kbd>F10</kbd> included, goes to the program in the terminal. Larger text also answers to <kbd>Ctrl</kbd>+<kbd>=</kbd>, and all three text size keys work on the keypad. Two trade-offs: <kbd>Ctrl</kbd>+<kbd>−</kbd> no longer reaches the program (readline's undo is still on <kbd>Ctrl</kbd>+<kbd>_</kbd>), and in a tab with several panes <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+arrows move between panes instead of scrolling a line (up and down) or jumping to the previous or next prompt (left and right), which they still do in a tab with one pane. **☰ → Keyboard Shortcuts** shows the same list.
 
 ### Tabs and windows
 
 - With one tab there is no tab bar. A remote tab is named after its profile, and the remote shell cannot change that; a local tab follows its shell's title until you rename it.
 - Closing a tab or a window hangs up whatever runs in it: the `ssh`, or the shell and its job. Closing the last window quits.
-- Each tab has its own text size, from 50% to 300%. A new tab starts at the size of the tab you were in, and the size of the last window's active tab is remembered for the next launch.
+- Each tab (each pane, in a split tab) has its own text size, from 50% to 300%. A new tab or pane starts at the size of the one you were in, and the size of the last window's active one is remembered for the next launch.
 - While a dialog such as Rename, About or Preferences is open, the tab, copy, paste and text size keys leave the tab behind it alone, so <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> pastes into the dialog's field.
-- **Copy and paste:** select with the mouse and press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>; <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> pastes. Right-click a terminal for a menu with Copy and Paste. When the program is using the mouse (htop, mc, tmux with mouse on), a plain right-click goes to the program and <kbd>Shift</kbd>+right-click opens the menu. A multi-line paste reaches a shell that supports bracketed paste as one block instead of running line by line. Middle-click still pastes the selection.
+- **Copy and paste:** select with the mouse and press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd>; <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd> pastes. Right-click a terminal for a menu with Copy and Paste (into that terminal) and Split Right and Split Down. When the program is using the mouse (htop, mc, tmux with mouse on), a plain right-click goes to the program and <kbd>Shift</kbd>+right-click opens the menu. A multi-line paste reaches a shell that supports bracketed paste as one block instead of running line by line. Middle-click still pastes the selection.
+
+### Panes
+
+A tab can hold several panes, each its own session: a connection or a local shell, with its own title, text size and transcript.
+
+- **Splitting.** <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> (right) or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> (down) halves the pane you are in; the new pane shows the new-tab list. Split again, either way, for any arrangement: three side by side, or two side by side with one of them split top and bottom. Drag a divider to resize.
+- **The pane you are in** has a marked header; the others' titles are dimmed. The tab and the window are titled after it, and the text size keys, copy and paste act on it. Click a pane, or press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+an arrow, to go to another. The tab's tooltip lists every pane.
+- **Moving panes.** Drag a pane by its header: onto another pane (in any tab or window) to put it beside that one, on the side you drop it nearest to; onto a tab in the tab bar to make it a tab of its own (the tab bar shows while you drag, and hovering over a tab opens it, so you can drop into its panes); or outside every window for a window of its own. The header's menu has **Move to New Tab** and **Move to New Window** too.
+- **Tiling tabs.** Drag a tab from the tab bar onto a pane, or onto the terminal of a tab with one pane: its panes go beside it, laid out as they were, and the tab goes. Dropped on a tab bar, a tab moves as a tab.
+- **Closing.** The × in a pane's header or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>W</kbd> closes that pane and hangs up its session, and the pane beside it takes the room. A session that ends closes its pane as it would close its tab. The tab's own × closes all of its panes.
 
 ### Profiles and startup sequences
 

@@ -24,7 +24,7 @@ use moniker_core::store::ProfileStore;
 
 use super::{
     MARKUP_NAME, all_widgets, button_labeled, fake_ssh, files_in, find_widget, fixture, labels_in,
-    make_helper, pump_for, pump_until, wait_for_text,
+    make_helper, pane, pump_for, pump_until, wait_for_text,
 };
 use crate::connect_menu::{self, RECORD_LABEL};
 use crate::context::AppContext;
@@ -438,12 +438,12 @@ fn the_connect_time_choice_decides_whether_a_transcript_is_written(bin: &Path, d
 
         let fx = fixture();
         let page = new_holder_page(&fx.view, "x");
-        let mut launched = launch(&page, &p, sequence, record, &ctx, &case, false);
+        let mut launched = launch(&pane(&page), &p, sequence, record, &ctx, &case, false);
         launched.command.program = fake.clone();
         assert_eq!(launched.transcript.is_some(), expect_file);
 
         let terminal = start_command(
-            &page,
+            &pane(&page),
             &launched.title,
             launched.command,
             launched.transcript,

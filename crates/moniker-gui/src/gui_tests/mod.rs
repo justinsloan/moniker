@@ -48,6 +48,7 @@ use crate::{form, new_tab, window};
 mod hosts;
 mod main_window;
 mod notifications;
+mod panes;
 mod preferences;
 mod profiles;
 mod recordings;
@@ -273,10 +274,15 @@ impl Fixture {
     }
 }
 
-/// The page of `view` that shows `terminal`.
+/// The page of `view` that shows `terminal` (in one of its panes).
 fn page_of(view: &adw::TabView, terminal: &Terminal) -> adw::TabPage {
-    let holder = terminal.parent().expect("a terminal in a tab has a holder");
-    view.page(&holder)
+    let layout = crate::panes::layout_of(terminal).expect("a terminal in a tab is in its layout");
+    view.page(&layout)
+}
+
+/// The pane of `page` that has the focus: its only one, in a tab with one.
+fn pane(page: &adw::TabPage) -> crate::terminal_tab::PaneHolder {
+    crate::terminal_tab::holder_of(page).expect("a page made by new_holder_page has a pane")
 }
 
 /// A profile with a fixed name, host and user, plus the given sequences.
@@ -364,6 +370,15 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #6, the panes of a tab.
+    panes::splitting_puts_a_new_pane_beside_the_focused_one(&bin, &tmp.path().join("s-split"));
+    panes::the_tab_follows_its_focused_pane(&bin, &tmp.path().join("s-focus"));
+    panes::closing_a_pane_gives_its_room_to_the_others(&bin, &tmp.path().join("s-close"));
+    panes::panes_move_between_tabs_and_windows(&bin, &tmp.path().join("s-move"));
+    panes::the_terminal_menu_acts_on_its_own_pane(&bin, &tmp.path().join("s-menu"));
+    panes::a_tab_never_gives_the_focus_to_a_pane_that_left_it(&bin, &tmp.path().join("s-left"));
+    panes::a_late_session_leaves_the_focus_in_the_pane_in_use(&bin, &tmp.path().join("s-late"));
+    panes::the_header_acts_on_its_own_pane(&bin, &tmp.path().join("s-header"));
     hosts::both_lists_mark_each_hosts_status(&tmp.path().join("p-both"));
     hosts::a_mark_waits_for_its_check_and_keeps_its_state(&tmp.path().join("p-wait"));
     hosts::turned_off_there_is_no_mark_and_no_ping(&tmp.path().join("p-off"));
@@ -673,6 +688,26 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     assert_eq!(title.title(), MARKUP_NAME);
     literal_labels("window title", &title, MARKUP_NAME);
     set_test_ssh_program(None);
+
+    // With a second pane the headers show: the pane's title there is plain
+    // text too, and the tab's tooltip lists both titles, escaped.
+    WidgetExt::activate_action(&main.window, "win.split-right", None).expect("win.split-right");
+    let layout = crate::panes::layout_of_page(&page).expect("the tab's layout");
+    let first = crate::panes::pane_of(&layout.holders()[0]).expect("the first pane");
+    assert!(first.header().is_visible());
+    literal_labels("pane header", first.header(), MARKUP_NAME);
+    assert_eq!(
+        page.tooltip().as_deref(),
+        Some(
+            format!(
+                "{}\n{}",
+                glib::markup_escape_text(MARKUP_NAME),
+                crate::panes::NEW_PANE_TITLE
+            )
+            .as_str()
+        ),
+        "the tooltip is markup for GTK"
+    );
 
     // A notification made of this text (an error message built from a name has
     // the same shape) is shown as it is.

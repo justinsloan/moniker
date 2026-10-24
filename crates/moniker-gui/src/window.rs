@@ -13,25 +13,34 @@
 //! terminal, below the bars.
 //!
 //! Each main window has the actions of its tabs: `win.new-tab` (as ＋ does),
-//! `win.close-tab`, `win.next-tab` and `win.previous-tab`; and `win.copy`,
-//! `win.paste`, `win.zoom-in`, `win.zoom-out` and `win.zoom-reset`, which act on
-//! the selected tab's terminal and are enabled while it has one
+//! `win.next-tab` and `win.previous-tab`; of the panes of a tab
+//! (`crate::panes`), on the selected tab's focused pane: `win.split-right` and
+//! `win.split-down` (a new pane beside it that shows the new-tab list),
+//! `win.close-pane` (the tab, with one pane), `win.pane-to-tab` and
+//! `win.pane-to-window`, and `win.pane-left`, `win.pane-right`, `win.pane-up`
+//! and `win.pane-down` (going to another pane; the last four and the moves are
+//! enabled only in a tab with several); and `win.copy`, `win.paste`,
+//! `win.zoom-in`, `win.zoom-out` and `win.zoom-reset`, which act on the focused
+//! pane's terminal and are enabled while it has one
 //! ([`terminal_tab::sync_window_actions`]). `main.rs` gives them their
 //! accelerators. While a dialog (Rename, About, Keyboard Shortcuts ...) is open
 //! over the window all of these are disabled, so an accelerator's key reaches
 //! the dialog and not the tab behind it.
 //!
-//! Every tab has its own text size. The zoom row of ☰ ([`zoom_row`]) shows the
-//! selected tab's and follows it as the tab or the size changes. When the last
-//! main window closes, the size of the tab it had active (or, if its tabs were
-//! closed one by one, of the last one to go) is saved for the next launch
+//! Every pane has its own text size. The zoom row of ☰ ([`zoom_row`]) shows the
+//! focused pane's of the selected tab and follows it as the tab, the pane or
+//! the size changes. When the last main window closes, the size of the pane it
+//! had active (or, if its tabs were closed one by one, of the last one to go)
+//! is saved for the next launch
 //! ([`save_scale_when_last_window_closes`]); a window with no tab to take a size
 //! from starts its first tab at that saved size.
 //!
 //! There can be several main windows ([`new_window`]). A tab can be dragged
 //! from one into another, or out of every window, which makes a new main
 //! window for it (the tab view's `create-window`); a window whose last tab
-//! leaves closes. A moved tab keeps its session, title and transcript setting.
+//! leaves closes. A moved tab keeps its sessions, titles and transcript
+//! settings. A pane moves the same way, to another tab or window
+//! (`crate::panes`).
 //! Sessions started from the Connection Profiles window ([`crate::profiles`])
 //! open in the one that was active last ([`last_active`], [`connect_fn`]), or in
 //! a new one if none is left. When the last main window goes, the Connection
@@ -41,7 +50,7 @@
 //! The title shows the tab's title, which may be a profile name from another
 //! machine: `adw::WindowTitle` shows it as plain text.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -52,7 +61,7 @@ use moniker_core::profile::Profile;
 
 use crate::context::AppContext;
 use crate::notify::NotificationArea;
-use crate::{new_tab, profiles, recordings, settings, terminal_tab, zoom};
+use crate::{new_tab, panes, profiles, recordings, settings, terminal_tab, zoom};
 
 /// Widget name of a main window, how [`last_active`] tells it from the
 /// Connection Profiles window and dialogs.
@@ -141,7 +150,13 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
         ctx,
         #[upgrade_or]
         None,
-        move |_| {
+        move |view| {
+            // Not for a tab that was dropped on a pane: its panes went there,
+            // and its emptied page goes back where it came from, to be closed.
+            // (No view at all would do the same, with a critical warning.)
+            if panes::claims_new_window() {
+                return Some(view.clone());
+            }
             let main = build_empty(&app, &ctx);
             main.window.present();
             Some(main.view)
@@ -201,6 +216,7 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
     let show_scale = follow_selected_scale(&view, &percent, &scale);
 
     add_tab_actions(&window, &view, ctx);
+    add_pane_actions(&window, &view, app, ctx);
     add_clipboard_actions(&window, &view);
     add_zoom_actions(&window, &view, &show_scale);
     // The actions on a terminal apply while the selected tab has one, and the
@@ -225,7 +241,6 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
 }
 
 /// The window's tab actions: `win.new-tab` (the new-tab list in a new tab),
-/// `win.close-tab` (the selected tab, as its close button does),
 /// `win.next-tab` and `win.previous-tab`. The window owns them, so the view is
 /// held weakly.
 fn add_tab_actions(window: &adw::ApplicationWindow, view: &adw::TabView, ctx: &Rc<AppContext>) {
@@ -237,17 +252,6 @@ fn add_tab_actions(window: &adw::ApplicationWindow, view: &adw::TabView, ctx: &R
             ctx,
             move |_: &adw::ApplicationWindow, _, _| {
                 new_tab::open(&view, &ctx);
-            }
-        ))
-        .build();
-    let close_tab = gio::ActionEntry::builder(terminal_tab::CLOSE_TAB_ACTION)
-        .activate(glib::clone!(
-            #[weak]
-            view,
-            move |_: &adw::ApplicationWindow, _, _| {
-                if let Some(page) = view.selected_page() {
-                    view.close_page(&page);
-                }
             }
         ))
         .build();
@@ -269,12 +273,107 @@ fn add_tab_actions(window: &adw::ApplicationWindow, view: &adw::TabView, ctx: &R
             }
         ))
         .build();
-    window.add_action_entries([new_tab, close_tab, next_tab, previous_tab]);
+    window.add_action_entries([new_tab, next_tab, previous_tab]);
+}
+
+/// The window's pane actions, on the focused pane of the selected tab:
+/// `win.split-right` and `win.split-down` (a new pane beside it, which shows
+/// the new-tab list), `win.close-pane` (as its close button does; with one
+/// pane, the tab's), `win.pane-to-tab`, `win.pane-to-window`, and
+/// `win.pane-left`, `win.pane-right`, `win.pane-up` and `win.pane-down`. The
+/// window owns them, so the view and the application are held weakly.
+fn add_pane_actions(
+    window: &adw::ApplicationWindow,
+    view: &adw::TabView,
+    app: &adw::Application,
+    ctx: &Rc<AppContext>,
+) {
+    let split = |name: &str, side: panes::Side| {
+        gio::ActionEntry::builder(name)
+            .activate(glib::clone!(
+                #[weak]
+                view,
+                #[strong]
+                ctx,
+                move |_: &adw::ApplicationWindow, _, _| {
+                    if let Some(holder) = panes::split(&view, side) {
+                        new_tab::fill(&holder, &ctx);
+                    }
+                }
+            ))
+            .build()
+    };
+    let close = gio::ActionEntry::builder(panes::CLOSE_PANE_ACTION)
+        .activate(glib::clone!(
+            #[weak]
+            view,
+            move |_: &adw::ApplicationWindow, _, _| {
+                if let Some(holder) = terminal_tab::selected_holder(&view) {
+                    terminal_tab::close_pane(&holder);
+                }
+            }
+        ))
+        .build();
+    let to_tab = gio::ActionEntry::builder(panes::TO_TAB_ACTION)
+        .activate(glib::clone!(
+            #[weak]
+            view,
+            move |_: &adw::ApplicationWindow, _, _| {
+                let pane = terminal_tab::selected_holder(&view).and_then(|h| panes::pane_of(&h));
+                if let (Some(pane), Some(page)) = (pane, view.selected_page()) {
+                    panes::move_to_new_page(&pane, &view, view.page_position(&page) + 1);
+                }
+            }
+        ))
+        .build();
+    // A window of its own, presented; the pane goes into its view.
+    let to_window = gio::ActionEntry::builder(panes::TO_WINDOW_ACTION)
+        .activate(glib::clone!(
+            #[weak]
+            view,
+            #[weak]
+            app,
+            #[strong]
+            ctx,
+            move |_: &adw::ApplicationWindow, _, _| {
+                let Some(pane) =
+                    terminal_tab::selected_holder(&view).and_then(|h| panes::pane_of(&h))
+                else {
+                    return;
+                };
+                if !panes::selected_is_split(&view) {
+                    return;
+                }
+                let main = build_empty(&app, &ctx);
+                panes::move_to_new_page(&pane, &main.view, 0);
+                main.window.present();
+            }
+        ))
+        .build();
+    let toward = |name: &str, direction: panes::Direction| {
+        gio::ActionEntry::builder(name)
+            .activate(glib::clone!(
+                #[weak]
+                view,
+                move |_: &adw::ApplicationWindow, _, _| panes::focus_toward(&view, direction)
+            ))
+            .build()
+    };
+    window.add_action_entries([
+        split(panes::SPLIT_RIGHT_ACTION, panes::Side::Right),
+        split(panes::SPLIT_DOWN_ACTION, panes::Side::Bottom),
+        close,
+        to_tab,
+        to_window,
+        toward(panes::PANE_LEFT_ACTION, panes::Direction::Left),
+        toward(panes::PANE_RIGHT_ACTION, panes::Direction::Right),
+        toward(panes::PANE_UP_ACTION, panes::Direction::Up),
+        toward(panes::PANE_DOWN_ACTION, panes::Direction::Down),
+    ]);
 }
 
 /// The window's clipboard actions: `win.copy` and `win.paste` (Ctrl+Shift+C and
-/// Ctrl+Shift+V; the terminal's right-click menu also uses `win.paste`), on the
-/// selected tab's terminal. They start disabled and are enabled while the
+/// Ctrl+Shift+V), on the terminal of the selected tab's focused pane. They start disabled and are enabled while the
 /// selected tab has a terminal, whether or not it has a selection:
 /// Ctrl+Shift+C with nothing selected must be handled (and do nothing) rather
 /// than reach the program ([`terminal_tab::copy_selection`]). The window owns
@@ -303,7 +402,7 @@ fn add_clipboard_actions(window: &adw::ApplicationWindow, view: &adw::TabView) {
 
 /// The window's text size actions: `win.zoom-in` and `win.zoom-out` (one step
 /// of `crate::zoom` up and down) and `win.zoom-reset` (the normal size), on the
-/// selected tab only. Each one then has the zoom row show the new size.
+/// selected tab's focused pane only. Each one then has the zoom row show the new size.
 /// ([`terminal_tab::sync_window_actions`] enables them.) The window owns the
 /// actions, so the view is held weakly.
 fn add_zoom_actions(
@@ -371,9 +470,14 @@ fn zoom_row() -> (gtk::Box, gtk::Button) {
     (row, percent)
 }
 
+/// The selected tab's layout that [`follow_selected_scale`] follows, and its
+/// handler there.
+type Followed = (glib::WeakRef<panes::TabLayout>, glib::SignalHandlerId);
+
 /// Keep `percent` (the zoom row's button) and `scale` showing the text size of
-/// `view`'s selected tab: now, and whenever the selected tab changes. The
-/// returned function does it again; the zoom actions call it after a change.
+/// the focused pane of `view`'s selected tab: now, and whenever the selected
+/// tab or its focused pane changes. The returned function does it again; the
+/// zoom actions call it after a change.
 ///
 /// `scale` is the size of the last tab that was selected, `None` until there
 /// was one. It is what [`save_scale_when_last_window_closes`] saves, and it
@@ -401,11 +505,35 @@ fn follow_selected_scale(
             }
         }
     ));
-    view.connect_selected_page_notify({
-        let show = Rc::clone(&show);
-        move |_| show()
-    });
-    show();
+    // The selected tab's layout tells when its focused pane changes; only the
+    // selected one is followed.
+    let followed: Rc<RefCell<Option<Followed>>> = Rc::default();
+    let follow = glib::clone!(
+        #[strong]
+        show,
+        move |view: &adw::TabView| {
+            if let Some((layout, handler)) = followed.take()
+                && let Some(layout) = layout.upgrade()
+            {
+                layout.disconnect(handler);
+            }
+            if let Some(layout) = view
+                .selected_page()
+                .as_ref()
+                .and_then(panes::layout_of_page)
+            {
+                let show = Rc::clone(&show);
+                let handler = layout.connect_local(panes::FOCUS_CHANGED, false, move |_| {
+                    show();
+                    None
+                });
+                followed.replace(Some((layout.downgrade(), handler)));
+            }
+            show();
+        }
+    );
+    follow(view);
+    view.connect_selected_page_notify(follow);
     show
 }
 

@@ -1,15 +1,18 @@
 //! The new-tab list: what a tab opened with ＋ (or Ctrl+Shift+T) shows until
-//! the person picks what it becomes ([`open`]).
+//! the person picks what it becomes ([`open`]), and what a new pane shows, made
+//! by splitting one (Ctrl+Shift+R or D, [`fill`]).
 //!
-//! The tab, called "New Tab", holds a search entry over a list. The first row
+//! The tab, called "New Tab" (a new pane: "New Pane"), holds a search entry
+//! over a list. The first row
 //! is always "Local terminal"; below it come the live profiles in the store's
 //! order, each with its name and `user@host:port`. "Local terminal" starts out
 //! selected and with the focus, so Enter gives a local shell at once.
 //!
 //! The tab starts at the text size of the tab that was selected when ＋ was
-//! pressed ([`terminal_tab::new_holder_page`]), and the session picked keeps it.
+//! pressed ([`terminal_tab::new_holder_page`]), a new pane at the size of the
+//! pane it was split from, and the session picked keeps it.
 //!
-//! Picking a row turns that same tab into the session: Local terminal starts
+//! Picking a row turns that same tab (or pane) into the session: Local terminal starts
 //! the person's shell ([`terminal_tab::start_local_shell`]), a profile connects
 //! with "Just connect". Whether the session saves a transcript is decided here,
 //! before the tab starts: with "Save transcripts of all sessions" on, every
@@ -25,11 +28,11 @@
 //! the search entry picks it (Local terminal if no profile matches); typing
 //! anywhere in the list goes to the search.
 //!
-//! The list fills its page once: it only ever puts a session into the fresh
-//! page it was made for, never into one that already ran one (whose unwritten
+//! The list fills its pane once: it only ever puts a session into the fresh
+//! pane it was made for, never into one that already ran one (whose unwritten
 //! transcript a new session would lose). Once it has, the list is gone, and a
-//! stale event from it starts nothing. Closing the tab before picking just
-//! closes it: there is no session, so nothing is written.
+//! stale event from it starts nothing. Closing the tab or pane before picking
+//! just closes it: there is no session, so nothing is written.
 //!
 //! While it is still a list it follows the profiles
 //! ([`AppContext::on_profiles_changed`]), keeping the search, the selected row
@@ -46,6 +49,7 @@ use libadwaita as adw;
 use moniker_core::profile::Profile;
 
 use crate::context::AppContext;
+use crate::terminal_tab::PaneHolder;
 use crate::{connect_menu, form, terminal_tab};
 
 /// Title of a tab that shows the new-tab list.
@@ -65,28 +69,36 @@ pub(crate) const LIST_NAME: &str = "new-tab-list";
 /// its page. The list fills this page with whatever is picked.
 pub fn open(view: &adw::TabView, ctx: &Rc<AppContext>) -> adw::TabPage {
     let page = terminal_tab::new_holder_page(view, TITLE);
-    let chooser = build(&page, ctx);
-    terminal_tab::show_chooser(&page, &chooser);
+    if let Some(holder) = terminal_tab::holder_of(&page) {
+        fill(&holder, ctx);
+    }
     page
+}
+
+/// Show the new-tab list in `holder`, a fresh pane (a new tab's, or one made by
+/// splitting), which it fills with whatever is picked.
+pub fn fill(holder: &PaneHolder, ctx: &Rc<AppContext>) {
+    let chooser = build(holder, ctx);
+    terminal_tab::show_chooser(holder, &chooser);
 }
 
 /// What the list's handlers share. It holds no widget, so the handlers that
 /// keep it (and the list keeps them) make no reference cycle.
 struct Chooser {
     ctx: Rc<AppContext>,
-    /// The page to fill. Weak: the page owns the list.
-    page: glib::WeakRef<adw::TabPage>,
+    /// The pane to fill. Weak: the pane owns the list.
+    holder: glib::WeakRef<PaneHolder>,
     /// The profiles listed, as the store had them at the last (re)build.
     profiles: RefCell<Vec<Profile>>,
 }
 
 impl Chooser {
-    /// The page to fill, while `list` is still what it shows: once a session
-    /// has replaced the list (or the tab is gone) there is nothing to fill.
-    fn fresh_page(&self, list: &gtk::ListBox) -> Option<adw::TabPage> {
-        self.page
+    /// The pane to fill, while `list` is still what it shows: once a session
+    /// has replaced the list (or the pane is gone) there is nothing to fill.
+    fn fresh_holder(&self, list: &gtk::ListBox) -> Option<PaneHolder> {
+        self.holder
             .upgrade()
-            .filter(|page| list.is_ancestor(&page.child()))
+            .filter(|holder| list.is_ancestor(holder))
     }
 
     /// The listed profile `id`, cloned so no borrow is held while connecting.
@@ -116,7 +128,7 @@ impl Chooser {
         self.ctx.settings().save_all_transcripts
     }
 
-    /// Turn the page into what `row` stands for: a local shell, or the
+    /// Turn the pane into what `row` stands for: a local shell, or the
     /// profile's session with "Just connect". A transcript is saved as
     /// [`terminal_tab::default_save`] says.
     fn pick(&self, list: &gtk::ListBox, row: &gtk::ListBoxRow) {
@@ -129,15 +141,15 @@ impl Chooser {
         }
     }
 
-    /// Turn the page into a local shell, saving its transcript if `save`.
+    /// Turn the pane into a local shell, saving its transcript if `save`.
     fn open_local(&self, list: &gtk::ListBox, save: bool) {
-        if let Some(page) = self.fresh_page(list) {
+        if let Some(holder) = self.fresh_holder(list) {
             let transcript = terminal_tab::local_transcript_spec(&self.ctx, save);
-            terminal_tab::start_local_shell(&page, transcript);
+            terminal_tab::start_local_shell(&holder, transcript);
         }
     }
 
-    /// Turn the page into a session for `profile`, saving its transcript if
+    /// Turn the pane into a session for `profile`, saving its transcript if
     /// `record`.
     fn connect(
         &self,
@@ -146,8 +158,8 @@ impl Chooser {
         sequence: Option<usize>,
         record: bool,
     ) {
-        if let Some(page) = self.fresh_page(list) {
-            terminal_tab::start_profile(&page, &self.ctx, profile, sequence, record);
+        if let Some(holder) = self.fresh_holder(list) {
+            terminal_tab::start_profile(&holder, &self.ctx, profile, sequence, record);
         }
     }
 }
@@ -157,11 +169,11 @@ fn live_profiles(ctx: &AppContext) -> Vec<Profile> {
     ctx.store.borrow().live().into_iter().cloned().collect()
 }
 
-/// The search entry over the list, in a scrolled column, for `page`.
-fn build(page: &adw::TabPage, ctx: &Rc<AppContext>) -> gtk::Widget {
+/// The search entry over the list, in a scrolled column, for `holder`'s pane.
+fn build(holder: &PaneHolder, ctx: &Rc<AppContext>) -> gtk::Widget {
     let chooser = Rc::new(Chooser {
         ctx: Rc::clone(ctx),
-        page: page.downgrade(),
+        holder: holder.downgrade(),
         profiles: RefCell::new(live_profiles(ctx)),
     });
     let search = gtk::SearchEntry::builder()
