@@ -693,19 +693,37 @@ fn follow_focus(pane: &Pane) {
     click.connect_pressed(glib::clone!(
         #[weak]
         pane,
-        move |_, _, _, _| {
+        move |_, _, x, y| {
             let within = pane
                 .root()
                 .and_then(|root| root.focus())
                 .is_some_and(|focus| {
                     focus == *pane.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&pane)
                 });
-            if !within {
+            // Not for the header's buttons: × on a pane not in use closes it
+            // and leaves the keyboard where it is, the menu acts on its pane
+            // anyway.
+            if !within && !on_a_button(&pane, x, y) {
                 focus_pane(pane.holder());
             }
         }
     ));
     pane.add_controller(click);
+}
+
+/// Whether the point (`x`, `y`) of `pane` is on a button (the header's).
+fn on_a_button(pane: &Pane, x: f64, y: f64) -> bool {
+    let mut widget = pane.pick(x, y, gtk::PickFlags::DEFAULT);
+    while let Some(current) = widget {
+        if current.is::<gtk::Button>() {
+            return true;
+        }
+        if current == *pane.upcast_ref::<gtk::Widget>() {
+            return false;
+        }
+        widget = current.parent();
+    }
+    false
 }
 
 /// A double click on the header's title renames the pane.
@@ -729,11 +747,25 @@ fn rename_on_double_click(pane: &Pane) {
 /// Give `holder`'s pane the keyboard focus and make it its tab's focused pane:
 /// its terminal, or the first thing in it that takes the focus (the new-tab
 /// list).
+///
+/// A pane with nothing to take the keyboard yet (one that waits for the
+/// keyring) is still made the focused pane, and the keyboard is taken from
+/// the other panes of its tab: the focused pane and the keys must not part
+/// ways, or Ctrl+Shift+W would close one pane while typing goes to another,
+/// and Ctrl+Shift+C (copy, off without a terminal) would reach a terminal as
+/// Ctrl+C.
 pub(crate) fn focus_pane(holder: &PaneHolder) {
-    if let Some(layout) = layout_of(holder) {
+    let layout = layout_of(holder);
+    if let Some(layout) = &layout {
         layout.set_focused(holder);
     }
-    focus_content(holder);
+    if !focus_content(holder)
+        && let Some(layout) = &layout
+        && let Some(root) = holder.root()
+        && root.focus().is_some_and(|focus| focus.is_ancestor(layout))
+    {
+        root.set_focus(gtk::Widget::NONE);
+    }
 }
 
 /// Give the keyboard focus to what `holder` shows: its terminal, or the first
@@ -1102,6 +1134,14 @@ pub(crate) fn claims_new_window() -> bool {
 /// changed while it was being dragged), and if it is the one whose panes a
 /// drop took, close it, from an idle callback (libadwaita is still attaching
 /// it).
+///
+/// libadwaita selects the page it puts back, and the focus that page
+/// remembers has moved away with its panes, so none is left in the window.
+/// The tab that was selected before it came back is selected again (with
+/// several tabs, closing the page would select another), and its focused
+/// pane gets the keyboard back if it may ([`in_front`]), from wherever GTK
+/// put it meanwhile outside the tab. (The page is attached, and this signal
+/// emitted, before libadwaita selects it.)
 pub(crate) fn page_attached(view: &adw::TabView, page: &adw::TabPage) {
     if let Some(layout) = layout_of_page(page)
         && layout.node().is_some()
@@ -1113,16 +1153,52 @@ pub(crate) fn page_attached(view: &adw::TabView, page: &adw::TabPage) {
         return;
     }
     JOINED.with(|joined| joined.set(None));
+    let before = view.selected_page().map(|before| before.downgrade());
     let view = view.downgrade();
     let page = page.downgrade();
     glib::idle_add_local_once(move || {
-        if let (Some(view), Some(page)) = (view.upgrade(), page.upgrade())
-            && view_of_page(&page).as_ref() == Some(&view)
-            && layout_of_page(&page).is_some_and(|layout| layout.node().is_none())
+        let (Some(view), Some(page)) = (view.upgrade(), page.upgrade()) else {
+            return;
+        };
+        if view_of_page(&page).as_ref() != Some(&view)
+            || layout_of_page(&page).is_none_or(|layout| layout.node().is_some())
         {
-            view.close_page(&page);
+            return;
+        }
+        if let Some(before) = before.and_then(|before| before.upgrade())
+            && before != page
+            && view_of_page(&before).as_ref() == Some(&view)
+        {
+            view.set_selected_page(&before);
+        }
+        view.close_page(&page);
+        // Left with no focus, GTK gives the window's to its first button (＋)
+        // by itself, maybe before this runs: a focus outside the tab shown
+        // counts as none.
+        if let Some(layout) = view.selected_page().as_ref().and_then(layout_of_page)
+            && let Some(holder) = layout.focused_holder()
+            && in_front(&holder)
+            && view
+                .root()
+                .is_some_and(|root| root.focus().is_none_or(|focus| !focus.is_ancestor(&layout)))
+        {
+            focus_content(&holder);
         }
     });
+}
+
+/// Tests only: a tab in `view` whose panes have all gone, as a tab dropped on
+/// a pane is when libadwaita puts it back ([`page_attached`]).
+#[cfg(test)]
+pub(crate) fn empty_page_for_tests(view: &adw::TabView) -> adw::TabPage {
+    view.append(&TabLayout::new())
+}
+
+/// Tests only: take `page` for the tab a drop on a pane emptied, which
+/// [`page_attached`] closes once it is back in a view.
+#[cfg(test)]
+pub(crate) fn expect_back_for_tests(page: &adw::TabPage) {
+    JOINED.with(|joined| joined.set(Some(page)));
 }
 
 /// Keep the keyboard focus out of the tabs `view` does not show
@@ -1430,13 +1506,26 @@ pub(crate) fn take_tab_drops(view: &adw::TabView) {
 
 /// The pane of `view`'s selected tab at the point (`x`, `y`) of the view, and
 /// the side of it the point is nearest to. Untargetable widgets count: during a
-/// tab drag they all are.
+/// tab drag they all are. On a divider between two panes (a pixel wide), the
+/// pane next to it.
 fn pane_at(view: &adw::TabView, x: f64, y: f64) -> Option<(Pane, Side)> {
-    let picked = view.pick(x, y, gtk::PickFlags::NON_TARGETABLE)?;
-    let pane = match picked.downcast::<Pane>() {
-        Ok(pane) => pane,
-        Err(widget) => widget.ancestor(Pane::static_type()).and_downcast()?,
+    let pane_under = |x: f64, y: f64| {
+        let picked = view.pick(x, y, gtk::PickFlags::NON_TARGETABLE)?;
+        match picked.downcast::<Pane>() {
+            Ok(pane) => Some(pane),
+            Err(widget) => widget.ancestor(Pane::static_type()).and_downcast(),
+        }
     };
+    const DIVIDER: f64 = 3.0;
+    let pane = [
+        (0.0, 0.0),
+        (-DIVIDER, 0.0),
+        (DIVIDER, 0.0),
+        (0.0, -DIVIDER),
+        (0.0, DIVIDER),
+    ]
+    .into_iter()
+    .find_map(|(dx, dy)| pane_under(x + dx, y + dy))?;
     let point = view.compute_point(&pane, &gtk::graphene::Point::new(x as f32, y as f32))?;
     let side = side_at(
         f64::from(point.x()),

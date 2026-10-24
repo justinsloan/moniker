@@ -640,6 +640,15 @@ pub(super) fn a_late_session_leaves_the_focus_in_the_pane_in_use(bin: &Path, dir
     list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
     pump_for(Duration::from_millis(100));
     assert!(terminal_in(&second).is_none(), "it waits for the keyring");
+    // Going to the waiting pane takes the keyboard from the other: the keys
+    // and the pane in use never part ways.
+    panes::focus_pane(&first);
+    pump_until("the first pane's shell to have the focus", || {
+        t1.has_focus()
+    });
+    panes::focus_pane(&second);
+    assert_eq!(focused(&page), second);
+    assert!(!t1.has_focus(), "the keyboard stayed in another pane");
     panes::focus_pane(&first);
     pump_until("the first pane's shell to have the focus", || {
         t1.has_focus()
@@ -1035,4 +1044,136 @@ pub(super) fn a_list_in_a_split_tab_leaves_the_keyboard_alone(dir: &Path) {
     assert_eq!(focused(&c), c2, "the clicked pane is the one in use");
     main.window.destroy();
     pump_for(Duration::from_millis(200));
+}
+
+/// A tab whose panes a drop on a pane took comes back, empty, as libadwaita
+/// puts it back after the drop: at the first place, selected (it is attached
+/// here the way libadwaita does it, by a transfer from another window). It
+/// goes, the tab that was in use is shown again, not the one beside the place
+/// it came back to, and its pane has the keyboard.
+pub(super) fn a_tab_whose_panes_were_taken_goes_quietly(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let a = main.view.selected_page().expect("the launch tab");
+    let t1 = terminal_in(&pane(&a)).expect("the launch shell");
+    new_tab::open(&main.view, &ctx);
+    new_tab::open(&main.view, &ctx);
+    // [B, A, C], A in use.
+    main.view.reorder_page(&a, 1);
+    main.view.set_selected_page(&a);
+    panes::focus_pane(&pane(&a));
+    pump_until("the shell to have the keyboard", || t1.has_focus());
+
+    let other = main_window(&app, &ctx);
+    let emptied = panes::empty_page_for_tests(&other.view);
+    panes::expect_back_for_tests(&emptied);
+    other.view.transfer_page(&emptied, &main.view, 0);
+    pump_until("the emptied tab to go", || main.view.n_pages() == 3);
+    assert_eq!(
+        main.view.selected_page().as_ref(),
+        Some(&a),
+        "the tab in use is shown again"
+    );
+    // The other window is the active one now: the focus inside this one.
+    wait_for_focus(&main.window, &t1);
+    other.window.destroy();
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The × of a pane not in use closes it and leaves the keyboard in the pane in
+/// use (the press on the button does not make its pane the one in use first).
+/// A keyboard focus put in a pane of a tab out of sight is sent back to the tab
+/// shown.
+pub(super) fn closing_another_pane_and_a_stray_focus_leave_the_keyboard(bin: &Path, dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let a = main.view.selected_page().expect("the launch tab");
+    let a1 = pane(&a);
+    let t1 = terminal_in(&a1).expect("the launch shell");
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a2 = focused(&a);
+    let t2 = shell_in(&a2, bin, dir, "stray-two", "echo STRAY-TWO\nexec sleep 600");
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a3 = focused(&a);
+    shell_in(
+        &a3,
+        bin,
+        dir,
+        "stray-three",
+        "echo STRAY-THREE\nexec sleep 600",
+    );
+    wait_for_text(&t2, "STRAY-TWO");
+    panes::focus_pane(&a1);
+    pump_until("the first pane to have the keyboard", || t1.has_focus());
+
+    // A press on the third pane's ×, then its click.
+    let third = pane_of(&a3);
+    let close = all_widgets::<gtk::Button>(third.header())
+        .into_iter()
+        .find(|b| b.tooltip_text().as_deref() == Some("Close Pane"))
+        .expect("the close button");
+    let at = close
+        .compute_point(
+            &third,
+            &gtk::graphene::Point::new(close.width() as f32 / 2.0, close.height() as f32 / 2.0),
+        )
+        .expect("the button is in its pane");
+    let press = controllers::<gtk::GestureClick>(&third)
+        .into_iter()
+        .find(|g| g.propagation_phase() == gtk::PropagationPhase::Capture)
+        .expect("a pane follows clicks");
+    press.emit_by_name::<()>("pressed", &[&1i32, &f64::from(at.x()), &f64::from(at.y())]);
+    close.emit_clicked();
+    pump_until("the third pane to close", || {
+        layout_of(&a).panes().len() == 2
+    });
+    pump_for(Duration::from_millis(300));
+    assert!(t1.has_focus(), "the keyboard left the pane in use");
+    assert_eq!(focused(&a), a1);
+
+    // A focus given to a pane of a tab out of sight goes back.
+    let b = new_tab::open(&main.view, &ctx);
+    let tb = shell_in(
+        &pane(&b),
+        bin,
+        dir,
+        "stray-b",
+        "echo STRAY-B\nexec sleep 600",
+    );
+    wait_for_text(&tb, "STRAY-B");
+    pump_until("the new tab to have the keyboard", || tb.has_focus());
+    t2.grab_focus();
+    pump_until("the keyboard back in the tab shown", || tb.has_focus());
+    assert!(!t2.has_focus());
+    assert_eq!(focused(&a), a1, "the hidden tab's pane in use is unchanged");
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Run the main loop until `widget` is the focus widget of `window` (whether
+/// or not that window is the active one); on a timeout, say where the focus is.
+#[track_caller]
+fn wait_for_focus(window: &impl IsA<gtk::Window>, widget: &impl IsA<gtk::Widget>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let context = gtk::glib::MainContext::default();
+    loop {
+        while context.iteration(false) {}
+        let focus = gtk::prelude::RootExt::focus(window.upcast_ref::<gtk::Window>());
+        if focus.as_ref() == Some(widget.upcast_ref()) {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            let mut chain = Vec::new();
+            let mut current = focus;
+            while let Some(w) = current {
+                chain.push(w.type_().name().to_owned());
+                current = w.parent();
+            }
+            panic!("timed out waiting for the focus; it is on {chain:?}");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
