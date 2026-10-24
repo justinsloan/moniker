@@ -379,6 +379,10 @@ fn gui_integration() {
     panes::a_tab_never_gives_the_focus_to_a_pane_that_left_it(&bin, &tmp.path().join("s-left"));
     panes::a_late_session_leaves_the_focus_in_the_pane_in_use(&bin, &tmp.path().join("s-late"));
     panes::the_header_acts_on_its_own_pane(&bin, &tmp.path().join("s-header"));
+    panes::a_pane_that_closes_out_of_sight_moves_no_keyboard(&bin, &tmp.path().join("s-sight"));
+    panes::drops_reach_panes_tabs_and_the_tab_bar(&bin, &tmp.path().join("s-drops"));
+    panes::a_pane_dropped_on_nothing_gets_its_own_window(&bin, &tmp.path().join("s-nothing"));
+    panes::a_list_in_a_split_tab_leaves_the_keyboard_alone(&tmp.path().join("s-list"));
     hosts::both_lists_mark_each_hosts_status(&tmp.path().join("p-both"));
     hosts::a_mark_waits_for_its_check_and_keeps_its_state(&tmp.path().join("p-wait"));
     hosts::turned_off_there_is_no_mark_and_no_ping(&tmp.path().join("p-off"));

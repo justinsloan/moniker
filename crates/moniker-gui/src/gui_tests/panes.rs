@@ -363,13 +363,23 @@ pub(super) fn closing_a_pane_gives_its_room_to_the_others(bin: &Path, dir: &Path
         "the third took its place"
     );
     assert_eq!(focused(&page), third, "and the focus");
+    pump_until("the third pane's terminal to have the keyboard", || {
+        three.has_focus()
+    });
     pump_until("the closed pane's shell to be hung up", || hup.exists());
     assert_eq!(files_in(&transcripts).len(), 1, "its transcript, once");
     assert!(two.parent().is_none(), "its terminal is out of the window");
 
-    // The third's shell exits: only its pane closes; the tab stays, alone again.
+    // The third's shell exits: only its pane closes; the tab stays, alone again,
+    // and the first pane, which takes its room, has the keyboard. (Not the
+    // widget GTK would move the focus to on its own, the next one after the
+    // terminal that went.)
     three.feed_child(b"\n");
     pump_until("the third pane to close", || layout.panes().len() == 1);
+    let one = terminal_in(&first).expect("the launch shell");
+    pump_until("the first pane's terminal to have the keyboard", || {
+        one.has_focus()
+    });
     assert_eq!(main.view.n_pages(), 1);
     assert_eq!(layout.holders(), std::slice::from_ref(&first));
     assert!(
@@ -590,7 +600,8 @@ pub(super) fn the_terminal_menu_acts_on_its_own_pane(bin: &Path, dir: &Path) {
 
     WidgetExt::activate_action(&t2, "pane.split-right", None).expect("pane.split-right");
     let layout = layout_of(&page);
-    assert_eq!(layout.panes().len(), 3);
+    // Once the menu would have handed the keyboard back.
+    pump_until("the split", || layout.panes().len() == 3);
     let new = focused(&page);
     assert_eq!(
         layout.holders(),
@@ -693,6 +704,7 @@ pub(super) fn the_header_acts_on_its_own_pane(bin: &Path, dir: &Path) {
     );
     WidgetExt::activate_action(pane_of(&first).header(), "pane.pane-to-tab", None)
         .expect("pane.pane-to-tab");
+    pump_until("the pane's own tab", || main.view.n_pages() == 2);
     assert_eq!(
         main.view.n_pages(),
         2,
@@ -745,4 +757,282 @@ fn pump_dialog(main: &window::MainWindow) -> adw::AlertDialog {
         .visible_dialog()
         .and_downcast::<adw::AlertDialog>()
         .expect("an alert dialog")
+}
+
+/// The drop target of `pane` (a pane dropped on it), as GTK runs it.
+fn pane_drop_target(pane: &Pane) -> gtk::DropTarget {
+    controllers::<gtk::DropTarget>(pane)
+        .into_iter()
+        .next()
+        .expect("a pane takes drops")
+}
+
+/// The event controllers of type `T` on `widget`.
+fn controllers<T: IsA<gtk::EventController> + IsA<gtk::glib::Object>>(
+    widget: &impl IsA<gtk::Widget>,
+) -> Vec<T> {
+    let all = widget.observe_controllers();
+    (0..all.n_items())
+        .filter_map(|i| all.item(i).and_downcast::<T>())
+        .collect()
+}
+
+/// The point at (`x`, `y`) of `pane`, in the coordinates of `view`.
+fn point_in(view: &adw::TabView, pane: &Pane, x: f32, y: f32) -> (f64, f64) {
+    let point = pane
+        .compute_point(view, &gtk::graphene::Point::new(x, y))
+        .expect("the pane is in the view");
+    (f64::from(point.x()), f64::from(point.y()))
+}
+
+/// A pane that closes in a tab out of sight, or behind a dialog, moves no
+/// keyboard focus: the keys typed next still go to the pane in use, not to the
+/// session beside the one that went (on another host maybe).
+pub(super) fn a_pane_that_closes_out_of_sight_moves_no_keyboard(bin: &Path, dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let a = main.view.selected_page().expect("the launch tab");
+    let a1 = pane(&a);
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a2 = focused(&a);
+    let ends = "echo ENDS\nread x\nexit 0";
+    let t2 = shell_in(&a2, bin, dir, "sight-two", ends);
+    wait_for_text(&t2, "ENDS");
+    panes::focus_pane(&a2);
+    pump_until("the second pane to have the keyboard", || t2.has_focus());
+
+    // Another tab, in use; the second pane's shell ends in the hidden one.
+    let b = new_tab::open(&main.view, &ctx);
+    let tb = shell_in(&pane(&b), bin, dir, "sight-b", "echo IN-USE\nexec cat");
+    wait_for_text(&tb, "IN-USE");
+    pump_until("the tab in use to have the keyboard", || tb.has_focus());
+    t2.feed_child(b"\n");
+    pump_until("the pane to close", || layout_of(&a).panes().len() == 1);
+    pump_for(Duration::from_millis(300));
+    assert!(tb.has_focus(), "the keyboard left the tab in use");
+    assert_eq!(main.view.selected_page().as_ref(), Some(&b));
+    assert_eq!(focused(&a), a1, "the first pane is the focused one there");
+
+    // Behind a dialog: a pane of the tab in use ends while About is open.
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let b2 = focused(&b);
+    let tb2 = shell_in(&b2, bin, dir, "sight-dialog", ends);
+    wait_for_text(&tb2, "ENDS");
+    panes::focus_pane(&b2);
+    pump_until("the new pane to have the keyboard", || tb2.has_focus());
+    let about = crate::about_dialog();
+    about.present(Some(&main.window));
+    pump_until("the About dialog", || {
+        main.window.visible_dialog().is_some()
+    });
+    tb2.feed_child(b"\n");
+    pump_until("the pane to close", || layout_of(&b).panes().len() == 1);
+    pump_for(Duration::from_millis(300));
+    assert!(
+        !tb.has_focus(),
+        "the keyboard went to the pane behind the dialog"
+    );
+    about.close();
+    pump_until("the dialog to close", || {
+        main.window.visible_dialog().is_none()
+    });
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The drops, as GTK hands them over: a pane dropped on a pane goes beside it
+/// on that side (onto itself: refused); a tab dropped on a pane of a shown tab
+/// (taken by the tab view, whose tabs' contents a tab drag makes untargetable)
+/// brings its panes and goes; a pane dropped on a tab of the tab bar becomes a
+/// tab after it.
+pub(super) fn drops_reach_panes_tabs_and_the_tab_bar(bin: &Path, dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let a = main.view.selected_page().expect("the launch tab");
+    let a1 = pane(&a);
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a2 = focused(&a);
+    shell_in(&a2, bin, dir, "drop-two", "echo DROP-TWO\nexec sleep 600");
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a3 = focused(&a);
+    shell_in(
+        &a3,
+        bin,
+        dir,
+        "drop-three",
+        "echo DROP-THREE\nexec sleep 600",
+    );
+    pump_for(Duration::from_millis(300));
+
+    // The third pane dropped near the left edge of the first.
+    let onto = pane_of(&a1);
+    let height = f64::from(onto.height());
+    let took: bool = pane_drop_target(&onto).emit_by_name(
+        "drop",
+        &[
+            &gtk::glib::BoxedValue(pane_of(&a3).to_value()),
+            &2.0f64,
+            &(height / 2.0),
+        ],
+    );
+    assert!(took, "the drop is taken");
+    assert_eq!(
+        layout_of(&a).holders(),
+        [a3.clone(), a1.clone(), a2.clone()]
+    );
+    let took: bool = pane_drop_target(&onto).emit_by_name(
+        "drop",
+        &[&gtk::glib::BoxedValue(onto.to_value()), &2.0f64, &2.0f64],
+    );
+    assert!(!took, "a pane dropped on itself is refused");
+
+    // A tab dropped near the right edge of the second pane.
+    let e = new_tab::open(&main.view, &ctx);
+    let e1 = pane(&e);
+    shell_in(&e1, bin, dir, "drop-tab", "echo DROP-TAB\nexec sleep 600");
+    main.view.set_selected_page(&a);
+    pump_for(Duration::from_millis(300));
+    let view_target = controllers::<gtk::DropTarget>(&main.view)
+        .into_iter()
+        .find(|t| t.propagation_phase() == gtk::PropagationPhase::Capture)
+        .expect("the tab view takes tabs dropped on its panes");
+    let beside = pane_of(&a2);
+    let (x, y) = point_in(
+        &main.view,
+        &beside,
+        beside.width() as f32 - 2.0,
+        beside.height() as f32 / 2.0,
+    );
+    let tabs = main.view.n_pages();
+    let took: bool =
+        view_target.emit_by_name("drop", &[&gtk::glib::BoxedValue(e.to_value()), &x, &y]);
+    assert!(took, "the tab view took the tab");
+    pump_until("the tab to go", || main.view.n_pages() == tabs - 1);
+    assert_eq!(
+        layout_of(&a).holders(),
+        [a3.clone(), a1.clone(), a2.clone(), e1.clone()],
+        "its pane on the right of the second"
+    );
+
+    // A pane dropped on the tab of the tab bar: a tab after it.
+    let bar: adw::TabBar = find_widget(&main.window).expect("the tab bar");
+    let took: bool = bar.emit_by_name(
+        "extra-drag-drop",
+        &[&a, &gtk::glib::BoxedValue(pane_of(&a1).to_value())],
+    );
+    assert!(took, "the tab bar took the pane");
+    let made = main.view.selected_page().expect("the pane's own tab");
+    assert_eq!(
+        main.view.page_position(&made),
+        main.view.page_position(&a) + 1
+    );
+    assert_eq!(layout_of(&made).holders(), std::slice::from_ref(&a1));
+    assert_eq!(
+        layout_of(&a).holders(),
+        [a3.clone(), a2.clone(), e1.clone()]
+    );
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A pane dropped on nothing gets a window of its own: that very pane, even
+/// when the drag hovered another tab open meanwhile.
+pub(super) fn a_pane_dropped_on_nothing_gets_its_own_window(bin: &Path, dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let a = main.view.selected_page().expect("the launch tab");
+    let a1 = pane(&a);
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a2 = focused(&a);
+    let t2 = shell_in(&a2, bin, dir, "nothing-two", "echo NOTHING\nexec sleep 600");
+    wait_for_text(&t2, "NOTHING");
+    // The drag hovered another tab open: a split one, whose focused pane is not
+    // the dragged one.
+    let b = new_tab::open(&main.view, &ctx);
+    shell_in(&pane(&b), bin, dir, "nothing-b", "echo B\nexec sleep 600");
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let b_panes = layout_of(&b).holders();
+    let windows = app.windows().len();
+    panes::dropped_on_nothing(&pane_of(&a2));
+    pump_until("a new window", || app.windows().len() == windows + 1);
+    assert_eq!(layout_of(&a).holders(), std::slice::from_ref(&a1));
+    assert_eq!(
+        layout_of(&b).holders(),
+        b_panes,
+        "the other tab keeps its panes"
+    );
+    let own = app
+        .windows()
+        .into_iter()
+        .find(|w| {
+            find_widget::<adw::TabView>(w).is_some_and(|view| {
+                view.selected_page()
+                    .is_some_and(|p| layout_of(&p).holders() == std::slice::from_ref(&a2))
+            })
+        })
+        .expect("the dragged pane's window");
+    own.destroy();
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The new-tab list shown in a pane of a split tab takes the keyboard only as
+/// the pane in use: not each time its tab is shown again while another pane is
+/// the one in use, nor when panes move and it is left alone in a tab out of
+/// sight.
+pub(super) fn a_list_in_a_split_tab_leaves_the_keyboard_alone(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let a = main.view.selected_page().expect("the launch tab");
+    let a1 = pane(&a);
+    let t1 = terminal_in(&a1).expect("the launch shell");
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a2 = focused(&a);
+    assert!(list_in_pane(&a2).is_some());
+    pump_for(Duration::from_millis(300));
+    panes::focus_pane(&a1);
+    pump_until("the first pane's shell to have the keyboard", || {
+        t1.has_focus()
+    });
+
+    // Away and back: the shell keeps the keyboard.
+    let b = new_tab::open(&main.view, &ctx);
+    pump_for(Duration::from_millis(300));
+    main.view.set_selected_page(&a);
+    pump_until("the shell to have the keyboard again", || t1.has_focus());
+    pump_for(Duration::from_millis(300));
+    assert!(t1.has_focus(), "the list took the keyboard");
+    assert_eq!(focused(&a), a1);
+
+    // The shell moves to a tab of its own; the list, alone in a tab out of
+    // sight now, does not take the keyboard.
+    act(&main, panes::TO_TAB_ACTION);
+    pump_until("the shell to have the keyboard in its tab", || {
+        t1.has_focus()
+    });
+    pump_for(Duration::from_millis(300));
+    assert!(
+        t1.has_focus(),
+        "the list in the tab out of sight took the keyboard"
+    );
+    let _ = b;
+
+    // Clicking a pane (its header, say) makes it the one in use.
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let c = main.view.selected_page().expect("the shell's tab");
+    let c2 = focused(&c);
+    panes::focus_pane(&a1);
+    pump_until("the shell to have the keyboard", || t1.has_focus());
+    let click = controllers::<gtk::GestureClick>(&pane_of(&c2))
+        .into_iter()
+        .find(|g| g.propagation_phase() == gtk::PropagationPhase::Capture)
+        .expect("a pane follows clicks");
+    click.emit_by_name::<()>("pressed", &[&1i32, &5.0f64, &5.0f64]);
+    assert_eq!(focused(&c), c2, "the clicked pane is the one in use");
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
 }

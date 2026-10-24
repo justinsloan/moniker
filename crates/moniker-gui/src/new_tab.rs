@@ -286,20 +286,34 @@ fn build(holder: &PaneHolder, ctx: &Rc<AppContext>) -> gtk::Widget {
 
     // The focus goes to the selected row when the list shows, unless it is
     // already somewhere in it (coming back to the tab). After the tab view has
-    // moved the focus into the page, hence the idle.
+    // moved the focus into the page, hence the idle. Only if its pane may take
+    // the keyboard (`crate::panes::in_front`): the focused pane of the tab its
+    // window shows, with no dialog open. A list in another pane of a split tab
+    // must not take it from the pane in use, nor one shown again as panes
+    // move from a tab that is no longer in sight.
     scroller.connect_map(glib::clone!(
         #[weak]
         list,
+        #[strong]
+        chooser,
         move |scroller| {
             let scroller = scroller.downgrade();
             glib::idle_add_local_once(glib::clone!(
                 #[weak]
                 list,
+                #[strong]
+                chooser,
                 move || {
                     let Some(scroller) = scroller.upgrade() else {
                         return;
                     };
-                    if !focus_within(&scroller)
+                    let in_front = chooser
+                        .holder
+                        .upgrade()
+                        .is_some_and(|holder| crate::panes::in_front(&holder));
+                    if scroller.is_mapped()
+                        && in_front
+                        && !focus_within(&scroller)
                         && let Some(row) = list.selected_row()
                     {
                         row.grab_focus();

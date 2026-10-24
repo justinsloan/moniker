@@ -34,20 +34,29 @@
 //! # Drag and drop
 //!
 //! A pane is dragged by its header (only shown with two panes or more). Every
-//! pane is a drop target for a pane and for a tab (`adw::TabPage`, what
-//! libadwaita's tab drags carry): what is dropped goes beside it on the side
-//! nearest the pointer ([`side_at`]), and a highlight shows the half it will
-//! take. A pane dropped on a tab in a tab bar becomes a tab after that tab
+//! pane is a drop target for a pane: it goes beside it on the side nearest the
+//! pointer ([`side_at`]), and a highlight shows the half it will take. A pane
+//! dropped on a tab in a tab bar becomes a tab after that tab
 //! ([`setup_tab_bar`]); while a pane is dragged every tab bar shows, as
 //! libadwaita shows them for a tab. A pane dropped on nothing gets a window of
-//! its own (`win.pane-to-window`).
+//! its own ([`dropped_on_nothing`]).
 //!
-//! A tab dropped on a pane needs one thing of libadwaita's drag: once our drop
-//! is done the drag's source sees it as a drop outside every tab view and asks
-//! its view for a new window (`create-window`). The window's handler asks
+//! A tab (`adw::TabPage`, what libadwaita's tab drags carry) dropped on a pane
+//! brings its panes there. libadwaita makes the contents of every tab
+//! untargetable while a tab is dragged, so the tab view takes that drop, in the
+//! capture phase, ahead of libadwaita's own target on it, and finds the pane
+//! under the pointer itself ([`take_tab_drops`]). Once our drop is done the
+//! drag's source sees it as a drop outside every tab view and asks its view
+//! for a new window (`create-window`). The window's handler asks
 //! [`claims_new_window`] first, which says yes for the page whose panes were
 //! just taken: the handler then gives back the asking view itself, libadwaita
 //! puts the emptied page back there, and [`page_attached`] closes it.
+//!
+//! The keyboard never goes to a pane out of sight: a pane given the focus in a
+//! tab its window does not show sends it back to the tab that is shown
+//! ([`follow_focus`]), as does a tab selected again whose remembered focus
+//! moved away with a pane ([`keep_focus_in_selected`]); a pane that closes or
+//! a list that shows takes it only where it may ([`in_front`]).
 //!
 //! Nothing here runs per frame: a change of layout is one allocation, and the
 //! highlight changes only when a drag moves to another side. Titles are plain
@@ -121,6 +130,8 @@ mod layout {
         pub struct TabLayout {
             /// The pane that had the keyboard focus last.
             pub(super) focused: glib::WeakRef<PaneHolder>,
+            /// The focused pane as `FOCUS_CHANGED` last told it.
+            pub(super) announced: glib::WeakRef<PaneHolder>,
         }
 
         #[glib::object_subclass]
@@ -183,6 +194,10 @@ mod layout {
 
         pub(super) fn focused(&self) -> &glib::WeakRef<PaneHolder> {
             &self.imp().focused
+        }
+
+        pub(super) fn announced(&self) -> &glib::WeakRef<PaneHolder> {
+            &self.imp().announced
         }
     }
 }
@@ -411,7 +426,33 @@ pub(crate) fn refresh(layout: &TabLayout) {
         show_titles(&page, &panes, focused.as_ref());
         terminal_tab::sync_window_actions(&view);
     }
-    layout.emit_by_name::<()>(FOCUS_CHANGED, &[]);
+    if layout.announced().upgrade() != focused {
+        layout.announced().set(focused.as_ref());
+        layout.emit_by_name::<()>(FOCUS_CHANGED, &[]);
+    }
+}
+
+/// Whether `holder`'s pane is the focused pane of its tab, and that tab the
+/// one its view shows (or in no view: a tab being dragged, a test's).
+pub(crate) fn is_shown_and_focused(holder: &PaneHolder) -> bool {
+    let Some(layout) = layout_of(holder) else {
+        return false;
+    };
+    if layout.focused_holder().as_ref() != Some(holder) {
+        return false;
+    }
+    page_of(&layout).is_none_or(|(view, page)| view.selected_page().as_ref() == Some(&page))
+}
+
+/// Whether `holder`'s pane may take the keyboard now: it is the focused pane
+/// of the tab its window shows, and no dialog is open over the window. Keys
+/// typed must never go to a session out of sight, nor behind a dialog.
+pub(crate) fn in_front(holder: &PaneHolder) -> bool {
+    is_shown_and_focused(holder)
+        && holder
+            .root()
+            .and_downcast::<gtk::Window>()
+            .is_none_or(|window| crate::notify::visible_dialog(&window).is_none())
 }
 
 /// Title `page` after the focused pane and list every pane's title in its
@@ -534,16 +575,33 @@ pub(crate) fn split_menu_section() -> gio::Menu {
 /// terminal's menu: they act on this pane, not on the focused one. Splitting
 /// and moving to a new window need what only the window has (the application
 /// and its context), so those focus this pane and run the window's action.
+/// Those of a menu run once the closing menu has handed the keyboard focus
+/// back (`terminal_tab::after_the_menu_lets_go`), which would otherwise put it
+/// back on the right-clicked terminal or the header button after the change.
 fn add_pane_actions(pane: &Pane) {
     let actions = gio::SimpleActionGroup::new();
+    let after_the_menu = |pane: &Pane, change: Box<dyn FnOnce(&Pane)>| {
+        let window = pane.root().and_downcast::<gtk::Window>();
+        let pane = pane.downgrade();
+        terminal_tab::after_the_menu_lets_go(window.as_ref(), move || {
+            if let Some(pane) = pane.upgrade() {
+                change(&pane);
+            }
+        });
+    };
     for name in [SPLIT_RIGHT_ACTION, SPLIT_DOWN_ACTION, TO_WINDOW_ACTION] {
         let action = gio::SimpleAction::new(name, None);
         action.connect_activate(glib::clone!(
             #[weak]
             pane,
             move |_, _| {
-                focus_pane(pane.holder());
-                let _ = pane.activate_action(&format!("win.{name}"), None);
+                after_the_menu(
+                    &pane,
+                    Box::new(move |pane| {
+                        show_pane(pane);
+                        let _ = pane.activate_action(&format!("win.{name}"), None);
+                    }),
+                );
             }
         ));
         actions.add_action(&action);
@@ -560,9 +618,14 @@ fn add_pane_actions(pane: &Pane) {
         #[weak]
         pane,
         move |_, _| {
-            if let Some((view, page)) = layout_of(&pane).as_ref().and_then(page_of) {
-                move_to_new_page(&pane, &view, view.page_position(&page) + 1);
-            }
+            after_the_menu(
+                &pane,
+                Box::new(|pane| {
+                    if let Some((view, page)) = layout_of(pane).as_ref().and_then(page_of) {
+                        move_to_new_page(pane, &view, view.page_position(&page) + 1);
+                    }
+                }),
+            );
         }
     ));
     actions.add_action(&to_tab);
@@ -586,19 +649,63 @@ fn add_pane_actions(pane: &Pane) {
 }
 
 /// Make the pane the focused one of its tab whenever the keyboard focus goes
-/// into it (a click in its terminal, a key that moves the focus there).
+/// into it (a click in its terminal, a key that moves the focus there), and
+/// when it is clicked anywhere (its header, a pane that waits for the keyring),
+/// give it the keyboard too.
+///
+/// One guard for every way the keyboard could land in a pane of a tab its
+/// window does not show (a widget a tab remembered that moved there, a focus
+/// asked for by code that did not look): it is sent back, before any key
+/// typed meanwhile is handled, to the tab that is shown
+/// ([`keep_focus_in_selected`]). Keys must never reach a session out of sight.
 fn follow_focus(pane: &Pane) {
     let focus = gtk::EventControllerFocus::new();
     focus.connect_enter(glib::clone!(
         #[weak]
         pane,
         move |_| {
-            if let Some(layout) = layout_of(&pane) {
-                layout.set_focused(pane.holder());
+            let Some(layout) = layout_of(&pane) else {
+                return;
+            };
+            if let Some((view, page)) = page_of(&layout)
+                && view.selected_page().as_ref() != Some(&page)
+            {
+                // Not from inside the focus change GTK is making: once it is
+                // done, ahead of input events.
+                let view = view.downgrade();
+                glib::idle_add_local_full(glib::Priority::HIGH, move || {
+                    if let Some(view) = view.upgrade() {
+                        keep_focus_in_selected(&view);
+                    }
+                    glib::ControlFlow::Break
+                });
+                return;
             }
+            layout.set_focused(pane.holder());
         }
     ));
     pane.add_controller(focus);
+
+    let click = gtk::GestureClick::builder()
+        .button(gdk::BUTTON_PRIMARY)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    click.connect_pressed(glib::clone!(
+        #[weak]
+        pane,
+        move |_, _, _, _| {
+            let within = pane
+                .root()
+                .and_then(|root| root.focus())
+                .is_some_and(|focus| {
+                    focus == *pane.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&pane)
+                });
+            if !within {
+                focus_pane(pane.holder());
+            }
+        }
+    ));
+    pane.add_controller(click);
 }
 
 /// A double click on the header's title renames the pane.
@@ -678,17 +785,34 @@ fn detach(node: &gtk::Widget) {
     }
 }
 
-/// Put `node` (a pane or a split) beside `target`, on its `side`: the two share
-/// the room `target` had, half each.
-fn put_beside(node: &gtk::Widget, target: &Pane, side: Side) {
-    let orientation = match side {
+/// The way a split for `side` divides its room.
+fn orientation_for(side: Side) -> gtk::Orientation {
+    match side {
         Side::Left | Side::Right => gtk::Orientation::Horizontal,
         Side::Top | Side::Bottom => gtk::Orientation::Vertical,
-    };
-    let room = match orientation {
-        gtk::Orientation::Horizontal => target.width(),
-        _ => target.height(),
-    };
+    }
+}
+
+/// How much room `target` will have, the way a split for `side` divides it,
+/// once `leaving` (a pane or split about to be taken out, if any) has gone: the
+/// room of the split the two share if they are its children (the target then
+/// fills it), else the target's own. Measured before anything moves.
+fn room_beside(target: &Pane, side: Side, leaving: Option<&gtk::Widget>) -> i32 {
+    let shared = target
+        .parent()
+        .filter(|parent| leaving.and_then(gtk::Widget::parent).as_ref() == Some(parent));
+    let room: gtk::Widget = shared.unwrap_or_else(|| target.clone().upcast());
+    match orientation_for(side) {
+        gtk::Orientation::Horizontal => room.width(),
+        _ => room.height(),
+    }
+}
+
+/// Put `node` (a pane or a split) beside `target`, on its `side`: the two share
+/// `room`, the target's room measured before anything moved ([`room_beside`]),
+/// half each.
+fn put_beside(node: &gtk::Widget, target: &Pane, side: Side, room: i32) {
+    let orientation = orientation_for(side);
     let split = gtk::Paned::builder()
         .orientation(orientation)
         .hexpand(true)
@@ -753,10 +877,19 @@ impl FocusAside {
 }
 
 /// After panes left `layout`: close its tab if none is left (the sessions that
-/// were in it went elsewhere or were ended already), else show what is left.
+/// were in it went elsewhere or were ended already), else show what is left,
+/// and give the keyboard to its focused pane if its window has none left (it
+/// was in a pane that went) and that pane may take it ([`in_front`]: not in a
+/// tab out of sight, not behind a dialog).
 fn after_leaving(layout: &TabLayout) {
     if layout.node().is_some() {
         refresh(layout);
+        if layout.root().is_some_and(|root| root.focus().is_none())
+            && let Some(holder) = layout.focused_holder()
+            && in_front(&holder)
+        {
+            focus_content(&holder);
+        }
     } else if let Some((view, page)) = page_of(layout) {
         view.close_page(&page);
     }
@@ -774,23 +907,27 @@ pub(crate) fn split(view: &adw::TabView, side: Side) -> Option<PaneHolder> {
         target.holder().scale().get(),
     );
     let pane = build_pane(&holder);
+    let room = room_beside(&target, side, None);
     // Not given back: the new pane takes the keyboard once it shows what it
     // is filled with.
     let _ = FocusAside::take(&[&layout]);
-    put_beside(pane.upcast_ref(), &target, side);
+    put_beside(pane.upcast_ref(), &target, side, room);
     layout.focused().set(Some(&holder));
     refresh(&layout);
     Some(holder)
 }
 
 /// Take `holder`'s pane out of its tab, whose other panes share its room; the
-/// one that takes its place gets the focus if it had it. The session must be
-/// over (`terminal_tab::close_pane`). A tab left with no pane closes.
+/// one that takes its place becomes the focused pane if it was, and gets the
+/// keyboard if it was in the pane that went and the tab is in front
+/// ([`after_leaving`]): a pane that closes in a tab out of sight, or behind a
+/// dialog, moves no keyboard focus. The session must be over
+/// (`terminal_tab::close_pane`). A tab left with no pane closes.
 pub(crate) fn take_out(holder: &PaneHolder) {
     let Some(pane) = pane_of(holder) else {
         return;
     };
-    let had_focus = layout_of(&pane)
+    let was_focused = layout_of(&pane)
         .and_then(|layout| layout.focused_holder())
         .as_ref()
         == Some(holder);
@@ -815,14 +952,11 @@ pub(crate) fn take_out(holder: &PaneHolder) {
     };
     let aside = FocusAside::take(&[&layout]);
     detach(pane.upcast_ref());
-    if had_focus && let Some(heir) = &heir {
+    if was_focused && let Some(heir) = &heir {
         layout.focused().set(Some(heir.holder()));
     }
     after_leaving(&layout);
     aside.give_back();
-    if had_focus && let Some(heir) = heir {
-        focus_pane(heir.holder());
-    }
 }
 
 /// Move `pane` beside `target` (in any tab of any window), on its `side`. The
@@ -833,6 +967,7 @@ pub(crate) fn move_beside(pane: &Pane, target: &Pane, side: Side) {
         return;
     }
     let (from, to) = (layout_of(pane), layout_of(target));
+    let room = room_beside(target, side, Some(pane.upcast_ref()));
     let aside = FocusAside::take(
         &[from.as_ref(), to.as_ref()]
             .into_iter()
@@ -840,7 +975,7 @@ pub(crate) fn move_beside(pane: &Pane, target: &Pane, side: Side) {
             .collect::<Vec<_>>(),
     );
     detach(pane.upcast_ref());
-    put_beside(pane.upcast_ref(), target, side);
+    put_beside(pane.upcast_ref(), target, side, room);
     if let Some(from) = from
         && Some(&from) != to.as_ref()
     {
@@ -884,6 +1019,10 @@ pub(crate) fn move_to_new_page(pane: &Pane, view: &adw::TabView, position: i32) 
     show_moved(pane.holder());
 }
 
+/// How long the tab whose panes a drop took is waited for, to be closed once
+/// libadwaita puts it back ([`join_page`]); it takes milliseconds.
+const JOINED_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
 thread_local! {
     /// The tab whose panes a drop on a pane took ([`join_page`]), until it is
     /// back in a view and closed. GTK runs on one thread.
@@ -907,6 +1046,7 @@ pub(crate) fn join_page(page: &adw::TabPage, target: &Pane, side: Side) -> bool 
         return false;
     };
     let focused = layout.focused_holder();
+    let room = room_beside(target, side, None);
     let aside = FocusAside::take(
         &[&layout]
             .into_iter()
@@ -914,10 +1054,23 @@ pub(crate) fn join_page(page: &adw::TabPage, target: &Pane, side: Side) -> bool 
             .collect::<Vec<_>>(),
     );
     layout.remove(&node);
-    put_beside(&node, target, side);
+    put_beside(&node, target, side, room);
     match view_of_page(page) {
         Some(view) => view.close_page(page),
-        None => JOINED.with(|joined| joined.set(Some(page))),
+        None => {
+            JOINED.with(|joined| joined.set(Some(page)));
+            // Should libadwaita never put it back, the claim must not outlive
+            // this drag: a later tab dropped outside every window gets its
+            // window.
+            let page = page.downgrade();
+            glib::timeout_add_local_once(JOINED_FOR, move || {
+                JOINED.with(|joined| {
+                    if joined.upgrade().is_some_and(|j| Some(j) == page.upgrade()) {
+                        joined.set(None);
+                    }
+                });
+            });
+        }
     }
     aside.give_back();
     if let Some(holder) = focused {
@@ -1092,35 +1245,51 @@ fn drag_by_header(pane: &Pane) {
             if reason != gdk::DragCancelReason::NoTarget {
                 return false;
             }
-            focus_pane(pane.holder());
-            let _ = pane.activate_action(&format!("win.{TO_WINDOW_ACTION}"), None);
+            dropped_on_nothing(&pane);
             true
         }
     ));
     pane.header().add_controller(source);
 }
 
-/// What is dragged over a pane, if it can be dropped there: another pane, or a
-/// tab that holds panes (not this pane's own).
-enum Dropped {
-    Pane(Pane),
-    Tab(adw::TabPage),
+/// A pane dragged and dropped on nothing that takes it: a window of its own.
+/// Its tab is selected first, as the drag may have hovered another tab open:
+/// the window's action moves the focused pane of the selected tab.
+pub(crate) fn dropped_on_nothing(pane: &Pane) {
+    show_pane(pane);
+    let _ = pane.activate_action(&format!("win.{TO_WINDOW_ACTION}"), None);
 }
 
-fn dropped(value: &glib::Value, onto: &Pane) -> Option<Dropped> {
-    if let Ok(pane) = value.get::<Pane>() {
-        return (&pane != onto).then_some(Dropped::Pane(pane));
+/// Select the tab of `pane` and make it the focused pane, with the keyboard:
+/// what the window's actions on the focused pane then act on.
+fn show_pane(pane: &Pane) {
+    if let Some((view, page)) = layout_of(pane).as_ref().and_then(page_of) {
+        view.set_selected_page(&page);
     }
+    focus_pane(pane.holder());
+}
+
+/// The pane dragged in `value`, if it can be dropped on `onto`: another pane,
+/// still in a tab (one whose session ended during the drag has gone).
+fn dropped_pane(value: &glib::Value, onto: &Pane) -> Option<Pane> {
+    let pane = value.get::<Pane>().ok()?;
+    (&pane != onto && layout_of(&pane).is_some()).then_some(pane)
+}
+
+/// The tab dragged in `value`, if its panes can be dropped on `onto`: a tab
+/// that holds panes, not the one `onto` is in.
+fn dropped_tab(value: &glib::Value, onto: &Pane) -> Option<adw::TabPage> {
     let page = value.get::<adw::TabPage>().ok()?;
     let layout = layout_of_page(&page)?;
-    (!onto.is_ancestor(&layout) && layout.node().is_some()).then_some(Dropped::Tab(page))
+    (!onto.is_ancestor(&layout) && layout.node().is_some()).then_some(page)
 }
 
-/// The pane takes a pane or a tab dropped on it, beside it on the side nearest
-/// the pointer, and shows that side while it is dragged over it.
+/// The pane takes a pane dropped on it, beside it on the side nearest the
+/// pointer, and shows that side while one is dragged over it. (A tab dropped on
+/// a pane is taken by the tab view, [`take_tab_drops`]: libadwaita makes the
+/// tabs' contents untargetable while a tab is dragged.)
 fn take_drops(pane: &Pane) {
-    let target = gtk::DropTarget::new(glib::Type::INVALID, gdk::DragAction::MOVE);
-    target.set_types(&[Pane::static_type(), adw::TabPage::static_type()]);
+    let target = gtk::DropTarget::new(Pane::static_type(), gdk::DragAction::MOVE);
     target.set_preload(true);
     let motion = glib::clone!(
         #[weak]
@@ -1130,7 +1299,7 @@ fn take_drops(pane: &Pane) {
         move |target: &gtk::DropTarget, x: f64, y: f64| {
             let acceptable = target
                 .value()
-                .is_some_and(|value| dropped(&value, &pane).is_some());
+                .is_some_and(|value| dropped_pane(&value, &pane).is_some());
             if !acceptable {
                 show_side(&pane, None);
                 return gdk::DragAction::empty();
@@ -1162,17 +1331,120 @@ fn take_drops(pane: &Pane) {
         move |_, value, x, y| {
             show_side(&pane, None);
             let side = side_at(x, y, f64::from(pane.width()), f64::from(pane.height()));
-            match dropped(value, &pane) {
-                Some(Dropped::Pane(dragged)) => {
+            match dropped_pane(value, &pane) {
+                Some(dragged) => {
                     move_beside(&dragged, &pane, side);
                     true
                 }
-                Some(Dropped::Tab(page)) => join_page(&page, &pane, side),
                 None => false,
             }
         }
     ));
     pane.add_controller(target);
+}
+
+/// Let `view` take a tab dropped on one of its panes: the tab's panes go beside
+/// that pane, on the side nearest the pointer ([`join_page`]), and the pane
+/// shows that side while a tab is dragged over it.
+///
+/// libadwaita makes the contents of every tab untargetable while a tab is
+/// dragged (`AdwTabView:is-transferring-page`), so a pane cannot take the drop
+/// itself: the view does, in the capture phase, before libadwaita's own drop
+/// target on it (which would move the tab into this view as a tab), and finds
+/// the pane under the pointer itself. A tab dropped on a tab bar still moves as
+/// a tab. One dropped where no pane is (none should be) is refused, and
+/// libadwaita puts it back where it came from.
+pub(crate) fn take_tab_drops(view: &adw::TabView) {
+    let target = gtk::DropTarget::new(adw::TabPage::static_type(), gdk::DragAction::MOVE);
+    target.set_propagation_phase(gtk::PropagationPhase::Capture);
+    target.set_preload(true);
+    let over: std::rc::Rc<glib::WeakRef<Pane>> = std::rc::Rc::default();
+    let show = glib::clone!(
+        #[strong]
+        over,
+        move |pane: Option<&Pane>, side: Option<Side>| {
+            if let Some(old) = over.upgrade()
+                && Some(&old) != pane
+            {
+                show_side(&old, None);
+            }
+            over.set(pane);
+            if let Some(pane) = pane {
+                show_side(pane, side);
+            }
+        }
+    );
+    let motion = glib::clone!(
+        #[weak]
+        view,
+        #[strong]
+        show,
+        #[upgrade_or]
+        gdk::DragAction::empty(),
+        move |target: &gtk::DropTarget, x: f64, y: f64| {
+            let place = pane_at(&view, x, y);
+            let acceptable = place.as_ref().is_some_and(|(pane, _)| {
+                target
+                    .value()
+                    .is_some_and(|value| dropped_tab(&value, pane).is_some())
+            });
+            match place.filter(|_| acceptable) {
+                Some((pane, side)) => {
+                    show(Some(&pane), Some(side));
+                    gdk::DragAction::MOVE
+                }
+                None => {
+                    show(None, None);
+                    gdk::DragAction::empty()
+                }
+            }
+        }
+    );
+    target.connect_enter(motion.clone());
+    target.connect_motion(motion);
+    target.connect_leave(glib::clone!(
+        #[strong]
+        show,
+        move |_| show(None, None)
+    ));
+    target.connect_drop(glib::clone!(
+        #[weak]
+        view,
+        #[strong]
+        show,
+        #[upgrade_or]
+        false,
+        move |_, value, x, y| {
+            show(None, None);
+            let Some((pane, side)) = pane_at(&view, x, y) else {
+                return false;
+            };
+            match dropped_tab(value, &pane) {
+                Some(page) => join_page(&page, &pane, side),
+                None => false,
+            }
+        }
+    ));
+    view.add_controller(target);
+}
+
+/// The pane of `view`'s selected tab at the point (`x`, `y`) of the view, and
+/// the side of it the point is nearest to. Untargetable widgets count: during a
+/// tab drag they all are.
+fn pane_at(view: &adw::TabView, x: f64, y: f64) -> Option<(Pane, Side)> {
+    let picked = view.pick(x, y, gtk::PickFlags::NON_TARGETABLE)?;
+    let pane = match picked.downcast::<Pane>() {
+        Ok(pane) => pane,
+        Err(widget) => widget.ancestor(Pane::static_type()).and_downcast()?,
+    };
+    let point = view.compute_point(&pane, &gtk::graphene::Point::new(x as f32, y as f32))?;
+    let side = side_at(
+        f64::from(point.x()),
+        f64::from(point.y()),
+        f64::from(pane.width()),
+        f64::from(pane.height()),
+    );
+    Some((pane, side))
 }
 
 /// Show the drop highlight over `side` of `pane` (over its session, below the
@@ -1504,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pane_that_overlaps_most_wins() {
+    fn a_pane_beside_wins_over_one_that_is_not() {
         // A short pane at the bottom left, and on the right a short pane at the
         // top and a tall one below it: going right from the bottom left pane
         // reaches the tall one, which is beside it.

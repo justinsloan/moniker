@@ -134,9 +134,14 @@ pub(super) fn both_lists_mark_each_hosts_status(dir: &Path) {
             "Not checked: reached through another host"
         )
     );
-    // The pointer over the mark is over the mark, so its tooltip shows.
+    // The pointer over the mark is over the mark, so its tooltip shows. (Once
+    // the mark has its size: a change of state restyles it, and its new size
+    // comes with the next layout.)
     let window = main.window.upcast_ref::<gtk::Widget>();
     let up_mark = mark(&up);
+    pump_until("the mark to be laid out", || {
+        up_mark.width() > 0 && up_mark.height() > 0 && up_mark.is_mapped()
+    });
     let center = up_mark
         .compute_point(
             window,
@@ -150,7 +155,15 @@ pub(super) fn both_lists_mark_each_hosts_status(dir: &Path) {
             gtk::PickFlags::INSENSITIVE,
         )
         .expect("something under the pointer");
-    assert_eq!(&under, up_mark.upcast_ref::<gtk::Widget>(), "the mark");
+    assert_eq!(
+        &under,
+        up_mark.upcast_ref::<gtk::Widget>(),
+        "the mark: picked a {} with classes {:?} (the mark is {}x{})",
+        under.type_().name(),
+        under.css_classes(),
+        up_mark.width(),
+        up_mark.height()
+    );
     assert!(
         mark_in(&row(&list, new_tab::LOCAL_ROW)).is_none(),
         "no mark on Local terminal"

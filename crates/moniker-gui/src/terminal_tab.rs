@@ -558,8 +558,8 @@ const TAB_VIEW_SHORTCUTS: adw::TabViewShortcuts = adw::TabViewShortcuts::NONE;
 /// * When the last page goes the window closes. A page leaving for another
 ///   window (`page-detached`) writes nothing and keeps its askpass markers: its
 ///   sessions carry on over there.
-/// * A page whose panes a drop on a pane took comes back empty and is closed
-///   (`crate::panes::page_attached`).
+/// * A tab dropped on a pane tiles there (`crate::panes::take_tab_drops`); its
+///   page comes back empty and is closed (`crate::panes::page_attached`).
 /// * A tab that is selected never leaves the keyboard focus in another tab
 ///   (`crate::panes::keep_focus_in_selected`): the focus it remembers may have
 ///   moved there with a pane.
@@ -582,6 +582,7 @@ pub fn setup_tab_view(view: &adw::TabView) {
     });
     view.connect_page_attached(|view, page, _| panes::page_attached(view, page));
     view.connect_selected_page_notify(panes::keep_focus_in_selected);
+    panes::take_tab_drops(view);
 
     view.connect_n_pages_notify(|view| {
         if view.n_pages() == 0
@@ -1494,22 +1495,9 @@ fn begin_session(holder: &PaneHolder, title: TabTitle) -> Terminal {
 }
 
 /// Whether the pane of `holder` is the focused pane of the selected tab of its
-/// view, in a window that shows no dialog.
+/// view, in a window that shows no dialog (`crate::panes::in_front`).
 fn in_front(holder: &PaneHolder) -> bool {
-    let Some(layout) = panes::layout_of(holder) else {
-        return false;
-    };
-    let Some((view, page)) = panes::page_of(&layout) else {
-        return false;
-    };
-    if view.selected_page().as_ref() != Some(&page)
-        || layout.focused_holder().as_ref() != Some(holder)
-    {
-        return false;
-    }
-    view.root()
-        .and_downcast::<adw::ApplicationWindow>()
-        .is_none_or(|window| window.visible_dialog().is_none())
+    panes::in_front(holder)
 }
 
 /// Start `argv` (program first) in `terminal`, in `dir` if given, adding `envv`
