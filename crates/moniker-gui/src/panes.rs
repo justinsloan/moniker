@@ -39,7 +39,9 @@
 //! dropped on a tab in a tab bar becomes a tab after that tab
 //! ([`setup_tab_bar`]); while a pane is dragged every tab bar shows, as
 //! libadwaita shows them for a tab. A pane dropped on nothing gets a window of
-//! its own ([`dropped_on_nothing`]).
+//! its own ([`dropped_on_nothing`]). On GNOME's Wayland that takes a drag that
+//! offers [`ROOT_DROP_MIME`], so that the compositor takes a drop outside every
+//! window ([`pane_drag_finished`]); X11 calls it a drop on no target.
 //!
 //! A tab (`adw::TabPage`, what libadwaita's tab drags carry) dropped on a pane
 //! brings its panes there. libadwaita makes the contents of every tab
@@ -1296,13 +1298,19 @@ fn drag_by_header(pane: &Pane) {
             // Only a pane among others: alone, it is its tab, which its tab
             // bar drags.
             let several = layout_of(&pane).is_some_and(|layout| layout.panes().len() > 1);
-            several.then(|| gdk::ContentProvider::for_value(&pane.to_value()))
+            several.then(|| drag_content(&pane))
         }
     ));
     source.connect_drag_begin(glib::clone!(
         #[weak]
         pane,
         move |_, drag| {
+            pane_drag_began();
+            drag.connect_dnd_finished(glib::clone!(
+                #[weak]
+                pane,
+                move |_| pane_drag_finished(&pane)
+            ));
             if let Ok(icon) = gtk::DragIcon::for_drag(drag).downcast::<gtk::DragIcon>() {
                 icon.set_child(Some(&drag_icon(&pane)));
             }
@@ -1310,8 +1318,11 @@ fn drag_by_header(pane: &Pane) {
         }
     ));
     source.connect_drag_end(|_, _, _| reveal_tab_bars(false));
-    // Dropped on nothing that takes it, inside a window or outside every one:
-    // a window of its own, as a tab dropped outside every window gets.
+    // On X11, dropped on nothing that takes it, inside a window or outside
+    // every one: a window of its own, as a tab dropped outside every window
+    // gets. (On Wayland a drop outside every window finishes instead,
+    // `pane_drag_finished`; one on a part of a window that takes nothing is
+    // cancelled as an error, and the pane stays.)
     source.connect_drag_cancel(glib::clone!(
         #[weak]
         pane,
@@ -1326,6 +1337,38 @@ fn drag_by_header(pane: &Pane) {
         }
     ));
     pane.header().add_controller(source);
+}
+
+/// The type a pane's drag offers besides the pane, so that GNOME's compositor
+/// takes a drop outside every window. On Wayland a drag dropped there that does
+/// not offer it is cancelled as an error, not as "no target" (what X11 says,
+/// above), and the pane would stay where it was. The compositor takes the drop
+/// by reading this type (nothing), so the drag finishes
+/// ([`pane_drag_finished`]). libadwaita's tab drags offer it for the same
+/// reason; Mutter calls it `ROOTWINDOW_DROP_MIME`.
+pub(crate) const ROOT_DROP_MIME: &str = "application/x-rootwindow-drop";
+
+/// What a pane's drag carries: the pane, for the panes and tab bars that take
+/// it, and [`ROOT_DROP_MIME`], for the compositor.
+fn drag_content(pane: &Pane) -> gdk::ContentProvider {
+    gdk::ContentProvider::new_union(&[
+        gdk::ContentProvider::for_bytes(ROOT_DROP_MIME, &glib::Bytes::from_static(b"")),
+        gdk::ContentProvider::for_value(&pane.to_value()),
+    ])
+}
+
+/// A pane drag began: no pane or tab bar has taken the pane yet.
+pub(crate) fn pane_drag_began() {
+    PANE_TAKEN.set(false);
+}
+
+/// A pane drag finished, that is, it was not cancelled. If no pane or tab bar
+/// took the pane, the compositor did, as a drop outside every window
+/// ([`ROOT_DROP_MIME`]), and the pane gets a window of its own.
+pub(crate) fn pane_drag_finished(pane: &Pane) {
+    if !PANE_TAKEN.replace(false) && layout_of(pane).is_some() {
+        dropped_on_nothing(pane);
+    }
 }
 
 /// A pane dragged and dropped on nothing that takes it: a window of its own.
@@ -1409,6 +1452,7 @@ fn take_drops(pane: &Pane) {
             let side = side_at(x, y, f64::from(pane.width()), f64::from(pane.height()));
             match dropped_pane(value, &pane) {
                 Some(dragged) => {
+                    PANE_TAKEN.set(true);
                     move_beside(&dragged, &pane, side);
                     true
                 }
@@ -1567,6 +1611,9 @@ thread_local! {
     static TAB_BARS: RefCell<Vec<glib::WeakRef<adw::TabBar>>> = const { RefCell::new(Vec::new()) };
     static REVEALED: RefCell<Vec<glib::WeakRef<adw::TabBar>>> = const { RefCell::new(Vec::new()) };
     static CSS_ADDED: Cell<bool> = const { Cell::new(false) };
+    /// Whether a pane or a tab bar took the pane being dragged
+    /// ([`pane_drag_finished`]).
+    static PANE_TAKEN: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Let `bar` take a pane dropped on one of its tabs, which becomes a tab of its
@@ -1585,6 +1632,7 @@ pub(crate) fn setup_tab_bar(bar: &adw::TabBar) {
         let (Ok(pane), Some(view)) = (value.get::<Pane>(), bar.view()) else {
             return false;
         };
+        PANE_TAKEN.set(true);
         move_to_new_page(&pane, &view, view.page_position(page) + 1);
         true
     });

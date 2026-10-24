@@ -383,6 +383,10 @@ fn gui_integration() {
     panes::the_header_acts_on_its_own_pane(&bin, &tmp.path().join("s-header"));
     panes::a_pane_that_closes_out_of_sight_moves_no_keyboard(&bin, &tmp.path().join("s-sight"));
     panes::drops_reach_panes_tabs_and_the_tab_bar(&bin, &tmp.path().join("s-drops"));
+    panes::a_pane_dropped_outside_every_window_gets_its_own_window(
+        &bin,
+        &tmp.path().join("s-outside"),
+    );
     panes::a_pane_dropped_on_nothing_gets_its_own_window(&bin, &tmp.path().join("s-nothing"));
     panes::a_tab_whose_panes_were_taken_goes_quietly(&tmp.path().join("s-back"));
     panes::closing_another_pane_and_a_stray_focus_leave_the_keyboard(

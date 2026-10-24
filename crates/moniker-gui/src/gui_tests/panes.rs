@@ -988,6 +988,101 @@ pub(super) fn a_pane_dropped_on_nothing_gets_its_own_window(bin: &Path, dir: &Pa
     pump_for(Duration::from_millis(200));
 }
 
+/// A pane dropped outside every window on GNOME's Wayland: the drag offers the
+/// type the compositor takes such a drop with, so the drag finishes instead of
+/// being cancelled, and the pane gets a window of its own unless a pane or a
+/// tab bar of Moniker took it.
+pub(super) fn a_pane_dropped_outside_every_window_gets_its_own_window(bin: &Path, dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let a = main.view.selected_page().expect("the launch tab");
+    let a1 = pane(&a);
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a2 = focused(&a);
+    let t2 = shell_in(&a2, bin, dir, "outside-two", "echo OUTSIDE\nexec sleep 600");
+    wait_for_text(&t2, "OUTSIDE");
+    act(&main, panes::SPLIT_RIGHT_ACTION);
+    let a3 = focused(&a);
+    let t3 = shell_in(&a3, bin, dir, "outside-three", "echo AWAY\nexec sleep 600");
+    wait_for_text(&t3, "AWAY");
+
+    let source = controllers::<gtk::DragSource>(pane_of(&a3).header())
+        .into_iter()
+        .next()
+        .expect("a pane is dragged by its header");
+    let content: Option<gdk::ContentProvider> = source.emit_by_name("prepare", &[&5.0f64, &5.0f64]);
+    let formats = content.expect("a pane among others drags").formats();
+    assert!(
+        formats.contain_mime_type(panes::ROOT_DROP_MIME),
+        "the drag offers what the compositor takes a drop outside every window with"
+    );
+    assert!(formats.contains_type(Pane::static_type()), "and the pane");
+
+    // Taken by nothing of Moniker: a window of its own.
+    let windows = app.windows().len();
+    panes::pane_drag_began();
+    panes::pane_drag_finished(&pane_of(&a3));
+    pump_until("a new window", || app.windows().len() == windows + 1);
+    assert_eq!(layout_of(&a).holders(), [a1.clone(), a2.clone()]);
+    let own = app
+        .windows()
+        .into_iter()
+        .find(|w| {
+            find_widget::<adw::TabView>(w).is_some_and(|view| {
+                view.selected_page()
+                    .is_some_and(|p| layout_of(&p).holders() == std::slice::from_ref(&a3))
+            })
+        })
+        .expect("the dragged pane's window");
+    own.destroy();
+    pump_for(Duration::from_millis(200));
+    let windows = app.windows().len();
+
+    // Taken by a pane: no window.
+    panes::pane_drag_began();
+    let onto = pane_of(&a1);
+    let height = f64::from(onto.height());
+    let took: bool = pane_drop_target(&onto).emit_by_name(
+        "drop",
+        &[
+            &gtk::glib::BoxedValue(pane_of(&a2).to_value()),
+            &2.0f64,
+            &(height / 2.0),
+        ],
+    );
+    assert!(took, "the pane took it");
+    panes::pane_drag_finished(&pane_of(&a2));
+    pump_for(Duration::from_millis(300));
+    assert_eq!(
+        app.windows().len(),
+        windows,
+        "no window for a pane a pane took"
+    );
+    assert_eq!(layout_of(&a).holders(), [a2.clone(), a1.clone()]);
+
+    // Taken by a tab bar: no window either. (The pane is then alone in its
+    // tab, which the window's action would refuse to move anyway, so this
+    // part passes without the mark too; it stays for a drop that might not.)
+    panes::pane_drag_began();
+    let bar: adw::TabBar = find_widget(&main.window).expect("the tab bar");
+    let took: bool = bar.emit_by_name(
+        "extra-drag-drop",
+        &[&a, &gtk::glib::BoxedValue(pane_of(&a1).to_value())],
+    );
+    assert!(took, "the tab bar took it");
+    panes::pane_drag_finished(&pane_of(&a1));
+    pump_for(Duration::from_millis(300));
+    assert_eq!(
+        app.windows().len(),
+        windows,
+        "no window for a pane a tab bar took"
+    );
+    assert_eq!(main.view.n_pages(), 2, "a tab of its own");
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
 /// The new-tab list shown in a pane of a split tab takes the keyboard only as
 /// the pane in use: not each time its tab is shown again while another pane is
 /// the one in use, nor when panes move and it is left alone in a tab out of
