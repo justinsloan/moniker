@@ -116,7 +116,7 @@ pub(super) fn the_side_windows_keep_notifications_below_their_header_bars(dir: &
     let app = test_app();
     let nothing: profiles::ConnectFn = Rc::new(|_, _, _| {});
     let profiles_window = profiles::present(&app, &ctx, nothing);
-    let transcripts_window = recordings::present(&app, dir.join("transcripts"));
+    let transcripts_window = recordings::present(&app, dir.join("transcripts"), &ctx.settings_path);
     pump_for(Duration::from_millis(400));
 
     for (what, window) in [

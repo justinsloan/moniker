@@ -31,6 +31,7 @@ mod sync;
 mod terminal_tab;
 mod theme;
 mod window;
+mod window_size;
 mod zoom;
 
 use std::cell::Cell;
@@ -213,7 +214,7 @@ fn add_actions(app: &adw::Application, ctx: &Rc<AppContext>) {
             #[strong]
             ctx,
             move |app: &adw::Application, _, _| {
-                recordings::present(app, ctx.transcripts_dir());
+                recordings::present(app, ctx.transcripts_dir(), &ctx.settings_path);
             }
         ))
         .build();

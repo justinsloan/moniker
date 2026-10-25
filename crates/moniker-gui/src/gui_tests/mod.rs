@@ -462,6 +462,8 @@ fn gui_integration() {
     );
     main_window::profiles_connect_opens_in_the_last_active_window(&tmp.path().join("w-last"));
     windows::plus_opens_the_new_tab_list_with_local_first(&tmp.path().join("n-plus"));
+    windows::a_main_window_opens_at_the_size_the_last_one_closed_at(&tmp.path().join("n-size"));
+    windows::the_side_windows_open_at_the_size_they_closed_at(&tmp.path().join("n-side-size"));
     windows::picking_a_profile_turns_the_tab_into_the_session(&bin, &tmp.path().join("n-pick"));
     windows::the_new_tab_choices_reach_profiles_without_sequences(
         &bin,

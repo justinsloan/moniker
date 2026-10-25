@@ -71,7 +71,7 @@ fn now() -> i64 {
 fn open(dir: &Path) -> (adw::Application, adw::Window) {
     fs::create_dir_all(dir).expect("dir");
     let app = test_app();
-    let window = recordings::present(&app, dir.to_path_buf());
+    let window = recordings::present(&app, dir.to_path_buf(), &dir.join("gui-settings.json"));
     pump_for(Duration::from_millis(300));
     (app, window)
 }
@@ -221,7 +221,7 @@ pub(super) fn lists_newest_first_and_can_flip(dir: &Path) {
     select_string(&order, "Newest first");
     assert_eq!(row_names(&window), newest);
 
-    let again = recordings::present(&app, dir.to_path_buf());
+    let again = recordings::present(&app, dir.to_path_buf(), &dir.join("gui-settings.json"));
     assert_eq!(again, window, "one Transcripts window per app");
     close(&window);
     assert!(app.windows().is_empty());
@@ -917,7 +917,11 @@ pub(super) fn closing_the_last_main_window_closes_it(dir: &Path) {
     window::close_side_windows_with_last_main_window(&app);
     let main = window::build(&app, &ctx);
     main.window.present();
-    let recordings_window = recordings::present(&app, dir.join("transcripts"));
+    let recordings_window = recordings::present(
+        &app,
+        dir.join("transcripts"),
+        &dir.join("gui-settings.json"),
+    );
     pump_for(Duration::from_millis(300));
     assert!(recordings_window.is_visible());
 

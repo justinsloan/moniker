@@ -45,6 +45,7 @@ use crate::context::AppContext;
 use crate::form;
 use crate::notify::NotificationArea;
 use crate::terminal_tab::default_save;
+use crate::window_size::{self, Kind};
 use page::ProfilePage;
 use sync_page::SyncPage;
 
@@ -290,12 +291,12 @@ fn build(app: &adw::Application, ctx: &Rc<AppContext>, connect: ConnectFn) -> ad
         .application(app)
         .name(WINDOW_NAME)
         .title("Connection Profiles")
-        .default_width(900)
-        .default_height(640)
         .width_request(360)
         .height_request(400)
         .content(&notifications)
         .build();
+    // At the size it had when it last closed (issue #14).
+    window_size::remember(&window, Kind::Profiles, &ctx.settings_path, (900, 640));
     // Narrow: one pane at a time with back navigation, as Settings does.
     let narrow = adw::Breakpoint::new(
         adw::BreakpointCondition::parse("max-width: 600sp").expect("a valid breakpoint condition"),

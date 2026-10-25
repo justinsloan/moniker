@@ -201,7 +201,7 @@ What needs your attention (a transcript that could not be saved, `moniker-askpas
 |---|---|---|
 | Passwords and the sync key | The system keyring (Secret Service) | Passwords yes, the sync key never |
 | Profiles, no secrets | `~/.config/moniker/profiles.json` (mode 0600) | Yes |
-| Sync partner, automatic sync, text size for the next launch, Preferences | `~/.config/moniker/gui-settings.json` (mode 0600) | No |
+| Sync partner, automatic sync, text size and window sizes for the next launch, Preferences | `~/.config/moniker/gui-settings.json` (mode 0600) | No |
 | When this machine last completed a sync | `~/.config/moniker/sync-state.json` (mode 0600) | No |
 | Transcripts | `~/.local/share/moniker/transcripts/`, or the folder chosen in Preferences | No |
 
@@ -335,7 +335,7 @@ The workflow runs every check, builds and install-tests both packages, and only 
 - A wrong stored password is tried once; then ssh asks in the terminal, as plain ssh does (three attempts in all). A sync has no terminal, so there a wrong stored password fails the sync.
 - Transcripts hold what VTE holds: content shown only on the alternate screen (htop, vim) is not in them, and a crash loses the transcript in progress.
 - Removing a stored password is local to that machine. Others keep theirs, and a later sync from one that still has it can bring it back.
-- The text size is saved when the last window closes. If Moniker is killed, or the session ends without closing its windows, the previously saved size stays.
+- The text size is saved when the last window closes, and each window's size when it closes. If Moniker is killed, or the session ends without closing its windows, the previously saved sizes stay.
 - A process that ignores the hang-up keeps running after its tab closes, and its terminal is kept until it exits.
 - The Transcripts window reads a transcript whole to show or search it (off the UI thread), so a very large transcript, or searching a very large folder, takes time and memory. A transcript you renamed is no longer listed (the file stays where it is). If an export onto an existing file fails part-way, that file is left partly written.
 - Moving the transcripts folder across file systems copies each file, then removes it. Moniker waits for the move to end before it quits, but a kill or a logout in the middle can leave a truncated copy in the new folder; the original is still whole in the old one.

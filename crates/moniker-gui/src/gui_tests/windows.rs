@@ -1322,3 +1322,88 @@ pub(super) fn connecting_uses_the_profile_as_saved_just_before(bin: &Path, dir: 
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }
+
+/// The widest and the tallest of the display's monitors.
+fn largest_monitor() -> (i32, i32) {
+    let monitors = gdk::Display::default().expect("a display").monitors();
+    (0..monitors.n_items())
+        .filter_map(|i| monitors.item(i).and_downcast::<gdk::Monitor>())
+        .map(|m| (m.geometry().width(), m.geometry().height()))
+        .fold((0, 0), |(w, h), (mw, mh)| (w.max(mw), h.max(mh)))
+}
+
+fn size(width: i32, height: i32) -> Option<settings::WindowSize> {
+    Some(settings::WindowSize {
+        width,
+        height,
+        maximized: false,
+    })
+}
+
+/// A main window opens at the size the main window that closed last had,
+/// made to fit the screen (issue #14).
+pub(super) fn a_main_window_opens_at_the_size_the_last_one_closed_at(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let first = main_window(&app, &ctx);
+    assert_eq!(
+        first.window.default_size(),
+        (1100, 700),
+        "the built-in size"
+    );
+    first.window.set_default_size(800, 500);
+    first.window.close();
+    pump_until("the window to go", || app.windows().is_empty());
+    assert_eq!(ctx.settings().main_window, size(800, 500));
+    let second = main_window(&app, &ctx);
+    assert_eq!(second.window.default_size(), (800, 500));
+
+    // Of several, the last to close decides.
+    let third = main_window(&app, &ctx);
+    third.window.set_default_size(640, 400);
+    second.window.set_default_size(900, 600);
+    third.window.close();
+    second.window.close();
+    pump_until("both to go", || app.windows().is_empty());
+    assert_eq!(ctx.settings().main_window, size(900, 600));
+
+    // Too big for the screen: as big as the screen.
+    settings::update(&ctx.settings_path, |s| s.main_window = size(16_000, 9_000)).unwrap();
+    let big = main_window(&app, &ctx);
+    let (width, height) = largest_monitor();
+    assert_eq!(big.window.default_size(), (width, height));
+    big.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The Connection Profiles and Transcripts windows remember their own sizes.
+pub(super) fn the_side_windows_open_at_the_size_they_closed_at(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let nothing: crate::profiles::ConnectFn = Rc::new(|_: &Profile, _, _| {});
+    let profiles = crate::profiles::present(&app, &ctx, Rc::clone(&nothing));
+    pump_for(Duration::from_millis(200));
+    assert_eq!(profiles.default_size(), (900, 640), "the built-in size");
+    profiles.set_default_size(700, 450);
+    crate::profiles::close(&app);
+    pump_until("it to go", || app.windows().is_empty());
+    let transcripts = crate::recordings::present(&app, dir.join("t"), &ctx.settings_path);
+    pump_for(Duration::from_millis(200));
+    assert_eq!(transcripts.default_size(), (900, 640), "the built-in size");
+    transcripts.set_default_size(720, 480);
+    crate::recordings::close(&app);
+    pump_until("it to go", || app.windows().is_empty());
+    let saved = ctx.settings();
+    assert_eq!(saved.profiles_window, size(700, 450));
+    assert_eq!(saved.transcripts_window, size(720, 480));
+    assert_eq!(saved.main_window, None, "each kind keeps its own");
+
+    let profiles = crate::profiles::present(&app, &ctx, nothing);
+    let transcripts = crate::recordings::present(&app, dir.join("t"), &ctx.settings_path);
+    pump_for(Duration::from_millis(200));
+    assert_eq!(profiles.default_size(), (700, 450));
+    assert_eq!(transcripts.default_size(), (720, 480));
+    profiles.destroy();
+    transcripts.destroy();
+    pump_for(Duration::from_millis(200));
+}

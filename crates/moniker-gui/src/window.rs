@@ -61,6 +61,7 @@ use moniker_core::profile::Profile;
 
 use crate::context::AppContext;
 use crate::notify::NotificationArea;
+use crate::window_size::{self, Kind};
 use crate::{new_tab, panes, profiles, recordings, settings, terminal_tab, zoom};
 
 /// Widget name of a main window, how [`last_active`] tells it from the
@@ -196,10 +197,10 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
         .application(app)
         .name(WINDOW_NAME)
         .title("Moniker")
-        .default_width(1100)
-        .default_height(700)
         .content(&toolbar)
         .build();
+    // At the size the main window that closed last had (issue #14).
+    window_size::remember(&window, Kind::Main, &ctx.settings_path, DEFAULT_SIZE);
 
     // The title in the header bar, and the window's own, follow the selected
     // tab's title. The view is held weakly, so the bindings keep nothing alive.
@@ -571,6 +572,9 @@ fn save_scale_when_last_window_closes(
         }
     ));
 }
+
+/// The size of a main window when none has closed yet.
+const DEFAULT_SIZE: (i32, i32) = (1100, 700);
 
 /// The ☰ menu: the zoom row, then entries that are app actions (`main.rs`),
 /// Preferences among them.

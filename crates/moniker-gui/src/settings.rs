@@ -83,6 +83,50 @@ pub struct GuiSettings {
     /// (`crate::hosts`; the Preferences switch, on by default). Off, no ping is
     /// sent and no mark is shown.
     pub ping_hosts: bool,
+    /// The size of the main window that closed last, which new main windows
+    /// open at (issue #14); `None` is the built-in size.
+    pub main_window: Option<WindowSize>,
+    /// The same for the Connection Profiles window.
+    pub profiles_window: Option<WindowSize>,
+    /// The same for the Transcripts window.
+    pub transcripts_window: Option<WindowSize>,
+}
+
+/// A window's size as it was when it closed: its size when not maximized or
+/// full screen, and whether it was maximized. Full screen is not kept.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WindowSize {
+    pub width: i32,
+    pub height: i32,
+    pub maximized: bool,
+}
+
+/// The smallest window size the settings keep (width, height), and the
+/// largest width or height.
+pub const WINDOW_MIN: (i32, i32) = (360, 240);
+pub const WINDOW_MAX: i32 = 16_384;
+
+impl WindowSize {
+    /// The size in `value`: an object with a `width` and a `height` (numbers,
+    /// brought into range) and an optional `maximized`. Anything else is no
+    /// size.
+    fn from_json(value: &serde_json::Value) -> Option<WindowSize> {
+        let fields = value.as_object()?;
+        let side = |name: &str, min: i32| {
+            let n = fields.get(name)?.as_f64()?;
+            // JSON has no NaN; both ends are whole numbers an f64 holds
+            // exactly, so the cast cannot leave the range.
+            Some(n.clamp(f64::from(min), f64::from(WINDOW_MAX)) as i32)
+        };
+        Some(WindowSize {
+            width: side("width", WINDOW_MIN.0)?,
+            height: side("height", WINDOW_MIN.1)?,
+            maximized: fields
+                .get("maximized")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
 }
 
 /// The scrollback of an ordinary tab unless the person changes it.
@@ -144,6 +188,13 @@ impl GuiSettings {
                 .get("ping_hosts")
                 .and_then(Value::as_bool)
                 .unwrap_or(defaults.ping_hosts),
+            main_window: fields.get("main_window").and_then(WindowSize::from_json),
+            profiles_window: fields
+                .get("profiles_window")
+                .and_then(WindowSize::from_json),
+            transcripts_window: fields
+                .get("transcripts_window")
+                .and_then(WindowSize::from_json),
         })
     }
 }
@@ -178,6 +229,9 @@ impl Default for GuiSettings {
             font: None,
             transcripts_dir: None,
             ping_hosts: true,
+            main_window: None,
+            profiles_window: None,
+            transcripts_window: None,
         }
     }
 }
@@ -324,6 +378,17 @@ mod tests {
             font: Some("Monospace Bold 12".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/transcripts")),
             ping_hosts: false,
+            main_window: Some(WindowSize {
+                width: 1200,
+                height: 800,
+                maximized: true,
+            }),
+            profiles_window: Some(WindowSize {
+                width: 700,
+                height: 500,
+                maximized: false,
+            }),
+            transcripts_window: None,
         };
         save(&path, &settings).unwrap();
         assert_eq!(load(&path), settings);
@@ -496,6 +561,13 @@ mod tests {
             font: Some("Monospace 11".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/transcripts")),
             ping_hosts: false,
+            main_window: Some(WindowSize {
+                width: 1000,
+                height: 600,
+                maximized: true,
+            }),
+            profiles_window: None,
+            transcripts_window: None,
         };
         save(&path, &before).unwrap();
         save_font_scale(&path, 1.5).unwrap();
@@ -637,6 +709,9 @@ mod tests {
             assert_eq!(loaded.font, None, "{text}");
             assert_eq!(loaded.transcripts_dir, None, "{text}");
             assert!(loaded.ping_hosts, "{text}: on unless turned off");
+            assert_eq!(loaded.main_window, None, "{text}");
+            assert_eq!(loaded.profiles_window, None, "{text}");
+            assert_eq!(loaded.transcripts_window, None, "{text}");
         }
         let default = GuiSettings::default();
         assert!(default.ping_hosts);
@@ -645,6 +720,64 @@ mod tests {
         assert_eq!(default.font, None);
         assert_eq!(default.transcripts_dir, None);
         assert_eq!(load(&dir.path().join("none.json")), default);
+    }
+
+    #[test]
+    fn window_sizes_are_read_and_kept_in_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let size = |width, height, maximized| {
+            Some(WindowSize {
+                width,
+                height,
+                maximized,
+            })
+        };
+        for (text, want) in [
+            (r#"{"width": 1000, "height": 600}"#, size(1000, 600, false)),
+            (
+                r#"{"width": 1000, "height": 600, "maximized": true}"#,
+                size(1000, 600, true),
+            ),
+            (
+                r#"{"width": 1000.7, "height": 600, "maximized": "yes"}"#,
+                size(1000, 600, false),
+            ),
+            // Brought into range, not refused.
+            (
+                r#"{"width": 10, "height": -5}"#,
+                size(WINDOW_MIN.0, WINDOW_MIN.1, false),
+            ),
+            (
+                r#"{"width": 1e9, "height": 1e9}"#,
+                size(WINDOW_MAX, WINDOW_MAX, false),
+            ),
+            // Not a size: the default size.
+            (r#"{"width": 1000}"#, None),
+            (r#"{"height": 600}"#, None),
+            (r#"{"width": "1000", "height": 600}"#, None),
+            ("[1000, 600]", None),
+            ("null", None),
+        ] {
+            fs::write(
+                &path,
+                format!(r#"{{"main_window": {text}, "font_scale": 1.5}}"#),
+            )
+            .unwrap();
+            let loaded = load(&path);
+            assert_eq!(loaded.main_window, want, "{text}");
+            assert_eq!(loaded.font_scale, 1.5, "{text}: the others are kept");
+        }
+        fs::write(
+            &path,
+            r#"{"profiles_window": {"width": 800, "height": 500},
+                "transcripts_window": {"width": 640, "height": 480, "maximized": true}}"#,
+        )
+        .unwrap();
+        let loaded = load(&path);
+        assert_eq!(loaded.main_window, None);
+        assert_eq!(loaded.profiles_window, size(800, 500, false));
+        assert_eq!(loaded.transcripts_window, size(640, 480, true));
     }
 
     #[test]
@@ -810,6 +943,13 @@ mod tests {
             font: Some("Monospace 11".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/t")),
             ping_hosts: false,
+            main_window: Some(WindowSize {
+                width: 1000,
+                height: 600,
+                maximized: true,
+            }),
+            profiles_window: None,
+            transcripts_window: None,
         };
         save(&path, &before).unwrap();
 

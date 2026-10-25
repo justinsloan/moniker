@@ -680,7 +680,7 @@ pub(super) fn wording_uses_transcripts_and_connection_profiles(dir: &Path) {
     // The Transcripts window: title, warning and empty state.
     let transcripts = dir.join("transcripts");
     fs::create_dir_all(&transcripts).expect("dir");
-    let window = crate::recordings::present(&app, transcripts);
+    let window = crate::recordings::present(&app, transcripts, &ctx.settings_path);
     pump_for(Duration::from_millis(300));
     assert_eq!(window.title().as_deref(), Some("Transcripts"));
     let shown: Vec<String> = labels_in(&window)

@@ -82,6 +82,7 @@ use moniker_core::transcript::{Recording, list_recordings};
 use time::{Date, Month, OffsetDateTime};
 
 use crate::notify::NotificationArea;
+use crate::window_size::{self, Kind};
 use search::{Day, Order};
 
 /// Widget name of the Transcripts window, how [`present`] finds an open
@@ -135,9 +136,10 @@ const SAME_FILE: &str =
 
 /// Show the Transcripts window of `app`, listing the recordings in
 /// `dir`: the open one if there is one (it keeps the directory it was opened
-/// with), else a new one.
-pub fn present(app: &adw::Application, dir: PathBuf) -> adw::Window {
-    let window = open_window(app).unwrap_or_else(|| build(app, dir));
+/// with), else a new one, at the size it had when it last closed, as the GUI
+/// settings at `settings_path` say (issue #14).
+pub fn present(app: &adw::Application, dir: PathBuf, settings_path: &Path) -> adw::Window {
+    let window = open_window(app).unwrap_or_else(|| build(app, dir, settings_path));
     window.present();
     window
 }
@@ -469,7 +471,7 @@ struct State {
     monitor: RefCell<Option<gio::FileMonitor>>,
 }
 
-fn build(app: &adw::Application, dir: PathBuf) -> adw::Window {
+fn build(app: &adw::Application, dir: PathBuf, settings_path: &Path) -> adw::Window {
     // Sidebar: header, search and the two drop-downs, the list, the warning.
     let sidebar_header = adw::HeaderBar::new();
     let search = gtk::SearchEntry::builder()
@@ -662,12 +664,11 @@ fn build(app: &adw::Application, dir: PathBuf) -> adw::Window {
         .application(app)
         .name(WINDOW_NAME)
         .title("Transcripts")
-        .default_width(900)
-        .default_height(640)
         .width_request(360)
         .height_request(400)
         .content(&notifications)
         .build();
+    window_size::remember(&window, Kind::Transcripts, settings_path, (900, 640));
     // Narrow: one pane at a time with back navigation, as Settings does.
     let narrow = adw::Breakpoint::new(
         adw::BreakpointCondition::parse("max-width: 600sp").expect("a valid breakpoint condition"),

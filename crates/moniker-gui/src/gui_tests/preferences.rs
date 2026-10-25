@@ -579,7 +579,7 @@ pub(super) fn choosing_a_folder_moves_the_transcripts(dir: &Path) {
     .expect("write the settings");
     let app = test_app();
     let main = main_window(&app, &ctx);
-    recordings::present(&app, ctx.transcripts_dir());
+    recordings::present(&app, ctx.transcripts_dir(), &ctx.settings_path);
     pump_for(Duration::from_millis(300));
     assert_eq!(listed_in_transcripts_window(&app), names);
     let dialog = open(&app, &ctx, &main);
