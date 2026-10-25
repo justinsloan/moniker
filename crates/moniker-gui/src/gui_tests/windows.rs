@@ -1358,6 +1358,13 @@ pub(super) fn a_main_window_opens_at_the_size_the_last_one_closed_at(dir: &Path)
     let second = main_window(&app, &ctx);
     assert_eq!(second.window.default_size(), (800, 500));
 
+    // Resized and left open: saved once it has kept still, so a logout, which
+    // closes no window, keeps it too.
+    second.window.set_default_size(820, 520);
+    pump_until("the size to be saved", || {
+        ctx.settings().main_window == size(820, 520)
+    });
+
     // Of several, the last to close decides.
     let third = main_window(&app, &ctx);
     third.window.set_default_size(640, 400);
@@ -1367,7 +1374,10 @@ pub(super) fn a_main_window_opens_at_the_size_the_last_one_closed_at(dir: &Path)
     pump_until("both to go", || app.windows().is_empty());
     assert_eq!(ctx.settings().main_window, size(900, 600));
 
-    // Too big for the screen: as big as the screen.
+    // Too big for the screen: as big as the screen. (GTK bounds a new window
+    // by the screen itself on X11, so this holds without `window_size`'s own
+    // fit too; that one is for a compositor that gives no bounds, and
+    // `window_size::opening`'s unit tests cover it.)
     settings::update(&ctx.settings_path, |s| s.main_window = size(16_000, 9_000)).unwrap();
     let big = main_window(&app, &ctx);
     let (width, height) = largest_monitor();

@@ -6,8 +6,10 @@
 //! a sync asks when this machine has been away for long ([`crate::sync`]). A
 //! missing, unreadable or unrecognized file means "unknown", which prunes
 //! nothing and asks nothing. The file is written atomically, mode 0600, under
-//! its own lock (`sync-state.json.lock`), and the recorded time never moves
-//! backwards, so two syncs that end out of order keep the later one.
+//! its own lock (`sync-state.json.lock`), and the recorded time does not move
+//! backwards, so two syncs that end out of order keep the later one; only a
+//! time more than [`AHEAD_MS`] ahead of the sync being recorded is replaced,
+//! as it was recorded while the clock ran ahead.
 
 use std::fs;
 use std::io;
@@ -17,6 +19,10 @@ use crate::store;
 
 /// The file's name, in the directory of the profile file.
 pub const STATE_FILE: &str = "sync-state.json";
+
+/// How far ahead of the clock a recorded time may be and still count: a day.
+/// One further ahead was recorded while the clock was wrong.
+pub const AHEAD_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// Where the sync state of the profile file at `profile_file` is kept.
 pub fn state_path(profile_file: &Path) -> PathBuf {
@@ -29,12 +35,13 @@ pub fn last_sync(profile_file: &Path) -> Option<i64> {
     read(&state_path(profile_file))
 }
 
-/// Record that a sync completed at `at_ms`, unless a later one is recorded.
+/// Record that a sync completed at `at_ms`, unless a later one is recorded
+/// (by no more than [`AHEAD_MS`]).
 pub fn record_sync(profile_file: &Path, at_ms: i64) -> io::Result<()> {
     let path = state_path(profile_file);
     store::ensure_parent_dir(&path)?;
     let _lock = store::lock_exclusive(&path)?;
-    if read(&path).is_some_and(|recorded| recorded >= at_ms) {
+    if read(&path).is_some_and(|recorded| recorded >= at_ms && recorded - at_ms <= AHEAD_MS) {
         return Ok(());
     }
     let state = serde_json::json!({ "version": VERSION, "last_sync": at_ms });
@@ -102,6 +109,27 @@ mod tests {
         assert_eq!(last_sync(&profiles), Some(2_000));
         record_sync(&profiles, 3_000).unwrap();
         assert_eq!(last_sync(&profiles), Some(3_000));
+    }
+
+    #[test]
+    fn a_time_recorded_far_ahead_of_the_clock_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = profile_file(&dir);
+        let day = 24 * 60 * 60 * 1000;
+        record_sync(&profiles, 400 * day).unwrap();
+        record_sync(&profiles, 10 * day).unwrap();
+        assert_eq!(
+            last_sync(&profiles),
+            Some(10 * day),
+            "a year ahead: replaced"
+        );
+        record_sync(&profiles, 10 * day + day / 2).unwrap();
+        record_sync(&profiles, 10 * day).unwrap();
+        assert_eq!(
+            last_sync(&profiles),
+            Some(10 * day + day / 2),
+            "half a day: two syncs that ended out of order"
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! Each kind of window (the main window, Connection Profiles, Transcripts)
 //! keeps one size in the GUI settings ([`settings::WindowSize`]). When a window
 //! of that kind closes, its size and whether it was maximized are saved, so of
-//! several the last to close decides; a new one opens at that size, made to fit
+//! several the last to close decides (and a resize is saved once it has
+//! settled, as a logout closes no window); a new one opens at that size, made to fit
 //! the largest monitor, and maximized if it was. The size saved is the window's
 //! default size, which GTK keeps as the size the window has when it is not
 //! maximized or full screen; full screen itself is not kept. A quit that closes
@@ -11,7 +12,10 @@
 //! does a window still at its built-in size when no size was saved. One read
 //! when a window opens, one write when it closes, nothing per frame.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gdk, glib};
@@ -49,7 +53,9 @@ impl Kind {
 
 /// The size a window opens at, and whether it is maximized: the `saved` one,
 /// else `default`, no wider than the widest of `monitors` and no taller than
-/// the tallest (each a logical width and height; none known, no limit).
+/// the tallest (each a logical width and height; one with no size is ignored,
+/// and with none known there is no limit), and never below
+/// [`settings::WINDOW_MIN`].
 pub(crate) fn opening(
     saved: Option<WindowSize>,
     default: (i32, i32),
@@ -59,18 +65,24 @@ pub(crate) fn opening(
         Some(size) => (size.width, size.height, size.maximized),
         None => (default.0, default.1, false),
     };
-    let widest = monitors.iter().map(|m| m.0).max();
-    let tallest = monitors.iter().map(|m| m.1).max();
+    let usable = || monitors.iter().filter(|m| m.0 > 0 && m.1 > 0);
+    let widest = usable().map(|m| m.0).max();
+    let tallest = usable().map(|m| m.1).max();
+    let fit =
+        |side: i32, limit: Option<i32>, min: i32| limit.map_or(side, |l| side.min(l)).max(min);
     (
         (
-            widest.map_or(width, |w| width.min(w)),
-            tallest.map_or(height, |h| height.min(h)),
+            fit(width, widest, settings::WINDOW_MIN.0),
+            fit(height, tallest, settings::WINDOW_MIN.1),
         ),
         maximized,
     )
 }
 
-/// The logical sizes of the default display's monitors.
+/// The logical sizes of the default display's monitors. (GTK also bounds a
+/// new window by the screen it opens on when the display says how big that
+/// is, as X11 does; this fit is for a Wayland compositor that sends no
+/// bounds.)
 fn monitors() -> Vec<(i32, i32)> {
     let Some(display) = gdk::Display::default() else {
         return Vec::new();
@@ -82,9 +94,13 @@ fn monitors() -> Vec<(i32, i32)> {
         .collect()
 }
 
+/// How long a window must keep still after a resize before its size is saved.
+const SETTLE: Duration = Duration::from_secs(1);
+
 /// Open `window`, not yet shown, at the size saved for `kind` in the settings
-/// at `settings_path` (else `default`), and save its size there when it
-/// closes.
+/// at `settings_path` (else `default`), and save its size there once a resize
+/// has settled ([`SETTLE`]: a logout or a shutdown closes no window, and would
+/// otherwise lose it) and when it closes.
 pub(crate) fn remember(
     window: &impl IsA<gtk::Window>,
     kind: Kind,
@@ -93,22 +109,22 @@ pub(crate) fn remember(
 ) {
     let window = window.upcast_ref::<gtk::Window>();
     let saved = kind.saved(&settings::load(settings_path));
-    let ((width, height), maximized) = opening(saved, default, &monitors());
-    window.set_default_size(width, height);
+    let (opened, maximized) = opening(saved, default, &monitors());
+    window.set_default_size(opened.0, opened.1);
     if maximized {
         window.maximize();
     }
     let path: PathBuf = settings_path.to_path_buf();
-    window.connect_close_request(move |window| {
+    let save = Rc::new(move |window: &gtk::Window| {
         let (width, height) = window.default_size();
         let size = WindowSize {
             width,
             height,
             maximized: window.is_maximized(),
         };
-        // A window never resized, with nothing saved before, writes nothing,
-        // as quitting at the normal text size writes nothing.
-        let untouched = (width, height) == default && !size.maximized;
+        // A window not resized since it opened, with nothing saved before,
+        // writes nothing, as quitting at the normal text size writes nothing.
+        let untouched = (width, height) == opened && !size.maximized;
         let result = settings::update(&path, |s| {
             let slot = kind.slot(s);
             if slot.is_some() || !untouched {
@@ -121,6 +137,34 @@ pub(crate) fn remember(
                 path.display()
             );
         }
+    });
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    let settle = Rc::new({
+        let (save, pending) = (Rc::clone(&save), Rc::clone(&pending));
+        move |window: &gtk::Window| {
+            if let Some(id) = pending.take() {
+                id.remove();
+            }
+            let weak = window.downgrade();
+            let (save, fired) = (Rc::clone(&save), Rc::clone(&pending));
+            let id = glib::timeout_add_local_once(SETTLE, move || {
+                fired.take();
+                if let Some(window) = weak.upgrade() {
+                    save(&window);
+                }
+            });
+            pending.replace(Some(id));
+        }
+    });
+    for property in ["default-width", "default-height", "maximized"] {
+        let settle = Rc::clone(&settle);
+        window.connect_notify_local(Some(property), move |window, _| settle(window));
+    }
+    window.connect_close_request(move |window| {
+        if let Some(id) = pending.take() {
+            id.remove();
+        }
+        save(window);
         glib::Propagation::Proceed
     });
 }
@@ -173,6 +217,20 @@ mod tests {
             opening(size(4000, 3000, false), (1100, 700), &[]),
             ((4000, 3000), false),
             "no monitor known: as saved"
+        );
+    }
+
+    #[test]
+    fn a_monitor_with_no_size_is_ignored_and_a_window_never_opens_tiny() {
+        assert_eq!(
+            opening(size(1000, 600, false), (1100, 700), &[(0, 0), (-5, 7)]),
+            ((1000, 600), false),
+            "no usable monitor: as saved"
+        );
+        assert_eq!(
+            opening(size(1000, 600, false), (1100, 700), &[(200, 100)]),
+            (settings::WINDOW_MIN, false),
+            "never below the smallest size kept"
         );
     }
 }

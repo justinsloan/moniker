@@ -314,10 +314,14 @@ impl SyncTarget for LocalState {
     fn apply(&mut self, merged: Vec<BundleEntry>) -> Result<SyncOutcome, SyncError> {
         validate_entries(&merged)?;
         // Tombstones a year old that a completed sync has already carried
-        // away are not kept ([`TOMBSTONE_KEEP_MS`]).
+        // away are not kept ([`TOMBSTONE_KEEP_MS`]). A last sync recorded
+        // ahead of the clock says nothing about that: nothing is forgotten
+        // until a sync has recorded the clock's time.
+        let now = self.now();
         let prune_before = self
             .last_sync()
-            .map(|last| last.min(self.now().saturating_sub(TOMBSTONE_KEEP_MS)));
+            .filter(|last| last.saturating_sub(now) <= sync_state::AHEAD_MS)
+            .map(|last| last.min(now.saturating_sub(TOMBSTONE_KEEP_MS)));
         let secrets: &dyn SecretStore = &*self.secrets;
         let mut undo = UndoLog::default();
         // `update` wants a StoreError from the closure; keep the real cause.
@@ -441,8 +445,10 @@ impl UndoLog {
 /// # Forgetting deletions (issue #8)
 ///
 /// A tombstone whose `updated_at` is before `prune_before` is left out of the
-/// profiles to write, after the merge has used it: a live copy it beats is
-/// still deleted here, password included. [`LocalState::apply`] sets
+/// profiles to write, after the merge has used it, unless it has just deleted
+/// a live copy here (password included): that one is kept until the next sync,
+/// so a deletion that arrives late is still handed on to the next machine
+/// rather than stopping at the first one past the year. [`LocalState::apply`] sets
 /// `prune_before` to [`TOMBSTONE_KEEP_MS`] ago, or to this machine's last
 /// completed sync if that is earlier, so a deletion is forgotten a year after
 /// it was made, and only once a sync has carried it away from this machine.
@@ -475,7 +481,7 @@ fn plan_apply(
                     id: w.profile.id.clone(),
                 });
             }
-            if prune_before.is_some_and(|cutoff| w.profile.updated_at < cutoff) {
+            if !was_live && prune_before.is_some_and(|cutoff| w.profile.updated_at < cutoff) {
                 // Forgotten (see the docs above): not written.
                 continue;
             }
@@ -672,7 +678,10 @@ fn tell<T>(w: &mut impl Write, result: Result<T, SyncError>) -> Result<T, SyncEr
 
 /// `Err(Stale)` if `local` has not completed a sync for longer than
 /// [`STALE_AFTER_MS`] and the person did not accept that. A side with no
-/// recorded sync has nothing the others could have forgotten deleting.
+/// recorded sync is not asked: a new machine has nothing the others could
+/// have forgotten deleting. (The exception, documented: a machine last synced
+/// by Moniker 0.5.0 or older, which kept no record, and upgraded after more
+/// than a year away.)
 fn check_not_away(local: &dyn SyncTarget, stale: StaleSync) -> Result<(), SyncError> {
     let Some(last) = local.last_sync() else {
         return Ok(());
@@ -2750,7 +2759,7 @@ mod tests {
     }
 
     #[test]
-    fn an_old_tombstone_from_a_peer_deletes_the_live_copy_and_is_not_kept() {
+    fn an_old_tombstone_from_a_peer_deletes_the_live_copy_and_is_kept_one_sync_more() {
         let x = prof_at("x", 10);
         let t = x.tombstone(100);
         let (profiles, (outcome, ops)) = plan_apply(
@@ -2758,12 +2767,15 @@ mod tests {
             vec![entry(&t, None)],
             Some(101),
         );
-        assert!(profiles.is_empty(), "no tombstone is written");
+        assert_eq!(profiles, vec![t.clone()], "kept, to be handed on");
         assert_eq!(outcome.removed, 1);
         assert!(
             matches!(ops.as_slice(), [SecretOp::Delete { id }] if *id == x.id),
             "its password is removed"
         );
+        // The next sync forgets it.
+        let (profiles, _) = plan_apply(vec![entry(&t, None)], vec![], Some(101));
+        assert!(profiles.is_empty());
         // For a profile this machine never had: nothing at all.
         let (profiles, (outcome, ops)) = plan_apply(vec![], vec![entry(&t, None)], Some(101));
         assert!(profiles.is_empty());
@@ -2874,6 +2886,64 @@ mod tests {
         for m in [&a, &b, &c] {
             assert!(m.on_disk().is_empty(), "nothing comes back");
         }
+    }
+
+    #[test]
+    fn a_late_deletion_still_travels_on_from_a_machine_past_the_year() {
+        // `a` deletes and then syncs only elsewhere for a year; `m` is a hub
+        // that `c` syncs with often. When the deletion reaches `m` at last,
+        // `m` hands it on to `c` instead of forgetting it at once.
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut m = Machine::new(&clock, &[]);
+        let mut c = Machine::new(&clock, &[]);
+        synced(&mut a, &mut m);
+        synced(&mut c, &mut m);
+        a.delete(&x.id);
+        for day in [100, 200, 300] {
+            clock.set(start + day * DAY_MS);
+            synced(&mut c, &mut m);
+            crate::sync_state::record_sync(&a.path, clock.now()).unwrap();
+        }
+        clock.set(start + 366 * DAY_MS);
+        synced(&mut a, &mut m);
+        assert_eq!(m.secrets.password(&x.id), None, "deleted on the hub");
+        clock.set(start + 367 * DAY_MS);
+        synced(&mut c, &mut m);
+        assert_eq!(c.secrets.password(&x.id), None, "and on the far side");
+        assert!(c.on_disk().iter().all(|(_, deleted)| *deleted));
+        clock.set(start + 368 * DAY_MS);
+        synced(&mut c, &mut m);
+        synced(&mut a, &mut m);
+        for machine in [&a, &m, &c] {
+            assert!(machine.on_disk().is_empty(), "then forgotten everywhere");
+        }
+    }
+
+    #[test]
+    fn a_last_sync_recorded_ahead_of_the_clock_prunes_nothing() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), None)]);
+        let mut b = Machine::new(&clock, &[]);
+        a.delete(&x.id);
+        clock.set(start + 400 * DAY_MS);
+        // Recorded while the clock ran a year ahead.
+        crate::sync_state::record_sync(&a.path, start + 800 * DAY_MS).unwrap();
+        synced(&mut a, &mut b);
+        assert_eq!(
+            a.on_disk(),
+            vec![(x.id.clone(), true)],
+            "kept: not known to have left"
+        );
+        assert_eq!(
+            a.last_sync(),
+            Some(start + 400 * DAY_MS),
+            "the clock's time replaces it"
+        );
     }
 
     #[test]
