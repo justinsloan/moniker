@@ -9,9 +9,9 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk4 as gtk;
@@ -238,11 +238,13 @@ impl Setup {
         self.sequence_page().expect("the sub-page")
     }
 
-    /// Click `label` on the sub-page.
+    /// Click `label` on the sub-page, and wait for what it saves (on the
+    /// keyring worker).
     fn click(&self, page: &adw::NavigationPage, label: &str) {
         button_labeled(page, label)
             .unwrap_or_else(|| panic!("no {label:?} button"))
             .emit_clicked();
+        saved();
         pump_for(Duration::from_millis(50));
     }
 
@@ -274,10 +276,23 @@ impl Setup {
     }
 }
 
-/// Click ✓ (or press Enter) on an entry row.
+/// Click ✓ (or press Enter) on an entry row, and wait for its save.
 fn apply(row: &impl IsA<adw::EntryRow>) {
+    press_apply(row);
+    saved();
+}
+
+/// Click ✓ on an entry row, without waiting for its save (the keyring or the
+/// file is held).
+fn press_apply(row: &impl IsA<adw::EntryRow>) {
     row.emit_by_name::<()>("apply", &[]);
     pump_for(Duration::from_millis(50));
+}
+
+/// Wait until every save asked for is back: they run on the keyring worker
+/// (issue #7), and the page shows the outcome once they are.
+fn saved() {
+    pump_until("the saves", || keyring::pending() == 0);
 }
 
 /// Whether the ✓ of `row` is showing (libadwaita keeps it in a revealer).
@@ -427,6 +442,7 @@ pub(super) fn entry_apply_saves_only_that_field(dir: &Path) {
     );
     assert_eq!(s.file_bytes(), before);
     assert_eq!(host.text(), "bad host!");
+    assert!(host.is_editable(), "editable again after a failed save");
 
     host.set_text("  new.example.test ");
     apply(&host);
@@ -535,7 +551,7 @@ pub(super) fn switch_port_and_key_file_save_when_changed(dir: &Path) {
     assert_eq!(switch.title(), "Save transcript");
     assert!(!switch.is_active());
     switch.set_active(true);
-    pump_for(Duration::from_millis(50));
+    saved();
     assert!(s.on_disk(&p.id).expect("there").transcript);
 
     let port: adw::SpinRow = find_widget(&s.window).expect("the port row");
@@ -549,7 +565,7 @@ pub(super) fn switch_port_and_key_file_save_when_changed(dir: &Path) {
     port.grab_focus();
     port.set_value(2200.0);
     s.entry("Host").grab_focus();
-    pump_for(Duration::from_millis(50));
+    saved();
     assert_eq!(s.on_disk(&p.id).expect("there").port, 2200);
 
     let key_row = all_widgets::<adw::ActionRow>(&s.window)
@@ -564,7 +580,7 @@ pub(super) fn switch_port_and_key_file_save_when_changed(dir: &Path) {
     button_labeled(&key_row, "Clear")
         .expect("the clear button")
         .emit_clicked();
-    pump_for(Duration::from_millis(50));
+    saved();
     assert_eq!(s.on_disk(&p.id).expect("there").key_file, None);
     assert_eq!(key_row.subtitle().as_deref(), Some("None"));
     s.close();
@@ -583,6 +599,7 @@ pub(super) fn a_settling_port_is_saved_when_the_page_goes(dir: &Path) {
     pump_for(Duration::from_millis(50));
     assert_eq!(s.on_disk(&p.id).expect("there").port, 22, "still settling");
     s.select(&q.id);
+    saved();
     assert_eq!(s.on_disk(&p.id).expect("there").port, 2201);
     pump_for(Duration::from_millis(100));
     assert_eq!(s.entry("Host").text(), q.host, "q's page is shown");
@@ -606,6 +623,7 @@ pub(super) fn a_settling_port_is_saved_when_the_page_goes(dir: &Path) {
     );
     let dir = s.dir.clone();
     s.close();
+    saved();
     let stored = ProfileStore::open(&dir.join("profiles.json"))
         .expect("store")
         .get(&p.id)
@@ -1079,6 +1097,8 @@ pub(super) fn sequence_errors_stay_on_the_sub_page(dir: &Path) {
     assert_eq!(s.ctx.notice.last_text().as_deref(), Some(message));
     assert_eq!(s.file_bytes(), before);
     assert_eq!(commands_text(&page), "echo s3cret-token");
+    assert!(commands_view(&page).is_editable() && sub_name(&page).is_editable());
+    assert!(page.can_pop(), "can be left again after a failed save");
     for text in [inline_error(&page), s.ctx.notice.last_text()] {
         assert!(!text.expect("a message").contains("s3cret"));
     }
@@ -1429,7 +1449,7 @@ pub(super) fn the_keyring_workers_answers_are_never_lost(dir: &Path) {
     let password = s.entry("Password");
     password.grab_focus();
     password.set_text("pw-refused");
-    apply(&password);
+    press_apply(&password);
     s.select(&q.id);
     keyring.release();
     pump_until("the refusal to be told", || {
@@ -1460,7 +1480,7 @@ pub(super) fn the_keyring_workers_answers_are_never_lost(dir: &Path) {
     let password = s.entry("Password");
     password.grab_focus();
     password.set_text("pw-late");
-    apply(&password);
+    press_apply(&password);
     keyring.release();
     pump_until("the keyring calls to come back", || keyring::pending() == 0);
     assert!(s.on_disk(&p.id).is_none(), "the profile is deleted");
@@ -1469,5 +1489,333 @@ pub(super) fn the_keyring_workers_answers_are_never_lost(dir: &Path) {
         None,
         "no password left for a profile that is gone"
     );
+    s.close();
+}
+
+/// How long [`HeldProfileFile`] holds the lock at most: a save that waits for
+/// it on the main thread then fails the test instead of hanging it.
+const HELD_AT_MOST: Duration = Duration::from_secs(10);
+
+/// The profile file's lock, held by another thread as a sync that waits for
+/// the keyring holds it (issue #7), until released (or dropped, or
+/// [`HELD_AT_MOST`] has passed).
+struct HeldProfileFile {
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeldProfileFile {
+    fn hold(dir: &Path) -> HeldProfileFile {
+        HeldProfileFile::hold_then_write(dir, None)
+    }
+
+    /// [`hold`](Self::hold), and replace the file with `contents` (if any)
+    /// just before letting go, as a sync does.
+    fn hold_then_write(dir: &Path, contents: Option<Vec<u8>>) -> HeldProfileFile {
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("profiles.json.lock"))
+            .expect("the profile file's lock file");
+        let file = dir.join("profiles.json");
+        let (held, is_held) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            lock.lock().expect("take the lock");
+            held.send(()).expect("say it is held");
+            let _ = released.recv_timeout(HELD_AT_MOST);
+            if let Some(contents) = contents {
+                let temp = file.with_extension("json.by-sync");
+                fs::write(&temp, contents).expect("write the new file");
+                fs::rename(&temp, &file).expect("put it in place");
+            }
+            lock.unlock().expect("let go of the lock");
+        });
+        is_held.recv().expect("the lock taken");
+        HeldProfileFile {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for HeldProfileFile {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The profile file as a sync elsewhere would write it, with `change` made to
+/// profile `id`: written in a copy beside it, so the file itself is untouched.
+fn written_elsewhere(s: &Setup, id: &str, change: impl FnOnce(&mut Profile)) -> Vec<u8> {
+    let copy = s.dir.join("elsewhere");
+    fs::create_dir_all(&copy).expect("a folder for the copy");
+    fs::copy(s.dir.join("profiles.json"), copy.join("profiles.json")).expect("copy");
+    let mut store = ProfileStore::open(&copy.join("profiles.json")).expect("the copy");
+    let mut profile = store.get(id).cloned().expect("the profile");
+    change(&mut profile);
+    store.upsert(profile).expect("save the copy");
+    fs::read(copy.join("profiles.json")).expect("the copy's bytes")
+}
+
+/// Run `act`, which asks for a save while the profile file is held, and check
+/// that it came back at once: a save that waited for the file on the main
+/// thread would only come back when the lock is let go.
+fn at_once(what: &str, act: impl FnOnce()) {
+    let start = Instant::now();
+    act();
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "{what} waited for the profile file on the main thread"
+    );
+}
+
+/// Whether a spinner shows in `root` (a row, or the sub-page).
+fn spinner_shown(root: &impl IsA<gtk::Widget>) -> bool {
+    all_widgets::<adw::Spinner>(root)
+        .iter()
+        .any(|spinner| spinner.is_visible())
+}
+
+/// Whether the keyboard focus is in `row`.
+fn has_focus_in(window: &adw::Window, row: &impl IsA<gtk::Widget>) -> bool {
+    gtk::prelude::GtkWindowExt::focus(window)
+        .is_some_and(|f| f.is_ancestor(row) || &f == row.upcast_ref())
+}
+
+/// Saving waits for the profile file, not the window (issue #7). With the
+/// file's lock held, as a sync that waits for the keyring holds it, a text
+/// field, the switch, the port, the key file and a startup sequence each ask
+/// for their save at once and the window goes on. A row being saved keeps
+/// the focus and what it shows (a refresh puts nothing back), takes no more
+/// typing, and shows a spinner after a moment. Once the lock is let go the
+/// saves are made in the order asked, and a failure is told even when its
+/// page has gone.
+pub(super) fn saving_waits_for_the_profile_file_not_the_window(dir: &Path) {
+    let mut p = web_with(&[
+        seq("update", &["sudo apt update"]),
+        seq("reboot", &["sudo reboot"]),
+    ]);
+    p.key_file = Some(PathBuf::from("/home/alice/.ssh/id_ed25519"));
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    s.select(&p.id);
+    let before = s.file_bytes();
+    let held = HeldProfileFile::hold(dir);
+
+    let name = s.entry("Name");
+    name.grab_focus();
+    name.set_text("  renamed ");
+    at_once("applying the name", || {
+        name.emit_by_name::<()>("apply", &[]);
+    });
+    assert!(!name.is_editable(), "no more typing while it saves");
+    pump_until("the name row's spinner", || spinner_shown(&name));
+    assert!(has_focus_in(&s.window, &name), "the row keeps the focus");
+    assert_eq!(name.text(), "  renamed ");
+
+    let switch: adw::SwitchRow = find_widget(&s.window).expect("the transcript switch");
+    at_once("turning the switch on", || switch.set_active(true));
+    let port: adw::SpinRow = find_widget(&s.window).expect("the port row");
+    at_once("changing the port", || port.set_value(2222.0));
+    pump_until("the port row's spinner (once settled)", || {
+        spinner_shown(&port)
+    });
+    let key_row = all_widgets::<adw::ActionRow>(&s.window)
+        .into_iter()
+        .find(|r| r.title() == "Key file")
+        .expect("the key file row");
+    at_once("clearing the key file", || {
+        button_labeled(&key_row, "Clear")
+            .expect("the clear button")
+            .emit_clicked();
+    });
+
+    // A refresh meanwhile (a sync elsewhere, say) puts nothing back.
+    s.ctx.profiles_changed();
+    pump_for(Duration::from_millis(100));
+    assert_eq!(name.text(), "  renamed ");
+    assert!(switch.is_active());
+    assert_eq!(port.value(), 2222.0);
+    assert_eq!(key_row.subtitle().as_deref(), Some("None"));
+    // A second change of the switch is a second save, after the first.
+    at_once("turning the switch off again", || switch.set_active(false));
+    assert_eq!(
+        s.file_bytes(),
+        before,
+        "nothing written while the file is held"
+    );
+
+    held.release();
+    pump_until("the saves", || keyring::pending() == 0);
+    let stored_profile = s.on_disk(&p.id).expect("there");
+    assert_eq!(stored_profile.name, "renamed");
+    assert!(
+        !stored_profile.transcript,
+        "the later of the switch's saves"
+    );
+    assert_eq!(stored_profile.port, 2222);
+    assert_eq!(stored_profile.key_file, None);
+    assert_eq!(name.text(), "renamed", "the row shows what was stored");
+    assert!(name.is_editable());
+    assert!(!switch.is_active());
+    assert_eq!(port.value(), 2222.0);
+    assert_eq!(key_row.subtitle().as_deref(), Some("None"));
+    for row in [
+        name.upcast_ref::<gtk::Widget>(),
+        port.upcast_ref(),
+        switch.upcast_ref(),
+        key_row.upcast_ref(),
+    ] {
+        assert!(!spinner_shown(row), "a spinner left on {}", row.type_());
+        assert!(!row.has_css_class("error"));
+    }
+    assert_eq!(
+        s.rows()[0].title().as_str(),
+        "renamed",
+        "the sidebar follows"
+    );
+
+    // A startup sequence: Save waits, the sub-page stays with its text, takes
+    // no more typing and no second Save, and closes once saved.
+    let page = s.open_sequence("update");
+    set_commands(&page, "sudo apt update\nsudo apt upgrade");
+    let held = HeldProfileFile::hold(dir);
+    let save = button_labeled(&page, "Save").expect("the Save button");
+    at_once("saving the sequence", || save.emit_clicked());
+    at_once("pressing Save again", || save.emit_clicked());
+    assert_eq!(keyring::pending(), 1, "one save");
+    assert!(!commands_view(&page).is_editable());
+    assert!(!sub_name(&page).is_editable());
+    pump_until("the sub-page's spinner", || spinner_shown(&page));
+    assert!(s.sequence_page().is_some(), "the sub-page waits");
+    assert!(
+        !button_labeled(&page, "Cancel")
+            .expect("the Cancel button")
+            .is_sensitive(),
+        "Cancel waits for the save"
+    );
+    assert!(!page.can_pop(), "and so does Escape");
+    held.release();
+    s.wait_for_sub_page_to_close();
+    assert_eq!(
+        s.stored_sequences(&p.id),
+        [
+            stored("update", &["sudo apt update", "sudo apt upgrade"]),
+            stored("reboot", &["sudo reboot"])
+        ]
+    );
+
+    // Move Down waits too, and takes no second press; once it is back the
+    // page is at the sequence's new place.
+    let page = s.open_sequence("update");
+    let held = HeldProfileFile::hold(dir);
+    let down = button_labeled(&page, "Move Down").expect("Move Down");
+    at_once("moving the sequence down", || down.emit_clicked());
+    at_once("pressing it again", || down.emit_clicked());
+    assert_eq!(keyring::pending(), 1, "one move");
+    held.release();
+    saved();
+    assert_eq!(
+        s.stored_sequences(&p.id),
+        [
+            stored("reboot", &["sudo reboot"]),
+            stored("update", &["sudo apt update", "sudo apt upgrade"])
+        ]
+    );
+    assert!(
+        s.sequence_page().is_some(),
+        "still open, on the moved sequence"
+    );
+    assert!(!down.is_sensitive(), "it is last now");
+    assert!(
+        button_labeled(&page, "Move Up")
+            .expect("Move Up")
+            .is_sensitive()
+    );
+    assert!(page.can_pop());
+
+    // A sync that writes the file while a save waits for it is not written
+    // over: the save is checked against what the sync wrote.
+    set_commands(&page, "edited while a sync ran");
+    let by_sync = written_elsewhere(&s, &p.id, |profile| {
+        profile.sequences[1].name = "update (synced)".to_owned();
+    });
+    let held = HeldProfileFile::hold_then_write(dir, Some(by_sync.clone()));
+    at_once("saving during the sync", || {
+        button_labeled(&page, "Save")
+            .expect("the Save button")
+            .emit_clicked();
+    });
+    held.release();
+    saved();
+    assert_eq!(inline_error(&page).as_deref(), Some(form::SEQUENCE_CHANGED));
+    assert_eq!(s.file_bytes(), by_sync, "what the sync wrote stays");
+    assert_eq!(commands_text(&page), "edited while a sync ran");
+    s.click(&page, "Cancel");
+    s.wait_for_sub_page_to_close();
+
+    // A save that fails after its page has gone is still told.
+    let q = Profile::new("nas", "nas.lan", "admin");
+    s.other_store().upsert(q.clone()).expect("save");
+    s.ctx.profiles_changed();
+    let held = HeldProfileFile::hold(dir);
+    let host = s.entry("Host");
+    host.grab_focus();
+    host.set_text("bad host!");
+    at_once("applying a bad host", || {
+        host.emit_by_name::<()>("apply", &[]);
+    });
+    s.select(&q.id);
+    held.release();
+    pump_until("the failure to be told", || {
+        s.ctx
+            .notice
+            .last_text()
+            .is_some_and(|text| text.starts_with("Host must not be empty"))
+    });
+    assert_eq!(s.on_disk(&p.id).expect("there").host, p.host);
+    s.close();
+}
+
+/// A save that fails puts the switch and the port back to what is stored (a
+/// row that shows an unsaved state would mislead), marks them and says why.
+pub(super) fn a_failed_save_puts_the_switch_and_the_port_back(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let p = web();
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    s.select(&p.id);
+    // The file cannot be replaced (its folder is read-only): every save fails.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("chmod");
+
+    let switch: adw::SwitchRow = find_widget(&s.window).expect("the transcript switch");
+    switch.set_active(true);
+    saved();
+    assert!(!switch.is_active(), "back to what is stored");
+    assert!(switch.has_css_class("error"));
+    assert!(
+        s.ctx
+            .notice
+            .last_text()
+            .is_some_and(|text| text.starts_with("Could not save the profile")),
+        "{:?}",
+        s.ctx.notice.last_text()
+    );
+
+    let port: adw::SpinRow = find_widget(&s.window).expect("the port row");
+    port.grab_focus();
+    port.set_value(2222.0);
+    s.entry("Host").grab_focus();
+    saved();
+    assert_eq!(port.value(), 22.0, "back to what is stored");
+    assert!(port.has_css_class("error"));
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+    assert_eq!(s.on_disk(&p.id).expect("there").port, 22);
     s.close();
 }

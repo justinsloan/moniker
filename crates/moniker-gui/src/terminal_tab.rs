@@ -1667,6 +1667,12 @@ pub fn open_profile(
 /// unless the tab was closed meanwhile (its window too), which starts nothing.
 /// A tab dragged to another window meanwhile starts there. A keyring worker
 /// that stopped counts as no stored password: ssh asks in the terminal.
+///
+/// The session uses the profile as the window holds it when the answer is
+/// back, not as it was when it was picked: saves asked for before (a host or
+/// port changed just before connecting) run first on the same worker, and the
+/// window has read the file again by then (issue #7). The startup sequence is
+/// the one the person picked, as they saw it.
 pub(crate) fn start_profile(
     page: &adw::TabPage,
     ctx: &Rc<AppContext>,
@@ -1703,6 +1709,15 @@ pub(crate) fn start_profile(
             if !still_waiting {
                 return;
             }
+            // Bind first so the store borrow ends here.
+            let now = ctx.store.borrow().get(&profile.id).cloned();
+            let profile = match now {
+                Some(mut now) => {
+                    now.sequences = profile.sequences;
+                    now
+                }
+                None => profile,
+            };
             let Launch {
                 title,
                 command,

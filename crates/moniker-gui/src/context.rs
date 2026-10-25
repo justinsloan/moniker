@@ -27,7 +27,7 @@ use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore};
-use moniker_core::store::ProfileStore;
+use moniker_core::store::{ProfileStore, StoreError};
 use moniker_core::transcript;
 
 use crate::notify::{self, NotificationArea};
@@ -86,9 +86,33 @@ fn host_check() -> crate::hosts::Check {
     crate::hosts::Check::new(|_, _| crate::hosts::Reach::Unknown)
 }
 
+/// The profile file as the main thread has it: read, and read again after
+/// every change ([`AppContext::profiles_changed`]), never written. Writing
+/// takes the file's lock, which a sync holds while it waits for the keyring, so
+/// every write of the GUI goes to the keyring worker with a handle of its own
+/// (`crate::keyring::write_profiles`; issue #7). This type has no way to
+/// write: it gives only the store's reads.
+pub struct ProfileSnapshot(ProfileStore);
+
+impl ProfileSnapshot {
+    /// Read the file again (no lock: writers replace it atomically).
+    pub fn reload(&mut self) -> Result<(), StoreError> {
+        self.0.reload()
+    }
+}
+
+impl std::ops::Deref for ProfileSnapshot {
+    type Target = ProfileStore;
+
+    fn deref(&self) -> &ProfileStore {
+        &self.0
+    }
+}
+
 /// State shared by every window and dialog of the application.
 pub struct AppContext {
-    pub store: RefCell<ProfileStore>,
+    /// The profiles, as last read; never written from here ([`ProfileSnapshot`]).
+    pub store: RefCell<ProfileSnapshot>,
     /// The keyring. The GUI calls it only on the keyring worker
     /// (`crate::keyring::read` and `change`), never on the main thread.
     pub secrets: Arc<dyn SecretStore>,
@@ -196,7 +220,7 @@ impl AppContext {
         let pings = settings::load(&settings_path).ping_hosts;
         AppContext {
             hosts: crate::hosts::Hosts::new(pings, host_check()),
-            store: RefCell::new(store),
+            store: RefCell::new(ProfileSnapshot(store)),
             secrets,
             askpass_path,
             runtime_dir,

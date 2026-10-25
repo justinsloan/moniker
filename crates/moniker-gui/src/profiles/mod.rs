@@ -27,6 +27,7 @@
 
 mod new_profile;
 mod page;
+mod saving;
 mod sequence_page;
 pub(crate) mod sync_page;
 

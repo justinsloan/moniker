@@ -9,6 +9,17 @@
 //! failed save marks the row with the `error` style, explains in a
 //! notification, and writes nothing.
 //!
+//! The saves run on the keyring worker ([`keyring::write_profiles`]), never on
+//! the main thread: a sync that waits for the keyring holds the profile file,
+//! and the window must not wait with it (issue #7). They run in the order
+//! asked. While a row's save is under way ([`Saving`]) the row keeps the focus
+//! and what it shows, a refresh does not put the file's value back, a text row
+//! takes no more typing, and after a moment a spinner says it waits; the port,
+//! the switch and the key file can change again, which is a further save after
+//! it. When a save is back, every list and this page show the file as it is
+//! then, so a failed save's switch or port goes back to what is stored. A
+//! failure is still told when the page has gone.
+//!
 //! The startup sequences are listed here and edited on a sub-page of their own
 //! ([`sequence_page`]) that opens over this one.
 //!
@@ -35,6 +46,7 @@ use moniker_core::profile::Profile;
 use moniker_core::secrets::password_key;
 use zeroize::Zeroizing;
 
+use super::saving::Saving;
 use super::sequence_page;
 use crate::context::AppContext;
 use crate::form::{self, Field};
@@ -72,6 +84,15 @@ struct TextRow {
     stored: RefCell<String>,
     value: fn(&Profile) -> String,
     field: fn(String) -> Field,
+    saving: Rc<Saving>,
+}
+
+/// Which text row.
+#[derive(Clone, Copy)]
+enum Text {
+    Name,
+    Host,
+    Username,
 }
 
 struct Inner {
@@ -81,16 +102,21 @@ struct Inner {
     host: TextRow,
     username: TextRow,
     port: adw::SpinRow,
+    /// The port the file has, or will have once the saves asked for are back.
     port_stored: Cell<u16>,
     /// The pending save of a changed port, if one is waiting to settle.
     port_timer: RefCell<Option<glib::SourceId>>,
+    port_saving: Rc<Saving>,
     password: adw::PasswordEntryRow,
     key_file: adw::ActionRow,
     key_clear: gtk::Button,
+    key_saving: Rc<Saving>,
     sequences: adw::PreferencesGroup,
     sequence_rows: RefCell<Vec<adw::ActionRow>>,
     transcript: adw::SwitchRow,
+    /// What the file says, or will say once the saves asked for are back.
     transcript_stored: Cell<bool>,
+    transcript_saving: Rc<Saving>,
 }
 
 impl ProfilePage {
@@ -104,11 +130,14 @@ impl ProfilePage {
                 .show_apply_button(true)
                 .text(value(profile))
                 .build();
+            let saving = Saving::new();
+            row.add_suffix(&saving.spinner);
             TextRow {
                 row,
                 stored: RefCell::new(value(profile)),
                 value,
                 field,
+                saving,
             }
         };
         let name = text_row("Name", |p| p.name.clone(), Field::Name);
@@ -126,6 +155,8 @@ impl ProfilePage {
             ))
             .numeric(true)
             .build();
+        let port_saving = Saving::new();
+        port.add_suffix(&port_saving.spinner);
         let connection = adw::PreferencesGroup::builder().title("Connection").build();
         connection.add(&name.row);
         connection.add(&host.row);
@@ -161,6 +192,8 @@ impl ProfilePage {
             .use_markup(false)
             .subtitle_selectable(true)
             .build();
+        let key_saving = Saving::new();
+        key_file.add_suffix(&key_saving.spinner);
         key_file.add_suffix(&choose);
         key_file.add_suffix(&key_clear);
         let authentication = adw::PreferencesGroup::builder()
@@ -185,6 +218,8 @@ impl ProfilePage {
             .use_markup(false)
             .active(profile.transcript)
             .build();
+        let transcript_saving = Saving::new();
+        transcript.add_suffix(&transcript_saving.spinner);
         let session = adw::PreferencesGroup::builder().title("Session").build();
         session.add(&transcript);
         widget.add(&session);
@@ -207,13 +242,16 @@ impl ProfilePage {
             port,
             port_stored: Cell::new(profile.port),
             port_timer: RefCell::new(None),
+            port_saving,
             password,
             key_file,
             key_clear,
+            key_saving,
             sequences,
             sequence_rows: RefCell::new(Vec::new()),
             transcript,
             transcript_stored: Cell::new(profile.transcript),
+            transcript_saving,
         });
         inner.show_key_file(profile.key_file.as_ref());
         inner.show_sequences(profile);
@@ -222,8 +260,10 @@ impl ProfilePage {
     }
 
     /// Show `profile` (the same one, as it is in the file now) in every row
-    /// that has no unapplied edit. A row with one keeps its text; what it
-    /// would go back to becomes the new stored value.
+    /// that has no unapplied edit and no save under way. A text row with an
+    /// unapplied edit (or one being saved) keeps its text; what it would go
+    /// back to becomes the new stored value. A port, switch or key file being
+    /// saved keeps what it shows, which is what the file will hold.
     pub fn refresh(&self, profile: &Profile) {
         let inner = &self.inner;
         for text in inner.text_rows() {
@@ -234,14 +274,19 @@ impl ProfilePage {
             }
             text.stored.replace(value);
         }
-        let port_pending = inner.port_timer.borrow().is_some();
-        inner.port_stored.set(profile.port);
-        if !port_pending {
-            inner.port.set_value(f64::from(profile.port));
+        if !inner.port_saving.busy() {
+            inner.port_stored.set(profile.port);
+            if inner.port_timer.borrow().is_none() {
+                inner.port.set_value(f64::from(profile.port));
+            }
         }
-        inner.transcript_stored.set(profile.transcript);
-        inner.transcript.set_active(profile.transcript);
-        inner.show_key_file(profile.key_file.as_ref());
+        if !inner.transcript_saving.busy() {
+            inner.transcript_stored.set(profile.transcript);
+            inner.transcript.set_active(profile.transcript);
+        }
+        if !inner.key_saving.busy() {
+            inner.show_key_file(profile.key_file.as_ref());
+        }
         inner.show_sequences(profile);
     }
 
@@ -252,7 +297,8 @@ impl ProfilePage {
         let inner = &self.inner;
         let left = |row: &gtk::Widget| !focus.is_some_and(|f| f == row || f.is_ancestor(row));
         for text in inner.text_rows() {
-            if left(text.row.upcast_ref()) {
+            // A row being saved has no unapplied edit: it was applied.
+            if left(text.row.upcast_ref()) && !text.saving.busy() {
                 set_text_quietly(&text.row, &text.stored.borrow());
                 text.row.remove_css_class("error");
             }
@@ -272,31 +318,12 @@ impl ProfilePage {
 
     /// Save a port change that is still settling, now: the window is closing
     /// or the page is going away, and a changed port is a choice the person
-    /// already made (it has no ✓ to wait for).
-    ///
-    /// The page may be going away in the middle of a refresh or a selection
-    /// change, so the windows are told only once the main loop is idle: the
-    /// refresh, or the message if the save failed (in whichever window is
-    /// still there to show it).
+    /// already made (it has no ✓ to wait for). It is back once the page has
+    /// gone, from the main loop: the windows then refresh, or the message goes
+    /// to whichever window is still there to show it.
     pub fn flush(&self) {
-        let inner = &self.inner;
-        let Some(timer) = inner.port_timer.take() else {
-            return;
-        };
-        timer.remove();
-        let port = inner.port_value();
-        if port == inner.port_stored.get() {
-            return;
-        }
-        let ctx = Rc::clone(&inner.ctx);
-        match form::apply_field(&ctx.store, &inner.id, Field::Port(port)) {
-            Ok(profile) => {
-                inner.port_stored.set(profile.port);
-                glib::idle_add_local_once(move || ctx.profiles_changed());
-            }
-            Err(message) => {
-                glib::idle_add_local_once(move || ctx.notice.show(&message));
-            }
+        if self.inner.port_timer.borrow().is_some() {
+            self.inner.save_port();
         }
     }
 }
@@ -315,6 +342,14 @@ impl Inner {
         [&self.name, &self.host, &self.username]
     }
 
+    fn text(&self, which: Text) -> &TextRow {
+        match which {
+            Text::Name => &self.name,
+            Text::Host => &self.host,
+            Text::Username => &self.username,
+        }
+    }
+
     /// Wire the rows and buttons. Every handler holds the page weakly: the
     /// page owns the widgets the handlers are attached to.
     fn connect(self: &Rc<Self>, remove: &gtk::Button, choose: &gtk::Button, delete: &gtk::Button) {
@@ -328,11 +363,11 @@ impl Inner {
             }
         };
 
-        let apply = with(|inner| inner.apply_text(&inner.name));
+        let apply = with(|inner| inner.apply_text(Text::Name));
         self.name.row.connect_apply(move |_| apply());
-        let apply = with(|inner| inner.apply_text(&inner.host));
+        let apply = with(|inner| inner.apply_text(Text::Host));
         self.host.row.connect_apply(move |_| apply());
-        let apply = with(|inner| inner.apply_text(&inner.username));
+        let apply = with(|inner| inner.apply_text(Text::Username));
         self.username.row.connect_apply(move |_| apply());
         let apply = with(|inner| inner.apply_password());
         self.password.connect_apply(move |_| apply());
@@ -352,31 +387,73 @@ impl Inner {
         delete.connect_clicked(move |_| ask());
     }
 
-    /// Save one field. On success everything showing profiles refreshes; on
-    /// failure `row` is marked and the message shown near it.
-    fn save(&self, row: &impl IsA<gtk::Widget>, field: Field) -> Option<Profile> {
-        match form::apply_field(&self.ctx.store, &self.id, field) {
-            Ok(profile) => {
-                row.remove_css_class("error");
-                Some(profile)
-            }
-            Err(message) => {
-                row.add_css_class("error");
-                self.ctx.notice.show_near(row, &message);
-                None
-            }
-        }
+    /// Save one field on the keyring worker, after every change asked for
+    /// before it, while `saving` says that `row` waits (module docs). When it
+    /// is back: on failure `row` is marked and the message shown near it, or
+    /// in a window if the page has gone; `then` gets the result if the page is
+    /// still there; and everything showing profiles refreshes.
+    fn save(
+        self: &Rc<Self>,
+        row: &impl IsA<gtk::Widget>,
+        saving: &Rc<Saving>,
+        field: Field,
+        then: impl FnOnce(&Rc<Inner>, &Result<Profile, String>) + 'static,
+    ) {
+        saving.begin();
+        let id = self.id.clone();
+        let ctx = Rc::clone(&self.ctx);
+        let weak = Rc::downgrade(self);
+        let row = row.clone().upcast::<gtk::Widget>();
+        let saving = Rc::clone(saving);
+        keyring::write_profiles(
+            &self.ctx,
+            move |store| form::apply_field(store, &id, field),
+            move |result| {
+                saving.end();
+                match weak.upgrade() {
+                    Some(inner) => {
+                        match &result {
+                            Ok(_) => row.remove_css_class("error"),
+                            Err(message) => {
+                                row.add_css_class("error");
+                                ctx.notice.show_near(&row, message);
+                            }
+                        }
+                        then(&inner, &result);
+                    }
+                    // The page has gone (another profile selected, the window
+                    // closed) while the save waited: a failure is still told.
+                    None => {
+                        if let Err(message) = &result {
+                            ctx.notice.show(message);
+                        }
+                    }
+                }
+                ctx.profiles_changed();
+            },
+        );
     }
 
-    fn apply_text(&self, text: &TextRow) {
-        let typed = text.row.text().to_string();
-        if let Some(profile) = self.save(&text.row, (text.field)(typed)) {
-            // Show what was stored (trimmed) before anyone refreshes.
-            let value = (text.value)(&profile);
-            set_text_quietly(&text.row, &value);
-            text.stored.replace(value);
-            self.ctx.profiles_changed();
+    /// Save what was typed in a text row. The row keeps the focus but takes no
+    /// more typing until the save is back.
+    fn apply_text(self: &Rc<Self>, which: Text) {
+        let text = self.text(which);
+        if text.saving.busy() {
+            return;
         }
+        let typed = text.row.text().to_string();
+        text.row.set_editable(false);
+        let field = (text.field)(typed);
+        self.save(&text.row, &text.saving, field, move |inner, result| {
+            let text = inner.text(which);
+            text.row.set_editable(true);
+            if let Ok(profile) = result {
+                // Show what was stored (trimmed) before anyone refreshes.
+                let value = (text.value)(profile);
+                set_text_quietly(&text.row, &value);
+                text.stored.replace(value);
+            }
+        });
     }
 
     /// Store the typed password ([`form::apply_password`]: the keyring first,
@@ -456,7 +533,7 @@ impl Inner {
         self.port_timer.replace(Some(timer));
     }
 
-    fn save_port(&self) {
+    fn save_port(self: &Rc<Self>) {
         if let Some(timer) = self.port_timer.take() {
             timer.remove();
         }
@@ -464,10 +541,8 @@ impl Inner {
         if port == self.port_stored.get() {
             return;
         }
-        if let Some(profile) = self.save(&self.port, Field::Port(port)) {
-            self.port_stored.set(profile.port);
-            self.ctx.profiles_changed();
-        }
+        self.port_stored.set(port);
+        self.save(&self.port, &self.port_saving, Field::Port(port), |_, _| {});
     }
 
     /// The spin row is limited to 1..=65535; 0 would fail validation anyway.
@@ -475,19 +550,21 @@ impl Inner {
         u16::try_from(self.port.value().round() as i64).unwrap_or(0)
     }
 
-    fn transcript_changed(&self) {
+    /// The switch changed: save it. If that fails, the refresh once it is back
+    /// puts the switch back to what is stored: a switch that shows an unsaved
+    /// state would mislead.
+    fn transcript_changed(self: &Rc<Self>) {
         let on = self.transcript.is_active();
         if on == self.transcript_stored.get() {
             return;
         }
-        match self.save(&self.transcript, Field::Transcript(on)) {
-            Some(profile) => {
-                self.transcript_stored.set(profile.transcript);
-                self.ctx.profiles_changed();
-            }
-            // A switch that shows an unsaved state would mislead: put it back.
-            None => self.transcript.set_active(self.transcript_stored.get()),
-        }
+        self.transcript_stored.set(on);
+        self.save(
+            &self.transcript,
+            &self.transcript_saving,
+            Field::Transcript(on),
+            |_, _| {},
+        );
     }
 
     fn show_key_file(&self, key_file: Option<&PathBuf>) {
@@ -496,11 +573,15 @@ impl Inner {
         self.key_clear.set_sensitive(key_file.is_some());
     }
 
-    fn save_key_file(&self, path: Option<PathBuf>) {
-        if let Some(profile) = self.save(&self.key_file, Field::KeyFile(path)) {
-            self.show_key_file(profile.key_file.as_ref());
-            self.ctx.profiles_changed();
-        }
+    /// Show the key file chosen (or none) and save it.
+    fn save_key_file(self: &Rc<Self>, path: Option<PathBuf>) {
+        self.show_key_file(path.as_ref());
+        self.save(
+            &self.key_file,
+            &self.key_saving,
+            Field::KeyFile(path),
+            |_, _| {},
+        );
     }
 
     /// Let the person pick a key file, then save it.

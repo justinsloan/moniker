@@ -203,3 +203,11 @@ Watching the pings: `sudo tcpdump -ni any icmp or icmp6` in another terminal.
 123. A profile whose host name does not exist (`no-such-host.invalid`): its mark is a red ring at once, hovering it says "Name not found", and tcpdump shows no ping for it.
 124. A host whose name has both an IPv6 and an IPv4 address, on a network with IPv6: tcpdump shows ICMPv6 requests to it, and if its IPv6 address gets no reply, ICMP (IPv4) requests three seconds later; the mark is green if either answers. With `AddressFamily inet` for that host in `~/.ssh/config` (then the marks turned off and on in Preferences), only IPv4 requests are sent; with `AddressFamily inet6`, only IPv6 ones (remove it afterwards).
 125. With a list open and `Match exec "date >> /tmp/match.log"` at the top of `~/.ssh/config`, turn the marks off and on in Preferences: a new line appears in `/tmp/match.log` at once, not up to five minutes later. Change a profile's host's `HostName` in `~/.ssh/config` and turn the marks off and on: the mark shows the new host's status at once (remove both afterwards).
+
+## Alpha 5: saving never freezes the window
+
+The profile file busy, as a sync that waits for the keyring holds it: `flock ~/.config/moniker/profiles.json.lock sleep 30` in a terminal, with `htop` running in a Moniker tab.
+
+126. While `flock` runs, in the Connection Profiles window: change a profile's name and press Enter, change its port, flip Save transcript, and clear its key file. The window and `htop` keep going; each row keeps what you set and, after a moment, shows a small spinner; the name row keeps the keyboard focus but takes no typing until it is saved. When `flock` ends, all four are saved (the spinners go, the sidebar shows the new name), and a restart shows them.
+127. While `flock` runs, flip Save transcript on and then off again: once it ends, the switch and the file both say off. Open a startup sequence, edit it and click Save: the sub-page stays with a spinner in its header, takes no typing and no second Save, and closes once `flock` ends, with the edit saved.
+128. While `flock` runs, type an invalid host (`bad host!`), press Enter, and select another profile: when `flock` ends, a notification says what is wrong with the host, and nothing was saved. Without `flock`, saving works as before, with no spinner and no flicker.

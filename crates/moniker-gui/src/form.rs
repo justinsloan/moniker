@@ -187,9 +187,6 @@ pub enum Field {
     /// `None`, or a path that is empty once trimmed, means no key file.
     KeyFile(Option<PathBuf>),
     Transcript(bool),
-    /// The whole list: the startup-sequence sub-page builds it from the
-    /// sequences in the file now ([`sequences_now`]).
-    Sequences(Vec<StartupSequence>),
 }
 
 impl Field {
@@ -208,7 +205,6 @@ impl Field {
                 });
             }
             Field::Transcript(on) => profile.transcript = on,
-            Field::Sequences(sequences) => profile.sequences = sequences,
         }
     }
 }
@@ -375,36 +371,49 @@ pub fn without_sequence(seqs: &[StartupSequence], index: usize) -> Vec<StartupSe
     list
 }
 
-/// The startup sequences of the live profile `id` as they are in the file now,
-/// to build the list that [`Field::Sequences`] replaces them with.
+/// Change the startup sequences of the live profile `id` as the file holds
+/// them now: `change` gets the list and returns the one to save.
 ///
 /// The sub-page works on one sequence, opened at `target` (its index and what
-/// it held then). A sync can change the list while the page is open, and the
-/// index could then name a different sequence: moving or deleting that one
-/// would be a silent loss. So the file is read again and the sequence at that
-/// index must still be the one the page was opened on, else
-/// [`SEQUENCE_CHANGED`]. A new sequence (`None`) has no such expectation.
-/// A profile that is missing or deleted is [`GONE`].
-///
-/// The file can still change between this read and the write that follows;
-/// `apply_field` writes over what it finds then. The window is a few
-/// milliseconds, and the next sync merges by `updated_at`.
-pub fn sequences_now(
+/// it held then). A sync can change the list while the page is open, or while
+/// this waits for the file's lock, and the index could then name a different
+/// sequence: moving or deleting that one would be a silent loss, and saving a
+/// list built from an older one would undo the sync. So the check and the
+/// change are made on what the file holds under the store's lock
+/// ([`rewrite_live_if`]): the sequence at that index must still be the one the
+/// page was opened on, else [`SEQUENCE_CHANGED`] and nothing is written. A new
+/// sequence (`None`) has no such expectation. `Ok(None)`: the list came out the
+/// same, and nothing was written. A profile that is missing or deleted is
+/// [`GONE`].
+pub fn apply_sequences(
     store: &RefCell<ProfileStore>,
     id: &str,
     target: Option<(usize, &StartupSequence)>,
-) -> Result<Vec<StartupSequence>, String> {
-    // Bind first so the store borrow ends here.
-    let reloaded = store.borrow_mut().reload();
-    reloaded.map_err(|err| format!("Could not read the profile file: {err}"))?;
-    let store = store.borrow();
-    let profile = store.get(id).ok_or_else(|| GONE.to_owned())?;
-    if let Some((index, expected)) = target
-        && profile.sequences.get(index) != Some(expected)
-    {
-        return Err(SEQUENCE_CHANGED.to_owned());
-    }
-    Ok(profile.sequences.clone())
+    change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence>,
+) -> Result<Option<Profile>, String> {
+    rewrite_live_if(store, id, |profile| {
+        if let Some((index, expected)) = target
+            && profile.sequences.get(index) != Some(expected)
+        {
+            return Err(SEQUENCE_CHANGED.to_owned());
+        }
+        let next = change(&profile.sequences);
+        if next == profile.sequences {
+            return Ok(false);
+        }
+        profile.sequences = next;
+        Ok(true)
+    })
+}
+
+/// The startup sequences of the live profile `id` in `store` as it was last
+/// read, to open the sub-page on. A profile that is missing or deleted is
+/// [`GONE`].
+pub fn sequences_of(store: &ProfileStore, id: &str) -> Result<Vec<StartupSequence>, String> {
+    store
+        .get(id)
+        .map(|profile| profile.sequences.clone())
+        .ok_or_else(|| GONE.to_owned())
 }
 
 /// What the New Profile dialog asks for.
@@ -461,13 +470,34 @@ fn rewrite_live(
     id: &str,
     change: impl FnOnce(&mut Profile),
 ) -> Result<Profile, String> {
+    let saved = rewrite_live_if(store, id, |profile| {
+        change(profile);
+        Ok(true)
+    })?;
+    // `None` only for a change that says it changed nothing; this one never does.
+    saved.ok_or_else(|| GONE.to_owned())
+}
+
+/// [`rewrite_live`] for a change that can refuse (`Err`: nothing is written)
+/// or find nothing to change (`Ok(false)`: nothing is written, and the result
+/// is `Ok(None)`). It runs under the store's lock, on the profile as the file
+/// holds it then.
+fn rewrite_live_if(
+    store: &RefCell<ProfileStore>,
+    id: &str,
+    change: impl FnOnce(&mut Profile) -> Result<bool, String>,
+) -> Result<Option<Profile>, String> {
     let result = store.borrow_mut().update(|current| {
         let unchanged = current.to_vec();
         let Some(old) = current.iter().find(|p| p.id == id && !p.deleted) else {
             return Ok((unchanged, Err(GONE.to_owned())));
         };
         let mut changed = old.clone();
-        change(&mut changed);
+        match change(&mut changed) {
+            Ok(true) => {}
+            Ok(false) => return Ok((unchanged, Ok(None))),
+            Err(message) => return Ok((unchanged, Err(message))),
+        }
         if let Err(err) = changed.validate() {
             return Ok((unchanged, Err(describe(err))));
         }
@@ -482,7 +512,7 @@ fn rewrite_live(
                 }
             })
             .collect();
-        Ok((next, Ok(changed)))
+        Ok((next, Ok(Some(changed))))
     });
     result.unwrap_or_else(|err| Err(format!("Could not save the profile: {err}")))
 }
@@ -741,11 +771,9 @@ mod tests {
         apply_field(&store, &p.id, Field::Username(" bob ".to_owned())).unwrap();
         apply_field(&store, &p.id, Field::Port(2222)).unwrap();
         apply_field(&store, &p.id, Field::Transcript(true)).unwrap();
-        apply_field(
-            &store,
-            &p.id,
-            Field::Sequences(vec![seq("update", &["sudo apt update"])]),
-        )
+        apply_sequences(&store, &p.id, None, |_| {
+            vec![seq("update", &["sudo apt update"])]
+        })
         .unwrap();
         apply_field(
             &store,
@@ -931,69 +959,107 @@ mod tests {
         sequences: &[StartupSequence],
     ) -> (tempfile::TempDir, RefCell<ProfileStore>, Profile) {
         let (dir, store, p) = store_with_profile();
-        apply_field(&store, &p.id, Field::Sequences(sequences.to_vec())).unwrap();
+        apply_sequences(&store, &p.id, None, |_| sequences.to_vec()).unwrap();
         let p = store.borrow().get(&p.id).unwrap().clone();
         (dir, store, p)
     }
 
     #[test]
-    fn sequences_now_reads_the_file_not_the_snapshot() {
+    fn sequences_are_changed_as_the_file_holds_them() {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"])]);
         let mut other = other_handle(&dir);
         let mut changed = p.clone();
         changed.sequences.push(seq("b", &["2"]));
         other.upsert(changed).unwrap();
 
-        // The window's snapshot has not seen the second sequence.
+        // The window's snapshot has not seen the second sequence; the change
+        // gets the list the file holds.
         assert_eq!(store.borrow().get(&p.id).unwrap().sequences.len(), 1);
-        let now = sequences_now(&store, &p.id, Some((0, &seq("a", &["1"])))).unwrap();
-        assert_eq!(now, [seq("a", &["1"]), seq("b", &["2"])]);
+        let saved = apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), |now| {
+            assert_eq!(now, [seq("a", &["1"]), seq("b", &["2"])]);
+            with_sequence(now, Some(0), seq("a", &["1", "one"]))
+        })
+        .unwrap()
+        .expect("written");
+        assert_eq!(saved.sequences, [seq("a", &["1", "one"]), seq("b", &["2"])]);
+        assert_eq!(
+            other_handle(&dir).get(&p.id).unwrap().sequences,
+            saved.sequences
+        );
         // A new sequence expects nothing to be there.
-        assert_eq!(sequences_now(&store, &p.id, None).unwrap().len(), 2);
+        let saved = apply_sequences(&store, &p.id, None, |now| {
+            with_sequence(now, None, seq("c", &["3"]))
+        })
+        .unwrap()
+        .expect("written");
+        assert_eq!(saved.sequences.len(), 3);
     }
 
     #[test]
-    fn sequences_now_refuses_a_sequence_that_changed_or_moved() {
+    fn a_list_that_comes_out_the_same_is_not_written() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"])]);
+        let before = file_bytes(&dir);
+        // Moving the only sequence up changes nothing.
+        let saved = apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), |now| {
+            moved(now, 0, Move::Up)
+        });
+        assert_eq!(saved, Ok(None));
+        assert_eq!(file_bytes(&dir), before);
+    }
+
+    #[test]
+    fn a_sequence_that_changed_or_moved_is_not_written_over() {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
         let mut other = other_handle(&dir);
         let mut changed = p.clone();
         changed.sequences = vec![seq("b", &["2"]), seq("a", &["1"])];
         other.upsert(changed).unwrap();
-
-        // The page was opened on "a" at index 0; now index 0 holds "b".
-        let err = sequences_now(&store, &p.id, Some((0, &seq("a", &["1"])))).unwrap_err();
-        assert_eq!(err, SEQUENCE_CHANGED);
-        // Past the end counts the same.
-        let err = sequences_now(&store, &p.id, Some((5, &seq("a", &["1"])))).unwrap_err();
-        assert_eq!(err, SEQUENCE_CHANGED);
-        // Neither message holds a command.
-        assert!(!err.contains('1'));
-    }
-
-    #[test]
-    fn sequences_now_of_a_deleted_profile_is_gone() {
-        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"])]);
-        other_handle(&dir).delete(&p.id).unwrap();
         let before = file_bytes(&dir);
 
-        assert_eq!(
-            sequences_now(&store, &p.id, Some((0, &seq("a", &["1"])))).unwrap_err(),
-            GONE
-        );
-        assert_eq!(sequences_now(&store, &p.id, None).unwrap_err(), GONE);
+        // The page was opened on "a" at index 0; now index 0 holds "b".
+        let err = apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), |now| {
+            without_sequence(now, 0)
+        })
+        .unwrap_err();
+        assert_eq!(err, SEQUENCE_CHANGED);
+        // Past the end counts the same.
+        let err = apply_sequences(&store, &p.id, Some((5, &seq("a", &["1"]))), |now| {
+            now.to_vec()
+        })
+        .unwrap_err();
+        assert_eq!(err, SEQUENCE_CHANGED);
+        // Neither message holds a command, and nothing was written.
+        assert!(!err.contains('1'));
         assert_eq!(file_bytes(&dir), before);
     }
 
     #[test]
-    fn sequences_now_reports_an_unreadable_file_without_its_contents() {
+    fn the_sequences_of_a_deleted_profile_are_gone() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"])]);
+        other_handle(&dir).delete(&p.id).unwrap();
+        let before = file_bytes(&dir);
+
+        let change = |now: &[StartupSequence]| with_sequence(now, None, seq("b", &["2"]));
+        assert_eq!(
+            apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), change).unwrap_err(),
+            GONE
+        );
+        assert_eq!(
+            apply_sequences(&store, &p.id, None, change).unwrap_err(),
+            GONE
+        );
+        assert_eq!(file_bytes(&dir), before);
+        store.borrow_mut().reload().unwrap();
+        assert_eq!(sequences_of(&store.borrow(), &p.id).unwrap_err(), GONE);
+    }
+
+    #[test]
+    fn an_unreadable_file_is_reported_without_its_contents() {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["echo s3cret"])]);
         std::fs::write(dir.path().join("profiles.json"), "{ echo s3cret").unwrap();
 
-        let err = sequences_now(&store, &p.id, None).unwrap_err();
-        assert!(
-            err.starts_with("Could not read the profile file"),
-            "got: {err}"
-        );
+        let err = apply_sequences(&store, &p.id, None, |now| now.to_vec()).unwrap_err();
+        assert!(err.starts_with("Could not save the profile"), "got: {err}");
         assert!(!err.contains("s3cret"));
     }
 

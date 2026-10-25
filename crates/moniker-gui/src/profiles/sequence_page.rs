@@ -3,16 +3,23 @@
 //!
 //! A Name row and a monospace editor with one command per line. A multi-line
 //! editor has no ✓, so the header has Cancel and Save. Save, Move Up, Move
-//! Down and Delete Sequence all go through [`form::apply_field`] with
-//! [`Field::Sequences`]; the list they pass is built from the sequences in the
-//! file *now* ([`form::sequences_now`]), not from what the page was opened on,
-//! and only if the sequence at its place is still the one the page was opened
-//! on. A sync that reordered or changed the list meanwhile is therefore never
-//! overwritten, and Move or Delete never acts on a different sequence.
+//! Down and Delete Sequence all go through [`form::apply_sequences`]: the list
+//! they save is built, under the profile file's lock, from the sequences the
+//! file holds *then*, not from what the page was opened on, and only if the
+//! sequence at its place is still the one the page was opened on. A sync that
+//! reordered or changed the list meanwhile is therefore never overwritten, and
+//! Move or Delete never acts on a different sequence.
 //!
 //! Move and Delete act on what is saved, at once. Text typed in the editor is
 //! kept by Move (the page stays open at the sequence's new place) and is
 //! discarded by Cancel, Escape, Delete, or selecting another profile.
+//!
+//! Each of them runs on the keyring worker ([`keyring::write_profiles`]), never
+//! on the main thread (issue #7): a sync that waits for the keyring holds the
+//! profile file. Until it is back the page takes no typing and no other Save,
+//! Move or Delete, Cancel and Escape wait too, and after a moment a spinner in
+//! the header says it waits. Selecting another profile still closes the page;
+//! the change asked for goes on, and a failure is then told in the window.
 //!
 //! The page does not follow the profile file: a refresh of the profile page
 //! under it leaves what was typed alone. If the profile is deleted by a sync
@@ -32,9 +39,11 @@ use libadwaita as adw;
 use moniker_core::profile::{Profile, StartupSequence};
 
 use super::page::SECRETS_WARNING;
+use super::saving::Saving;
 use super::{PROFILE_TAG, SEQUENCE_TAG};
 use crate::context::AppContext;
-use crate::form::{self, Field, Move};
+use crate::form::{self, Move};
+use crate::keyring;
 
 /// The page's title and the header's. They name no sequence: the name is data,
 /// shown in the Name row with markup off.
@@ -53,7 +62,7 @@ struct Inner {
     /// Move changes it.
     index: Cell<Option<usize>>,
     /// The sequence as it was when the page was opened (`None` for a new
-    /// one): what [`form::sequences_now`] expects to find at `index`.
+    /// one): what [`form::apply_sequences`] expects to find at `index`.
     original: Option<StartupSequence>,
     /// How many sequences the profile had at the last read: Move Down is
     /// offered while there is a later one.
@@ -66,6 +75,11 @@ struct Inner {
     cancel: gtk::Button,
     save: gtk::Button,
     delete: gtk::Button,
+    /// The change under way, if any (module docs).
+    saving: Rc<Saving>,
+    /// The page itself, once it is made: it cannot be left while a change is
+    /// under way.
+    page: glib::WeakRef<adw::NavigationPage>,
 }
 
 /// Push the sub-page for the sequence at `index` of profile `id` (`None`: a new
@@ -80,7 +94,10 @@ pub(super) fn push(
     id: &str,
     index: Option<usize>,
 ) -> Result<(), String> {
-    let current = form::sequences_now(&ctx.store, id, None)?;
+    // Bind first so the store borrow ends here.
+    let reloaded = ctx.store.borrow_mut().reload();
+    reloaded.map_err(|err| format!("Could not read the profile file: {err}"))?;
+    let current = form::sequences_of(&ctx.store.borrow(), id)?;
     let original = match index {
         None => None,
         Some(i) => Some(
@@ -143,6 +160,8 @@ pub(super) fn push(
             .halign(gtk::Align::Center)
             .css_classes(["destructive-action", "pill"])
             .build(),
+        saving: Saving::new(),
+        page: glib::WeakRef::new(),
     });
     inner.update_moves();
 
@@ -151,6 +170,7 @@ pub(super) fn push(
         .tag(SEQUENCE_TAG)
         .child(&inner.build_view())
         .build();
+    inner.page.set(Some(&page));
     inner.connect();
 
     // The page owns its state: this handler holds the only strong reference,
@@ -190,6 +210,7 @@ impl Inner {
             .build();
         header.pack_start(&self.cancel);
         header.pack_end(&self.save);
+        header.pack_end(&self.saving.spinner);
 
         let page = adw::PreferencesPage::new();
         let identity = adw::PreferencesGroup::new();
@@ -285,20 +306,57 @@ impl Inner {
         })
     }
 
-    /// Change the profile's sequences: `change` gets the list as it is in the
-    /// file now and returns the one to save. `Ok(None)` means it came out the
-    /// same, so nothing was written.
+    /// Change the profile's sequences on the keyring worker (module docs):
+    /// `change` gets the list as it is in the file then and returns the one to
+    /// save. When it is back, `then` gets the profile as stored, or `None` if
+    /// the list came out the same and nothing was written; a failure is shown
+    /// ([`fail`](Self::fail)). If the page has gone by then, a failure is told
+    /// in the window.
     fn apply(
-        &self,
-        change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence>,
-    ) -> Result<Option<Profile>, String> {
-        let target = self.index.get().zip(self.original.as_ref());
-        let current = form::sequences_now(&self.ctx.store, &self.id, target)?;
-        let next = change(&current);
-        if next == current {
-            return Ok(None);
+        self: &Rc<Self>,
+        change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence> + Send + 'static,
+        then: impl FnOnce(&Rc<Inner>, Option<Profile>) + 'static,
+    ) {
+        self.saving.begin();
+        self.set_waiting(true);
+        let id = self.id.clone();
+        let target = self.index.get().zip(self.original.clone());
+        let ctx = Rc::clone(&self.ctx);
+        let saving = Rc::clone(&self.saving);
+        let weak = Rc::downgrade(self);
+        keyring::write_profiles(
+            &self.ctx,
+            move |store| {
+                let target = target.as_ref().map(|(index, sequence)| (*index, sequence));
+                form::apply_sequences(store, &id, target, change)
+            },
+            move |result| {
+                saving.end();
+                let Some(inner) = weak.upgrade() else {
+                    if let Err(message) = &result {
+                        ctx.notice.show(message);
+                    }
+                    ctx.profiles_changed();
+                    return;
+                };
+                inner.set_waiting(false);
+                match result {
+                    Ok(saved) => then(&inner, saved),
+                    Err(message) => inner.fail(&message),
+                }
+            },
+        );
+    }
+
+    /// While a change is under way (module docs): no typing, and no leaving
+    /// by Cancel, Escape or the back gesture.
+    fn set_waiting(&self, waiting: bool) {
+        self.name.set_editable(!waiting);
+        self.commands.set_editable(!waiting);
+        self.cancel.set_sensitive(!waiting);
+        if let Some(page) = self.page.upgrade() {
+            page.set_can_pop(!waiting);
         }
-        form::apply_field(&self.ctx.store, &self.id, Field::Sequences(next)).map(Some)
     }
 
     /// Show a failure on the page (the text stays, the page stays) and as a
@@ -328,51 +386,62 @@ impl Inner {
         self.name.set_text("");
     }
 
-    fn save(&self) {
-        let result = self.edited().and_then(|sequence| {
-            self.apply(|current| form::with_sequence(current, self.index.get(), sequence))
-        });
-        match result {
-            Ok(_) => {
-                self.ctx.profiles_changed();
-                self.close();
-            }
-            Err(message) => self.fail(&message),
+    fn save(self: &Rc<Self>) {
+        if self.saving.busy() {
+            return;
         }
+        let sequence = match self.edited() {
+            Ok(sequence) => sequence,
+            Err(message) => return self.fail(&message),
+        };
+        let index = self.index.get();
+        self.apply(
+            move |current| form::with_sequence(current, index, sequence),
+            |inner, _| {
+                inner.ctx.profiles_changed();
+                inner.close();
+            },
+        );
     }
 
-    fn move_by(&self, dir: Move) {
+    fn move_by(self: &Rc<Self>, dir: Move) {
         let Some(index) = self.index.get() else {
             return;
         };
-        match self.apply(|current| form::moved(current, index, dir)) {
-            Ok(saved) => {
+        if self.saving.busy() {
+            return;
+        }
+        self.apply(
+            move |current| form::moved(current, index, dir),
+            move |inner, saved| {
                 if let Some(profile) = saved {
                     // It moved: the sequence now sits one place over.
-                    self.index.set(Some(match dir {
+                    inner.index.set(Some(match dir {
                         Move::Up => index.saturating_sub(1),
                         Move::Down => index + 1,
                     }));
-                    self.count.set(profile.sequences.len());
-                    self.ctx.profiles_changed();
+                    inner.count.set(profile.sequences.len());
+                    inner.ctx.profiles_changed();
                 }
-                self.update_moves();
-            }
-            Err(message) => self.fail(&message),
-        }
+                inner.update_moves();
+            },
+        );
     }
 
-    fn delete(&self) {
+    fn delete(self: &Rc<Self>) {
         let Some(index) = self.index.get() else {
             return;
         };
-        match self.apply(|current| form::without_sequence(current, index)) {
-            Ok(_) => {
-                self.ctx.profiles_changed();
-                self.close();
-            }
-            Err(message) => self.fail(&message),
+        if self.saving.busy() {
+            return;
         }
+        self.apply(
+            move |current| form::without_sequence(current, index),
+            |inner, _| {
+                inner.ctx.profiles_changed();
+                inner.close();
+            },
+        );
     }
 
     /// Move Up needs an earlier sequence, Move Down a later one.

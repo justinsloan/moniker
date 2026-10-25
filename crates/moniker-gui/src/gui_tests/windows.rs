@@ -32,6 +32,7 @@ use super::{
     pump_until, wait_for_session, wait_for_text,
 };
 use crate::context::{AppContext, Notice};
+use crate::form::{self, Field};
 use crate::terminal_tab::{self, TranscriptSpec, open_command, tab_title, terminal_of};
 use crate::{connect_menu, keyring, new_tab, settings, window, zoom};
 
@@ -1259,6 +1260,57 @@ pub(super) fn connecting_waits_for_the_keyring_off_the_main_thread(bin: &Path, d
         "nothing started for the closed tab"
     );
 
+    terminal_tab::set_test_ssh_program(None);
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Connecting right after a profile change uses the profile as saved (issue
+/// #7): the save waits on the keyring worker and the connection's keyring
+/// question after it, so the session starts with the new host and user name,
+/// and with the startup sequence that was picked, as it was when picked.
+pub(super) fn connecting_uses_the_profile_as_saved_just_before(bin: &Path, dir: &Path) {
+    let fake = fake_ssh(bin, "after-save", "echo FAKE-END\nexec sleep 600");
+    let web = profile(&[("update", &["uptime"])]);
+    let ctx = ctx_with(dir, std::slice::from_ref(&web));
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    terminal_tab::set_test_ssh_program(Some(fake));
+
+    // Saves asked for just before connecting, as the profile page asks them.
+    let id = web.id.clone();
+    let after = Rc::clone(&ctx);
+    keyring::write_profiles(
+        &ctx,
+        move |store| {
+            form::apply_field(store, &id, Field::Host("moved.example.test".to_owned()))?;
+            form::apply_field(store, &id, Field::Username("bob".to_owned()))?;
+            form::apply_sequences(store, &id, None, |_| {
+                vec![StartupSequence {
+                    name: "update".to_owned(),
+                    commands: vec!["reboot".to_owned()],
+                }]
+            })?;
+            Ok(())
+        },
+        move |result| {
+            result.expect("saved");
+            after.profiles_changed();
+        },
+    );
+    terminal_tab::open_profile(&main.view, &ctx, &web, Some(0), false);
+    let page = main.view.nth_page(main.view.n_pages() - 1);
+    let terminal = wait_for_session(&page);
+    wait_for_text(&terminal, "FAKE-END");
+    let text = terminal_tab::terminal_text(&terminal);
+    assert!(
+        text.contains("ARG:bob@moved.example.test"),
+        "the saved host and user name: {text}"
+    );
+    assert!(
+        text.contains("uptime") && !text.contains("reboot"),
+        "the sequence picked: {text}"
+    );
     terminal_tab::set_test_ssh_program(None);
     main.window.destroy();
     pump_for(Duration::from_millis(200));

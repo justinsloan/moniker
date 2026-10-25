@@ -725,8 +725,13 @@ pub(super) fn sync_page_profiles_change_during_a_sync(dir: &Path) {
     );
 
     // A profile removed behind the page's back is refused, and the list
-    // catches up.
-    rig.ctx.store.borrow_mut().delete(&profile.id).unwrap();
+    // catches up. (Removed through a handle of its own, as a sync elsewhere
+    // does; the window's snapshot is read again without telling anyone.)
+    ProfileStore::open(&path)
+        .unwrap()
+        .delete(&profile.id)
+        .unwrap();
+    rig.ctx.store.borrow_mut().reload().unwrap();
     let before = runs.load(Ordering::SeqCst);
     d.sync_with(&rig.ctx, counting(&runs, || Ok(added(1))));
     pump_for(Duration::from_millis(100));
@@ -886,7 +891,11 @@ pub(super) fn first_manual_success_enables_sync_now(dir: &Path) {
     );
 
     // The partner deleted (by a sync, say): Sync Now goes away again.
-    rig.ctx.store.borrow_mut().delete(&profile.id).unwrap();
+    let path = rig.ctx.store.borrow().path().to_path_buf();
+    ProfileStore::open(&path)
+        .unwrap()
+        .delete(&profile.id)
+        .unwrap();
     rig.ctx.profiles_changed();
     assert!(!sync_now_enabled(&rig.app));
     main.window.destroy();

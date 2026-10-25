@@ -1,4 +1,5 @@
-//! The GUI's one way to the system keyring: a worker thread.
+//! The GUI's one way to the system keyring, and to writing the profile file:
+//! a worker thread.
 //!
 //! A Secret Service call can take long. A locked keyring shows its unlock
 //! prompt and waits for the person, and a slow or stuck service answers late.
@@ -15,9 +16,17 @@
 //!   writes it on the worker, after the keyring, through a handle of its own on
 //!   the file ([`own_store`]), so the order every save keeps (the secret first,
 //!   then the file) does not depend on the main loop. The file's mutations are
-//!   locked read-modify-writes (`moniker_core::store`), so this handle and the
-//!   main thread's never lose each other's changes; the callback reloads the
-//!   main thread's snapshot (`AppContext::profiles_changed`).
+//!   locked read-modify-writes (`moniker_core::store`), so the worker's
+//!   handles and other processes (a sync, `moniker-server`) never lose each
+//!   other's changes; the callback reloads the main thread's snapshot
+//!   (`AppContext::profiles_changed`).
+//! * **The profile file is written there too** ([`write_profiles`]), also by
+//!   saves that do not touch the keyring (a field of the profile page, a
+//!   startup sequence; issue #7). A sync holds the file's lock while it waits
+//!   for the keyring (an unlock prompt), and a save waits for that lock: on the
+//!   worker it delays the save, not the window. Saves keep their place in line
+//!   with the keyring's changes, so a later edit never loses to an earlier one.
+//!   The main thread's handle cannot write (`context::ProfileSnapshot`).
 //! * **The app waits for a change under way** ([`change`], not [`read`]). It is
 //!   held until the callback has run, so closing the last window does not cut
 //!   a save short between the keyring and the file. A read stuck at an unlock
@@ -154,6 +163,25 @@ fn start() -> std::io::Result<mpsc::Sender<Job>> {
             }
         })?;
     Ok(sender)
+}
+
+/// [`change`] for `work` that writes the profile file and does not touch the
+/// keyring (module docs): it gets a handle of its own on the file
+/// ([`own_store`]). `done` gets what it returned, or a message ending in
+/// [`STOPPED`] if it did not come back.
+pub(crate) fn write_profiles<R: Send + 'static>(
+    ctx: &AppContext,
+    work: impl FnOnce(&RefCell<ProfileStore>) -> Result<R, String> + Send + 'static,
+    done: impl FnOnce(Result<R, String>) + 'static,
+) {
+    let path = ctx.store.borrow().path().to_path_buf();
+    change(
+        ctx,
+        move |_| work(&own_store(&path)?),
+        move |result| {
+            done(result.unwrap_or_else(|| Err(format!("Could not save the profile: {STOPPED}."))))
+        },
+    );
 }
 
 /// A handle of its own on the profile file at `path`, for a call that writes

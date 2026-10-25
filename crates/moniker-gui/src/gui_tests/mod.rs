@@ -368,6 +368,11 @@ fn gui_integration() {
     hosts::a_mark_waits_for_its_check_and_keeps_its_state(&tmp.path().join("p-wait"));
     hosts::turned_off_there_is_no_mark_and_no_ping(&tmp.path().join("p-off"));
     hosts::turning_off_calls_off_a_check_under_way(&tmp.path().join("p-call-off"));
+    // Issue #7 first: it fails fast when the profile file is written on the
+    // main thread.
+    profiles::saving_waits_for_the_profile_file_not_the_window(&tmp.path().join("f-held"));
+    profiles::a_failed_save_puts_the_switch_and_the_port_back(&tmp.path().join("f-fail"));
+    windows::connecting_uses_the_profile_as_saved_just_before(&bin, &tmp.path().join("f-connect"));
     // Issue #4 first: they fail fast when a keyring call is on the main thread.
     sync::the_sync_page_uses_the_keyring_off_the_main_thread(&tmp.path().join("k-sync"));
     sync::the_sync_page_waits_for_the_keyring(&tmp.path().join("k-sync-wait"));
