@@ -41,7 +41,9 @@ use moniker_core::secrets::{
 };
 use moniker_core::ssh::{SERVER_PROGRAM, SshCommand, sync_command};
 use moniker_core::store::ProfileStore;
-use moniker_core::sync::{LocalState, SshTerminal, SyncError, SyncOutcome, sync_over_ssh};
+use moniker_core::sync::{
+    LocalState, SshTerminal, StaleSync, SyncError, SyncOutcome, sync_over_ssh,
+};
 use zeroize::Zeroizing;
 
 use crate::context::AppContext;
@@ -55,6 +57,8 @@ pub(crate) struct SyncInputs {
     pub(crate) passphrase: Zeroizing<String>,
     pub(crate) askpass: PathBuf,
     pub(crate) store_path: PathBuf,
+    /// Whether to go ahead when a machine has been away (issue #8).
+    pub(crate) stale: StaleSync,
 }
 
 /// Whether a sync key is stored.
@@ -86,6 +90,12 @@ pub(crate) fn explain(err: &SyncError) -> String {
         SyncError::VersionMismatch => {
             "The other machine runs an incompatible version of Moniker.".to_owned()
         }
+        SyncError::Stale { days } => {
+            format!("This machine has not synced for {days} days. {FORGETS}")
+        }
+        SyncError::PeerStale => {
+            format!("The other machine has not synced for more than 180 days. {FORGETS}")
+        }
         // ssh's login failed. It cannot ask anyone (it has no terminal), so a
         // password that is not stored, or a key that needs its passphrase,
         // ends here too.
@@ -97,6 +107,19 @@ pub(crate) fn explain(err: &SyncError) -> String {
         // been sanitized there).
         other => other.to_string(),
     }
+}
+
+/// Why a sync with a machine that has been away asks first (issue #8).
+const FORGETS: &str = "Moniker forgets a deletion a year after it is made, so a profile deleted \
+    on another machine more than a year ago could come back on every machine.";
+
+/// Whether `failure` is a sync that stopped because this machine or the other
+/// one has been away, which the person may choose to sync anyway (issue #8).
+pub(crate) fn is_away(failure: &SyncFailure) -> bool {
+    matches!(
+        failure,
+        SyncFailure::Sync(SyncError::Stale { .. } | SyncError::PeerStale)
+    )
 }
 
 /// What a successful sync changed, in one line.
@@ -211,6 +234,7 @@ pub(crate) struct SyncRequest {
     pub(crate) profile: Profile,
     pub(crate) askpass: PathBuf,
     pub(crate) store_path: PathBuf,
+    pub(crate) stale: StaleSync,
 }
 
 /// On the main thread: the profile to sync with, and where the worker finds
@@ -236,6 +260,7 @@ pub(crate) fn sync_request(
         profile,
         askpass: askpass.to_path_buf(),
         store_path,
+        stale: StaleSync::Refuse,
     })
 }
 
@@ -269,6 +294,7 @@ pub(crate) fn complete_inputs(
         passphrase,
         askpass: request.askpass,
         store_path: request.store_path,
+        stale: request.stale,
     })
 }
 
@@ -324,7 +350,13 @@ pub(crate) fn run_with(
     tweak(&mut cmd);
     // In a session of its own: a question ssh would ask on a terminal fails at
     // once instead of waiting in the terminal Moniker was started from.
-    sync_over_ssh(&mut local, &cmd, &inputs.passphrase, SshTerminal::Detached)
+    sync_over_ssh(
+        &mut local,
+        &cmd,
+        &inputs.passphrase,
+        SshTerminal::Detached,
+        inputs.stale,
+    )
 }
 
 // ----- the worker thread -----
@@ -434,7 +466,8 @@ pub(crate) enum SyncEvent<'a> {
     Finished(&'a SyncResult),
 }
 
-/// Start a sync with the profile `partner_id`, run by `run` on a worker thread.
+/// Start a sync with the profile `partner_id`, run by `run` on a worker thread;
+/// `stale` says whether it goes ahead when a machine has been away (issue #8).
 ///
 /// `Err` (a plain sentence) if it does not start: [`ALREADY_RUNNING`] while
 /// another sync of this app runs, or what is wrong with the profile (gone,
@@ -450,6 +483,7 @@ pub(crate) enum SyncEvent<'a> {
 pub(crate) fn begin_app_sync<R>(
     ctx: &Rc<AppContext>,
     partner_id: &str,
+    stale: StaleSync,
     run: R,
     done: impl FnOnce(&SyncResult) + 'static,
 ) -> Result<(), String>
@@ -460,10 +494,11 @@ where
         return Err(ALREADY_RUNNING.to_owned());
     }
     // Bind first so the store borrow ends here.
-    let request = {
+    let mut request = {
         let store = ctx.store.borrow();
         sync_request(&store, &ctx.askpass_path, partner_id)
     }?;
+    request.stale = stale;
     let open_secrets = worker_secrets(ctx);
     ctx.sync_running.set(true);
     ctx.sync_event(&SyncEvent::Started);
@@ -1087,6 +1122,7 @@ mod tests {
             passphrase: Zeroizing::new(KEY.to_owned()),
             askpass: w.askpass.clone(),
             store_path: w.store.path().to_path_buf(),
+            stale: StaleSync::Refuse,
         }
     }
 

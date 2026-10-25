@@ -202,6 +202,7 @@ What needs your attention (a transcript that could not be saved, `moniker-askpas
 | Passwords and the sync key | The system keyring (Secret Service) | Passwords yes, the sync key never |
 | Profiles, no secrets | `~/.config/moniker/profiles.json` (mode 0600) | Yes |
 | Sync partner, automatic sync, text size for the next launch, Preferences | `~/.config/moniker/gui-settings.json` (mode 0600) | No |
+| When this machine last completed a sync | `~/.config/moniker/sync-state.json` (mode 0600) | No |
 | Transcripts | `~/.local/share/moniker/transcripts/`, or the folder chosen in Preferences | No |
 
 If `gui-settings.json` is damaged, Moniker uses the defaults and leaves the file as it is instead of overwriting it; a Preferences change then says it cannot be saved.
@@ -214,6 +215,8 @@ If `gui-settings.json` is damaged, Moniker uses the defaults and leaves the file
 4. **Save a profile for the other machine and connect to it once from a tab** to accept its host key. Sync never asks about host keys; it refuses unknown ones.
 5. **Sync** from the Sync page of the Connection Profiles window, after choosing the other machine's profile there, or with `moniker-server sync <profile name>` (the name must be unique).
 6. **From then on it is automatic.** Once a sync from the Sync page has succeeded, that profile is your sync partner: Moniker syncs with it at each launch, in the background (the terminal never waits, and a success is silent), and **☰ → Sync Now** syncs on request. A failure is one notification. The Sync page has a switch to turn the launch sync off.
+
+**Deleting a profile** deletes it on every machine you sync. Moniker remembers a deletion for a year, then forgets it, so that deletions do not pile up forever. A machine that has not synced for longer than that could still hold the deleted profile and bring it back. So when this machine or the other one has not completed a sync for more than 180 days, a sync asks first: Sync Now and the Sync page show **Sync Anyway?**, the sync at launch does not run and says so, and `moniker-server sync` stops unless you add `--allow-stale`. If a deleted profile does come back, delete it again.
 
 > [!IMPORTANT]
 > `moniker-server` must be on the other machine's *non-interactive* `PATH`, and `~/.cargo/bin` usually is not. Install it in `/usr/local/bin` or `~/.local/bin` (the packages put it in `/usr/bin`), then check that `ssh other-machine which moniker-server` prints a path.
@@ -340,7 +343,8 @@ The workflow runs every check, builds and install-tests both packages, and only 
 - A sync cannot ask you anything: its `ssh` runs without a terminal (even when you start `moniker` from a shell), so a key that needs its passphrase, a ProxyJump hop's password or a password that is not stored makes the sync fail at once, and the message says so. Add the key to `ssh-agent` or store the password. `moniker-server sync` in a terminal can still ask there.
 - The host marks: a host reached through ProxyJump or ProxyCommand, or one `ssh -G` cannot tell about, is never pinged (its mark stays a gray dash); a host that drops pings shows a red ring though `ssh` may still reach it. Only addresses your `AddressFamily` allows are pinged: the first the system gives for the name and, if that one gets no reply, the first of the other kind (IPv4 or IPv6), so a host that is down can take six seconds to show its red ring. A name that cannot be looked up shows a red ring with "Name not found"; while this machine is offline, hosts given by name can show it too. Finding where a profile really connects runs `ssh -G` (your `Match exec` commands then run too), at most every five minutes per host, so a change to `~/.ssh/config` can take that long to show; turning the marks off and on again in Preferences asks again at once. Your network and its DNS see the names of the hosts pinged.
 - Sync needs a Secret Service on the other machine; there is no fallback store.
-- Not there yet: split panes, search in the terminal and color settings (the terminal colors follow the system light or dark style). The packages are for x86-64 only.
+- A deletion is forgotten a year after it was made. A profile deleted more than a year ago can come back, password included, from a machine that had not synced since: after **Sync Anyway** (or `--allow-stale`), or from a machine still running Moniker 0.5.0 or older, which never asks. Delete it again if it does.
+- Not there yet: search in the terminal and color settings (the terminal colors follow the system light or dark style). The packages are for x86-64 only.
 
 ## License
 

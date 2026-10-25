@@ -10,12 +10,20 @@
 //!
 //! | kind | name   | payload                                          |
 //! |------|--------|--------------------------------------------------|
-//! | 1    | HELLO  | `[protocol version]` (currently 1)               |
+//! | 1    | HELLO  | `[protocol version]` (currently 1), from the client optionally followed by a flags byte |
 //! | 2    | BUNDLE | a sealed bundle (see [`crate::crypto`])          |
 //! | 3    | ERROR  | `[code u8]` then a UTF-8 message                 |
 //!
 //! Error codes: 1 wrong sync key, 2 version mismatch, 3 no secret store,
-//! 255 anything else. Messages are fixed, non-secret text.
+//! 4 the server has been away ([`SyncError::Stale`] there,
+//! [`SyncError::PeerStale`] here), 255 anything else. Messages are fixed,
+//! non-secret text.
+//!
+//! The client's HELLO flags byte has one flag, bit 0: the person accepted
+//! syncing with a machine that has been away ([`StaleSync::Allow`]). A client
+//! that accepts nothing sends a one-byte HELLO, exactly what clients sent
+//! before the flags existed, and servers that predate them read only the first
+//! byte, so the flags need no new protocol version.
 //!
 //! # Exchange
 //!
@@ -61,6 +69,19 @@
 //! Entries from the peer are untrusted: every one is checked with
 //! [`Profile::validate`] and any invalid entry rejects the whole sync.
 //!
+//! # Forgetting deletions (issue #8)
+//!
+//! A tombstone is kept for [`TOMBSTONE_KEEP_MS`] after the deletion it
+//! records, and only dropped once a completed sync has carried it away from
+//! this machine (see `plan_apply`). A machine that has not completed a sync
+//! for longer than [`STALE_AFTER_MS`] may hold a profile whose deletion the
+//! others have since forgotten, and would bring it back, so a sync with one
+//! stops unless the person accepted that: a client checks itself before it
+//! connects ([`SyncError::Stale`]), a server checks itself after the HELLO
+//! and answers with error 4. When this machine last completed a sync is kept
+//! by [`crate::sync_state`]; a client records it after applying, a server
+//! after sending its reply.
+//!
 //! # Passwords: set and changed travel, removal does not
 //!
 //! A password reaches the other machine by being set or changed. Clearing one
@@ -81,10 +102,11 @@ use zeroize::Zeroizing;
 
 use crate::bundle::{BundleEntry, merge};
 use crate::crypto::{self, CryptoError};
-use crate::profile::Profile;
+use crate::profile::{Profile, now_ms};
 use crate::secrets::{SecretError, SecretStore, password_key};
 use crate::ssh::SshCommand;
 use crate::store::{ProfileStore, StoreError};
+use crate::sync_state;
 
 /// Largest frame accepted or sent, kind byte included (16 MiB).
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -102,7 +124,33 @@ pub const SYNC_TIMEOUT: Duration = Duration::from_secs(120);
 const CODE_WRONG_SYNC_KEY: u8 = 1;
 const CODE_VERSION_MISMATCH: u8 = 2;
 const CODE_NO_SECRET_STORE: u8 = 3;
+const CODE_STALE: u8 = 4;
 const CODE_OTHER: u8 = 255;
+
+/// The bit of the client's HELLO flags byte that says the person accepted
+/// syncing with a machine that has been away ([`StaleSync::Allow`]).
+const HELLO_ALLOW_STALE: u8 = 1;
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// How long a tombstone is kept after the deletion it records (issue #8): a
+/// year, from its `updated_at`.
+pub const TOMBSTONE_KEEP_MS: i64 = 365 * DAY_MS;
+
+/// How long a machine may go without completing a sync before a sync with it
+/// asks first ([`StaleSync`]): half of [`TOMBSTONE_KEEP_MS`].
+pub const STALE_AFTER_MS: i64 = 180 * DAY_MS;
+
+/// Whether a sync goes ahead when this machine or the other one has not
+/// completed a sync for longer than [`STALE_AFTER_MS`] (issue #8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleSync {
+    /// Stop with [`SyncError::Stale`] or [`SyncError::PeerStale`].
+    Refuse,
+    /// Go ahead: the person accepted that a deletion the others have forgotten
+    /// may come back.
+    Allow,
+}
 
 /// Longest message put in an outgoing ERROR frame, in bytes.
 const MAX_SENT_MESSAGE: usize = 1024;
@@ -146,6 +194,18 @@ pub enum SyncError {
     Timeout,
     #[error("the sync passphrase is not set")]
     EmptyPassphrase,
+    /// This machine has not completed a sync for longer than
+    /// [`STALE_AFTER_MS`]; nothing was sent.
+    #[error(
+        "this machine has not synced for {days} days, so a profile deleted on another machine more than a year ago could come back on every machine"
+    )]
+    Stale { days: i64 },
+    /// The other machine has not completed a sync for longer than
+    /// [`STALE_AFTER_MS`]; nothing was sent but the HELLO.
+    #[error(
+        "the other machine has not synced for more than 180 days, so a profile deleted on another machine more than a year ago could come back on every machine"
+    )]
+    PeerStale,
     /// The peer broke the frame protocol (bad length, unexpected frame).
     #[error("sync protocol error: {0}")]
     Protocol(String),
@@ -180,17 +240,42 @@ pub trait SyncTarget {
     fn export(&self) -> Result<Vec<BundleEntry>, SyncError>;
     /// Store the merged set. Entries are already validated by the protocol.
     fn apply(&mut self, merged: Vec<BundleEntry>) -> Result<SyncOutcome, SyncError>;
+    /// When this side last completed a sync, if that is known.
+    fn last_sync(&self) -> Option<i64> {
+        None
+    }
+    /// Record that a sync completed now. Best effort.
+    fn record_sync(&mut self) {}
+    /// The time now, in milliseconds since the epoch.
+    fn now(&self) -> i64 {
+        now_ms()
+    }
 }
 
 /// The real sync target: the profile file plus the secret store.
 pub struct LocalState {
     store: ProfileStore,
     secrets: Box<dyn SecretStore>,
+    clock: Box<dyn Fn() -> i64 + Send>,
 }
 
 impl LocalState {
     pub fn new(store: ProfileStore, secrets: Box<dyn SecretStore>) -> Self {
-        LocalState { store, secrets }
+        LocalState::with_clock(store, secrets, Box::new(now_ms))
+    }
+
+    /// A [`LocalState`] whose time is `clock` (milliseconds since the epoch)
+    /// rather than the system clock: for tests that let a year go by.
+    pub fn with_clock(
+        store: ProfileStore,
+        secrets: Box<dyn SecretStore>,
+        clock: Box<dyn Fn() -> i64 + Send>,
+    ) -> Self {
+        LocalState {
+            store,
+            secrets,
+            clock,
+        }
     }
 
     /// The profile store, as of the last write by [`apply`](SyncTarget::apply)
@@ -228,13 +313,18 @@ impl SyncTarget for LocalState {
     /// [`export`]: SyncTarget::export
     fn apply(&mut self, merged: Vec<BundleEntry>) -> Result<SyncOutcome, SyncError> {
         validate_entries(&merged)?;
+        // Tombstones a year old that a completed sync has already carried
+        // away are not kept ([`TOMBSTONE_KEEP_MS`]).
+        let prune_before = self
+            .last_sync()
+            .map(|last| last.min(self.now().saturating_sub(TOMBSTONE_KEEP_MS)));
         let secrets: &dyn SecretStore = &*self.secrets;
         let mut undo = UndoLog::default();
         // `update` wants a StoreError from the closure; keep the real cause.
         let mut secret_failure = None;
         let result = self.store.update(|disk| {
             let staged = with_passwords(disk, secrets).and_then(|local| {
-                let (profiles, (outcome, ops)) = plan_apply(local, merged);
+                let (profiles, (outcome, ops)) = plan_apply(local, merged, prune_before);
                 undo.run(secrets, &ops)?;
                 Ok((profiles, outcome))
             });
@@ -258,6 +348,20 @@ impl SyncTarget for LocalState {
                 })
             }
         }
+    }
+
+    fn last_sync(&self) -> Option<i64> {
+        sync_state::last_sync(self.store.path())
+    }
+
+    /// Best effort: a sync that could not be recorded only makes pruning
+    /// later, and the question for a machine that has been away earlier.
+    fn record_sync(&mut self) {
+        let _ = sync_state::record_sync(self.store.path(), (self.clock)());
+    }
+
+    fn now(&self) -> i64 {
+        (self.clock)()
     }
 }
 
@@ -333,9 +437,22 @@ impl UndoLog {
 /// freshly created keyring (every profile there has no password) could wipe
 /// the passwords on all its peers with one sync. Whether removal should
 /// propagate is an open design question for the product owner.
+///
+/// # Forgetting deletions (issue #8)
+///
+/// A tombstone whose `updated_at` is before `prune_before` is left out of the
+/// profiles to write, after the merge has used it: a live copy it beats is
+/// still deleted here, password included. [`LocalState::apply`] sets
+/// `prune_before` to [`TOMBSTONE_KEEP_MS`] ago, or to this machine's last
+/// completed sync if that is earlier, so a deletion is forgotten a year after
+/// it was made, and only once a sync has carried it away from this machine.
+/// Every machine measures from the same deletion time, so one that still has
+/// the tombstone and sends it back does not make the others keep it again.
+/// `None`: nothing is forgotten.
 fn plan_apply(
     local: Vec<BundleEntry>,
     incoming: Vec<BundleEntry>,
+    prune_before: Option<i64>,
 ) -> (Vec<Profile>, (SyncOutcome, Vec<SecretOp>)) {
     let before: BTreeMap<String, BundleEntry> = local
         .iter()
@@ -357,6 +474,10 @@ fn plan_apply(
                 ops.push(SecretOp::Delete {
                     id: w.profile.id.clone(),
                 });
+            }
+            if prune_before.is_some_and(|cutoff| w.profile.updated_at < cutoff) {
+                // Forgotten (see the docs above): not written.
+                continue;
             }
         } else {
             // A winner taken from the file has the file's password, so this
@@ -506,6 +627,7 @@ fn error_from_payload(payload: &[u8]) -> SyncError {
         CODE_WRONG_SYNC_KEY => SyncError::WrongSyncKey,
         CODE_VERSION_MISMATCH => SyncError::VersionMismatch,
         CODE_NO_SECRET_STORE => SyncError::NoSecretStore,
+        CODE_STALE => SyncError::PeerStale,
         _ => {
             let text = clean(&String::from_utf8_lossy(message));
             SyncError::Remote(first_bytes(&text, MAX_SHOWN_MESSAGE).to_string())
@@ -520,9 +642,19 @@ fn send_error(w: &mut impl Write, err: &SyncError) {
         SyncError::WrongSyncKey => CODE_WRONG_SYNC_KEY,
         SyncError::VersionMismatch => CODE_VERSION_MISMATCH,
         SyncError::NoSecretStore => CODE_NO_SECRET_STORE,
+        SyncError::Stale { .. } | SyncError::PeerStale => CODE_STALE,
         _ => CODE_OTHER,
     };
-    let text = err.to_string();
+    let text = match err {
+        // Said from the peer's side, for a Moniker that knows no code 4 and
+        // shows the text as it is.
+        SyncError::Stale { days } => format!(
+            "the other machine has not synced for {days} days, so a profile deleted on another \
+             machine more than a year ago could come back on every machine; a newer Moniker can \
+             sync anyway"
+        ),
+        _ => err.to_string(),
+    };
     let mut payload = vec![code];
     payload.extend_from_slice(first_bytes(&text, MAX_SENT_MESSAGE).as_bytes());
     let _ = write_frame(w, KIND_ERROR, &payload);
@@ -537,6 +669,42 @@ fn tell<T>(w: &mut impl Write, result: Result<T, SyncError>) -> Result<T, SyncEr
 }
 
 // ----- protocol -----
+
+/// `Err(Stale)` if `local` has not completed a sync for longer than
+/// [`STALE_AFTER_MS`] and the person did not accept that. A side with no
+/// recorded sync has nothing the others could have forgotten deleting.
+fn check_not_away(local: &dyn SyncTarget, stale: StaleSync) -> Result<(), SyncError> {
+    let Some(last) = local.last_sync() else {
+        return Ok(());
+    };
+    let away = local.now().saturating_sub(last);
+    if stale == StaleSync::Refuse && away > STALE_AFTER_MS {
+        return Err(SyncError::Stale {
+            days: away / DAY_MS,
+        });
+    }
+    Ok(())
+}
+
+/// What the client's HELLO says about a server that has been away: its
+/// optional second byte. A one-byte HELLO (every client before issue #8)
+/// accepts nothing.
+fn stale_from_hello(hello: &[u8]) -> StaleSync {
+    match hello.get(1) {
+        Some(flags) if flags & HELLO_ALLOW_STALE != 0 => StaleSync::Allow,
+        _ => StaleSync::Refuse,
+    }
+}
+
+/// The client's HELLO: the protocol version, then the flags byte only when
+/// there is a flag to send, so a client that accepts nothing sends exactly
+/// what clients before issue #8 sent.
+fn client_hello(stale: StaleSync) -> Vec<u8> {
+    match stale {
+        StaleSync::Refuse => vec![PROTOCOL_VERSION],
+        StaleSync::Allow => vec![PROTOCOL_VERSION, HELLO_ALLOW_STALE],
+    }
+}
 
 fn check_passphrase(passphrase: &str) -> Result<(), SyncError> {
     if passphrase.is_empty() {
@@ -593,7 +761,8 @@ pub fn serve(
         &mut w,
         check_passphrase(passphrase)
             .and_then(|()| local.ready())
-            .and_then(|()| check_version(&hello)),
+            .and_then(|()| check_version(&hello))
+            .and_then(|()| check_not_away(&*local, stale_from_hello(&hello))),
     )?;
     write_frame(&mut w, KIND_HELLO, &[PROTOCOL_VERSION])?;
 
@@ -601,6 +770,7 @@ pub fn serve(
     let (merged, reply) = tell(&mut w, server_merge(&*local, passphrase, &sealed))?;
     let outcome = tell(&mut w, local.apply(merged))?;
     write_frame(&mut w, KIND_BUNDLE, &reply)?;
+    local.record_sync();
     Ok(outcome)
 }
 
@@ -625,10 +795,12 @@ pub fn run_client(
     mut w: impl Write,
     local: &mut dyn SyncTarget,
     passphrase: &str,
+    stale: StaleSync,
 ) -> Result<SyncOutcome, SyncError> {
     check_passphrase(passphrase)?;
     local.ready()?;
-    write_frame(&mut w, KIND_HELLO, &[PROTOCOL_VERSION])?;
+    check_not_away(&*local, stale)?;
+    write_frame(&mut w, KIND_HELLO, &client_hello(stale))?;
     let hello = read_expected(&mut r, KIND_HELLO)?;
     let sealed = tell(
         &mut w,
@@ -641,7 +813,9 @@ pub fn run_client(
     let reply = read_expected(&mut r, KIND_BUNDLE)?;
     let merged = open_bundle(passphrase, &reply)?;
     validate_entries(&merged)?;
-    local.apply(merged)
+    let outcome = local.apply(merged)?;
+    local.record_sync();
+    Ok(outcome)
 }
 
 // ----- ssh transport -----
@@ -665,8 +839,9 @@ pub fn sync_over_ssh(
     cmd: &SshCommand,
     passphrase: &str,
     terminal: SshTerminal,
+    stale: StaleSync,
 ) -> Result<SyncOutcome, SyncError> {
-    sync_over_ssh_with_timeout(local, cmd, passphrase, terminal, SYNC_TIMEOUT)
+    sync_over_ssh_with_timeout(local, cmd, passphrase, terminal, stale, SYNC_TIMEOUT)
 }
 
 /// Whether the `ssh` of a sync keeps the controlling terminal of this process.
@@ -692,11 +867,14 @@ fn sync_over_ssh_with_timeout(
     cmd: &SshCommand,
     passphrase: &str,
     terminal: SshTerminal,
+    stale: StaleSync,
     timeout: Duration,
 ) -> Result<SyncOutcome, SyncError> {
     check_passphrase(passphrase)?;
-    // No point connecting if received passwords could not be stored.
+    // No point connecting if received passwords could not be stored, or if
+    // this machine has been away and the person has not accepted that.
     local.ready()?;
+    check_not_away(&*local, stale)?;
     let deadline = Instant::now() + timeout;
     let mut command = Command::new(&cmd.program);
     command
@@ -740,7 +918,7 @@ fn sync_over_ssh_with_timeout(
 
     // `reader` and `writer` are dropped when this returns, which closes the
     // child's stdin once everything queued has been written.
-    let result = run_client(reader, writer, local, passphrase);
+    let result = run_client(reader, writer, local, passphrase, stale);
 
     let timed_out = matches!(&result, Err(SyncError::Io(e)) if e.kind() == io::ErrorKind::TimedOut);
     let wait_until = deadline.min(Instant::now() + EXIT_GRACE);
@@ -1047,7 +1225,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
     use tempfile::TempDir;
@@ -1253,7 +1431,7 @@ mod tests {
         let (cs, ss) = pair();
         let server = spawn_server(ss, b.state, PASS);
 
-        let out = run_client(&cs, &cs, &mut a.state, PASS).unwrap();
+        let out = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap();
         drop(cs);
         let (served, b_state) = server.join().unwrap();
         let served = served.unwrap();
@@ -1291,7 +1469,7 @@ mod tests {
         let (cs, ss) = pair();
         let server = spawn_server(ss, b.state, "the server's passphrase");
 
-        let err = run_client(&cs, &cs, &mut a.state, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
         drop(cs);
         let (served, _b_state) = server.join().unwrap();
         let served = served.unwrap_err();
@@ -1332,7 +1510,7 @@ mod tests {
             (r, stub, rest)
         });
 
-        let err = run_client(&cs, &cs, &mut a.state, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
         drop(cs);
         let (served, stub, rest) = server.join().unwrap();
 
@@ -1366,7 +1544,7 @@ mod tests {
             // Hang up without replying.
         });
 
-        let err = run_client(&cs, &cs, &mut a.state, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
         server.join().unwrap();
         assert!(matches!(err, SyncError::Io(_)), "client got {err:?}");
         assert_eq!(file_of(&a.path), a_file);
@@ -1439,7 +1617,7 @@ mod tests {
             (&ss).read_to_end(&mut rest).unwrap();
             rest
         });
-        let err = run_client(&cs, &cs, &mut a.state, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
         drop(cs);
         assert!(matches!(err, SyncError::VersionMismatch), "got {err:?}");
         assert!(server.join().unwrap().is_empty(), "nothing after HELLO");
@@ -1454,7 +1632,7 @@ mod tests {
             (&ss).read_to_end(&mut rest).unwrap();
             rest
         });
-        let err = run_client(&cs, &cs, &mut a.state, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
         drop(cs);
         assert!(matches!(err, SyncError::VersionMismatch), "got {err:?}");
         let rest = frames(&server.join().unwrap());
@@ -1469,8 +1647,14 @@ mod tests {
         let mut a = side(&[(prof("one"), Some("pw-one"))]);
         let a_file = file_of(&a.path);
 
-        let err =
-            sync_over_ssh(&mut a.state, &sh("exit 127"), PASS, SshTerminal::Inherit).unwrap_err();
+        let err = sync_over_ssh(
+            &mut a.state,
+            &sh("exit 127"),
+            PASS,
+            SshTerminal::Inherit,
+            StaleSync::Refuse,
+        )
+        .unwrap_err();
         assert!(matches!(err, SyncError::ServerNotFound), "got {err:?}");
 
         let err = sync_over_ssh(
@@ -1478,6 +1662,7 @@ mod tests {
             &sh(r#"echo "Host key verification failed." >&2; exit 255"#),
             PASS,
             SshTerminal::Inherit,
+            StaleSync::Refuse,
         )
         .unwrap_err();
         assert!(matches!(err, SyncError::HostKeyUnknown), "got {err:?}");
@@ -1486,7 +1671,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh(r#"printf 'early noise\nssh: connect to host x: \033[31mrefused\a\n' >&2; exit 255"#),
-            PASS, SshTerminal::Inherit
+            PASS, SshTerminal::Inherit, StaleSync::Refuse
         )
         .unwrap_err();
         let SyncError::Remote(msg) = &err else {
@@ -1500,7 +1685,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh("i=0; while [ $i -lt 400 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxx' >&2; i=$((i+1)); done; exit 3"),
-            PASS, SshTerminal::Inherit
+            PASS, SshTerminal::Inherit, StaleSync::Refuse
         )
         .unwrap_err();
         let SyncError::Remote(msg) = &err else {
@@ -1509,8 +1694,14 @@ mod tests {
         assert!(msg.len() <= 400, "{} bytes", msg.len());
 
         // Exit 0 without speaking the protocol keeps the protocol error.
-        let err =
-            sync_over_ssh(&mut a.state, &sh("exit 0"), PASS, SshTerminal::Inherit).unwrap_err();
+        let err = sync_over_ssh(
+            &mut a.state,
+            &sh("exit 0"),
+            PASS,
+            SshTerminal::Inherit,
+            StaleSync::Refuse,
+        )
+        .unwrap_err();
         assert!(matches!(err, SyncError::Io(_)), "got {err:?}");
 
         // A program that does not exist.
@@ -1519,7 +1710,14 @@ mod tests {
             args: vec![],
             env: vec![],
         };
-        let err = sync_over_ssh(&mut a.state, &missing, PASS, SshTerminal::Inherit).unwrap_err();
+        let err = sync_over_ssh(
+            &mut a.state,
+            &missing,
+            PASS,
+            SshTerminal::Inherit,
+            StaleSync::Refuse,
+        )
+        .unwrap_err();
         assert!(matches!(err, SyncError::Io(_)), "got {err:?}");
 
         assert_eq!(file_of(&a.path), a_file);
@@ -1546,7 +1744,7 @@ mod tests {
             env: vec![],
         };
         let mut a = side(&[]);
-        let err = sync_over_ssh(&mut a.state, &cmd, PASS, terminal).unwrap_err();
+        let err = sync_over_ssh(&mut a.state, &cmd, PASS, terminal, StaleSync::Refuse).unwrap_err();
         assert!(matches!(err, SyncError::ServerNotFound), "got {err:?}");
         let ids = fs::read_to_string(&out).unwrap();
         let mut ids = ids.split(' ').map(str::to_owned);
@@ -1604,7 +1802,14 @@ mod tests {
             env: vec![("MONIKER_TEST_VAR".to_string(), "v1".to_string())],
         };
         let mut a = side(&[]);
-        let err = sync_over_ssh(&mut a.state, &cmd, PASS, SshTerminal::Inherit).unwrap_err();
+        let err = sync_over_ssh(
+            &mut a.state,
+            &cmd,
+            PASS,
+            SshTerminal::Inherit,
+            StaleSync::Refuse,
+        )
+        .unwrap_err();
         assert!(matches!(err, SyncError::ServerNotFound), "got {err:?}");
         assert_eq!(fs::read_to_string(&out).unwrap(), "2|a 'b' \"c\"; $(x)|v1");
     }
@@ -1627,7 +1832,14 @@ mod tests {
             no_secret_store: true,
             ..Stub::default()
         };
-        let err = sync_over_ssh(&mut stub, &cmd, PASS, SshTerminal::Inherit).unwrap_err();
+        let err = sync_over_ssh(
+            &mut stub,
+            &cmd,
+            PASS,
+            SshTerminal::Inherit,
+            StaleSync::Refuse,
+        )
+        .unwrap_err();
         assert!(matches!(err, SyncError::NoSecretStore), "{err:?}");
         assert!(!marker.exists(), "ssh must not be started");
         assert!(stub.applied.is_none());
@@ -1672,7 +1884,14 @@ mod tests {
             ],
             env: vec![],
         };
-        let out = sync_over_ssh(&mut a.state, &cmd, PASS, SshTerminal::Inherit).unwrap();
+        let out = sync_over_ssh(
+            &mut a.state,
+            &cmd,
+            PASS,
+            SshTerminal::Inherit,
+            StaleSync::Refuse,
+        )
+        .unwrap();
         assert_eq!(out.added, 1);
         let (served, b_secrets, _b_dir) = server.join().unwrap();
         assert_eq!(served.unwrap().added, 1);
@@ -1696,7 +1915,7 @@ mod tests {
         let (cs, ss) = pair();
         let server = spawn_server(ss, b.state, PASS);
         let mut stub = stub;
-        let err = run_client(&cs, &cs, &mut stub, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut stub, PASS, StaleSync::Refuse).unwrap_err();
         drop(cs);
         let (served, _) = server.join().unwrap();
         assert!(matches!(served, Err(SyncError::Store(_))), "{served:?}");
@@ -1719,7 +1938,7 @@ mod tests {
                     .unwrap();
             write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
         });
-        let err = run_client(&cs, &cs, &mut a.state, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
         server.join().unwrap();
         assert!(matches!(err, SyncError::Store(_)), "client got {err:?}");
         assert_eq!(file_of(&a.path), a_file);
@@ -1939,7 +2158,7 @@ mod tests {
     ) {
         let (cs, ss) = pair();
         let handle = spawn_server(ss, server, PASS);
-        let c = run_client(&cs, &cs, client, PASS);
+        let c = run_client(&cs, &cs, client, PASS, StaleSync::Refuse);
         drop(cs);
         let (s, state) = handle.join().unwrap();
         (c, s, state)
@@ -2160,7 +2379,7 @@ mod tests {
         // Client: nothing goes on the wire.
         let mut a = side(&[(prof("one"), Some("pw-one"))]);
         let (cs, ss) = pair();
-        let err = run_client(&cs, &cs, &mut a.state, "").unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, "", StaleSync::Refuse).unwrap_err();
         drop(cs);
         assert!(matches!(err, SyncError::EmptyPassphrase), "{err:?}");
         let mut sent = Vec::new();
@@ -2172,7 +2391,7 @@ mod tests {
         let b_file = file_of(&b.path);
         let (cs, ss) = pair();
         let server = spawn_server(ss, b.state, "");
-        let err = run_client(&cs, &cs, &mut a.state, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
         drop(cs);
         let (served, _) = server.join().unwrap();
         assert!(matches!(served, Err(SyncError::EmptyPassphrase)));
@@ -2192,7 +2411,14 @@ mod tests {
             ],
             env: vec![],
         };
-        let err = sync_over_ssh(&mut a.state, &cmd, "", SshTerminal::Inherit).unwrap_err();
+        let err = sync_over_ssh(
+            &mut a.state,
+            &cmd,
+            "",
+            SshTerminal::Inherit,
+            StaleSync::Refuse,
+        )
+        .unwrap_err();
         assert!(matches!(err, SyncError::EmptyPassphrase), "{err:?}");
         assert!(!marker.exists());
         assert_eq!(a.secrets.writes(), 0);
@@ -2220,6 +2446,7 @@ mod tests {
             &cmd,
             PASS,
             SshTerminal::Inherit,
+            StaleSync::Refuse,
             Duration::from_secs(1),
         )
         .unwrap_err();
@@ -2256,7 +2483,7 @@ mod tests {
         let b_file = file_of(&b.path);
         let (cs, ss) = pair();
         let server = spawn_server(ss, b.state, PASS);
-        let err = run_client(&cs, &cs, &mut stub, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut stub, PASS, StaleSync::Refuse).unwrap_err();
         drop(cs);
         let (served, _) = server.join().unwrap();
         let SyncError::Store(msg) = &err else {
@@ -2341,7 +2568,7 @@ mod tests {
             let mut rest = Vec::new();
             (&ss).read_to_end(&mut rest).unwrap();
         });
-        let err = run_client(&cs, &cs, &mut a.state, PASS).unwrap_err();
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
         drop(cs);
         server.join().unwrap();
         assert!(matches!(err, SyncError::Protocol(_)), "{err:?}");
@@ -2407,5 +2634,383 @@ mod tests {
         let store = ProfileStore::open(&dir.path().join("p.json")).unwrap();
         let state = LocalState::new(store, Box::new(NoService));
         assert!(matches!(state.ready(), Err(SyncError::NoSecretStore)));
+    }
+
+    // ----- forgetting deletions, and machines that have been away (issue #8) -----
+
+    /// A clock the tests move by hand, shared by the machines of a scenario.
+    #[derive(Clone)]
+    struct Clock(Arc<AtomicI64>);
+
+    impl Clock {
+        fn starting_now() -> Clock {
+            Clock(Arc::new(AtomicI64::new(now_ms())))
+        }
+        fn now(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+        fn set(&self, ms: i64) {
+            self.0.store(ms, Ordering::SeqCst);
+        }
+    }
+
+    /// A machine of these scenarios: its files, its keyring and its sync
+    /// state, on a shared clock.
+    struct Machine {
+        _dir: TempDir,
+        path: PathBuf,
+        secrets: Shared,
+        state: Option<LocalState>,
+    }
+
+    impl Machine {
+        fn new(clock: &Clock, profiles: &[(Profile, Option<&str>)]) -> Machine {
+            let side = side(profiles);
+            let store = ProfileStore::open(&side.path).unwrap();
+            let clock = clock.clone();
+            let state = LocalState::with_clock(
+                store,
+                Box::new(side.secrets.clone()),
+                Box::new(move || clock.now()),
+            );
+            Machine {
+                _dir: side._dir,
+                path: side.path,
+                secrets: side.secrets,
+                state: Some(state),
+            }
+        }
+
+        /// The ids in its profile file, each with whether it is a tombstone.
+        fn on_disk(&self) -> Vec<(String, bool)> {
+            ProfileStore::open(&self.path)
+                .unwrap()
+                .all()
+                .into_iter()
+                .map(|p| (p.id, p.deleted))
+                .collect()
+        }
+
+        /// Delete the profile `id` as the app does: its password, then the
+        /// profile (a tombstone).
+        fn delete(&self, id: &str) {
+            self.secrets.0.inner.delete(&password_key(id)).unwrap();
+            ProfileStore::open(&self.path).unwrap().delete(id).unwrap();
+        }
+
+        fn last_sync(&self) -> Option<i64> {
+            crate::sync_state::last_sync(&self.path)
+        }
+    }
+
+    /// Sync `client` with `server`: what each side's sync returned.
+    fn sync_machines(
+        client: &mut Machine,
+        server: &mut Machine,
+        stale: StaleSync,
+    ) -> (
+        Result<SyncOutcome, SyncError>,
+        Result<SyncOutcome, SyncError>,
+    ) {
+        let (cs, ss) = pair();
+        let served = spawn_server(ss, server.state.take().unwrap(), PASS);
+        let out = run_client(&cs, &cs, client.state.as_mut().unwrap(), PASS, stale);
+        drop(cs);
+        let (served, back) = served.join().unwrap();
+        server.state = Some(back);
+        (out, served)
+    }
+
+    /// Sync and expect both sides to succeed.
+    fn synced(client: &mut Machine, server: &mut Machine) {
+        let (out, served) = sync_machines(client, server, StaleSync::Refuse);
+        out.unwrap();
+        served.unwrap();
+    }
+
+    #[test]
+    fn a_tombstone_older_than_the_cutoff_is_not_written() {
+        let x = prof_at("x", 10);
+        let t = x.tombstone(100);
+        let (profiles, (outcome, ops)) = plan_apply(vec![entry(&t, None)], vec![], Some(101));
+        assert!(profiles.is_empty());
+        assert_eq!(outcome, SyncOutcome::default());
+        assert!(ops.is_empty());
+        for cutoff in [Some(100), None] {
+            let (profiles, _) = plan_apply(vec![entry(&t, None)], vec![], cutoff);
+            assert_eq!(profiles, vec![t.clone()], "kept with the cutoff {cutoff:?}");
+        }
+    }
+
+    #[test]
+    fn live_profiles_are_never_pruned() {
+        let x = prof_at("x", 10);
+        let (profiles, _) = plan_apply(vec![entry(&x, Some("pw"))], vec![], Some(i64::MAX));
+        assert_eq!(profiles, vec![x]);
+    }
+
+    #[test]
+    fn an_old_tombstone_from_a_peer_deletes_the_live_copy_and_is_not_kept() {
+        let x = prof_at("x", 10);
+        let t = x.tombstone(100);
+        let (profiles, (outcome, ops)) = plan_apply(
+            vec![entry(&x, Some("pw"))],
+            vec![entry(&t, None)],
+            Some(101),
+        );
+        assert!(profiles.is_empty(), "no tombstone is written");
+        assert_eq!(outcome.removed, 1);
+        assert!(
+            matches!(ops.as_slice(), [SecretOp::Delete { id }] if *id == x.id),
+            "its password is removed"
+        );
+        // For a profile this machine never had: nothing at all.
+        let (profiles, (outcome, ops)) = plan_apply(vec![], vec![entry(&t, None)], Some(101));
+        assert!(profiles.is_empty());
+        assert_eq!(outcome, SyncOutcome::default());
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn a_deletion_is_forgotten_a_year_after_it_was_made_on_every_machine() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[]);
+        synced(&mut a, &mut b);
+        assert_eq!(a.last_sync(), Some(start), "recorded on the client");
+        assert_eq!(b.last_sync(), Some(start), "recorded on the server");
+
+        a.delete(&x.id);
+        clock.set(start + DAY_MS);
+        synced(&mut a, &mut b);
+        let tombstone = vec![(x.id.clone(), true)];
+        assert_eq!(b.on_disk(), tombstone);
+        assert_eq!(b.secrets.password(&x.id), None);
+
+        // Within the year it is kept, by both.
+        for day in [150, 300] {
+            clock.set(start + day * DAY_MS);
+            synced(&mut a, &mut b);
+            assert_eq!(a.on_disk(), tombstone, "day {day}");
+            assert_eq!(b.on_disk(), tombstone, "day {day}");
+        }
+        // A year after the deletion, both forget it, and it does not come back.
+        for day in [366, 367] {
+            clock.set(start + day * DAY_MS);
+            synced(&mut a, &mut b);
+            assert!(a.on_disk().is_empty(), "day {day}");
+            assert!(b.on_disk().is_empty(), "day {day}");
+        }
+    }
+
+    #[test]
+    fn a_deletion_is_kept_however_old_until_a_sync_has_carried_it_away() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[]);
+        crate::sync_state::record_sync(&a.path, start - 10 * DAY_MS).unwrap();
+        a.delete(&x.id);
+        // A year and more without a sync: still there, and it reaches `b`.
+        clock.set(start + 400 * DAY_MS);
+        let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Allow);
+        out.unwrap();
+        served.unwrap();
+        let tombstone = vec![(x.id.clone(), true)];
+        assert_eq!(a.on_disk(), tombstone);
+        assert_eq!(b.on_disk(), tombstone);
+        // Once it has left, it is forgotten.
+        clock.set(start + 401 * DAY_MS);
+        synced(&mut a, &mut b);
+        assert!(a.on_disk().is_empty());
+        assert!(b.on_disk().is_empty());
+    }
+
+    #[test]
+    fn along_a_chain_a_deletion_reaches_everyone_and_is_forgotten_without_bouncing() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[]);
+        let mut c = Machine::new(&clock, &[]);
+        synced(&mut a, &mut b);
+        synced(&mut c, &mut b);
+        assert_eq!(c.secrets.password(&x.id).as_deref(), Some("pw"));
+
+        a.delete(&x.id);
+        clock.set(start + DAY_MS);
+        synced(&mut a, &mut b);
+        clock.set(start + 2 * DAY_MS);
+        synced(&mut c, &mut b);
+        let tombstone = vec![(x.id.clone(), true)];
+        for m in [&a, &b, &c] {
+            assert_eq!(m.on_disk(), tombstone);
+            assert_eq!(m.secrets.password(&x.id), None);
+        }
+        for day in [100, 200, 300] {
+            clock.set(start + day * DAY_MS);
+            synced(&mut a, &mut b);
+            synced(&mut c, &mut b);
+        }
+        // `a` and `b` forget it first; `c` still has it and hands it to `b`,
+        // which does not keep it; then `c` forgets it too.
+        clock.set(start + 366 * DAY_MS);
+        synced(&mut a, &mut b);
+        assert!(a.on_disk().is_empty());
+        assert!(b.on_disk().is_empty());
+        assert_eq!(c.on_disk(), tombstone);
+        clock.set(start + 367 * DAY_MS);
+        synced(&mut c, &mut b);
+        for m in [&a, &b, &c] {
+            assert!(m.on_disk().is_empty());
+        }
+        clock.set(start + 368 * DAY_MS);
+        synced(&mut a, &mut b);
+        synced(&mut c, &mut b);
+        for m in [&a, &b, &c] {
+            assert!(m.on_disk().is_empty(), "nothing comes back");
+        }
+    }
+
+    #[test]
+    fn a_machine_that_has_been_away_asks_before_syncing() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut d = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[]);
+        synced(&mut d, &mut b);
+        b.delete(&x.id);
+        clock.set(start + 200 * DAY_MS);
+        // `b` has synced since, with another machine; `d` has not.
+        crate::sync_state::record_sync(&b.path, start + 199 * DAY_MS).unwrap();
+        let (d_file, b_file) = (file_of(&d.path), file_of(&b.path));
+
+        // `d` as the client: it stops before saying anything. (The timeout
+        // makes a client that waits for an answer fail instead of hanging.)
+        let (cs, ss) = pair();
+        cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let listener = thread::spawn(move || {
+            let mut heard = Vec::new();
+            (&ss).read_to_end(&mut heard).unwrap();
+            heard
+        });
+        let err =
+            run_client(&cs, &cs, d.state.as_mut().unwrap(), PASS, StaleSync::Refuse).unwrap_err();
+        drop(cs);
+        assert!(matches!(err, SyncError::Stale { days: 200 }), "got {err:?}");
+        assert!(listener.join().unwrap().is_empty(), "nothing was sent");
+
+        // `d` as the server: it answers the HELLO with error 4 and goes no
+        // further.
+        let (out, served) = sync_machines(&mut b, &mut d, StaleSync::Refuse);
+        assert!(matches!(out, Err(SyncError::PeerStale)), "got {out:?}");
+        assert!(
+            matches!(served, Err(SyncError::Stale { days: 200 })),
+            "got {served:?}"
+        );
+        assert_eq!(file_of(&d.path), d_file);
+        assert_eq!(file_of(&b.path), b_file);
+        assert_eq!(d.last_sync(), Some(start), "a refused sync is not a sync");
+
+        // Allowed, it syncs (the deletion is recent, so it wins), and `d` is
+        // no longer away.
+        let (out, served) = sync_machines(&mut b, &mut d, StaleSync::Allow);
+        out.unwrap();
+        served.unwrap();
+        assert_eq!(d.on_disk(), vec![(x.id.clone(), true)]);
+        assert_eq!(d.last_sync(), Some(start + 200 * DAY_MS));
+        synced(&mut d, &mut b);
+    }
+
+    #[test]
+    fn a_machine_that_never_synced_is_not_away() {
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[(prof("one"), None)]);
+        let mut b = Machine::new(&clock, &[]);
+        clock.set(clock.now() + 1000 * DAY_MS);
+        synced(&mut a, &mut b);
+    }
+
+    #[test]
+    fn a_failed_sync_is_not_recorded() {
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[(prof("one"), None)]);
+        let b = side(&[]);
+        let (cs, ss) = pair();
+        let server = spawn_server(ss, b.state, "another sync key entirely");
+        let err = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+        drop(cs);
+        let _ = server.join().unwrap();
+        assert!(matches!(err, Err(SyncError::WrongSyncKey)), "got {err:?}");
+        assert_eq!(a.last_sync(), None);
+        assert_eq!(crate::sync_state::last_sync(&b.path), None);
+    }
+
+    #[test]
+    fn a_one_byte_hello_from_an_older_client_still_works() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let mut b = Machine::new(&clock, &[]);
+        // Fresh: the HELLO is answered as before.
+        let (cs, ss) = pair();
+        let server = spawn_server(ss, b.state.take().unwrap(), PASS);
+        write_frame(&mut &cs, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
+        assert_eq!(
+            read_frame(&mut &cs).unwrap(),
+            (KIND_HELLO, vec![PROTOCOL_VERSION])
+        );
+        drop(cs);
+        b.state = Some(server.join().unwrap().1);
+
+        // Away: error 4, with a text an older client shows as it is.
+        crate::sync_state::record_sync(&b.path, start - 200 * DAY_MS).unwrap();
+        let (cs, ss) = pair();
+        let server = spawn_server(ss, b.state.take().unwrap(), PASS);
+        write_frame(&mut &cs, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
+        let (kind, payload) = read_frame(&mut &cs).unwrap();
+        drop(cs);
+        let _ = server.join().unwrap();
+        assert_eq!(kind, KIND_ERROR);
+        assert_eq!(payload[0], CODE_STALE);
+        let text = String::from_utf8_lossy(&payload[1..]).into_owned();
+        assert!(
+            text.starts_with("the other machine has not synced for 200 days"),
+            "{text}"
+        );
+        assert!(matches!(error_from_payload(&payload), SyncError::PeerStale));
+    }
+
+    #[test]
+    fn sync_over_ssh_asks_before_connecting() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let cmd = SshCommand {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                r#"touch "$1""#.to_string(),
+                "sh".to_string(),
+                marker.to_str().unwrap().to_string(),
+            ],
+            env: vec![],
+        };
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[]);
+        crate::sync_state::record_sync(&a.path, clock.now() - 181 * DAY_MS).unwrap();
+        let err = sync_over_ssh(
+            a.state.as_mut().unwrap(),
+            &cmd,
+            PASS,
+            SshTerminal::Inherit,
+            StaleSync::Refuse,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SyncError::Stale { days: 181 }), "{err:?}");
+        assert!(!marker.exists(), "ssh must not be started");
     }
 }

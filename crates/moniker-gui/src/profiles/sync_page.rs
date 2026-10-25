@@ -29,6 +29,7 @@ use adw::prelude::*;
 use gtk::{glib, pango};
 use gtk4 as gtk;
 use libadwaita as adw;
+use moniker_core::sync::StaleSync;
 use zeroize::Zeroizing;
 
 use crate::context::AppContext;
@@ -470,6 +471,12 @@ impl Drop for SyncPage {
 /// the profile as the sync partner. If the page has gone by the time the sync
 /// ends, the result is a notification instead, as nothing else would show it.
 fn begin_sync(page: &Rc<SyncPage>) {
+    begin_sync_with(page, StaleSync::Refuse);
+}
+
+/// [`begin_sync`], going ahead or not when a machine has been away; one that
+/// stopped for that asks whether to sync anyway ([`ask_to_sync_anyway`]).
+fn begin_sync_with(page: &Rc<SyncPage>, stale: StaleSync) {
     if page.ctx.sync_running.get() {
         return;
     }
@@ -480,27 +487,62 @@ fn begin_sync(page: &Rc<SyncPage>) {
     let ctx = Rc::clone(&page.ctx);
     let weak = Rc::downgrade(page);
     let partner = id.clone();
-    let started = sync::begin_app_sync(&page.ctx, &id, sync::runner(&page.ctx), move |result| {
-        if result.is_ok()
-            && let Err(err) = sync::record_partner(&ctx, &partner)
-        {
-            ctx.notice
-                .show(&format!("Could not save the sync settings: {err}"));
-        }
-        if weak.upgrade().is_none() {
-            let (text, is_error) = sync::result_text(result);
-            ctx.notice.show(&if is_error {
-                format!("Sync failed: {text}")
-            } else {
-                text
-            });
-        }
-    });
+    let started = sync::begin_app_sync(
+        &page.ctx,
+        &id,
+        stale,
+        sync::runner(&page.ctx),
+        move |result| {
+            if result.is_ok()
+                && let Err(err) = sync::record_partner(&ctx, &partner)
+            {
+                ctx.notice
+                    .show(&format!("Could not save the sync settings: {err}"));
+            }
+            if let (Some(page), Err(failure)) = (weak.upgrade(), result)
+                && stale == StaleSync::Refuse
+                && sync::is_away(failure)
+            {
+                let again = Rc::downgrade(&page);
+                ask_to_sync_anyway(&page.sync_button, &sync::failure_text(failure), move || {
+                    if let Some(page) = again.upgrade() {
+                        begin_sync_with(&page, StaleSync::Allow);
+                    }
+                });
+            } else if weak.upgrade().is_none() {
+                let (text, is_error) = sync::result_text(result);
+                ctx.notice.show(&if is_error {
+                    format!("Sync failed: {text}")
+                } else {
+                    text
+                });
+            }
+        },
+    );
     if let Err(message) = started {
         page.show_result(&message, true);
         // The profile list may be stale (that profile is gone).
         page.refresh_targets();
     }
+}
+
+/// After a sync stopped because this machine or the other one has been away
+/// (issue #8): ask, over `near`, whether to sync anyway, saying why (`why`,
+/// plain text); `go` runs on Sync Anyway. Sync Now uses it too.
+pub(crate) fn ask_to_sync_anyway(near: &impl IsA<gtk::Widget>, why: &str, go: impl Fn() + 'static) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Sync Anyway?")
+        .heading_use_markup(false)
+        .body(why)
+        .body_use_markup(false)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("sync", "Sync Anyway");
+    dialog.set_response_appearance("sync", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(Some("sync"), move |_, _| go());
+    dialog.present(Some(near));
 }
 
 /// A list item factory for a string list whose labels show the text as it is

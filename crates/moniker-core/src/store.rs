@@ -337,7 +337,7 @@ fn parent_dir(path: &Path) -> &Path {
 
 /// Create the directory that holds `path` with mode 0700 if it does not exist
 /// (and any missing ancestors); an existing directory is left as it is.
-fn ensure_parent_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -359,7 +359,7 @@ fn sibling(path: &Path, suffix: &str) -> io::Result<PathBuf> {
 /// truncated or written) rather than on the data file, which is replaced by
 /// rename. It is released when the returned handle is dropped. The parent
 /// directory must exist.
-fn lock_exclusive(path: &Path) -> io::Result<File> {
+pub(crate) fn lock_exclusive(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .write(true)
         .create(true)
@@ -377,8 +377,9 @@ fn lock_exclusive(path: &Path) -> io::Result<File> {
 /// mode 0600 (a leftover one from a crashed save is removed first; a symlink
 /// there is unlinked, not followed), fsynced, then renamed over the target. It
 /// is removed again if anything after its creation fails. Callers hold the
-/// store lock, so no other store writes the temp file meanwhile.
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// lock of the file they write ([`lock_exclusive`]), so nothing else writes the
+/// temp file meanwhile.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = sibling(path, ".tmp")?;
     match fs::remove_file(&tmp) {
         Ok(()) => {}

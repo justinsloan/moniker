@@ -22,7 +22,7 @@ use moniker_core::secrets::{
 };
 use moniker_core::ssh::{SERVER_PROGRAM, sync_command};
 use moniker_core::store::ProfileStore;
-use moniker_core::sync::{LocalState, SshTerminal, serve, sync_over_ssh};
+use moniker_core::sync::{LocalState, SshTerminal, StaleSync, SyncError, serve, sync_over_ssh};
 use zeroize::Zeroizing;
 
 /// What `moniker-server sync` says when this machine has no sync key.
@@ -61,6 +61,10 @@ enum Command {
     SyncServe,
     /// Sync with the machine a profile connects to
     Sync {
+        /// Sync even if this machine or the other one has not synced for more than 180 days
+        /// (a profile deleted elsewhere more than a year ago could then come back)
+        #[arg(long)]
+        allow_stale: bool,
         /// Name of the profile (must be unique)
         profile: String,
     },
@@ -92,7 +96,10 @@ fn main() -> ExitCode {
             command: SyncKeyCommand::Set { stdin },
         } => sync_key_set(stdin),
         Command::SyncServe => sync_serve(),
-        Command::Sync { profile } => sync(&profile),
+        Command::Sync {
+            profile,
+            allow_stale,
+        } => sync(&profile, allow_stale),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -142,8 +149,9 @@ fn sync_serve() -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-/// `moniker-server sync <profile-name>`: the local half of a sync, over ssh.
-fn sync(name: &str) -> Result<(), String> {
+/// `moniker-server sync [--allow-stale] <profile-name>`: the local half of a
+/// sync, over ssh.
+fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
     // Look the profile up before anything touches the keyring.
     let store = open_store()?;
     let profile = find_profile(&store, name)?.clone();
@@ -162,8 +170,13 @@ fn sync(name: &str) -> Result<(), String> {
     let cmd = sync_command(&profile, &askpass, has_password, SERVER_PROGRAM);
 
     let mut local = LocalState::new(store, Box::new(secrets));
-    let outcome = sync_over_ssh(&mut local, &cmd, &passphrase, SshTerminal::Inherit)
-        .map_err(|e| e.to_string())?;
+    let stale = if allow_stale {
+        StaleSync::Allow
+    } else {
+        StaleSync::Refuse
+    };
+    let outcome = sync_over_ssh(&mut local, &cmd, &passphrase, SshTerminal::Inherit, stale)
+        .map_err(|e| sync_error_text(&e))?;
     print_stdout(&format!(
         "added {}, updated {}, removed {}\n",
         outcome.added, outcome.updated, outcome.removed
@@ -171,6 +184,17 @@ fn sync(name: &str) -> Result<(), String> {
 }
 
 // ----- helpers -----
+
+/// What `moniker-server sync` says about a failed sync: the error, and for a
+/// machine that has been away, how to go ahead anyway.
+fn sync_error_text(err: &SyncError) -> String {
+    match err {
+        SyncError::Stale { .. } | SyncError::PeerStale => {
+            format!("{err}; run again with --allow-stale to sync anyway")
+        }
+        _ => err.to_string(),
+    }
+}
 
 /// A sync runs with no terminal, so a stored password reaches ssh only through
 /// the `moniker-askpass` helper. If one is stored and the helper is not an
@@ -310,6 +334,39 @@ mod tests {
     use super::*;
     use moniker_core::secrets::MemorySecretStore;
     use std::io;
+
+    #[test]
+    fn sync_takes_allow_stale() {
+        let cli = Cli::try_parse_from(["moniker-server", "sync", "--allow-stale", "Box"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync { allow_stale: true, ref profile } if profile == "Box"
+        ));
+        let cli = Cli::try_parse_from(["moniker-server", "sync", "Box"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync {
+                allow_stale: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_machine_that_has_been_away_is_told_how_to_sync_anyway() {
+        for err in [SyncError::Stale { days: 200 }, SyncError::PeerStale] {
+            let text = sync_error_text(&err);
+            assert!(text.starts_with(&err.to_string()), "{text}");
+            assert!(
+                text.ends_with("run again with --allow-stale to sync anyway"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            sync_error_text(&SyncError::WrongSyncKey),
+            SyncError::WrongSyncKey.to_string()
+        );
+    }
 
     #[test]
     fn one_trailing_newline_is_stripped() {

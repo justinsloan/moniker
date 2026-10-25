@@ -20,7 +20,7 @@ use moniker_core::secrets::{
     MemorySecretStore, SYNC_PASSPHRASE_KEY, SecretError, SecretStore, password_key,
 };
 use moniker_core::store::ProfileStore;
-use moniker_core::sync::{SyncError, SyncOutcome};
+use moniker_core::sync::{StaleSync, SyncError, SyncOutcome};
 use zeroize::Zeroizing;
 
 use super::main_window::test_app;
@@ -1383,4 +1383,146 @@ pub(super) fn the_sync_page_waits_for_the_keyring(dir: &Path) {
     pump_until("Sync to be on again", || page.sync_button.is_sensitive());
     window.destroy();
     pump_for(Duration::from_millis(100));
+}
+
+/// What a runner of these scenarios saw: whether each sync it ran accepted a
+/// machine that has been away.
+type Choices = Arc<Mutex<Vec<StaleSync>>>;
+
+/// A runner that says this machine has been away unless the sync accepts it.
+fn away_unless_allowed(ctx: &AppContext, seen: &Choices) {
+    let seen = Arc::clone(seen);
+    set_runner(ctx, move |inputs: SyncInputs| {
+        seen.lock().unwrap().push(inputs.stale);
+        match inputs.stale {
+            StaleSync::Refuse => Err(SyncError::Stale { days: 200 }),
+            StaleSync::Allow => Ok(added(1)),
+        }
+    });
+}
+
+/// The alert in `window`, once it shows.
+fn alert_in(window: &impl IsA<gtk::Widget>) -> adw::AlertDialog {
+    pump_until("the alert", || {
+        !all_widgets::<adw::AlertDialog>(window).is_empty()
+    });
+    all_widgets::<adw::AlertDialog>(window)
+        .into_iter()
+        .next()
+        .expect("the alert")
+}
+
+const AWAY: &str = "This machine has not synced for 200 days. Moniker forgets a deletion a year \
+    after it is made, so a profile deleted on another machine more than a year ago could come \
+    back on every machine.";
+
+/// Sync Now on a machine that has been away asks first (issue #8): Sync Anyway
+/// syncs again accepting it, Cancel does nothing more.
+pub(super) fn sync_now_asks_a_machine_that_has_been_away(dir: &Path) {
+    let (ctx, _secrets, profile) = sync_ctx(dir, true, Some(SYNC_KEY));
+    set_partner(&ctx, &profile.expect("a profile"), true);
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
+    let main = window::build(&app, &ctx);
+    main.window.present();
+    pump_for(Duration::from_millis(200));
+
+    let seen: Choices = Arc::default();
+    away_unless_allowed(&ctx, &seen);
+    app.activate_action("sync-now", None);
+    let alert = alert_in(&main.window);
+    assert_eq!(alert.heading().as_deref(), Some("Sync Anyway?"));
+    assert!(!alert.is_heading_use_markup());
+    assert_eq!(alert.body().as_str(), AWAY);
+    assert!(!alert.is_body_use_markup());
+    away_unless_allowed(&ctx, &seen);
+    button_labeled(&alert, "Sync Anyway")
+        .expect("the Sync Anyway button")
+        .emit_clicked();
+    pump_until("the second sync", || seen.lock().unwrap().len() == 2);
+    pump_until("it to finish", || !ctx.sync_running.get());
+    pump_for(Duration::from_millis(100));
+    assert_eq!(*seen.lock().unwrap(), [StaleSync::Refuse, StaleSync::Allow]);
+    assert_eq!(
+        ctx.notice.last_text().as_deref(),
+        Some("Synced: 1 added, 0 updated, 0 removed.")
+    );
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(&main.window).is_empty()
+    });
+
+    // Cancel: nothing more runs.
+    seen.lock().unwrap().clear();
+    away_unless_allowed(&ctx, &seen);
+    app.activate_action("sync-now", None);
+    let alert = alert_in(&main.window);
+    button_labeled(&alert, "Cancel")
+        .expect("the Cancel button")
+        .emit_clicked();
+    pump_until("the alert to close", || {
+        main.window.visible_dialog().is_none()
+    });
+    pump_for(Duration::from_millis(300));
+    assert_eq!(*seen.lock().unwrap(), [StaleSync::Refuse]);
+    main.window.destroy();
+    pump_for(Duration::from_millis(100));
+}
+
+/// The sync page asks the same, over the Connection Profiles window, and its
+/// line says why.
+pub(super) fn the_sync_page_asks_a_machine_that_has_been_away(dir: &Path) {
+    let (ctx, _secrets, _profile) = sync_ctx(dir, true, Some(SYNC_KEY));
+    let app = test_app();
+    let profiles_window = open_sync_page(&app, &ctx);
+    let page = page_in(&profiles_window);
+    pump_until("the key status", || page.sync_button.is_sensitive());
+
+    let seen: Choices = Arc::default();
+    away_unless_allowed(&ctx, &seen);
+    page.sync_button.emit_clicked();
+    let alert = alert_in(&profiles_window);
+    assert_eq!(alert.body().as_str(), AWAY);
+    assert_eq!(page.result.label(), AWAY);
+    away_unless_allowed(&ctx, &seen);
+    button_labeled(&alert, "Sync Anyway")
+        .expect("the Sync Anyway button")
+        .emit_clicked();
+    pump_until("the second sync", || seen.lock().unwrap().len() == 2);
+    pump_until("it to finish", || !ctx.sync_running.get());
+    pump_for(Duration::from_millis(100));
+    assert_eq!(*seen.lock().unwrap(), [StaleSync::Refuse, StaleSync::Allow]);
+    assert_eq!(
+        page.result.label(),
+        "Synced: 1 added, 0 updated, 0 removed."
+    );
+    drop(page);
+    profiles_window.destroy();
+    pump_for(Duration::from_millis(100));
+}
+
+/// The sync at launch never asks: one notification says why it did not sync
+/// and how to sync anyway.
+pub(super) fn the_launch_sync_of_a_machine_that_has_been_away_only_says_so(dir: &Path) {
+    let (ctx, _secrets, profile) = sync_ctx(dir, true, Some(SYNC_KEY));
+    set_partner(&ctx, &profile.expect("a profile"), true);
+    let app = test_app();
+    let seen: Choices = Arc::default();
+    away_unless_allowed(&ctx, &seen);
+    let delivered = ctx.notice.delivered();
+    crate::launch(&app, &ctx);
+    pump_until("the notification", || ctx.notice.delivered() > delivered);
+    pump_for(Duration::from_millis(300));
+    assert_eq!(*seen.lock().unwrap(), [StaleSync::Refuse]);
+    assert_eq!(ctx.notice.delivered(), delivered + 1);
+    assert_eq!(
+        ctx.notice.last_text().as_deref(),
+        Some(format!("Did not sync automatically. {AWAY} Use Sync Now to sync anyway.").as_str())
+    );
+    assert!(
+        app.windows().iter().all(|w| w
+            .downcast_ref::<adw::ApplicationWindow>()
+            .is_none_or(|w| w.visible_dialog().is_none())),
+        "no alert"
+    );
+    close_all(&app);
 }

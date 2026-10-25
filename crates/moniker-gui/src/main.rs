@@ -43,6 +43,7 @@ use libadwaita as adw;
 
 use crate::context::AppContext;
 use crate::sync::SyncEvent;
+use moniker_core::sync::StaleSync;
 
 const APP_ID: &str = "org.moniker.Moniker";
 
@@ -299,6 +300,12 @@ fn refresh_sync_now(app: &adw::Application, ctx: &AppContext) {
 /// Sync Now: sync with the partner and say how it went in a notification, in
 /// the main window it was chosen from.
 fn sync_now(app: &adw::Application, ctx: &Rc<AppContext>) {
+    sync_now_with(app, ctx, StaleSync::Refuse);
+}
+
+/// [`sync_now`], going ahead or not when a machine has been away; one that
+/// stopped for that asks over that window whether to sync anyway (issue #8).
+fn sync_now_with(app: &adw::Application, ctx: &Rc<AppContext>, stale: StaleSync) {
     let settings = settings::load(&ctx.settings_path);
     // Bind first so the store borrow ends here.
     let partner = sync::live_partner(&settings, &ctx.store.borrow());
@@ -308,7 +315,9 @@ fn sync_now(app: &adw::Application, ctx: &Rc<AppContext>) {
         profiles::present_sync(app, ctx, window::connect_fn(app, ctx));
         return;
     };
-    let near = window::last_active(app).map(|main| main.notifications.downgrade());
+    let main = window::last_active(app);
+    let over = main.as_ref().map(|main| main.window.downgrade());
+    let near = main.map(|main| main.notifications.downgrade());
     let tell: Rc<dyn Fn(&str)> = {
         let notice = ctx.notice.clone();
         Rc::new(
@@ -318,9 +327,22 @@ fn sync_now(app: &adw::Application, ctx: &Rc<AppContext>) {
             },
         )
     };
-    let started = sync::begin_app_sync(ctx, &partner, sync::runner(ctx), {
+    let started = sync::begin_app_sync(ctx, &partner, stale, sync::runner(ctx), {
         let tell = Rc::clone(&tell);
+        let (app, ctx) = (app.clone(), Rc::clone(ctx));
         move |result| {
+            if let Err(failure) = result
+                && stale == StaleSync::Refuse
+                && sync::is_away(failure)
+                && let Some(over) = over.as_ref().and_then(glib::WeakRef::upgrade)
+            {
+                profiles::sync_page::ask_to_sync_anyway(
+                    &over,
+                    &sync::failure_text(failure),
+                    move || sync_now_with(&app, &ctx, StaleSync::Allow),
+                );
+                return;
+            }
             let (text, is_error) = sync::result_text(result);
             tell(&if is_error {
                 format!("Sync failed: {text}")
@@ -361,12 +383,17 @@ fn sync_on_launch(ctx: &Rc<AppContext>) {
     };
     let notice = ctx.notice.clone();
     let report = move |why: &str| notice.show(&format!("Automatic sync failed: {why}"));
-    let started = sync::begin_app_sync(ctx, &partner, sync::runner(ctx), {
+    let started = sync::begin_app_sync(ctx, &partner, StaleSync::Refuse, sync::runner(ctx), {
         let report = report.clone();
-        move |result| {
-            if let Err(failure) = result {
-                report(&sync::failure_text(failure));
-            }
+        let notice = ctx.notice.clone();
+        move |result| match result {
+            // Never asked at launch: Sync Now is where the person decides.
+            Err(failure) if sync::is_away(failure) => notice.show(&format!(
+                "Did not sync automatically. {} Use Sync Now to sync anyway.",
+                sync::failure_text(failure)
+            )),
+            Err(failure) => report(&sync::failure_text(failure)),
+            Ok(_) => {}
         }
     });
     match started {

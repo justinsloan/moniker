@@ -547,6 +547,11 @@ fn gui_integration() {
     sync::sync_now_while_running_says_so(&tmp.path().join("s-busy"));
     sync::auto_sync_starts_after_the_window_is_shown(&tmp.path().join("s-launch"));
     sync::auto_sync_failure_is_one_notification(&tmp.path().join("s-launch-fail"));
+    sync::sync_now_asks_a_machine_that_has_been_away(&tmp.path().join("s-away-now"));
+    sync::the_sync_page_asks_a_machine_that_has_been_away(&tmp.path().join("s-away-page"));
+    sync::the_launch_sync_of_a_machine_that_has_been_away_only_says_so(
+        &tmp.path().join("s-away-launch"),
+    );
     sync::switch_off_stops_auto_sync(&tmp.path().join("s-switch"));
     sync::a_sync_refreshes_the_sidebar_and_new_tab_list(&tmp.path().join("s-refresh"));
     sync::syncs_read_the_keyring_on_the_worker_only(&tmp.path().join("s-worker"));

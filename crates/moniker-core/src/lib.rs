@@ -10,6 +10,7 @@ pub mod ssh;
 pub mod ssh_config;
 pub mod store;
 pub mod sync;
+pub mod sync_state;
 pub mod transcript;
 
 /// Crate version, as set in the workspace manifest.
