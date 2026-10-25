@@ -398,6 +398,8 @@ fn gui_integration() {
     hosts::a_mark_waits_for_its_check_and_keeps_its_state(&tmp.path().join("p-wait"));
     hosts::turned_off_there_is_no_mark_and_no_ping(&tmp.path().join("p-off"));
     hosts::turning_off_calls_off_a_check_under_way(&tmp.path().join("p-call-off"));
+    hosts::a_host_that_answers_is_not_kept_waiting(&tmp.path().join("p-fast"));
+    hosts::at_most_sixteen_checks_run_at_once(&tmp.path().join("p-sixteen"));
     // Issue #7 first: it fails fast when the profile file is written on the
     // main thread.
     profiles::saving_waits_for_the_profile_file_not_the_window(&tmp.path().join("f-held"));

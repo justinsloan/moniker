@@ -65,8 +65,10 @@ pub(crate) const INTERVAL: Duration = Duration::from_secs(60);
 /// How long what `ssh -G` said about a host is used before it is asked again.
 pub(crate) const TARGET_FRESH: Duration = Duration::from_secs(5 * 60);
 
-/// The most checks that run at once.
-const AT_ONCE: usize = 4;
+/// The most checks that run at once: enough that a host that answers is not
+/// kept waiting behind hosts that do not, each of which takes three seconds
+/// to say so. A waiting check is a thread asleep on its socket.
+const AT_ONCE: usize = 16;
 
 /// The CSS class every mark has.
 pub(crate) const MARK_CLASS: &str = "host-mark";

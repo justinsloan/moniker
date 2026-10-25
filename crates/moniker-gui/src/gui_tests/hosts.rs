@@ -386,3 +386,91 @@ pub(super) fn turning_off_calls_off_a_check_under_way(dir: &Path) {
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }
+
+/// Checks that hang until `release` is dropped (hosts that do not answer and
+/// are still waiting out their pings), and one that answers at once for the
+/// host `fast`; the hosts asked about, in order.
+fn hanging_but(ctx: &AppContext, fast: &str) -> (mpsc::Sender<()>, Arc<Mutex<Vec<String>>>) {
+    let (release, gate) = mpsc::channel::<()>();
+    let gate = Arc::new(Mutex::new(gate));
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&asked);
+    let fast = fast.to_owned();
+    ctx.hosts
+        .set_check(Check::new(move |p: &Profile, _: &dyn Fn() -> bool| {
+            record.lock().unwrap().push(p.host.clone());
+            if p.host == fast {
+                return Reach::Answers;
+            }
+            match gate.lock().unwrap().recv() {
+                Ok(()) | Err(_) => Reach::NoReply,
+            }
+        }));
+    (release, asked)
+}
+
+/// A host that answers is not kept waiting behind hosts that do not: their
+/// checks run side by side, so its mark turns while theirs are still waiting
+/// out their pings, wherever it is in the list.
+pub(super) fn a_host_that_answers_is_not_kept_waiting(dir: &Path) {
+    let mut saved: Vec<Profile> = (1..=5)
+        .map(|i| {
+            Profile::new(
+                &format!("A silent {i}"),
+                &format!("silent{i}.example.test"),
+                "alice",
+            )
+        })
+        .collect();
+    let fast = Profile::new("Z answers", "fast.example.test", "alice");
+    saved.push(fast.clone());
+    let ctx = ctx_with(dir, &saved);
+    let (release, _) = hanging_but(&ctx, &fast.host);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = new_tab::open(&main.view, &ctx);
+    let list = list_in(&page).expect("the list");
+    let mark = |p: &Profile| mark_in(&row(&list, &p.id)).expect("a mark");
+    pump_until("the host that answers to show it", || {
+        shown(&mark(&fast)).0 == "answers"
+    });
+    assert_eq!(ctx.hosts.running(), 5, "the others still wait for a reply");
+    for silent in &saved[..5] {
+        assert_eq!(shown(&mark(silent)).0, "unknown");
+    }
+    drop(release);
+    pump_until("the other checks to end", || ctx.hosts.running() == 0);
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// At most sixteen checks run at once: a seventeenth host waits for a free
+/// place, and is checked once one is.
+pub(super) fn at_most_sixteen_checks_run_at_once(dir: &Path) {
+    let saved: Vec<Profile> = (1..=17)
+        .map(|i| {
+            Profile::new(
+                &format!("Host {i:02}"),
+                &format!("host{i}.example.test"),
+                "alice",
+            )
+        })
+        .collect();
+    let ctx = ctx_with(dir, &saved);
+    let (release, asked) = hanging_but(&ctx, "");
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let _page = new_tab::open(&main.view, &ctx);
+    pump_until("sixteen checks", || ctx.hosts.running() == 16);
+    pump_for(Duration::from_millis(300));
+    assert_eq!(ctx.hosts.running(), 16, "the seventeenth waits");
+    assert_eq!(asked.lock().unwrap().len(), 16);
+    release.send(()).unwrap();
+    pump_until("the seventeenth to be checked", || {
+        asked.lock().unwrap().len() == 17
+    });
+    drop(release);
+    pump_until("every check to end", || ctx.hosts.running() == 0);
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
