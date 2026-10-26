@@ -179,7 +179,7 @@ fn profile_list_without_a_config_directory_fails_clearly() {
 fn help_lists_subcommands() {
     let env = Env::new();
     let help = stdout_of(env.moniker().arg("--help"));
-    for sub in ["profile", "sync-key", "sync-serve", "sync"] {
+    for sub in ["profile", "sync-key", "sync-switch", "sync-serve", "sync"] {
         assert!(
             help.lines().any(|l| l.trim_start().starts_with(sub)),
             "`{sub}` missing from help:\n{help}"
@@ -236,6 +236,138 @@ fn sync_names_match_exactly() {
     let assert = env.moniker().args(["sync", "web1"]).assert().failure();
     let err = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
     assert!(err.contains("no profile named \"web1\""), "{err}");
+}
+
+#[test]
+fn profile_list_marks_a_profile_kept_on_this_machine() {
+    let env = Env::new();
+    env.seed(Profile {
+        local_only: true,
+        ..Profile::new("Box", "10.0.0.5", "root")
+    });
+    env.seed(Profile::new("Web", "example.com", "admin"));
+    env.moniker()
+        .args(["profile", "list"])
+        .assert()
+        .success()
+        .stdout("Box  root@10.0.0.5:22  (this machine only)\nWeb  admin@example.com:22\n");
+}
+
+#[test]
+fn sync_switch_turns_sync_off_and_on() {
+    let env = Env::new();
+    env.moniker()
+        .args(["sync-switch", "status"])
+        .assert()
+        .success()
+        .stdout("Sync is on.\n");
+
+    env.moniker()
+        .args(["sync-switch", "off"])
+        .assert()
+        .success()
+        .stdout("Sync is off. Nothing is sent to or accepted from other machines.\n");
+    env.moniker()
+        .args(["sync-switch", "status"])
+        .assert()
+        .success()
+        .stdout("Sync is off.\n");
+    let file = fs::read_to_string(env.store_path()).unwrap();
+    assert!(file.contains("\"sync_off\": true"), "{file}");
+
+    // Standard input is not a terminal here, so nobody can be asked: without
+    // `--yes` it stays off, and says why, without ever reaching /dev/tty.
+    let assert = env.moniker().args(["sync-switch", "on"]).assert().failure();
+    let out = assert.get_output();
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--yes"), "{err}");
+    env.moniker()
+        .args(["sync-switch", "status"])
+        .assert()
+        .success()
+        .stdout("Sync is off.\n");
+
+    let text = stdout_of(env.moniker().args(["sync-switch", "on", "--yes"]));
+    assert!(
+        text.starts_with("At the next sync, every profile on this machine that syncs"),
+        "{text}"
+    );
+    assert!(text.ends_with("Sync is on.\n"), "{text}");
+    env.moniker()
+        .args(["sync-switch", "status"])
+        .assert()
+        .success()
+        .stdout("Sync is on.\n");
+    let file = fs::read_to_string(env.store_path()).unwrap();
+    assert!(file.contains("\"version\": 1"), "{file}");
+    assert!(!file.contains("sync_off"), "{file}");
+}
+
+#[test]
+fn sync_switch_status_names_a_setting_that_cannot_be_read() {
+    let env = Env::new();
+    fs::create_dir_all(env.store_path().parent().unwrap()).unwrap();
+    fs::write(env.store_path(), r#"{"version":2,"profiles":[]}"#).unwrap();
+    let out = stdout_of(env.moniker().args(["sync-switch", "status"]));
+    assert!(out.starts_with("Sync is off: the setting in "), "{out}");
+    assert!(out.contains("could not be read"), "{out}");
+}
+
+#[test]
+fn sync_while_off_stops_before_the_keyring() {
+    let env = Env::new();
+    env.seed(Profile::new("web1", "example.com", "admin"));
+    env.moniker()
+        .args(["sync-switch", "off"])
+        .assert()
+        .success();
+    for name in ["web1", "nosuch"] {
+        let assert = env.moniker().args(["sync", name]).assert().failure();
+        let out = assert.get_output();
+        assert!(out.stdout.is_empty());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            err.trim_end(),
+            "moniker-server: sync is turned off on this machine; turn it on with \
+             `moniker-server sync-switch on` or on the Sync page",
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn sync_serve_while_off_refuses_before_the_keyring() {
+    use moniker_core::sync::{KIND_ERROR, KIND_HELLO, read_frame, write_frame};
+
+    let env = Env::new();
+    env.moniker()
+        .args(["sync-switch", "off"])
+        .assert()
+        .success();
+    let mut hello = Vec::new();
+    write_frame(&mut hello, KIND_HELLO, &[1]).unwrap();
+    let assert = env
+        .moniker()
+        .arg("sync-serve")
+        .write_stdin(hello)
+        .assert()
+        .failure();
+    let out = assert.get_output();
+
+    // The client is told, in a frame, with the code for "sync is turned off".
+    let mut said = std::io::Cursor::new(&out.stdout);
+    let (kind, payload) = read_frame(&mut said).unwrap();
+    assert_eq!(kind, KIND_ERROR);
+    assert_eq!(payload[0], 5);
+    assert_eq!(said.position() as usize, out.stdout.len(), "one frame only");
+
+    // Whoever reads this machine's log is told too, and no sync key was asked
+    // for (there is no Secret Service here to answer it).
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("sync is turned off on this machine"), "{err}");
+    assert!(!err.contains("sync key"), "{err}");
+    assert!(!err.contains("Secret Service"), "{err}");
 }
 
 #[test]

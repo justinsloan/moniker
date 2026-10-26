@@ -1,4 +1,5 @@
-//! The `moniker-server` command line: list profiles, set the sync key, and sync.
+//! The `moniker-server` command line: list profiles, set the sync key, turn sync
+//! on or off, and sync.
 //!
 //! `main` parses the arguments and calls one small function per subcommand.
 //! Each returns `Err(message)` on failure; `main` prints the message to stderr
@@ -9,7 +10,7 @@
 //! ssh channel. Its stdout carries protocol frames and nothing else, so no
 //! function on that path may print to stdout.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -21,8 +22,10 @@ use moniker_core::secrets::{
     KeyringSecretStore, SYNC_PASSPHRASE_KEY, SecretStore, check_sync_passphrase, password_key,
 };
 use moniker_core::ssh::{SERVER_PROGRAM, sync_command};
-use moniker_core::store::ProfileStore;
-use moniker_core::sync::{LocalState, SshTerminal, StaleSync, SyncError, serve, sync_over_ssh};
+use moniker_core::store::{ProfileStore, SyncSwitch};
+use moniker_core::sync::{
+    LocalState, SshTerminal, StaleSync, SyncError, refuse, serve, sync_over_ssh,
+};
 use zeroize::Zeroizing;
 
 /// What `moniker-server sync` says when this machine has no sync key.
@@ -36,6 +39,21 @@ const NO_SYNC_KEY_REMOTE: &str = "no sync key is set on the remote machine \
 
 /// The longest sync key `sync-key set --stdin` accepts, in bytes.
 const MAX_STDIN_KEY: usize = 64 * 1024;
+
+/// What `moniker-server sync-switch on` tells before it asks: the app's "Turn
+/// Sync On?" warning, worded for the command line, which cannot keep a profile
+/// on this machine itself (that setting is on the profile's page in Moniker).
+const TURN_ON_WARNING: &str = "At the next sync, every profile on this machine that syncs, \
+    including any added while sync was off, will be copied to your other machines with its stored \
+    password. To keep a profile on this machine only, turn off \"Sync to other machines\" on its \
+    page in Moniker first.\n";
+
+/// The question `sync-switch on` asks.
+const TURN_ON_QUESTION: &str = "Turn sync on? [y/N] ";
+
+/// What `sync-switch on` says when it has nobody to ask and was not told `--yes`.
+const NO_TERMINAL_TO_ASK: &str =
+    "sync was not turned on: no terminal to ask in; run again with --yes to turn it on";
 
 /// Moniker: SSH connection profiles and credential sync between your machines.
 #[derive(Parser)]
@@ -56,6 +74,11 @@ enum Command {
     SyncKey {
         #[command(subcommand)]
         command: SyncKeyCommand,
+    },
+    /// Turn sync on or off on this machine
+    SyncSwitch {
+        #[command(subcommand)]
+        command: SyncSwitchCommand,
     },
     /// Serve one sync on stdin/stdout (run on the remote machine by `moniker-server sync`)
     SyncServe,
@@ -86,6 +109,20 @@ enum SyncKeyCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum SyncSwitchCommand {
+    /// Turn sync on (warns, and asks first when run in a terminal)
+    On {
+        /// Do not ask: turn sync on after showing the warning
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Turn sync off: nothing is sent to or accepted from other machines
+    Off,
+    /// Say whether sync is on
+    Status,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -95,6 +132,7 @@ fn main() -> ExitCode {
         Command::SyncKey {
             command: SyncKeyCommand::Set { stdin },
         } => sync_key_set(stdin),
+        Command::SyncSwitch { command } => sync_switch(command),
         Command::SyncServe => sync_serve(),
         Command::Sync {
             profile,
@@ -131,29 +169,72 @@ fn sync_key_set(from_stdin: bool) -> Result<(), String> {
     print_stdout("Sync key saved.\n")
 }
 
+/// `moniker-server sync-switch on|off|status`. Never touches the keyring.
+fn sync_switch(command: SyncSwitchCommand) -> Result<(), String> {
+    let path = store_path()?;
+    let text = match command {
+        SyncSwitchCommand::On { yes } => {
+            // Ask only when standard input is a terminal (`--yes` for anything
+            // else): a script that pipes into this command has not seen the
+            // warning, and /dev/tty may exist behind it all the same.
+            let mut dev_tty = DevTty;
+            let tty: Option<&mut dyn TtyPrompter> = if !yes && io::stdin().is_terminal() {
+                Some(&mut dev_tty)
+            } else {
+                None
+            };
+            turn_sync_on(&path, yes, tty)?
+        }
+        SyncSwitchCommand::Off => turn_sync_off(&path)?,
+        SyncSwitchCommand::Status => sync_status(&path)?,
+    };
+    print_stdout(&text)
+}
+
 /// `moniker-server sync-serve`: the remote half of a sync. Stdout is for protocol
 /// frames only; everything else goes to stderr.
 fn sync_serve() -> Result<(), String> {
-    let secrets = KeyringSecretStore::new();
-    let passphrase = sync_passphrase(&secrets, NO_SYNC_KEY_REMOTE)?;
-    let mut local = LocalState::new(open_store()?, Box::new(secrets));
-    // `serve` has already sent an ERROR frame for anything the peer should hear
-    // about; the message here is for whoever reads this machine's stderr.
-    serve(
+    serve_with(
+        open_store()?,
+        Box::new(KeyringSecretStore::new()),
         io::stdin().lock(),
         io::stdout().lock(),
-        &mut local,
-        &passphrase,
     )
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+}
+
+/// One `sync-serve` on `r` and `w`. With sync turned off the HELLO is answered
+/// with the refusal (error code 5) before the sync key is looked up: the
+/// keyring may be locked, and a machine that takes no part in a sync has no
+/// business asking it for anything.
+fn serve_with(
+    store: ProfileStore,
+    secrets: Box<dyn SecretStore>,
+    r: impl Read,
+    w: impl Write,
+) -> Result<(), String> {
+    if !store.sync_switch().is_on() {
+        let err = refuse(r, w, SyncError::SyncOff)
+            .err()
+            .unwrap_or(SyncError::SyncOff);
+        return Err(err.to_string());
+    }
+    let passphrase = sync_passphrase(&*secrets, NO_SYNC_KEY_REMOTE)?;
+    let mut local = LocalState::new(store, secrets);
+    // `serve` has already sent an ERROR frame for anything the peer should hear
+    // about; the message here is for whoever reads this machine's stderr.
+    serve(r, w, &mut local, &passphrase)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// `moniker-server sync [--allow-stale] <profile-name>`: the local half of a
 /// sync, over ssh.
 fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
-    // Look the profile up before anything touches the keyring.
+    // The switch and the profile are looked at before anything touches the keyring.
     let store = open_store()?;
+    if !store.sync_switch().is_on() {
+        return Err(sync_error_text(&SyncError::SyncOff));
+    }
     let profile = find_profile(&store, name)?.clone();
 
     let secrets = KeyringSecretStore::new();
@@ -183,14 +264,84 @@ fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
     ))
 }
 
+// ----- the sync switch -----
+
+/// `sync-switch on`: the text to print. Does nothing, and says so, when sync is
+/// already on (the file is not even created). Otherwise the warning is shown
+/// first: on `tty` before the question, so that it is read before it is
+/// answered, or, with `yes` or no terminal to show it on, at the head of the
+/// returned text. Without `yes` and without an answer from a terminal the
+/// switch stays as it was.
+fn turn_sync_on(
+    path: &Path,
+    yes: bool,
+    tty: Option<&mut dyn TtyPrompter>,
+) -> Result<String, String> {
+    let mut store = open_store_at(path)?;
+    if store.sync_switch() == SyncSwitch::On {
+        return Ok("Sync is already on.\n".to_owned());
+    }
+    let mut text = String::new();
+    match (yes, tty) {
+        (false, Some(tty)) => {
+            if !confirmed(tty)? {
+                return Ok("Sync stays off.\n".to_owned());
+            }
+        }
+        (false, None) => return Err(NO_TERMINAL_TO_ASK.to_owned()),
+        (true, _) => text.push_str(TURN_ON_WARNING),
+    }
+    store
+        .set_sync(true)
+        .map_err(|e| format!("cannot turn sync on: {e} ({})", path.display()))?;
+    text.push_str("Sync is on.\n");
+    Ok(text)
+}
+
+/// Show the warning on the terminal, then ask. Only `y` or `yes`, in any case,
+/// is a yes. A terminal that cannot be reached is no terminal.
+fn confirmed(tty: &mut dyn TtyPrompter) -> Result<bool, String> {
+    tty.notify(TURN_ON_WARNING)
+        .and_then(|()| tty.ask(TURN_ON_QUESTION, true))
+        .map(|answer| matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
+        .map_err(|_| NO_TERMINAL_TO_ASK.to_owned())
+}
+
+/// `sync-switch off`: the text to print. Off needs no confirmation: it sends
+/// nothing.
+fn turn_sync_off(path: &Path) -> Result<String, String> {
+    open_store_at(path)?
+        .set_sync(false)
+        .map_err(|e| format!("cannot turn sync off: {e} ({})", path.display()))?;
+    Ok("Sync is off. Nothing is sent to or accepted from other machines.\n".to_owned())
+}
+
+/// `sync-switch status`: the text to print. A setting that is in the file but
+/// cannot be understood counts as off, as it does everywhere else, and the
+/// text says why.
+fn sync_status(path: &Path) -> Result<String, String> {
+    Ok(match open_store_at(path)?.sync_switch() {
+        SyncSwitch::On => "Sync is on.\n".to_owned(),
+        SyncSwitch::Off => "Sync is off.\n".to_owned(),
+        SyncSwitch::Unreadable => format!(
+            "Sync is off: the setting in {} could not be read; \
+             `moniker-server sync-switch on` turns it on.\n",
+            sanitize_for_terminal(&path.display().to_string())
+        ),
+    })
+}
+
 // ----- helpers -----
 
 /// What `moniker-server sync` says about a failed sync: the error, and for a
-/// machine that has been away, how to go ahead anyway.
+/// machine that has been away or has sync turned off, how to go ahead anyway.
 fn sync_error_text(err: &SyncError) -> String {
     match err {
         SyncError::Stale { .. } | SyncError::PeerStale => {
             format!("{err}; run again with --allow-stale to sync anyway")
+        }
+        SyncError::SyncOff => {
+            format!("{err}; turn it on with `moniker-server sync-switch on` or on the Sync page")
         }
         _ => err.to_string(),
     }
@@ -221,8 +372,11 @@ fn print_stdout(text: &str) -> Result<(), String> {
 }
 
 fn open_store() -> Result<ProfileStore, String> {
-    let path = store_path()?;
-    ProfileStore::open(&path).map_err(|e| format!("{e} ({})", path.display()))
+    open_store_at(&store_path()?)
+}
+
+fn open_store_at(path: &Path) -> Result<ProfileStore, String> {
+    ProfileStore::open(path).map_err(|e| format!("{e} ({})", path.display()))
 }
 
 /// The sync passphrase from the keyring. `if_missing` is the message for
@@ -255,7 +409,8 @@ fn find_profile<'a>(store: &'a ProfileStore, name: &str) -> Result<&'a Profile, 
 }
 
 /// The output of `profile list`: `<name>  <user>@<host>:<port>` per profile, or
-/// `No profiles.`. Every field is made safe to print.
+/// `No profiles.`; a profile kept on this machine (it never syncs) ends with
+/// `  (this machine only)`. Every field is made safe to print.
 fn profile_list_text(profiles: &[&Profile]) -> String {
     if profiles.is_empty() {
         return "No profiles.\n".to_owned();
@@ -264,11 +419,16 @@ fn profile_list_text(profiles: &[&Profile]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{}  {}@{}:{}\n",
+                "{}  {}@{}:{}{}\n",
                 sanitize_for_terminal(&p.name),
                 sanitize_for_terminal(&p.username),
                 sanitize_for_terminal(&p.host),
-                p.port
+                p.port,
+                if p.local_only {
+                    "  (this machine only)"
+                } else {
+                    ""
+                }
             )
         })
         .collect()
@@ -333,6 +493,7 @@ fn prompt_passphrase(tty: &mut dyn TtyPrompter) -> Result<Zeroizing<String>, Str
 mod tests {
     use super::*;
     use moniker_core::secrets::MemorySecretStore;
+    use moniker_core::sync::{KIND_ERROR, KIND_HELLO, read_frame, write_frame};
     use std::io;
 
     #[test]
@@ -442,6 +603,8 @@ mod tests {
     struct ScriptedTty {
         answers: Vec<io::Result<String>>,
         asked: Vec<(String, bool)>,
+        /// What was shown without asking (the sync key prompts never do).
+        notified: Vec<String>,
     }
 
     impl ScriptedTty {
@@ -450,6 +613,7 @@ mod tests {
             ScriptedTty {
                 answers,
                 asked: Vec::new(),
+                notified: Vec::new(),
             }
         }
     }
@@ -460,8 +624,9 @@ mod tests {
             self.answers.pop().expect("asked more than expected")
         }
 
-        fn notify(&mut self, _msg: &str) -> io::Result<()> {
-            panic!("notify is not used for the sync key");
+        fn notify(&mut self, msg: &str) -> io::Result<()> {
+            self.notified.push(msg.to_owned());
+            Ok(())
         }
     }
 
@@ -480,6 +645,10 @@ mod tests {
                 ("Sync key: ".to_owned(), false),
                 ("Repeat sync key: ".to_owned(), false)
             ]
+        );
+        assert!(
+            tty.notified.is_empty(),
+            "the sync key prompts show nothing else"
         );
     }
 
@@ -705,6 +874,382 @@ mod tests {
         p.port = 22;
         let text = profile_list_text(&[&p]);
         assert_eq!(text, "a?b?c  u?ser@h?.example.com:22\n");
+    }
+
+    // ----- the sync switch (issue #10) -----
+
+    /// A secret store that must never be reached.
+    struct NoKeyring;
+
+    type SecretResult<T> = Result<T, moniker_core::secrets::SecretError>;
+
+    impl SecretStore for NoKeyring {
+        fn get(&self, key: &str) -> SecretResult<Option<Zeroizing<String>>> {
+            panic!("the keyring was read for {key}");
+        }
+        fn set(&self, key: &str, _value: &str) -> SecretResult<()> {
+            panic!("the keyring was written for {key}");
+        }
+        fn delete(&self, key: &str) -> SecretResult<()> {
+            panic!("the keyring was changed for {key}");
+        }
+        fn probe(&self) -> SecretResult<()> {
+            panic!("the keyring was probed");
+        }
+    }
+
+    /// A path in a fresh directory, with no file there yet.
+    fn fresh_path() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profiles.json");
+        (dir, path)
+    }
+
+    /// The same, with sync turned off in the file.
+    fn off_path() -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, path) = fresh_path();
+        ProfileStore::open(&path).unwrap().set_sync(false).unwrap();
+        (dir, path)
+    }
+
+    fn switch_at(path: &Path) -> SyncSwitch {
+        ProfileStore::open(path).unwrap().sync_switch()
+    }
+
+    fn answers(text: &str) -> ScriptedTty {
+        ScriptedTty::new(vec![Ok(text.to_owned())])
+    }
+
+    #[test]
+    fn profile_list_marks_profiles_kept_here() {
+        let kept = Profile {
+            local_only: true,
+            ..Profile::new("Box", "10.0.0.5", "root")
+        };
+        let shared = Profile::new("Web", "example.com", "admin");
+        assert_eq!(
+            profile_list_text(&[&kept, &shared]),
+            "Box  root@10.0.0.5:22  (this machine only)\nWeb  admin@example.com:22\n"
+        );
+    }
+
+    #[test]
+    fn sync_switch_parses() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["moniker-server", "sync-switch"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all)
+        };
+        assert!(matches!(
+            parse(&["on", "--yes"]).unwrap().command,
+            Command::SyncSwitch {
+                command: SyncSwitchCommand::On { yes: true }
+            }
+        ));
+        assert!(matches!(
+            parse(&["on"]).unwrap().command,
+            Command::SyncSwitch {
+                command: SyncSwitchCommand::On { yes: false }
+            }
+        ));
+        assert!(matches!(
+            parse(&["off"]).unwrap().command,
+            Command::SyncSwitch {
+                command: SyncSwitchCommand::Off
+            }
+        ));
+        assert!(matches!(
+            parse(&["status"]).unwrap().command,
+            Command::SyncSwitch {
+                command: SyncSwitchCommand::Status
+            }
+        ));
+        // `--yes` belongs to `on` alone, and a word is needed.
+        assert!(parse(&["off", "--yes"]).is_err());
+        assert!(parse(&[]).is_err());
+    }
+
+    #[test]
+    fn turning_sync_on_asks_and_can_be_declined() {
+        for no in ["n", "N", "no", "", "  ", "yep", "ye", "maybe"] {
+            let (_dir, path) = off_path();
+            let mut tty = answers(no);
+            let text = turn_sync_on(&path, false, Some(&mut tty)).unwrap();
+            assert_eq!(text, "Sync stays off.\n", "answer {no:?}");
+            assert_eq!(switch_at(&path), SyncSwitch::Off, "answer {no:?}");
+            // Declining is told the warning too: it is read before the question.
+            assert_eq!(tty.notified, vec![TURN_ON_WARNING.to_owned()], "{no:?}");
+        }
+
+        for yes in ["y", "Y", "yes", "YES", "Yes", " y ", "y\r"] {
+            let (_dir, path) = off_path();
+            let mut tty = answers(yes);
+            let text = turn_sync_on(&path, false, Some(&mut tty)).unwrap();
+            assert_eq!(text, "Sync is on.\n", "answer {yes:?}");
+            assert_eq!(switch_at(&path), SyncSwitch::On, "answer {yes:?}");
+            // The warning is read on the terminal before the question, which
+            // is asked with the answer shown as it is typed.
+            assert_eq!(tty.notified, vec![TURN_ON_WARNING.to_owned()], "{yes:?}");
+            assert_eq!(
+                tty.asked,
+                vec![("Turn sync on? [y/N] ".to_owned(), true)],
+                "{yes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_warning_says_what_will_happen() {
+        assert_eq!(
+            TURN_ON_WARNING,
+            "At the next sync, every profile on this machine that syncs, including any added \
+             while sync was off, will be copied to your other machines with its stored password. \
+             To keep a profile on this machine only, turn off \"Sync to other machines\" on its \
+             page in Moniker first.\n"
+        );
+    }
+
+    #[test]
+    fn turning_sync_on_without_a_terminal_needs_yes() {
+        let (_dir, path) = off_path();
+        let before = std::fs::read(&path).unwrap();
+        let err = turn_sync_on(&path, false, None).unwrap_err();
+        assert!(err.contains("--yes"), "{err}");
+        assert_eq!(
+            err,
+            "sync was not turned on: no terminal to ask in; run again with --yes to turn it on"
+        );
+        assert_eq!(switch_at(&path), SyncSwitch::Off);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+
+        // With --yes there is nobody to ask, and the warning is in the output.
+        let text = turn_sync_on(&path, true, None).unwrap();
+        assert_eq!(text, format!("{TURN_ON_WARNING}Sync is on.\n"));
+        assert_eq!(switch_at(&path), SyncSwitch::On);
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_reached_is_no_terminal() {
+        let (_dir, path) = off_path();
+        let mut tty = ScriptedTty::new(vec![Err(io::Error::from(io::ErrorKind::NotFound))]);
+        let err = turn_sync_on(&path, false, Some(&mut tty)).unwrap_err();
+        assert!(err.contains("--yes"), "{err}");
+        assert_eq!(switch_at(&path), SyncSwitch::Off);
+    }
+
+    #[test]
+    fn yes_does_not_ask_even_with_a_terminal() {
+        let (_dir, path) = off_path();
+        let mut tty = ScriptedTty::new(Vec::new());
+        let text = turn_sync_on(&path, true, Some(&mut tty)).unwrap();
+        assert_eq!(text, format!("{TURN_ON_WARNING}Sync is on.\n"));
+        assert!(tty.asked.is_empty() && tty.notified.is_empty());
+        assert_eq!(switch_at(&path), SyncSwitch::On);
+    }
+
+    #[test]
+    fn turning_sync_on_when_on_changes_nothing() {
+        // No file at all reads as on: nothing is asked and nothing is created.
+        let (_dir, path) = fresh_path();
+        let mut tty = ScriptedTty::new(Vec::new());
+        assert_eq!(
+            turn_sync_on(&path, false, Some(&mut tty)).unwrap(),
+            "Sync is already on.\n"
+        );
+        assert_eq!(
+            turn_sync_on(&path, false, None).unwrap(),
+            "Sync is already on.\n"
+        );
+        assert_eq!(
+            turn_sync_on(&path, true, None).unwrap(),
+            "Sync is already on.\n"
+        );
+        assert!(tty.asked.is_empty() && tty.notified.is_empty());
+        assert!(!path.exists(), "no file was created");
+
+        // A file that says on is left byte for byte as it is.
+        let (_dir, path) = fresh_path();
+        let mut store = ProfileStore::open(&path).unwrap();
+        store
+            .upsert(Profile::new("Box", "10.0.0.5", "root"))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            turn_sync_on(&path, true, None).unwrap(),
+            "Sync is already on.\n"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn turning_sync_on_replaces_a_setting_that_could_not_be_read() {
+        let (_dir, path) = fresh_path();
+        std::fs::write(&path, r#"{"version":2,"profiles":[]}"#).unwrap();
+        assert_eq!(switch_at(&path), SyncSwitch::Unreadable);
+        let text = turn_sync_on(&path, true, None).unwrap();
+        assert!(text.ends_with("Sync is on.\n"), "{text}");
+        assert_eq!(switch_at(&path), SyncSwitch::On);
+    }
+
+    #[test]
+    fn turning_sync_off_and_asking_how_it_is() {
+        let (_dir, path) = fresh_path();
+        assert_eq!(sync_status(&path).unwrap(), "Sync is on.\n");
+        assert!(!path.exists(), "status reads only");
+
+        let off = "Sync is off. Nothing is sent to or accepted from other machines.\n";
+        assert_eq!(turn_sync_off(&path).unwrap(), off);
+        assert_eq!(switch_at(&path), SyncSwitch::Off);
+        assert_eq!(sync_status(&path).unwrap(), "Sync is off.\n");
+
+        // Again: still off, the same words, the file as it was.
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(turn_sync_off(&path).unwrap(), off);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn turning_sync_off_keeps_the_profiles() {
+        let (_dir, path) = fresh_path();
+        let mut store = ProfileStore::open(&path).unwrap();
+        store
+            .upsert(Profile::new("Box", "10.0.0.5", "root"))
+            .unwrap();
+        let all = store.all();
+        turn_sync_off(&path).unwrap();
+        assert_eq!(ProfileStore::open(&path).unwrap().all(), all);
+    }
+
+    #[test]
+    fn status_says_when_the_setting_cannot_be_read() {
+        let (_dir, path) = fresh_path();
+        std::fs::write(&path, r#"{"version":2,"profiles":[]}"#).unwrap();
+        let text = sync_status(&path).unwrap();
+        assert!(text.starts_with("Sync is off: the setting in "), "{text}");
+        assert!(text.contains("could not be read"), "{text}");
+        assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(
+            text.ends_with("`moniker-server sync-switch on` turns it on.\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn status_makes_the_path_safe_to_print() {
+        let dir = tempfile::tempdir().unwrap();
+        let odd = dir.path().join("a\x1b[2Jb");
+        std::fs::create_dir(&odd).unwrap();
+        let path = odd.join("profiles.json");
+        std::fs::write(&path, r#"{"version":2,"profiles":[]}"#).unwrap();
+        let text = sync_status(&path).unwrap();
+        assert!(!text.contains('\x1b'), "{text:?}");
+        assert!(text.contains("a?[2Jb"), "{text:?}");
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_opened_is_an_error_not_a_guess() {
+        let (_dir, path) = fresh_path();
+        std::fs::write(&path, "not json").unwrap();
+        for err in [
+            sync_status(&path).unwrap_err(),
+            turn_sync_off(&path).unwrap_err(),
+            turn_sync_on(&path, true, None).unwrap_err(),
+        ] {
+            assert!(err.contains(&path.display().to_string()), "{err}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+    }
+
+    /// A HELLO frame as a client sends it.
+    fn hello() -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_frame(&mut buf, KIND_HELLO, &[1]).unwrap();
+        buf
+    }
+
+    #[test]
+    fn sync_serve_refuses_before_reading_the_key() {
+        let (_dir, path) = off_path();
+        let store = ProfileStore::open(&path).unwrap();
+        let mut out = Vec::new();
+        let err = serve_with(
+            store,
+            Box::new(NoKeyring),
+            io::Cursor::new(hello()),
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(err, SyncError::SyncOff.to_string());
+
+        let mut said = io::Cursor::new(&out);
+        let (kind, payload) = read_frame(&mut said).unwrap();
+        assert_eq!(kind, KIND_ERROR);
+        assert_eq!(payload[0], 5, "code 5: sync is turned off");
+        let text = String::from_utf8_lossy(&payload[1..]).into_owned();
+        assert!(text.contains("turned off on the other machine"), "{text}");
+        // That was all it said.
+        assert_eq!(said.position() as usize, out.len());
+    }
+
+    #[test]
+    fn sync_serve_refuses_a_setting_it_cannot_read_too() {
+        let (_dir, path) = fresh_path();
+        std::fs::write(&path, r#"{"version":2,"profiles":[]}"#).unwrap();
+        let store = ProfileStore::open(&path).unwrap();
+        let mut out = Vec::new();
+        serve_with(
+            store,
+            Box::new(NoKeyring),
+            io::Cursor::new(hello()),
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(read_frame(&mut io::Cursor::new(&out)).unwrap().1[0], 5);
+    }
+
+    #[test]
+    fn sync_serve_with_sync_on_goes_on_to_the_key() {
+        // The switch comes first, then the key: with sync on and no key stored
+        // the answer is the missing key, not a refusal, and nothing was sent.
+        let (_dir, path) = fresh_path();
+        let store = ProfileStore::open(&path).unwrap();
+        let mut out = Vec::new();
+        let err = serve_with(
+            store,
+            Box::new(MemorySecretStore::default()),
+            io::Cursor::new(hello()),
+            &mut out,
+        )
+        .unwrap_err();
+        assert_eq!(err, NO_SYNC_KEY_REMOTE);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn a_refusal_needs_a_hello_first() {
+        let (_dir, path) = off_path();
+        let store = ProfileStore::open(&path).unwrap();
+        let mut out = Vec::new();
+        let err = serve_with(store, Box::new(NoKeyring), io::empty(), &mut out).unwrap_err();
+        assert!(!err.is_empty());
+        assert!(
+            out.is_empty(),
+            "nothing is said to a connection that did not speak"
+        );
+    }
+
+    #[test]
+    fn sync_error_text_says_how_to_turn_sync_on() {
+        assert_eq!(
+            sync_error_text(&SyncError::SyncOff),
+            "sync is turned off on this machine; turn it on with `moniker-server sync-switch on` \
+             or on the Sync page"
+        );
+        // The other machine's refusal is its own business: as it is.
+        assert_eq!(
+            sync_error_text(&SyncError::PeerSyncOff),
+            SyncError::PeerSyncOff.to_string()
+        );
     }
 
     #[test]
