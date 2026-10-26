@@ -239,12 +239,41 @@ fn program_title(argv0: &str) -> String {
 /// set by a program, a newline in a name) become spaces and the ends are trimmed.
 /// `None` if nothing is left.
 pub fn clean_title(raw: &str) -> Option<String> {
-    let flat: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let flat = one_line(raw);
     let title = flat.trim();
     (!title.is_empty()).then(|| title.to_owned())
+}
+
+/// `text` with every control character (an escape sequence, a newline, a bell)
+/// turned into a space, so that showing it, or feeding it to a terminal, cannot
+/// act as a command.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// The note a program that could not be started leaves in its terminal. The
+/// program is whatever the command line named (any `-e` argument) and the
+/// reason is GLib's, which quotes it, so both go through [`one_line`]: the note
+/// is fed to the terminal, which would act on an escape sequence or a line
+/// break in either.
+fn start_failure_note(program: &str, reason: &str) -> String {
+    format!(
+        "[could not start {}: {}]",
+        one_line(program),
+        one_line(reason)
+    )
+}
+
+/// The same failure as a line for standard error, which is often the terminal
+/// that started Moniker and would act on an escape sequence just as well.
+fn start_failure_log(program: &str, reason: &str) -> String {
+    format!(
+        "moniker: failed to start {}: {}",
+        one_line(program),
+        one_line(reason)
+    )
 }
 
 /// The tab label for a profile: its name, made safe for a one-line label.
@@ -1594,14 +1623,9 @@ fn spawn(terminal: &Terminal, dir: Option<&str>, argv: &[String], envv: &[String
                 hang_up(&terminal);
             }
             if let Err(err) = result {
-                let reason: String = err
-                    .message()
-                    .chars()
-                    .map(|c| if c.is_control() { ' ' } else { c })
-                    .collect();
-                eprintln!("moniker: failed to start {program}: {reason}");
+                eprintln!("{}", start_failure_log(&program, err.message()));
                 if let Some(terminal) = weak.upgrade() {
-                    show_note(&terminal, &format!("[could not start {program}: {reason}]"));
+                    show_note(&terminal, &start_failure_note(&program, err.message()));
                     // No child: nothing to wait for when the tab closes.
                     if let Some(holder) = terminal.parent().and_downcast::<PaneHolder>() {
                         holder.child_gone().set(true);
@@ -2330,6 +2354,40 @@ mod tests {
         assert_eq!(t.shown(), "Logs");
         t.rename("");
         assert_eq!(t.shown(), "x");
+    }
+
+    // The note of a program that did not start
+
+    #[test]
+    fn a_start_failure_is_one_line_of_plain_text() {
+        assert_eq!(
+            start_failure_note("htop", "No such file"),
+            "[could not start htop: No such file]"
+        );
+        // Neither the program (any `-e` argument) nor the reason can act on
+        // the terminal that is fed the note: a title, a clear and a line
+        // break come out as spaces.
+        assert_eq!(
+            start_failure_note("\x1b]0;pwned\x07\nx", "a\x1b[2Jb\r\nc"),
+            "[could not start  ]0;pwned  x: a [2Jb  c]"
+        );
+        // What is not a control character stays as it is.
+        assert_eq!(
+            start_failure_note("ünï <b> & 'x'", "r"),
+            "[could not start ünï <b> & 'x': r]"
+        );
+    }
+
+    #[test]
+    fn the_start_failure_on_standard_error_is_plain_text_too() {
+        assert_eq!(
+            start_failure_log("htop", "No such file"),
+            "moniker: failed to start htop: No such file"
+        );
+        assert_eq!(
+            start_failure_log("\x1b]0;pwned\x07\nx", "a\x1b[2Jb\r\nc"),
+            "moniker: failed to start  ]0;pwned  x: a [2Jb  c"
+        );
     }
 
     // tab_title

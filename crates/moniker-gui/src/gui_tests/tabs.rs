@@ -947,6 +947,36 @@ pub(super) fn a_command_tab_closes_on_success_and_keeps_failures(bin: &Path, dir
     wait_for_text(&terminal, &format!("[could not start {missing}:"));
     assert_eq!(fx.tabs(), 1);
     fx.click_close(&terminal);
+    // A program name is as much text as the reason is: an escape sequence (a
+    // title, here) or a newline in it is shown as spaces, never reaches the
+    // terminal as what it is, and does not rename the tab.
+    let hostile = "\u{1b}]0;pwned\u{7}\nx";
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, command(&[hostile])),
+        None,
+    );
+    let page = fx.page_of(&terminal);
+    wait_for_text(&terminal, "[could not start  ]0;pwned  x: ");
+    pump_for(Duration::from_millis(200));
+    let lines = shown(&terminal);
+    assert_eq!(
+        lines.len(),
+        1,
+        "one line, no line break from the name: {lines:?}"
+    );
+    assert!(
+        lines[0].starts_with("[could not start  ]0;pwned  x: "),
+        "{lines:?}"
+    );
+    assert_ne!(terminal.window_title().as_deref(), Some("pwned"));
+    assert_eq!(
+        page.title(),
+        "]0;pwned  x",
+        "the name, cleaned, not the escape's title"
+    );
+    fx.click_close(&terminal);
     for argv in [&[""][..], &[][..]] {
         let terminal = open_local(
             &fx.view,
