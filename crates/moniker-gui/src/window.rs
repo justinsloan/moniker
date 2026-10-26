@@ -4,7 +4,8 @@
 //! list, [`crate::new_tab`], where a saved profile becomes a session in that
 //! tab), Sessions (the saved layouts of windows, to add back to this one, and
 //! saving this one: [`crate::sessions_menu`]; the Preferences can hide it),
-//! the selected tab's title, and ☰ (the app's actions, which `main.rs`
+//! the selected tab's title (after a record icon while that tab saves a
+//! transcript, `crate::panes`), and ☰ (the app's actions, which `main.rs`
 //! defines, under a zoom row for the selected tab's text size). There is no
 //! Connect button: connections come
 //! from the new-tab list and the Connection Profiles window.
@@ -79,6 +80,10 @@ pub(crate) const ZOOM_PERCENT_NAME: &str = "zoom-percent";
 /// The id the ☰ menu's zoom item has for the row that replaces it
 /// (`gtk::PopoverMenu::add_child`).
 const ZOOM_ITEM: &str = "zoom";
+
+/// Widget name of the record icon before the header bar's title, shown while
+/// the selected tab saves a transcript.
+pub(crate) const RECORDING_IMAGE_NAME: &str = "recording-indicator";
 
 /// A main window and the parts of it others work with.
 #[derive(Clone)]
@@ -209,8 +214,24 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
         menu.add_child(&zoom_row, ZOOM_ITEM);
     }
 
+    // The title, after the record icon while the tab in front saves a
+    // transcript (the tab bar, which shows it on the tab, is hidden while there
+    // is one tab).
     let title = adw::WindowTitle::new("Moniker", "");
-    let header = adw::HeaderBar::builder().title_widget(&title).build();
+    let recording = gtk::Image::builder()
+        .name(RECORDING_IMAGE_NAME)
+        .icon_name(panes::RECORDING_ICON)
+        .tooltip_text(panes::RECORDING_TOOLTIP)
+        .visible(false)
+        .build();
+    recording.update_property(&[gtk::accessible::Property::Label(panes::RECORDING_TOOLTIP)]);
+    let title_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    title_box.append(&recording);
+    title_box.append(&title);
+    let header = adw::HeaderBar::builder().title_widget(&title_box).build();
     header.pack_start(&new_tab);
     header.pack_end(&main_menu);
 
@@ -235,6 +256,14 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
         .chain_property::<adw::TabPage>("title");
     selected_title.bind(&title, "title", gtk::Widget::NONE);
     selected_title.bind(&window, "title", gtk::Widget::NONE);
+    // The record icon shows exactly while the selected tab has its indicator
+    // (`panes::show_titles` sets it only while a pane of the tab records).
+    view.property_expression_weak("selected-page")
+        .chain_property::<adw::TabPage>("indicator-icon")
+        .chain_closure::<bool>(glib::closure!(
+            |_: Option<glib::Object>, icon: Option<gio::Icon>| icon.is_some()
+        ))
+        .bind(&recording, "visible", gtk::Widget::NONE);
 
     // The size of the selected tab, as the zoom row shows it, and as the last
     // window to close saves it. Kept as it changes because a window whose last

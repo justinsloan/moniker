@@ -13,8 +13,9 @@
 //! and no keyring and kills nothing. Never run these tests any other way.
 //!
 //! The scenarios live in one file per area ([`tabs`], [`main_window`],
-//! [`windows`], [`save_transcripts`], [`preferences`], [`notifications`],
-//! [`sync`], [`profiles`], [`recordings`], [`sessions`]);
+//! [`windows`], [`save_transcripts`], [`transcript_indicator`],
+//! [`preferences`], [`notifications`], [`sync`], [`profiles`], [`recordings`],
+//! [`sessions`]);
 //! this file holds the test function that calls them, the helpers they
 //! share, and [`markup_is_shown_literally_everywhere`], the one scenario that
 //! spans the areas. The transcripts go to a temporary directory the tests pass
@@ -57,6 +58,7 @@ mod save_transcripts;
 mod sessions;
 mod sync;
 mod tabs;
+mod transcript_indicator;
 mod windows;
 
 /// A profile name (and tab title, sequence name ...) full of markup characters.
@@ -443,6 +445,11 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // The REC indicator of a tab that saves a transcript.
+    transcript_indicator::a_tab_saving_a_transcript_shows_rec(&bin, &tmp.path().join("rec-shows"));
+    transcript_indicator::rec_goes_when_the_transcript_is_written(&tmp.path().join("rec-goes"));
+    transcript_indicator::a_split_shows_rec_on_the_pane_that_saves(&tmp.path().join("rec-split"));
+    transcript_indicator::rec_is_not_part_of_the_name(&tmp.path().join("rec-name"));
     // Issue #12, the Sessions menu beside ＋.
     sessions::the_menu_with_no_sessions(&tmp.path().join("sm-none"));
     sessions::the_sessions_button_can_be_hidden(&tmp.path().join("sm-hidden"));
@@ -807,10 +814,12 @@ fn close_popover(popover: &gtk::Popover) {
 /// parses markup unless told not to.
 ///
 /// Surfaces: the new-tab list (row and the choices behind "›"), the tab (title,
-/// tooltip, as the tab bar draws it), the window title, a notification (and the
-/// toast of the Preferences dialog), the Sessions menu (a saved session's row, its
-/// rename field and the questions of delete and replace) and, from it, the note
-/// over the list of a restored pane whose profile is gone, the sync
+/// tooltip, as the tab bar draws it), the window title, the same two and a
+/// pane's header for a tab that saves a transcript (REC before the name), a
+/// notification (and the toast of the Preferences dialog), the Sessions menu (a
+/// saved session's row, its rename field and the questions of delete and
+/// replace) and, from it, the note over the list of a restored pane whose
+/// profile is gone, the sync
 /// page's profile choice, and in the Connection Profiles window the sidebar row, the page
 /// title, the key-file row, the sequence row, the Default sequence row (as chosen
 /// and in its open list) and the delete confirmation. The session runs a fake
@@ -893,6 +902,54 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         ),
         "the tooltip is markup for GTK"
     );
+
+    // A tab of the profile that saves a transcript shows REC before the name,
+    // as plain text, in the tab bar and the window title; in a split its pane's
+    // header shows the name as it is after the badge, and the tab's tooltip
+    // (markup) ends with the fixed line.
+    crate::settings::update(&ctx.settings_path, |s| {
+        s.transcripts_dir = Some(dir.join("transcripts"));
+    })
+    .expect("write the settings");
+    set_test_ssh_program(Some(fake_ssh(
+        bin,
+        "markup-rec",
+        "echo FAKE-END\nexec sleep 600",
+    )));
+    crate::terminal_tab::open_profile(&main.view, &ctx, &p, None, true);
+    let recording = main.view.selected_page().expect("the recording tab");
+    wait_for_text(&wait_for_session(&recording), "FAKE-END");
+    set_test_ssh_program(None);
+    let rec_title = format!("{}{MARKUP_NAME}", crate::panes::REC_PREFIX);
+    assert_eq!(recording.title(), rec_title);
+    pump_until("the tab bar to show the recording tab's title", || {
+        labels_in(&bar).iter().any(|l| l.label() == rec_title)
+    });
+    literal_labels("recording tab in the tab bar", &bar, &rec_title);
+    literal_labels("recording window title", &title, &rec_title);
+    WidgetExt::activate_action(&main.window, "win.split-right", None).expect("win.split-right");
+    let rec_layout = crate::panes::layout_of_page(&recording).expect("its layout");
+    let rec_pane = crate::panes::pane_of(&rec_layout.holders()[0]).expect("its first pane");
+    assert!(rec_pane.header().is_visible());
+    assert!(rec_pane.badge().is_visible());
+    literal_labels("recording pane header", rec_pane.header(), MARKUP_NAME);
+    assert_eq!(
+        recording.tooltip().as_deref(),
+        Some(
+            format!(
+                "{}\n{}\n{}",
+                glib::markup_escape_text(MARKUP_NAME),
+                crate::panes::NEW_PANE_TITLE,
+                crate::panes::RECORDING_TOOLTIP
+            )
+            .as_str()
+        ),
+        "the tooltip is markup for GTK"
+    );
+    main.view.close_page(&recording);
+    pump_until("the recording tab to close", || {
+        main.view.selected_page().as_ref() != Some(&recording)
+    });
 
     // A notification made of this text (an error message built from a name has
     // the same shape) is shown as it is.

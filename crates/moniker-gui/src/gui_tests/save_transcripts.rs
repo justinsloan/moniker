@@ -34,7 +34,7 @@ use crate::terminal_tab::{local_host_name, set_test_ssh_program, terminal_of};
 use crate::{connect_menu, new_tab, preferences, recordings, settings, window};
 
 /// Put `transcripts` and `save_all` into the settings file of `ctx`.
-fn configure(ctx: &AppContext, transcripts: &Path, save_all: bool) {
+pub(super) fn configure(ctx: &AppContext, transcripts: &Path, save_all: bool) {
     settings::update(&ctx.settings_path, |s| {
         s.transcripts_dir = Some(transcripts.to_path_buf());
         s.save_all_transcripts = save_all;
@@ -42,13 +42,16 @@ fn configure(ctx: &AppContext, transcripts: &Path, save_all: bool) {
     .expect("write the settings");
 }
 
-fn set_save_all(ctx: &AppContext, on: bool) {
+pub(super) fn set_save_all(ctx: &AppContext, on: bool) {
     settings::update(&ctx.settings_path, |s| s.save_all_transcripts = on)
         .expect("write the settings");
 }
 
 /// A new tab in `main` that shows the new-tab list.
-fn new_list(main: &window::MainWindow, ctx: &Rc<AppContext>) -> (adw::TabPage, gtk::ListBox) {
+pub(super) fn new_list(
+    main: &window::MainWindow,
+    ctx: &Rc<AppContext>,
+) -> (adw::TabPage, gtk::ListBox) {
     let page = new_tab::open(&main.view, ctx);
     pump_for(Duration::from_millis(200));
     let list = list_in(&page).expect("the new-tab list");
@@ -56,7 +59,7 @@ fn new_list(main: &window::MainWindow, ctx: &Rc<AppContext>) -> (adw::TabPage, g
 }
 
 /// A click (or Enter) on the row `name`.
-fn click(list: &gtk::ListBox, name: &str) {
+pub(super) fn click(list: &gtk::ListBox, name: &str) {
     list.emit_by_name::<()>("row-activated", &[&row(list, name)]);
 }
 
@@ -165,7 +168,11 @@ fn assert_transcript(file: &Path, needle: &str) {
 
 /// Connect to `id` with a plain click in a new tab of `main` and wait for the
 /// fake `ssh`'s output; returns the tab.
-fn connect_plainly(main: &window::MainWindow, ctx: &Rc<AppContext>, id: &str) -> adw::TabPage {
+pub(super) fn connect_plainly(
+    main: &window::MainWindow,
+    ctx: &Rc<AppContext>,
+    id: &str,
+) -> adw::TabPage {
     let (page, list) = new_list(main, ctx);
     click(&list, id);
     let terminal = wait_for_session(&page);

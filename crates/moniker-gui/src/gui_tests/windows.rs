@@ -749,7 +749,16 @@ pub(super) fn moved_recording_tab_writes_once_in_its_new_window(bin: &Path, dir:
         Some(&terminal),
         "the same session"
     );
-    assert_eq!(page.title(), "moved", "the same title");
+    assert_eq!(
+        terminal_tab::shown_title(&super::pane(&page)),
+        "moved",
+        "the same name"
+    );
+    assert_eq!(
+        page.title(),
+        format!("{}moved", crate::panes::REC_PREFIX),
+        "the same title, still saying it records"
+    );
     assert!(files_in(&out).is_empty(), "moving writes nothing");
 
     // A's window closing has nothing of it to write.

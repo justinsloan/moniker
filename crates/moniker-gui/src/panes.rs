@@ -11,6 +11,17 @@
 //! askpass marker), with a drop highlight over it. A tab with one pane looks as
 //! a tab always did: the header shows only while the tab has two panes or more.
 //!
+//! # REC
+//!
+//! A pane whose session saves a transcript (`PaneHolder::recording`, from the
+//! moment it starts recording until its transcript is written) has a REC badge
+//! on its header, and its tab shows libadwaita's indicator (the record icon at
+//! its start), REC before its title and a last line in its tooltip
+//! ([`show_titles`]), while any of its panes records. REC is for display only:
+//! never part of a pane's name. It is in the text's own color, never red (a
+//! red mark is a host that does not answer), and changes only when a session
+//! starts or stops recording.
+//!
 //! # Focus
 //!
 //! The pane that had the keyboard focus last is the tab's focused pane
@@ -90,6 +101,24 @@ pub(crate) const FOCUS_CHANGED: &str = "focus-changed";
 
 /// Title of a pane that shows the new-tab list, made by [`split`].
 pub(crate) const NEW_PANE_TITLE: &str = "New Pane";
+
+/// The icon of a session that saves a transcript: on its tab (libadwaita's
+/// indicator), in the header bar for the tab in front (`crate::window`) and on
+/// its pane's header in a split. Adwaita's own, drawn in the color of the text
+/// beside it, never red: a red mark is a host that does not answer
+/// (`crate::hosts`).
+pub(crate) const RECORDING_ICON: &str = "media-record-symbolic";
+
+/// What the record icon says, as its tooltip and to a screen reader, and as
+/// the last line of a recording tab's tooltip.
+pub(crate) const RECORDING_TOOLTIP: &str = "Saving a transcript";
+
+/// What a recording tab's title starts with, before the focused pane's title
+/// ([`tab_page_title`]).
+pub(crate) const REC_PREFIX: &str = "REC  ";
+
+/// The word on a recording pane's header, before its title.
+const REC_LABEL: &str = "REC";
 
 /// The action group each pane has for itself (`pane.`): what its header menu,
 /// its close button and its terminal's right-click menu do to that pane.
@@ -235,6 +264,7 @@ mod pane {
         pub struct Pane {
             pub(super) holder: OnceCell<PaneHolder>,
             pub(super) header: OnceCell<gtk::Box>,
+            pub(super) badge: OnceCell<gtk::Box>,
             pub(super) title: OnceCell<gtk::Label>,
             pub(super) zone: OnceCell<gtk::Box>,
             pub(super) actions: OnceCell<gio::SimpleActionGroup>,
@@ -265,6 +295,7 @@ mod pane {
         pub(super) fn new(
             holder: &PaneHolder,
             header: &gtk::Box,
+            badge: &gtk::Box,
             title: &gtk::Label,
             zone: &gtk::Box,
         ) -> Pane {
@@ -272,6 +303,7 @@ mod pane {
             let imp = pane.imp();
             let _ = imp.holder.set(holder.clone());
             let _ = imp.header.set(header.clone());
+            let _ = imp.badge.set(badge.clone());
             let _ = imp.title.set(title.clone());
             let _ = imp.zone.set(zone.clone());
             pane
@@ -285,6 +317,12 @@ mod pane {
         /// The header (title, menu, close button).
         pub(crate) fn header(&self) -> &gtk::Box {
             self.imp().header.get().expect("set when made")
+        }
+
+        /// The header's REC badge (the record icon and "REC"), before the
+        /// title, shown while the pane saves a transcript.
+        pub(crate) fn badge(&self) -> &gtk::Box {
+            self.imp().badge.get().expect("set when made")
         }
 
         /// The title in the header.
@@ -405,9 +443,10 @@ pub(crate) fn new_layout(holder: &PaneHolder) -> TabLayout {
 }
 
 /// Show what the panes of `layout` are called, which one has the focus and
-/// what can be done now: the headers (only with two panes or more), the title
-/// and tooltip of the tab and the window's actions; and tell those who follow
-/// the focused pane ([`FOCUS_CHANGED`]).
+/// what can be done now: the headers (only with two panes or more, each with
+/// its REC badge while its pane saves a transcript), the title, tooltip and
+/// indicator of the tab ([`show_titles`]) and the window's actions; and tell
+/// those who follow the focused pane ([`FOCUS_CHANGED`]).
 pub(crate) fn refresh(layout: &TabLayout) {
     let panes = layout.panes();
     let several = panes.len() > 1;
@@ -415,13 +454,17 @@ pub(crate) fn refresh(layout: &TabLayout) {
     for pane in &panes {
         let header = pane.header();
         header.set_visible(several);
+        pane.badge().set_visible(pane.holder().recording().get());
         let is_focused = focused.as_ref() == Some(pane.holder());
+        // The badge is dimmed with the title: in the title's own color.
         if is_focused {
             header.add_css_class(FOCUSED_CLASS);
             pane.title().remove_css_class("dim-label");
+            pane.badge().remove_css_class("dim-label");
         } else {
             header.remove_css_class(FOCUSED_CLASS);
             pane.title().add_css_class("dim-label");
+            pane.badge().add_css_class("dim-label");
         }
         pane.title()
             .set_text(&terminal_tab::shown_title(pane.holder()));
@@ -468,8 +511,33 @@ pub(crate) fn in_front(holder: &PaneHolder) -> bool {
             .is_none_or(|window| crate::notify::visible_dialog(&window).is_none())
 }
 
+/// What a tab is titled when its focused pane is called `title`: that, after
+/// [`REC_PREFIX`] while the tab saves a transcript (`recording`). For display
+/// only: the pane keeps its plain name (`terminal_tab::TabTitle`), which is
+/// what renaming starts from, what the tooltip lists and what a saved session
+/// records. Plain text in, plain text out: nothing is escaped.
+pub(crate) fn tab_page_title(title: &str, recording: bool) -> String {
+    if recording {
+        format!("{REC_PREFIX}{title}")
+    } else {
+        title.to_owned()
+    }
+}
+
 /// Title `page` after the focused pane and list every pane's title in its
 /// tooltip, which GTK reads as markup: each title is escaped.
+///
+/// While any pane of the tab saves a transcript, the tab says so three ways:
+/// libadwaita's indicator at its start shows [`RECORDING_ICON`] (not
+/// activatable, so not a button), the title starts with [`REC_PREFIX`]
+/// ([`tab_page_title`]), and the tooltip ends with the line
+/// [`RECORDING_TOOLTIP`]. That line is there because libadwaita 1.9 makes an
+/// indicator that cannot be activated untargetable, so its own tooltip never
+/// shows: the pointer over the icon finds the tab and its tooltip. The
+/// indicator's tooltip is set all the same, for libadwaita to give its button
+/// (a screen reader may read it). The icon is set only when it comes or goes,
+/// so the header bar's icon, which follows it (`crate::window`), hears of it
+/// only then.
 fn show_titles(page: &adw::TabPage, panes: &[Pane], focused: Option<&PaneHolder>) {
     let titles: Vec<String> = panes
         .iter()
@@ -479,19 +547,52 @@ fn show_titles(page: &adw::TabPage, panes: &[Pane], focused: Option<&PaneHolder>
         .map(terminal_tab::shown_title)
         .or_else(|| titles.first().cloned())
         .unwrap_or_default();
-    page.set_title(&title);
-    let tooltip: Vec<String> = titles
+    let recording = panes.iter().any(|pane| pane.holder().recording().get());
+    page.set_title(&tab_page_title(&title, recording));
+    let mut tooltip: Vec<String> = titles
         .iter()
         .map(|t| glib::markup_escape_text(t).to_string())
         .collect();
+    if recording {
+        // Fixed text with nothing in it that markup would read.
+        tooltip.push(RECORDING_TOOLTIP.to_owned());
+    }
     page.set_tooltip(&tooltip.join("\n"));
+    if page.indicator_icon().is_some() != recording {
+        page.set_indicator_icon(
+            recording
+                .then(|| gio::ThemedIcon::new(RECORDING_ICON))
+                .as_ref(),
+        );
+    }
+    if page.indicator_tooltip() != RECORDING_TOOLTIP {
+        page.set_indicator_tooltip(RECORDING_TOOLTIP);
+    }
 }
 
-/// The pane widget for `holder`: header (title, menu, close button) over the
-/// holder, with the drop highlight over it; its `pane.` actions, the drag
-/// source on the header and the drop target on the pane.
+/// The pane widget for `holder`: header (REC badge, title, menu, close button)
+/// over the holder, with the drop highlight over it; its `pane.` actions, the
+/// drag source on the header and the drop target on the pane. The badge shows
+/// while the pane saves a transcript ([`refresh`]); it is fixed text, not
+/// clickable, with the tooltip and accessible label [`RECORDING_TOOLTIP`].
 fn build_pane(holder: &PaneHolder) -> Pane {
     add_css();
+    let badge_icon = gtk::Image::from_icon_name(RECORDING_ICON);
+    badge_icon.update_property(&[gtk::accessible::Property::Label(RECORDING_TOOLTIP)]);
+    let badge_label = gtk::Label::builder()
+        .label(REC_LABEL)
+        .use_markup(false)
+        .build();
+    let badge = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(4)
+        .margin_end(6)
+        .valign(gtk::Align::Center)
+        .tooltip_text(RECORDING_TOOLTIP)
+        .visible(false)
+        .build();
+    badge.append(&badge_icon);
+    badge.append(&badge_label);
     let title = gtk::Label::builder()
         .hexpand(true)
         .xalign(0.0)
@@ -518,6 +619,7 @@ fn build_pane(holder: &PaneHolder) -> Pane {
         .css_classes([HEADER_CLASS])
         .visible(false)
         .build();
+    header.append(&badge);
     header.append(&title);
     header.append(&menu);
     header.append(&close);
@@ -534,7 +636,7 @@ fn build_pane(holder: &PaneHolder) -> Pane {
         .build();
     overlay.add_overlay(&zone);
 
-    let pane = Pane::new(holder, &header, &title, &zone);
+    let pane = Pane::new(holder, &header, &badge, &title, &zone);
     pane.set_orientation(gtk::Orientation::Vertical);
     pane.set_hexpand(true);
     pane.set_vexpand(true);
@@ -2169,5 +2271,15 @@ mod tests {
         ] {
             assert_eq!(neighbor(one[0], &one, direction), None);
         }
+    }
+
+    #[test]
+    fn the_rec_prefix_is_for_display_only() {
+        assert_eq!(tab_page_title("db", true), "REC  db");
+        assert_eq!(tab_page_title("db", false), "db");
+        assert_eq!(tab_page_title("", true), "REC  ");
+        // The title is plain text: nothing is escaped or added around it.
+        assert_eq!(tab_page_title("<b>x</b>", true), "REC  <b>x</b>");
+        assert_eq!(tab_page_title("<b>x</b>", false), "<b>x</b>");
     }
 }

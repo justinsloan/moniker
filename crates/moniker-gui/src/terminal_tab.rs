@@ -112,6 +112,11 @@
 //! chooses another folder in the Preferences: then every session still open is
 //! pointed at the new folder before the old one's transcripts move there
 //! ([`save_open_transcripts_to`]).
+//! While a session records, its pane says so ([`PaneHolder::recording`]): its
+//! tab shows a record icon and REC before its name, as do the header bar for
+//! the tab in front and the pane's header in a split (`crate::panes`,
+//! `crate::window`), from the moment it starts recording until its transcript
+//! is written. REC is never part of the name.
 //! Only text VTE holds is recorded: full-screen programs on the alternate
 //! screen (htop, vim) leave nothing in it, and closing a tab while one is
 //! showing records that screen instead of the scrollback. The text is never
@@ -415,6 +420,8 @@ mod holder {
             pub(super) scale: Cell<f64>,
             /// What the pane shows.
             pub(super) kind: RefCell<PaneKind>,
+            /// The pane's session saves a transcript that is not written yet.
+            pub(super) recording: Cell<bool>,
         }
 
         impl Default for PaneHolder {
@@ -425,6 +432,7 @@ mod holder {
                     child_gone: Cell::new(false),
                     scale: Cell::new(zoom::DEFAULT),
                     kind: RefCell::new(PaneKind::Empty),
+                    recording: Cell::new(false),
                 }
             }
         }
@@ -483,6 +491,14 @@ mod holder {
         pub(crate) fn kind(&self) -> &RefCell<PaneKind> {
             &self.imp().kind
         }
+
+        /// Whether the pane's session saves a transcript: true from the moment
+        /// it starts recording (`start_recording`) until its transcript is
+        /// written (`Session::write_transcript_once`). Its header and tab show
+        /// REC meanwhile (`crate::panes`).
+        pub(crate) fn recording(&self) -> &Cell<bool> {
+            &self.imp().recording
+        }
     }
 }
 
@@ -504,8 +520,8 @@ pub(crate) fn shown_title(holder: &PaneHolder) -> String {
 
 /// Apply the [`TabTitle`] of `holder` to its pane's header, and to its tab
 /// (which is titled after its focused pane, and lists every pane's title in
-/// its tooltip). The tooltip is markup for GTK, so titles are escaped there: a
-/// name with `<b>` in it stays literal.
+/// its tooltip), with REC while it saves a transcript. The tooltip is markup
+/// for GTK, so titles are escaped there: a name with `<b>` in it stays literal.
 fn refresh_title(holder: &PaneHolder) {
     if let Some(layout) = panes::layout_of(holder) {
         panes::refresh(&layout);
@@ -961,6 +977,8 @@ impl Session {
         let spec = self.spec.borrow().clone();
         let path = transcript_path(&spec.dir, &spec.host, self.started_secs);
         let result = write_transcript(&path, &text);
+        // Written (or tried): the pane no longer says it saves one.
+        show_recording(&terminal, false);
         if let Some(message) = transcript_notice(&result) {
             spec.notice.show_near(&terminal, &message);
         }
@@ -969,7 +987,8 @@ impl Session {
 
 /// Make `terminal`'s session a recording one if it has a `transcript` spec: the
 /// terminal keeps unlimited scrollback and the returned [`Session`] writes its
-/// text once (module docs). `None` leaves the terminal as it is.
+/// text once (module docs), and its pane shows REC until then
+/// ([`show_recording`]). `None` leaves the terminal as it is.
 fn start_recording(terminal: &Terminal, transcript: Option<TranscriptSpec>) -> Option<Rc<Session>> {
     transcript.map(|spec| {
         terminal.set_scrollback_lines(-1);
@@ -980,8 +999,22 @@ fn start_recording(terminal: &Terminal, transcript: Option<TranscriptSpec>) -> O
             written: Cell::new(false),
         });
         register(&session);
+        show_recording(terminal, true);
         session
     })
+}
+
+/// Say whether the session in `terminal` saves a transcript (`on`) on the
+/// pane whose holder shows it, and so on its header and tab
+/// ([`PaneHolder::recording`], `crate::panes`). A terminal no longer in a
+/// holder is left alone; one whose holder is in no tab only keeps the flag.
+/// Called twice per recording session, when it starts and when its transcript
+/// is written: nothing per frame.
+fn show_recording(terminal: &Terminal, on: bool) {
+    if let Some(holder) = terminal.parent().and_downcast::<PaneHolder>() {
+        holder.recording().set(on);
+        refresh_title(&holder);
+    }
 }
 
 /// Track `session` until it has written its transcript.
