@@ -100,6 +100,22 @@
 //! new protocol version. [`refuse`] lets `sync-serve` answer this way before
 //! it asks the keyring for the sync key.
 //!
+//! # Profiles kept on this machine (issue #10)
+//!
+//! A profile can be kept on this machine only ([`Profile::local_only`]). Then
+//! nothing about it leaves but its id and a stamp: both roles export it as
+//! its tombstone, stamped with its own `updated_at`, and never read its
+//! password for a sync. To the other machines that is an ordinary deletion,
+//! which removes their copy and its password (older versions understand it
+//! too). Nothing that arrives for the id changes the profile or its password
+//! here, in either role; when a peer had edited its copy after the profile was
+//! kept here, the local stamp is raised past that edit so that the next sync's
+//! tombstone wins (see `plan_apply`). Turning sync back on for the profile is
+//! an ordinary edit, stamped above every tombstone it sent, so the live
+//! profile and its password reach the others at the next sync. Whether a
+//! profile is kept is this machine's own choice: the flag is cleared on
+//! everything received. The HELLO and the bundle format are unchanged.
+//!
 //! # Passwords: set and changed travel, removal does not
 //!
 //! A password reaches the other machine by being set or changed. Clearing one
@@ -269,7 +285,8 @@ pub trait SyncTarget {
     }
     /// `Ok` if received data can be stored (the secret store is usable).
     fn ready(&self) -> Result<(), SyncError>;
-    /// Every profile, tombstones included, live ones with their passwords.
+    /// Every profile, tombstones included, live ones with their passwords; a
+    /// profile kept on this machine (issue #10) as its tombstone.
     fn export(&self) -> Result<Vec<BundleEntry>, SyncError>;
     /// Store the merged set. Entries are already validated by the protocol.
     fn apply(&mut self, merged: Vec<BundleEntry>) -> Result<SyncOutcome, SyncError>;
@@ -340,10 +357,13 @@ impl SyncTarget for LocalState {
     }
 
     /// Reads the profile file afresh (not the snapshot), so edits made since
-    /// the store was opened are included.
+    /// the store was opened are included. A profile kept on this machine goes
+    /// as its tombstone (`exported`), turned into one before any password is
+    /// looked up, so its password is not even read.
     fn export(&self) -> Result<Vec<BundleEntry>, SyncError> {
         let fresh = ProfileStore::open(self.store.path()).map_err(store_error)?;
-        with_passwords(&fresh.all(), &*self.secrets).map_err(secret_error)
+        let sent: Vec<Profile> = fresh.all().iter().map(exported).collect();
+        with_passwords(&sent, &*self.secrets).map_err(secret_error)
     }
 
     /// Merges `merged` into the profile file as it is now, under the store
@@ -352,7 +372,8 @@ impl SyncTarget for LocalState {
     ///
     /// Still under the lock, the secrets go first: the passwords of incoming
     /// winners are stored and the passwords of profiles this sync deletes are
-    /// removed, each previous value recorded in an undo log. Only then is the
+    /// removed (never that of a profile kept on this machine, see
+    /// `plan_apply`), each previous value recorded in an undo log. Only then is the
     /// profile file written. If a secret operation or the file write fails, the
     /// secrets are restored from the log (best effort) and the file is left as
     /// it was. Invariant: a profile version on disk implies its secret is
@@ -504,6 +525,32 @@ impl UndoLog {
 /// Every machine measures from the same deletion time, so one that still has
 /// the tombstone and sends it back does not make the others keep it again.
 /// `None`: nothing is forgotten.
+///
+/// # Profiles kept on this machine (issue #10)
+///
+/// A profile that is live and `local_only` in `local` is written back exactly
+/// as it is, whatever the merge chose for its id: a newer edit from a peer, a
+/// deletion, anything. No secret operation touches its password and nothing
+/// is counted. The peers only ever get its tombstone, stamped with its own
+/// `updated_at` (see `exported`), which deletes their copy because a
+/// tombstone wins a tie and the change that kept the profile here was an edit
+/// stamped above every version this machine had seen.
+///
+/// One thing changes: when the merge carries a newer version of the id
+/// (a peer edited its copy after this machine kept the profile, before it
+/// heard), the local `updated_at` is raised one past it. The next sync's
+/// tombstone then beats that edit, without trusting any clock; the deletion
+/// therefore wins on the sync after the one that saw the edit. The raise
+/// saturates: against a peer that pinned the profile at `i64::MAX` the stamp
+/// stays there, and the tombstone still wins the tie. A newer tombstone (a
+/// peer deleted its copy, or keeps it too) raises it as well, so the stamp is
+/// always above every version this machine has heard of: turning sync back
+/// on, an ordinary edit stamped above it, then beats those deletions too, not
+/// only the tombstones this machine sent, whatever the clocks say. Two
+/// machines that both keep the profile each keep their own copy; each sync
+/// between them raises one of the two stamps by one, and counts nothing.
+///
+/// The kept profile is live, so the pruning above never touches it.
 fn plan_apply(
     local: Vec<BundleEntry>,
     incoming: Vec<BundleEntry>,
@@ -520,6 +567,18 @@ fn plan_apply(
     let mut profiles = Vec::with_capacity(winners.len());
     for w in &winners {
         let prev = before.get(&w.profile.id);
+        if let Some(kept) = prev.filter(|p| p.profile.local_only && !p.profile.deleted) {
+            // Kept on this machine: left alone, password included, only
+            // raised past a newer version (see the docs above).
+            let mut profile = kept.profile.clone();
+            if w.profile.updated_at > profile.updated_at {
+                profile.updated_at = profile
+                    .updated_at
+                    .max(w.profile.updated_at.saturating_add(1));
+            }
+            profiles.push(profile);
+            continue;
+        }
         let was_live = prev.is_some_and(|p| !p.profile.deleted);
         if w.profile.deleted {
             // Only a profile this sync deletes has a secret to remove; older
@@ -563,8 +622,22 @@ fn plan_apply(
     (profiles, (outcome, ops))
 }
 
+/// What this machine sends for `p`: the profile itself, or for one kept on
+/// this machine (issue #10) its tombstone, stamped with the profile's own
+/// `updated_at`, which carries nothing but the id. See `plan_apply` for why
+/// that stamp makes the deletion win.
+fn exported(p: &Profile) -> Profile {
+    if p.local_only && !p.deleted {
+        p.tombstone(p.updated_at)
+    } else {
+        p.clone()
+    }
+}
+
 /// Entries for `profiles`: live ones with their stored password, tombstones
-/// without.
+/// without, and profiles kept on this machine without too. A sync never needs
+/// a kept profile's password (`plan_apply` neither sends nor changes it), so
+/// it is not read: not taken out of the keyring into this process at all.
 fn with_passwords(
     profiles: &[Profile],
     secrets: &dyn SecretStore,
@@ -572,7 +645,7 @@ fn with_passwords(
     profiles
         .iter()
         .map(|p| {
-            let password = if p.deleted {
+            let password = if p.deleted || p.local_only {
                 None
             } else {
                 secrets
@@ -795,15 +868,23 @@ fn seal_bundle(passphrase: &str, entries: &[BundleEntry]) -> Result<Vec<u8>, Syn
     Ok(sealed)
 }
 
+/// Open the peer's bundle. Whether a profile is kept on this machine is this
+/// machine's own choice, so `local_only` is cleared on every entry: a peer
+/// (an older version, a bug, a hostile one) cannot make this machine stop
+/// sending a profile and delete it from every other machine.
 fn open_bundle(passphrase: &str, sealed: &[u8]) -> Result<Vec<BundleEntry>, SyncError> {
-    crypto::open(passphrase, sealed).map_err(|e| match e {
+    let mut entries = crypto::open(passphrase, sealed).map_err(|e| match e {
         CryptoError::WrongKeyOrCorrupt => SyncError::WrongSyncKey,
         CryptoError::EmptyPassphrase => SyncError::EmptyPassphrase,
         CryptoError::BadFormat => {
             SyncError::Remote("the other machine sent data this version cannot read".to_string())
         }
         other => SyncError::Remote(other.to_string()),
-    })
+    })?;
+    for e in &mut entries {
+        e.profile.local_only = false;
+    }
+    Ok(entries)
 }
 
 /// The server's side of one sync (what `moniker-server sync-serve` runs on its
@@ -1311,13 +1392,16 @@ mod tests {
 
     // ----- fixtures -----
 
-    /// A memory secret store that counts writes (sets and deletes) and can be
-    /// told to fail one of them, shared with the test.
+    /// A memory secret store that counts writes (sets and deletes), records
+    /// the keys it was asked for, and can be told to fail one of the writes,
+    /// shared with the test.
     #[derive(Default)]
     struct Counted {
         inner: MemorySecretStore,
         writes: AtomicUsize,
         deletes: AtomicUsize,
+        /// Every key `get` was called with, in order.
+        reads: Mutex<Vec<String>>,
         /// The write number (1-based, counting all writes so far) that fails;
         /// 0 means none. Only that one write fails.
         fail_at: AtomicUsize,
@@ -1340,6 +1424,12 @@ mod tests {
         fn deletes(&self) -> usize {
             self.0.deletes.load(Ordering::SeqCst)
         }
+        /// Whether the password of `id` was asked for (by the code under
+        /// test: [`password`](Self::password) does not count).
+        fn was_read(&self, id: &str) -> bool {
+            let key = password_key(id);
+            self.0.reads.lock().unwrap().contains(&key)
+        }
         /// Make the `n`-th write from now fail (once).
         fn fail_nth_write(&self, n: usize) {
             self.0.fail_at.store(self.writes() + n, Ordering::SeqCst);
@@ -1357,6 +1447,7 @@ mod tests {
 
     impl SecretStore for Shared {
         fn get(&self, key: &str) -> Result<Option<zeroize::Zeroizing<String>>, SecretError> {
+            self.0.reads.lock().unwrap().push(key.to_owned());
             self.0.inner.get(key)
         }
         fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
@@ -2743,23 +2834,25 @@ mod tests {
         path: PathBuf,
         secrets: Shared,
         state: Option<LocalState>,
+        clock: Clock,
     }
 
     impl Machine {
         fn new(clock: &Clock, profiles: &[(Profile, Option<&str>)]) -> Machine {
             let side = side(profiles);
             let store = ProfileStore::open(&side.path).unwrap();
-            let clock = clock.clone();
+            let theirs = clock.clone();
             let state = LocalState::with_clock(
                 store,
                 Box::new(side.secrets.clone()),
-                Box::new(move || clock.now()),
+                Box::new(move || theirs.now()),
             );
             Machine {
                 _dir: side._dir,
                 path: side.path,
                 secrets: side.secrets,
                 state: Some(state),
+                clock: clock.clone(),
             }
         }
 
@@ -2791,6 +2884,43 @@ mod tests {
                 .unwrap()
                 .set_sync(false)
                 .unwrap();
+        }
+
+        /// The profile `id` in its profile file, tombstone or not.
+        fn profile(&self, id: &str) -> Option<Profile> {
+            ProfileStore::open(&self.path)
+                .unwrap()
+                .all()
+                .into_iter()
+                .find(|p| p.id == id)
+        }
+
+        /// Edit the profile `id` as the app does, through a store of its
+        /// own, stamped with the scenario's clock but never below one past
+        /// the stamp it replaces (as `store::next_stamp` does).
+        fn edit(&self, id: &str, change: impl FnOnce(&mut Profile)) {
+            let now = self.clock.now();
+            ProfileStore::open(&self.path)
+                .unwrap()
+                .update(|all| {
+                    let mut all = all.to_vec();
+                    let p = all.iter_mut().find(|p| p.id == id).unwrap();
+                    change(p);
+                    p.updated_at = now.max(p.updated_at.saturating_add(1));
+                    Ok((all, ()))
+                })
+                .unwrap();
+        }
+
+        /// Keep the profile `id` on this machine only (`on`), or sync it
+        /// again: an edit like any other.
+        fn keep_here(&self, id: &str, on: bool) {
+            self.edit(id, |p| p.local_only = on);
+        }
+
+        /// What it would send in a sync now.
+        fn export(&self) -> Vec<BundleEntry> {
+            self.state.as_ref().unwrap().export().unwrap()
         }
     }
 
@@ -3361,5 +3491,540 @@ mod tests {
             assert!(matches!(err, SyncError::SyncOff), "{err:?}");
         }
         assert!(!marker.exists(), "ssh must not be started");
+    }
+
+    // ----- profiles kept on this machine (issue #10) -----
+
+    /// A profile with every field a bundle could carry filled in, with text
+    /// found nowhere else in these scenarios, so a test can look for it.
+    fn full(name: &str) -> Profile {
+        let mut p = Profile::new(name, "kept.example.org", "carol");
+        p.port = 2222;
+        p.key_file = Some(PathBuf::from("/home/carol/.ssh/kept_key"));
+        p.sequences = vec![crate::profile::StartupSequence {
+            name: "kept update".to_string(),
+            commands: vec!["kept-command --now".to_string()],
+        }];
+        p.transcript = true;
+        p
+    }
+
+    /// Nothing of `p` but its id is in `sent`: not its name, host, user name,
+    /// port, key file, sequences or `password`, nor the flag that keeps it.
+    fn assert_nothing_of(sent: &[BundleEntry], p: &Profile, password: &str) {
+        let text = serde_json::to_string(sent).unwrap();
+        let port = format!("\"port\":{}", p.port);
+        let mut private = vec![
+            p.name.as_str(),
+            p.host.as_str(),
+            p.username.as_str(),
+            port.as_str(),
+            password,
+            "local_only",
+            "\"transcript\":true",
+        ];
+        let key_file = p.key_file.as_ref().map(|k| k.to_str().unwrap().to_owned());
+        private.extend(key_file.as_deref());
+        for seq in &p.sequences {
+            private.push(&seq.name);
+            private.extend(seq.commands.iter().map(String::as_str));
+        }
+        for s in private {
+            assert!(!text.contains(s), "{s:?} would leave the machine");
+        }
+    }
+
+    /// `kept` (as it was kept) is still in `m`'s profile file and keyring
+    /// exactly as it was, password included, and its password was never read.
+    fn assert_kept(m: &Machine, kept: &Profile, password: &str) {
+        assert_eq!(m.profile(&kept.id).as_ref(), Some(kept));
+        assert!(kept.local_only && !kept.deleted);
+        assert_eq!(m.secrets.password(&kept.id).as_deref(), Some(password));
+        assert!(!m.secrets.was_read(&kept.id), "its password was not read");
+    }
+
+    #[test]
+    fn a_profile_kept_here_leaves_as_a_bare_tombstone() {
+        let clock = Clock::starting_now();
+        let x = full("kept name");
+        let y = prof("synced");
+        let a = Machine::new(
+            &clock,
+            &[
+                (x.clone(), Some("kept-password")),
+                (y.clone(), Some("pw-y")),
+            ],
+        );
+        a.keep_here(&x.id, true);
+        let kept = a.profile(&x.id).unwrap();
+
+        let sent = a.export();
+        let gone = sent.iter().find(|e| e.profile.id == x.id).unwrap();
+        assert_eq!(gone.profile, x.tombstone(kept.updated_at));
+        assert!(gone.profile.deleted);
+        assert!(gone.profile.name.is_empty() && gone.profile.host.is_empty());
+        assert!(gone.profile.username.is_empty() && gone.profile.sequences.is_empty());
+        assert_eq!(gone.password, None);
+        assert_nothing_of(&sent, &x, "kept-password");
+        assert!(!a.secrets.was_read(&x.id), "its password is not even read");
+        // A profile that syncs leaves as before.
+        let other = sent.iter().find(|e| e.profile.id == y.id).unwrap();
+        assert_eq!(other.profile, y);
+        assert_eq!(other.password.as_deref(), Some("pw-y"));
+    }
+
+    #[test]
+    fn an_edit_of_a_kept_profile_still_leaves_bare() {
+        let clock = Clock::starting_now();
+        let x = full("kept name");
+        let a = Machine::new(&clock, &[(x.clone(), Some("kept-password"))]);
+        a.keep_here(&x.id, true);
+        let before = a.profile(&x.id).unwrap().updated_at;
+        a.edit(&x.id, |p| {
+            p.name = "renamed while kept".to_string();
+            p.port = 2200;
+        });
+        let edited = a.profile(&x.id).unwrap();
+        assert!(edited.updated_at > before && edited.local_only);
+
+        let sent = a.export();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].profile,
+            x.tombstone(edited.updated_at),
+            "at the new stamp"
+        );
+        assert_eq!(sent[0].password, None);
+        assert_nothing_of(&sent, &edited, "kept-password");
+        assert_nothing_of(&sent, &x, "kept-password");
+    }
+
+    #[test]
+    fn nothing_incoming_changes_a_kept_profile() {
+        let kept = Profile {
+            local_only: true,
+            ..prof_at("mine", 10)
+        };
+        let other = Profile {
+            name: "other".to_string(),
+            local_only: false,
+            updated_at: 20,
+            ..kept.clone()
+        };
+        let at = |updated_at| Profile {
+            updated_at,
+            ..kept.clone()
+        };
+        let (profiles, (outcome, ops)) = plan_apply(
+            vec![entry(&kept, Some("a"))],
+            vec![entry(&other, Some("b"))],
+            None,
+        );
+        assert_eq!(profiles, vec![at(21)], "only raised past the newer edit");
+        assert!(ops.is_empty());
+        assert_eq!(outcome, SyncOutcome::default());
+
+        // Nor a deletion, newer or as old; nor an older edit. A peer that
+        // pinned its stamp makes the raise saturate, and the tombstone this
+        // machine then sends still wins the tie.
+        let older = Profile {
+            updated_at: 5,
+            ..other.clone()
+        };
+        let pinned = Profile {
+            updated_at: i64::MAX,
+            ..other.clone()
+        };
+        let cases = [
+            (kept.tombstone(20), 21),
+            (kept.tombstone(10), 10),
+            (older, 10),
+            (pinned, i64::MAX),
+            (kept.tombstone(i64::MAX), i64::MAX),
+        ];
+        for (incoming, stamp) in cases {
+            let what = (incoming.deleted, incoming.updated_at);
+            let password = (!incoming.deleted).then_some("b");
+            let (profiles, (outcome, ops)) = plan_apply(
+                vec![entry(&kept, Some("a"))],
+                vec![entry(&incoming, password)],
+                Some(i64::MAX),
+            );
+            assert_eq!(profiles, vec![at(stamp)], "against {what:?}");
+            assert!(ops.is_empty(), "against {what:?}");
+            assert_eq!(outcome, SyncOutcome::default(), "against {what:?}");
+        }
+    }
+
+    #[test]
+    fn the_other_machine_deletes_its_copy_and_password() {
+        for kept_by_the_client in [true, false] {
+            let role = if kept_by_the_client {
+                "client"
+            } else {
+                "server"
+            };
+            let clock = Clock::starting_now();
+            let x = full("kept name");
+            let y = prof("synced");
+            let both = [
+                (x.clone(), Some("kept-password")),
+                (y.clone(), Some("pw-y")),
+            ];
+            let mut a = Machine::new(&clock, &both);
+            let mut b = Machine::new(&clock, &both);
+            a.keep_here(&x.id, true);
+            let kept = a.profile(&x.id).unwrap();
+            let a_file = file_of(&a.path);
+
+            for round in 1..=2 {
+                let (kept_out, other_out) = if kept_by_the_client {
+                    let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
+                    (out.unwrap(), served.unwrap())
+                } else {
+                    let (out, served) = sync_machines(&mut b, &mut a, StaleSync::Refuse);
+                    (served.unwrap(), out.unwrap())
+                };
+                let removed = usize::from(round == 1);
+                assert_eq!(kept_out, SyncOutcome::default(), "{role}, round {round}");
+                assert_eq!(other_out.removed, removed, "{role}, round {round}");
+                assert_eq!(
+                    b.profile(&x.id),
+                    Some(x.tombstone(kept.updated_at)),
+                    "{role}, round {round}"
+                );
+                assert_eq!(b.secrets.password(&x.id), None, "{role}, round {round}");
+                assert_eq!(b.profile(&y.id), Some(y.clone()));
+                assert_eq!(b.secrets.password(&y.id).as_deref(), Some("pw-y"));
+                assert_kept(&a, &kept, "kept-password");
+                assert_eq!(file_of(&a.path), a_file, "{role}, round {round}");
+                assert_eq!(a.secrets.writes(), 0, "{role}, round {round}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_partner_profile_itself_can_be_kept_here() {
+        // `a` syncs with `b` through its profile for `b`, which `b` has a
+        // copy of too, and keeps that profile to itself.
+        let clock = Clock::starting_now();
+        let partner = Profile::new("Machine B", "machine-b.example.org", "dana");
+        let mut a = Machine::new(&clock, &[(partner.clone(), Some("pw-b"))]);
+        let mut b = Machine::new(&clock, &[(partner.clone(), Some("pw-b"))]);
+        a.keep_here(&partner.id, true);
+        let kept = a.profile(&partner.id).unwrap();
+        for _ in 0..2 {
+            synced(&mut a, &mut b);
+            assert_eq!(
+                b.profile(&partner.id),
+                Some(partner.tombstone(kept.updated_at))
+            );
+            assert_eq!(b.secrets.password(&partner.id), None);
+            assert_kept(&a, &kept, "pw-b");
+        }
+        // The next sync still connects with it.
+        let store = ProfileStore::open(&a.path).unwrap();
+        let cmd = crate::ssh::sync_command(
+            store.get(&partner.id).unwrap(),
+            Path::new("/usr/bin/moniker-askpass"),
+            true,
+            "moniker-server",
+        );
+        assert!(cmd.args.iter().any(|a| a == "dana@machine-b.example.org"));
+    }
+
+    #[test]
+    fn a_newer_edit_elsewhere_loses_on_the_second_sync() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        a.keep_here(&x.id, true);
+        let kept = a.profile(&x.id).unwrap();
+        // `b` has not heard yet and edits its copy, password included.
+        clock.set(start + 60_000);
+        b.edit(&x.id, |p| p.name = "edited on b".to_string());
+        b.secrets.0.inner.set(&password_key(&x.id), "pw-b").unwrap();
+        let edit = b.profile(&x.id).unwrap();
+        assert!(edit.updated_at > kept.updated_at);
+
+        // The first sync sees the newer edit: `b` keeps it, and `a` only
+        // raises its stamp past it, counting nothing.
+        let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
+        assert_eq!(out.unwrap(), SyncOutcome::default());
+        served.unwrap();
+        assert_eq!(b.profile(&x.id), Some(edit.clone()));
+        assert_eq!(b.secrets.password(&x.id).as_deref(), Some("pw-b"));
+        let raised = Profile {
+            updated_at: edit.updated_at + 1,
+            ..kept.clone()
+        };
+        assert_kept(&a, &raised, "pw");
+        // The second deletes it there.
+        let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
+        assert_eq!(out.unwrap(), SyncOutcome::default());
+        assert_eq!(served.unwrap().removed, 1);
+        assert_eq!(b.profile(&x.id), Some(x.tombstone(raised.updated_at)));
+        assert_eq!(b.secrets.password(&x.id), None);
+        assert_kept(&a, &raised, "pw");
+    }
+
+    #[test]
+    fn a_chain_carries_the_deletion() {
+        let clock = Clock::starting_now();
+        let x = prof("x");
+        let all = [(x.clone(), Some("pw"))];
+        let mut a = Machine::new(&clock, &all);
+        let mut b = Machine::new(&clock, &all);
+        let mut c = Machine::new(&clock, &all);
+        a.keep_here(&x.id, true);
+        let kept = a.profile(&x.id).unwrap();
+        synced(&mut a, &mut b);
+        synced(&mut b, &mut c);
+        for m in [&b, &c] {
+            assert_eq!(m.profile(&x.id), Some(x.tombstone(kept.updated_at)));
+            assert_eq!(m.secrets.password(&x.id), None);
+        }
+        assert_kept(&a, &kept, "pw");
+    }
+
+    #[test]
+    fn syncing_it_again_brings_it_back_everywhere() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let all = [(x.clone(), Some("pw"))];
+        let mut a = Machine::new(&clock, &all);
+        let mut b = Machine::new(&clock, &all);
+        let mut c = Machine::new(&clock, &all);
+        a.keep_here(&x.id, true);
+        // A password changed while it is kept stays here too.
+        a.secrets.0.inner.set(&password_key(&x.id), "pw-a").unwrap();
+        synced(&mut a, &mut b);
+        synced(&mut b, &mut c);
+        for m in [&b, &c] {
+            assert_eq!(m.profile(&x.id).map(|p| p.deleted), Some(true));
+            assert_eq!(m.secrets.password(&x.id), None);
+        }
+
+        clock.set(start + DAY_MS);
+        a.keep_here(&x.id, false);
+        let back = a.profile(&x.id).unwrap();
+        assert!(!back.local_only);
+        for day in 1..=3 {
+            clock.set(start + day * DAY_MS);
+            synced(&mut a, &mut b);
+            synced(&mut b, &mut c);
+            for m in [&a, &b, &c] {
+                assert_eq!(m.profile(&x.id), Some(back.clone()), "day {day}");
+                assert_eq!(m.secrets.password(&x.id).as_deref(), Some("pw-a"));
+            }
+        }
+    }
+
+    #[test]
+    fn syncing_it_again_wins_with_the_clock_set_back() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        a.keep_here(&x.id, true);
+        synced(&mut a, &mut b);
+        let deletion = b.profile(&x.id).unwrap();
+        assert!(deletion.deleted);
+
+        clock.set(start - DAY_MS);
+        a.keep_here(&x.id, false);
+        let back = a.profile(&x.id).unwrap();
+        assert!(
+            back.updated_at > deletion.updated_at,
+            "above every tombstone sent"
+        );
+        let rounds = [
+            (true, start - DAY_MS),
+            (false, start),
+            (true, start + DAY_MS),
+        ];
+        for (a_is_the_client, at) in rounds {
+            clock.set(at);
+            if a_is_the_client {
+                synced(&mut a, &mut b);
+            } else {
+                synced(&mut b, &mut a);
+            }
+            for m in [&a, &b] {
+                assert_eq!(m.profile(&x.id), Some(back.clone()));
+                assert_eq!(m.secrets.password(&x.id).as_deref(), Some("pw"));
+            }
+        }
+    }
+
+    #[test]
+    fn syncing_it_again_beats_a_deletion_made_elsewhere_too() {
+        // `b` deletes its copy after `a` kept the profile, with a clock that
+        // runs a day ahead. `a` has heard of that deletion, so syncing the
+        // profile again from `a` wins over it, with `a`'s clock behind.
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        a.keep_here(&x.id, true);
+        clock.set(start + DAY_MS);
+        b.secrets.0.inner.delete(&password_key(&x.id)).unwrap();
+        b.edit(&x.id, |p| p.deleted = true);
+        let deletion = b.profile(&x.id).unwrap();
+        assert!(deletion.deleted);
+        synced(&mut a, &mut b);
+
+        clock.set(start);
+        a.keep_here(&x.id, false);
+        let back = a.profile(&x.id).unwrap();
+        assert!(back.updated_at > deletion.updated_at);
+        for _ in 0..2 {
+            synced(&mut a, &mut b);
+            for m in [&a, &b] {
+                assert_eq!(m.profile(&x.id), Some(back.clone()));
+                assert_eq!(m.secrets.password(&x.id).as_deref(), Some("pw"));
+            }
+        }
+    }
+
+    #[test]
+    fn two_keepers_keep_their_own() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw-a"))]);
+        let mut b = Machine::new(&clock, &[(x.clone(), Some("pw-b"))]);
+        a.keep_here(&x.id, true);
+        clock.set(start + 60_000);
+        b.edit(&x.id, |p| {
+            p.local_only = true;
+            p.name = "b's own".to_string();
+        });
+        for round in 1..=2 {
+            let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
+            assert_eq!(out.unwrap(), SyncOutcome::default(), "round {round}");
+            assert_eq!(served.unwrap(), SyncOutcome::default(), "round {round}");
+            for (m, name, password) in [(&a, "x", "pw-a"), (&b, "b's own", "pw-b")] {
+                let p = m.profile(&x.id).unwrap();
+                assert!(p.local_only && !p.deleted, "round {round}");
+                assert_eq!(p.name, name);
+                assert_eq!(m.secrets.password(&x.id).as_deref(), Some(password));
+                assert!(!m.secrets.was_read(&x.id));
+                assert_eq!(m.secrets.writes(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn when_one_keeper_syncs_again_the_other_keeps_it_alone() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw-a"))]);
+        let mut b = Machine::new(&clock, &[(x.clone(), Some("pw-b"))]);
+        a.keep_here(&x.id, true);
+        b.keep_here(&x.id, true);
+        clock.set(start + 60_000);
+        a.keep_here(&x.id, false);
+
+        // `a`'s copy reaches `b`, which keeps its own and raises its stamp;
+        // then `b`'s deletion reaches `a`.
+        let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
+        assert_eq!(out.unwrap(), SyncOutcome::default());
+        assert_eq!(served.unwrap(), SyncOutcome::default());
+        assert!(!a.profile(&x.id).unwrap().deleted, "not yet");
+        let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
+        assert_eq!(out.unwrap().removed, 1, "counted as any deletion");
+        assert_eq!(served.unwrap(), SyncOutcome::default());
+        for _ in 0..2 {
+            assert_eq!(a.profile(&x.id).map(|p| p.deleted), Some(true));
+            assert_eq!(a.secrets.password(&x.id), None);
+            let kept = b.profile(&x.id).unwrap();
+            assert!(kept.local_only && !kept.deleted);
+            assert_eq!(b.secrets.password(&x.id).as_deref(), Some("pw-b"));
+            assert_eq!(b.secrets.writes(), 0, "nothing of `a`'s was stored");
+            synced(&mut b, &mut a);
+        }
+    }
+
+    #[test]
+    fn a_peer_cannot_mark_a_profile_kept_here() {
+        let marked = Profile {
+            local_only: true,
+            ..prof("marked by the peer")
+        };
+        let sealed = seal_bundle(PASS, &[entry(&marked, Some("pw"))]).unwrap();
+        let opened = open_bundle(PASS, &sealed).unwrap();
+        assert_eq!(opened.len(), 1);
+        assert_eq!(
+            opened[0].profile,
+            Profile {
+                local_only: false,
+                ..marked.clone()
+            }
+        );
+        assert_eq!(opened[0].password.as_deref(), Some("pw"));
+
+        // As a client: from a server that sends one.
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[]);
+        let peer = Stub {
+            entries: vec![entry(&marked, Some("pw"))],
+            ..Stub::default()
+        };
+        let (cs, ss) = pair();
+        let served = spawn_server(ss, peer, PASS);
+        run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse).unwrap();
+        drop(cs);
+        served.join().unwrap().0.unwrap();
+        assert!(!a.profile(&marked.id).unwrap().local_only, "as a client");
+
+        // As a server: from a client that sends one.
+        let mut b = Machine::new(&clock, &[]);
+        let (cs, ss) = pair();
+        cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let served = spawn_server(ss, b.state.take().unwrap(), PASS);
+        write_frame(&mut &cs, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
+        assert_eq!(read_frame(&mut &cs).unwrap().0, KIND_HELLO);
+        write_frame(&mut &cs, KIND_BUNDLE, &sealed).unwrap();
+        assert_eq!(read_frame(&mut &cs).unwrap().0, KIND_BUNDLE);
+        drop(cs);
+        let (served, back) = served.join().unwrap();
+        served.unwrap();
+        b.state = Some(back);
+        assert!(!b.profile(&marked.id).unwrap().local_only, "as a server");
+    }
+
+    #[test]
+    fn forgetting_on_the_peer_does_not_bounce() {
+        // `b` forgets the deletion a year after it was made (issue #8); `a`
+        // sends it again at every sync, and `b` does not take it back.
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[(x.clone(), Some("pw"))]);
+        a.keep_here(&x.id, true);
+        let kept = a.profile(&x.id).unwrap();
+        let a_file = file_of(&a.path);
+        let deletion = Some(x.tombstone(kept.updated_at));
+        for day in [0, 100, 200, 300, 365, 366, 367, 500, 600, 730] {
+            clock.set(start + day * DAY_MS);
+            if day % 2 == 0 {
+                synced(&mut a, &mut b);
+            } else {
+                synced(&mut b, &mut a);
+            }
+            let held = if day <= 365 { deletion.clone() } else { None };
+            assert_eq!(b.profile(&x.id), held, "day {day}");
+            assert_eq!(b.secrets.password(&x.id), None, "day {day}");
+            assert_kept(&a, &kept, "pw");
+            assert_eq!(file_of(&a.path), a_file, "day {day}");
+        }
     }
 }
