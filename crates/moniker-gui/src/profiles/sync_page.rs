@@ -1,6 +1,17 @@
 //! The sync page: the content pane of the Connection Profiles window when the sidebar's
-//! Sync entry is chosen. Set the sync key, pick the other machine's profile,
-//! turn automatic sync on or off, and sync.
+//! Sync entry is chosen. Turn sync on or off, set the sync key, pick the other
+//! machine's profile, turn automatic sync on or off, and sync.
+//!
+//! The first group is the switch for sync as a whole (issue #10), which lives
+//! in the profile file where the core and `moniker-server` read it. Turning it
+//! off is saved at once and asks nothing; turning it on asks first
+//! ([`ask_to_turn_sync_on`]), because the profiles that sync, those added while
+//! it was off included, then go to the other machines with their passwords. The
+//! save runs on the keyring worker like every write of the profile file
+//! ([`keyring::write_profiles`]), and the row follows the file afterwards and
+//! whenever anyone else changes it. While it is off, Sync Automatically and the
+//! Sync button are off and the hint says why; the key and the other machine can
+//! still be chosen, as they send nothing.
 //!
 //! The logic and the worker thread are in [`crate::sync`]; this file is the
 //! widgets. The page starts its syncs with [`sync::begin_app_sync`], like Sync
@@ -10,7 +21,7 @@
 //!
 //! The first sync that succeeds from here records its profile as the sync
 //! partner in the GUI settings ([`sync::record_partner`]), which offers Sync
-//! Now and turns on the sync on launch (unless the switch here is off). The
+//! Now and turns on the sync on launch (unless Sync Automatically is off). The
 //! first sync is always started by hand, so a mistyped key or a wrong host is
 //! seen on this page rather than as a notification at launch.
 //!
@@ -58,6 +69,14 @@ pub(crate) fn auto_sync_with(name: &str) -> String {
     format!("Sync with {name} each time Moniker starts.")
 }
 
+/// What the "Turn Sync On?" alert says: every profile that syncs goes out with
+/// its stored password, including any added while sync was off, and the way to
+/// keep one here is to turn off its own switch first.
+const TURN_ON_BODY: &str = "At the next sync, every profile on this machine that syncs, \
+    including any added while sync was off, will be copied to your other machines with its \
+    stored password. To keep a profile on this machine only, cancel and turn off \"Sync to \
+    other machines\" on its page first.";
+
 /// The page's widgets and state. The Connection Profiles window holds it while the page
 /// is shown; everything else holds it weakly, so it goes when the page does.
 pub(crate) struct SyncPage {
@@ -66,6 +85,8 @@ pub(crate) struct SyncPage {
     key_entry: adw::PasswordEntryRow,
     key_status: gtk::Label,
     key_message: gtk::Label,
+    /// Sync as a whole (issue #10), first on the page.
+    sync_switch: adw::SwitchRow,
     /// The other machine's profile; its subtitle says where it connects.
     machine: adw::ComboRow,
     auto_sync: adw::SwitchRow,
@@ -78,13 +99,23 @@ pub(crate) struct SyncPage {
     key_set: Cell<bool>,
     /// The keyring has said whether a key is stored, once.
     key_known: Cell<bool>,
-    /// The switch is being set to what the settings file says, not by the
-    /// person.
+    /// A switch is being set to what a file says, not by the person.
     loading: Cell<bool>,
+    /// Saves of `sync_switch` that have not come back. While any is out the row
+    /// shows what the person asked for, not what the file still says.
+    switch_saves: Cell<u32>,
 }
 
 impl SyncPage {
     pub(crate) fn new(ctx: &Rc<AppContext>) -> Rc<SyncPage> {
+        // Its subtitle and state are set from the file by `refresh_sync_switch`.
+        let sync_switch = adw::SwitchRow::builder()
+            .title("Sync")
+            .use_markup(false)
+            .build();
+        let switch_group = adw::PreferencesGroup::builder().title("Sync").build();
+        switch_group.add(&sync_switch);
+
         let key_entry = adw::PasswordEntryRow::builder()
             .title(sync::KEY_PLACEHOLDER)
             .show_apply_button(true)
@@ -152,6 +183,7 @@ impl SyncPage {
         sync_group.add(&actions);
 
         let widget = adw::PreferencesPage::new();
+        widget.add(&switch_group);
         widget.add(&key_group);
         widget.add(&machine_group);
         widget.add(&sync_group);
@@ -162,6 +194,7 @@ impl SyncPage {
             key_entry,
             key_status,
             key_message,
+            sync_switch,
             machine,
             auto_sync,
             hint,
@@ -171,11 +204,13 @@ impl SyncPage {
             key_set: Cell::new(false),
             key_known: Cell::new(false),
             loading: Cell::new(false),
+            switch_saves: Cell::new(0),
         });
         page.wire();
         page.refresh_key_status();
         page.refresh_targets();
         page.refresh_auto_sync();
+        page.refresh_sync_switch();
         // A sync started elsewhere (Sync Now, on launch) may be running.
         if ctx.sync_running.get() {
             page.show_result(sync::SYNCING, false);
@@ -187,6 +222,15 @@ impl SyncPage {
     /// handler holds the page weakly.
     fn wire(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
+        self.sync_switch.connect_active_notify(glib::clone!(
+            #[strong]
+            weak,
+            move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.sync_switch_changed();
+                }
+            }
+        ));
         self.key_entry.connect_apply(glib::clone!(
             #[strong]
             weak,
@@ -232,6 +276,7 @@ impl SyncPage {
                     if let Some(page) = weak.upgrade() {
                         page.refresh_targets();
                         page.refresh_auto_sync();
+                        page.refresh_sync_switch();
                     }
                 }
             ),
@@ -362,24 +407,109 @@ impl SyncPage {
         }
     }
 
+    /// Set the sync switch, and its subtitle, to what the profile file says (as
+    /// the context last read it). A switch that could not be read shows off and
+    /// says so. Left alone while a save of the row is out: the row shows what
+    /// the person asked for until the file has it.
+    fn refresh_sync_switch(&self) {
+        if self.switch_saves.get() > 0 {
+            return;
+        }
+        let switch = self.ctx.store.borrow().sync_switch();
+        self.sync_switch.set_subtitle(sync::switch_subtitle(switch));
+        self.loading.set(true);
+        self.sync_switch.set_active(switch.is_on());
+        self.loading.set(false);
+    }
+
+    /// The person flipped the sync switch. Off is saved at once: it only stops
+    /// data leaving. On asks first ([`ask_to_turn_sync_on`]); Cancel, or closing
+    /// the alert, puts the row back to what the file says.
+    fn sync_switch_changed(self: &Rc<Self>) {
+        if self.loading.get() {
+            return;
+        }
+        if !self.sync_switch.is_active() {
+            self.save_sync_switch(false);
+            return;
+        }
+        let (go, cancel) = (Rc::downgrade(self), Rc::downgrade(self));
+        ask_to_turn_sync_on(
+            &self.sync_switch,
+            move || {
+                if let Some(page) = go.upgrade() {
+                    page.save_sync_switch(true);
+                }
+            },
+            move || {
+                if let Some(page) = cancel.upgrade() {
+                    page.refresh_sync_switch();
+                }
+            },
+        );
+    }
+
+    /// Save the switch in the profile file on the keyring worker (the main
+    /// thread never writes it: a sync can hold the file's lock at the keyring).
+    /// The row shows `on` meanwhile. When the save is back, a failure is told
+    /// near the page, or in a window if the page has gone, and everything
+    /// showing the switch re-reads the file, so the row ends up as the file has
+    /// it whether the save worked or not.
+    fn save_sync_switch(self: &Rc<Self>, on: bool) {
+        self.switch_saves.set(self.switch_saves.get() + 1);
+        self.loading.set(true);
+        self.sync_switch.set_active(on);
+        self.loading.set(false);
+        let weak = Rc::downgrade(self);
+        let ctx = Rc::clone(&self.ctx);
+        keyring::write_profiles(
+            &self.ctx,
+            move |store| {
+                store
+                    .borrow_mut()
+                    .set_sync(on)
+                    .map_err(|err| format!("Could not save the sync setting: {err}"))
+            },
+            move |saved| {
+                if let Some(page) = weak.upgrade() {
+                    page.switch_saves.set(page.switch_saves.get() - 1);
+                    if let Err(message) = &saved {
+                        ctx.notice.show_near(&page.widget, message);
+                    }
+                } else if let Err(message) = &saved {
+                    ctx.notice.show(message);
+                }
+                ctx.profiles_changed();
+            },
+        );
+    }
+
     /// Enable or disable the controls and show why Sync is unavailable. Until
     /// the keyring has said whether a key is stored, nothing is promised: no
-    /// hint, and Sync waits; it waits too while a new key is being saved.
+    /// hint, and Sync waits; it waits too while a new key is being saved. A
+    /// switch that is off is the exception: the hint says so whatever the
+    /// keyring has said, since the file already does.
     fn refresh_controls(&self) {
         let profiles = self.ids.borrow().len();
         let known = self.key_known.get();
+        let key_set = self.key_set.get();
         // The switch is in the profile file, which the context keeps current.
         let sync_on = self.ctx.store.borrow().sync_switch().is_on();
-        let hint = known
-            .then(|| sync::sync_hint(sync_on, self.key_set.get(), profiles))
+        let hint = (known || !sync_on)
+            .then(|| sync::sync_hint(sync_on, key_set, profiles))
             .flatten();
         self.hint.set_label(hint.unwrap_or(""));
         self.hint.set_visible(hint.is_some());
-        let ready = known && hint.is_none() && self.key_entry.is_sensitive();
+        // Whether everything else is in place for a sync, as if it were on.
+        let set_up = known
+            && sync::sync_hint(true, key_set, profiles).is_none()
+            && self.key_entry.is_sensitive();
         let idle = !self.ctx.sync_running.get();
-        // The whole "Other machine" part waits for what the hint asks for.
-        self.machine.set_sensitive(idle && ready);
-        self.sync_button.set_sensitive(idle && ready);
+        // The whole "Other machine" part waits for what the hint asks for. It
+        // does not wait for the switch: choosing sends nothing.
+        self.machine.set_sensitive(idle && set_up);
+        self.sync_button.set_sensitive(idle && set_up && sync_on);
+        self.auto_sync.set_sensitive(sync_on);
     }
 
     /// Any sync of the app started or ended.
@@ -544,6 +674,30 @@ pub(crate) fn ask_to_sync_anyway(near: &impl IsA<gtk::Widget>, why: &str, go: im
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
     dialog.connect_response(Some("sync"), move |_, _| go());
+    dialog.present(Some(near));
+}
+
+/// Before turning sync back on (issue #10), over `near`: say what the next sync
+/// sends, and ask. `go` runs on Turn Sync On, `cancel` on Cancel and when the
+/// alert is closed. All text is plain.
+pub(crate) fn ask_to_turn_sync_on(
+    near: &impl IsA<gtk::Widget>,
+    go: impl Fn() + 'static,
+    cancel: impl Fn() + 'static,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Turn Sync On?")
+        .heading_use_markup(false)
+        .body(TURN_ON_BODY)
+        .body_use_markup(false)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("on", "Turn Sync On");
+    dialog.set_response_appearance("on", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(Some("on"), move |_, _| go());
+    dialog.connect_response(Some("cancel"), move |_, _| cancel());
     dialog.present(Some(near));
 }
 

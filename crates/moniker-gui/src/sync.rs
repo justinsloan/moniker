@@ -40,7 +40,7 @@ use moniker_core::secrets::{
     SYNC_PASSPHRASE_KEY, SecretStore, check_sync_passphrase, password_key,
 };
 use moniker_core::ssh::{SERVER_PROGRAM, SshCommand, sync_command};
-use moniker_core::store::ProfileStore;
+use moniker_core::store::{ProfileStore, SyncSwitch};
 use moniker_core::sync::{
     LocalState, SshTerminal, StaleSync, SyncError, SyncOutcome, sync_over_ssh,
 };
@@ -148,6 +148,18 @@ pub(crate) fn sync_hint(sync_on: bool, key_set: bool, profiles: usize) -> Option
         Some("Add a profile for the other machine first (+ above the list of profiles).")
     } else {
         None
+    }
+}
+
+/// What the sync page's switch row says under its title, for what the profile
+/// file says (issue #10). Both unavailable states read as off: a switch nobody
+/// could read stops every sync, as the core treats it, and turning sync on is
+/// what replaces it.
+pub(crate) fn switch_subtitle(switch: SyncSwitch) -> &'static str {
+    match switch {
+        SyncSwitch::On => "Send and accept profiles from your other machines",
+        SyncSwitch::Off => "Off: nothing is sent to or accepted from other machines",
+        SyncSwitch::Unreadable => "Off: the setting could not be read. Turn sync on to replace it.",
     }
 }
 
@@ -736,6 +748,23 @@ mod tests {
         assert_eq!(sync_hint(false, false, 0), Some(SYNC_IS_OFF));
         assert_eq!(sync_hint(true, false, 3), Some(NO_SYNC_KEY));
         assert_eq!(SYNC_IS_OFF, "Sync is turned off on this machine.");
+    }
+
+    #[test]
+    fn the_switch_row_says_what_each_state_means() {
+        assert_eq!(
+            switch_subtitle(SyncSwitch::On),
+            "Send and accept profiles from your other machines"
+        );
+        assert_eq!(
+            switch_subtitle(SyncSwitch::Off),
+            "Off: nothing is sent to or accepted from other machines"
+        );
+        // A switch nobody could read counts as off, and says how to mend it.
+        assert_eq!(
+            switch_subtitle(SyncSwitch::Unreadable),
+            "Off: the setting could not be read. Turn sync on to replace it."
+        );
     }
 
     #[test]

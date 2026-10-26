@@ -19,7 +19,7 @@ use moniker_core::profile::Profile;
 use moniker_core::secrets::{
     MemorySecretStore, SYNC_PASSPHRASE_KEY, SecretError, SecretStore, password_key,
 };
-use moniker_core::store::ProfileStore;
+use moniker_core::store::{ProfileStore, SyncSwitch};
 use moniker_core::sync::{StaleSync, SyncError, SyncOutcome};
 use zeroize::Zeroizing;
 
@@ -154,11 +154,21 @@ struct Page {
     key_entry: adw::PasswordEntryRow,
     key_status: gtk::Label,
     key_message: gtk::Label,
+    /// The page's own switch for sync (issue #10), first on the page.
+    sync_switch: adw::SwitchRow,
     machine: adw::ComboRow,
     auto_sync: adw::SwitchRow,
     hint: gtk::Label,
     sync_button: gtk::Button,
     result: gtk::Label,
+}
+
+/// The switch row titled `title` on the sync page (there are two).
+fn switch_titled(root: &impl IsA<gtk::Widget>, title: &str) -> adw::SwitchRow {
+    all_widgets::<adw::SwitchRow>(root)
+        .into_iter()
+        .find(|row| row.title() == title)
+        .unwrap_or_else(|| panic!("no switch titled {title}"))
 }
 
 /// The label below `root` whose widget name is `name`.
@@ -175,8 +185,9 @@ fn page_in(window: &adw::Window) -> Page {
         key_entry: find_widget(&widget).expect("the key field"),
         key_status: named_label(&widget, sync_page::KEY_STATUS_NAME),
         key_message: named_label(&widget, sync_page::KEY_MESSAGE_NAME),
+        sync_switch: switch_titled(&widget, "Sync"),
         machine: find_widget(&widget).expect("the profile choice"),
-        auto_sync: find_widget(&widget).expect("the switch"),
+        auto_sync: switch_titled(&widget, "Sync Automatically"),
         hint: named_label(&widget, sync_page::HINT_NAME),
         sync_button: button_labeled(&widget, "Sync").expect("the Sync button"),
         result: named_label(&widget, sync_page::RESULT_NAME),
@@ -1225,6 +1236,268 @@ pub(super) fn sync_off_grays_out_sync_now_and_skips_launch(dir: &Path) {
     close_all(&app);
 }
 
+/// What the profile file says about the sync switch, read through a handle of
+/// its own (not the context's snapshot, which follows the file only after a
+/// reload).
+fn switch_on_disk(ctx: &AppContext) -> SyncSwitch {
+    ProfileStore::open(ctx.store.borrow().path())
+        .expect("open the store")
+        .sync_switch()
+}
+
+/// The body of the "Turn Sync On?" alert.
+const TURN_ON_BODY: &str = "At the next sync, every profile on this machine that syncs, \
+    including any added while sync was off, will be copied to your other machines with its \
+    stored password. To keep a profile on this machine only, cancel and turn off \"Sync to \
+    other machines\" on its page first.";
+
+/// Issue #10: the sync page's own switch. Turning it off is saved at once and
+/// asks nothing; Sync Automatically and Sync go gray (the choice of the other
+/// machine stays: choosing sends nothing) and the hint says why. Turning it on
+/// asks first: Cancel, or closing the alert, puts the switch back; Turn Sync On
+/// saves.
+pub(super) fn the_sync_page_turns_sync_off_and_asks_to_turn_it_on(dir: &Path) {
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    let (ctx, page, window) = (&rig.ctx, &rig.page, &rig.window);
+
+    // The first group of the page; on to begin with (a file that records
+    // nothing means on).
+    let groups = all_widgets::<adw::PreferencesGroup>(&page.widget);
+    assert_eq!(groups[0].title(), "Sync", "first on the page");
+    assert_eq!(page.sync_switch.title(), "Sync");
+    assert!(!page.sync_switch.uses_markup());
+    assert!(page.sync_switch.is_active());
+    assert_eq!(
+        page.sync_switch.subtitle().as_deref(),
+        Some(sync::switch_subtitle(SyncSwitch::On))
+    );
+    assert!(page.sync_button.is_sensitive());
+    assert!(page.auto_sync.is_sensitive());
+    assert!(!page.hint.is_visible());
+
+    // Off: saved at once, no question.
+    page.sync_switch.set_active(false);
+    pump_until("the file to say off", || {
+        switch_on_disk(ctx) == SyncSwitch::Off
+    });
+    pump_until("the page to follow the file", || {
+        !page.sync_button.is_sensitive()
+    });
+    assert!(
+        all_widgets::<adw::AlertDialog>(window).is_empty(),
+        "no alert"
+    );
+    assert_eq!(ctx.store.borrow().sync_switch(), SyncSwitch::Off);
+    assert!(!page.sync_switch.is_active());
+    assert_eq!(
+        page.sync_switch.subtitle().as_deref(),
+        Some(sync::switch_subtitle(SyncSwitch::Off))
+    );
+    assert!(!page.auto_sync.is_sensitive(), "Sync Automatically is off");
+    assert!(page.hint.is_visible());
+    assert_eq!(page.hint.label(), sync::SYNC_IS_OFF);
+    assert!(
+        page.machine.is_sensitive() && page.key_entry.is_sensitive(),
+        "the key and the other machine can still be chosen"
+    );
+
+    // On: asks first. Nothing is written yet.
+    page.sync_switch.set_active(true);
+    let alert = alert_in(window);
+    assert_eq!(alert.heading().as_deref(), Some("Turn Sync On?"));
+    assert!(!alert.is_heading_use_markup());
+    assert_eq!(alert.body().as_str(), TURN_ON_BODY);
+    assert!(
+        alert
+            .body()
+            .contains("including any added while sync was off")
+    );
+    assert!(alert.body().contains("on its page first"));
+    assert!(!alert.is_body_use_markup());
+    assert_eq!(alert.default_response().as_deref(), Some("cancel"));
+    assert_eq!(alert.close_response().as_str(), "cancel");
+    assert_eq!(alert.response_label("cancel").as_str(), "Cancel");
+    assert_eq!(alert.response_label("on").as_str(), "Turn Sync On");
+    assert_eq!(
+        alert.response_appearance("on"),
+        adw::ResponseAppearance::Suggested
+    );
+    pump_for(Duration::from_millis(300));
+    assert_eq!(switch_on_disk(ctx), SyncSwitch::Off);
+
+    // Cancel: the switch goes back, nothing is written.
+    button_labeled(&alert, "Cancel")
+        .expect("the Cancel button")
+        .emit_clicked();
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(window).is_empty()
+    });
+    assert!(!page.sync_switch.is_active(), "back to off");
+    assert_eq!(switch_on_disk(ctx), SyncSwitch::Off);
+    assert!(!page.sync_button.is_sensitive());
+
+    // Closing the alert (Escape) is Cancel.
+    page.sync_switch.set_active(true);
+    let alert = alert_in(window);
+    alert.close();
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(window).is_empty()
+    });
+    assert!(!page.sync_switch.is_active(), "back to off");
+    assert_eq!(switch_on_disk(ctx), SyncSwitch::Off);
+
+    // Turn Sync On: saved, and everything comes back.
+    page.sync_switch.set_active(true);
+    let alert = alert_in(window);
+    button_labeled(&alert, "Turn Sync On")
+        .expect("the Turn Sync On button")
+        .emit_clicked();
+    pump_until("the file to say on", || {
+        switch_on_disk(ctx) == SyncSwitch::On
+    });
+    pump_until("the page to follow the file", || {
+        page.sync_button.is_sensitive()
+    });
+    assert!(page.sync_switch.is_active());
+    assert_eq!(
+        page.sync_switch.subtitle().as_deref(),
+        Some(sync::switch_subtitle(SyncSwitch::On))
+    );
+    assert!(page.auto_sync.is_sensitive());
+    assert!(!page.hint.is_visible());
+    assert_eq!(ctx.store.borrow().sync_switch(), SyncSwitch::On);
+    rig.finish();
+}
+
+/// A switch changed by `moniker-server sync-switch` or another Moniker (the
+/// file watch tells the page) is followed by the page, by Sync Now and by the
+/// page's controls.
+pub(super) fn the_sync_page_follows_a_switch_changed_elsewhere(dir: &Path) {
+    let (ctx, _secrets, profile) = sync_ctx(dir, true, Some(SYNC_KEY));
+    set_partner(&ctx, &profile.expect("a profile"), true);
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
+    ctx.watch_profile_file();
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
+    assert!(page.sync_switch.is_active());
+    assert!(sync_now_enabled(&app));
+    let path = ctx.store.borrow().path().to_path_buf();
+
+    // Another handle writes the file; nobody calls `profiles_changed`.
+    ProfileStore::open(&path).unwrap().set_sync(false).unwrap();
+    pump_until("the page to follow the file", || {
+        !page.sync_switch.is_active() && !sync_now_enabled(&app)
+    });
+    assert!(sync_now_exists(&app), "Sync Now stays, grayed out");
+    assert_eq!(
+        page.sync_switch.subtitle().as_deref(),
+        Some(sync::switch_subtitle(SyncSwitch::Off))
+    );
+    assert_eq!(page.hint.label(), sync::SYNC_IS_OFF);
+    assert!(!page.sync_button.is_sensitive());
+    assert!(!page.auto_sync.is_sensitive());
+
+    // And back on (no question: someone else asked it).
+    ProfileStore::open(&path).unwrap().set_sync(true).unwrap();
+    pump_until("the page to follow the file", || {
+        page.sync_switch.is_active() && sync_now_enabled(&app)
+    });
+    assert!(all_widgets::<adw::AlertDialog>(&window).is_empty());
+    assert!(page.sync_button.is_sensitive());
+    assert!(page.auto_sync.is_sensitive());
+    assert!(!page.hint.is_visible());
+    drop(page);
+    close_all(&app);
+}
+
+/// A switch that is recorded but cannot be read counts as off and says so;
+/// turning sync on replaces it (and only then is the file touched).
+pub(super) fn a_damaged_switch_shows_off_and_says_so(dir: &Path) {
+    const DAMAGED: &str = r#"{"version":2,"profiles":[]}"#;
+    fs::create_dir_all(dir).expect("dir");
+    fs::write(dir.join("profiles.json"), DAMAGED).expect("write the file");
+    let rig = sync_rig(dir, false, Some(SYNC_KEY));
+    let (ctx, page, window) = (&rig.ctx, &rig.page, &rig.window);
+    assert_eq!(ctx.store.borrow().sync_switch(), SyncSwitch::Unreadable);
+    assert!(!page.sync_switch.is_active());
+    assert_eq!(
+        page.sync_switch.subtitle().as_deref(),
+        Some(sync::switch_subtitle(SyncSwitch::Unreadable))
+    );
+    assert_eq!(page.hint.label(), sync::SYNC_IS_OFF);
+    assert!(!page.auto_sync.is_sensitive());
+    assert!(!page.sync_button.is_sensitive());
+    let file = dir.join("profiles.json");
+    assert_eq!(fs::read_to_string(&file).unwrap(), DAMAGED, "untouched");
+
+    page.sync_switch.set_active(true);
+    let alert = alert_in(window);
+    button_labeled(&alert, "Turn Sync On")
+        .expect("the Turn Sync On button")
+        .emit_clicked();
+    pump_until("the file to say on", || {
+        switch_on_disk(ctx) == SyncSwitch::On
+    });
+    pump_until("the page to follow the file", || {
+        page.sync_switch.subtitle().as_deref() == Some(sync::switch_subtitle(SyncSwitch::On))
+    });
+    assert!(page.sync_switch.is_active());
+    assert!(page.auto_sync.is_sensitive());
+    // On, so the hint is about what else is missing: no profile to sync with.
+    assert!(page.hint.is_visible());
+    assert_ne!(page.hint.label(), sync::SYNC_IS_OFF);
+    rig.finish();
+}
+
+/// A save that fails is told near the page, and the switch goes back to what
+/// the file says, whichever way it was flipped.
+pub(super) fn a_switch_that_cannot_be_saved_goes_back_and_says_so(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    let (ctx, page, window) = (&rig.ctx, &rig.page, &rig.window);
+    // The file cannot be replaced (its folder is read-only): every save fails.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("chmod");
+
+    page.sync_switch.set_active(false);
+    pump_until("the failure to be told", || ctx.notice.delivered() > 0);
+    assert!(
+        ctx.notice
+            .last_text()
+            .is_some_and(|text| text.starts_with("Could not save the sync setting")),
+        "{:?}",
+        ctx.notice.last_text()
+    );
+    pump_until("the switch to go back", || page.sync_switch.is_active());
+    assert!(page.sync_button.is_sensitive(), "still on");
+    assert!(page.auto_sync.is_sensitive());
+
+    // The same turning it on (the file says off): after the question.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+    ProfileStore::open(ctx.store.borrow().path())
+        .unwrap()
+        .set_sync(false)
+        .unwrap();
+    ctx.profiles_changed();
+    assert!(!page.sync_switch.is_active());
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("chmod");
+    let told = ctx.notice.delivered();
+    page.sync_switch.set_active(true);
+    let alert = alert_in(window);
+    button_labeled(&alert, "Turn Sync On")
+        .expect("the Turn Sync On button")
+        .emit_clicked();
+    pump_until("the failure to be told", || ctx.notice.delivered() > told);
+    pump_until("the switch to go back", || !page.sync_switch.is_active());
+    assert!(!page.sync_button.is_sensitive(), "still off");
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+    assert_eq!(switch_on_disk(ctx), SyncSwitch::Off);
+    rig.finish();
+}
+
 pub(super) fn switch_off_stops_auto_sync(dir: &Path) {
     let (ctx, _secrets, profile) = sync_ctx(dir, true, Some(SYNC_KEY));
     let profile = profile.expect("a profile");
@@ -1511,6 +1784,74 @@ pub(super) fn the_sync_page_waits_for_the_keyring(dir: &Path) {
         page.key_message.label() == "Sync key saved."
     });
     pump_until("Sync to be on again", || page.sync_button.is_sensitive());
+    window.destroy();
+    pump_for(Duration::from_millis(100));
+}
+
+/// The switch is in the profile file, not the keyring: with the keyring held
+/// (its unlock prompt open), a page whose switch is off already says so, and a
+/// switch the person turns on shows what they asked for, even if something
+/// re-reads the file, until the save (queued behind the keyring on the one
+/// worker) is back.
+pub(super) fn the_sync_switch_does_not_wait_for_the_keyring(dir: &Path) {
+    fs::create_dir_all(dir).expect("dir");
+    let mut store = ProfileStore::open(&dir.join("profiles.json")).expect("open the store");
+    store
+        .upsert(Profile::new(NAME, "app.example.test", "alice"))
+        .expect("save the profile");
+    store.set_sync(false).expect("turn sync off");
+    let seeded = Arc::new(MemorySecretStore::default());
+    seeded
+        .set(SYNC_PASSPHRASE_KEY, SYNC_KEY)
+        .expect("set the key");
+    let keyring = Arc::new(HeldKeyring::new(seeded));
+    let ctx = Rc::new(AppContext::with_parts(
+        store,
+        Arc::clone(&keyring) as Arc<dyn SecretStore>,
+        make_helper(dir),
+    ));
+    let app = test_app();
+
+    keyring.hold();
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    assert_eq!(page.key_status.label(), sync::KEY_CHECKING);
+    assert!(page.hint.is_visible(), "the hint does not wait");
+    assert_eq!(page.hint.label(), sync::SYNC_IS_OFF);
+    assert!(!page.sync_switch.is_active());
+    assert!(!page.auto_sync.is_sensitive());
+    assert!(!page.sync_button.is_sensitive());
+
+    page.sync_switch.set_active(true);
+    let alert = alert_in(&window);
+    // Something re-reads the file while the question is up: the row snaps to
+    // what the file says, and Turn Sync On shows the answer again.
+    ctx.profiles_changed();
+    assert!(!page.sync_switch.is_active());
+    button_labeled(&alert, "Turn Sync On")
+        .expect("the Turn Sync On button")
+        .emit_clicked();
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(&window).is_empty()
+    });
+    // The save waits behind the keyring; the file still says off.
+    assert!(page.sync_switch.is_active(), "shows the answer at once");
+    ctx.profiles_changed();
+    assert_eq!(switch_on_disk(&ctx), SyncSwitch::Off);
+    assert!(
+        page.sync_switch.is_active(),
+        "what was asked for, meanwhile"
+    );
+    keyring.release();
+    pump_until("the file to say on", || {
+        switch_on_disk(&ctx) == SyncSwitch::On
+    });
+    pump_until("the page to be ready", || {
+        page.key_status.label() == "Sync key: set" && page.sync_button.is_sensitive()
+    });
+    assert!(page.sync_switch.is_active());
+    assert!(!page.hint.is_visible());
+    drop(page);
     window.destroy();
     pump_for(Duration::from_millis(100));
 }

@@ -374,6 +374,11 @@ fn gui_integration() {
 
     // Issue #10, sync turned off.
     sync::sync_off_grays_out_sync_now_and_skips_launch(&tmp.path().join("s-off"));
+    sync::the_sync_page_turns_sync_off_and_asks_to_turn_it_on(&tmp.path().join("s-sw-ask"));
+    sync::the_sync_page_follows_a_switch_changed_elsewhere(&tmp.path().join("s-sw-else"));
+    sync::a_damaged_switch_shows_off_and_says_so(&tmp.path().join("s-sw-damaged"));
+    sync::a_switch_that_cannot_be_saved_goes_back_and_says_so(&tmp.path().join("s-sw-fail"));
+    sync::the_sync_switch_does_not_wait_for_the_keyring(&tmp.path().join("s-sw-held"));
     // Issue #6, the panes of a tab.
     panes::splitting_puts_a_new_pane_beside_the_focused_one(&bin, &tmp.path().join("s-split"));
     panes::the_tab_follows_its_focused_pane(&bin, &tmp.path().join("s-focus"));
