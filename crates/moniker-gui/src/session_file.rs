@@ -15,19 +15,24 @@
 //! makes no sense is skipped and costs the others nothing; a file that is not
 //! JSON, is of another version or is not a list of sessions is
 //! [`Loaded::Unreadable`] and is never written over unless the caller says so.
-//! A skipped entry is not kept: the next write leaves it out.
+//! A skipped entry is kept: every write puts it back as it was (as a JSON
+//! value), in its place, so saving one session never destroys one the person
+//! might fix by hand or a newer Moniker might understand. It is not a session,
+//! so its name does not block another session's.
 //!
-//! The reading limits keep a damaged or hand-made file harmless: a tab nests at
-//! most [`MAX_SPLIT_DEPTH`] splits deep and holds at most [`MAX_PANES`] panes
-//! (work stops at the first pane or split past either), and serde_json itself
-//! refuses a file nested past its own limit before any of this runs.
+//! The reading limits keep a damaged or hand-made file harmless: a session has
+//! at most [`MAX_TABS`] tabs, a tab nests at most [`MAX_SPLIT_DEPTH`] splits
+//! deep and holds at most [`MAX_PANES`] panes (work stops at the first pane or
+//! split past either), a file larger than [`MAX_FILE_BYTES`] is not read (and
+//! none is written), and serde_json itself refuses a file nested past its own
+//! limit before any of this runs.
 //!
 //! This module is pure: no GTK, no display. Every write reads the file again
 //! first, so a session saved meanwhile (from another window) is kept.
 
 use std::collections::HashSet;
-use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
@@ -48,6 +53,10 @@ const VERSION: u64 = 1;
 const MAX_SPLIT_DEPTH: usize = 16;
 /// The most panes in a tab; a tab with more is skipped.
 const MAX_PANES: usize = 32;
+/// The most tabs in a session; a session with more is skipped.
+const MAX_TABS: usize = 64;
+/// The largest file read (and written): 4 MiB.
+const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// The longest profile id kept, in characters (a canonical id has 36).
 const MAX_ID_CHARS: usize = 64;
 /// The longest session name, in characters ([`check_name`]).
@@ -141,12 +150,21 @@ pub(crate) enum Loaded {
     Unreadable(String),
 }
 
-/// The saved sessions at `path`.
+/// The saved sessions at `path`: the entries of the file that make sense. (An
+/// entry that does not is skipped here, but the writes below keep it.)
 // Used first by the sessions menu (task 5).
 #[allow(dead_code)]
 pub(crate) fn load(path: &Path) -> Loaded {
     match read(path) {
-        Ok(sessions) => Loaded::Sessions(sessions),
+        Ok(entries) => Loaded::Sessions(
+            entries
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    Entry::Session(session) => Some(session),
+                    Entry::Skipped(_) => None,
+                })
+                .collect(),
+        ),
         Err(why) => Loaded::Unreadable(why),
     }
 }
@@ -171,36 +189,36 @@ pub(crate) fn check_name(raw: &str) -> Result<String, &'static str> {
 
 /// Save `session` in the file at `path`: read the file again, replace the
 /// session of the same name (keeping its place) or add this one at the end,
-/// and write the file.
+/// and write the file. The entries the reader skips are written back as they
+/// were.
 ///
 /// A file that cannot be read is an error and is left as it is, unless
 /// `replace_unreadable` says the person was told and chose to start over: then
 /// the file is replaced by one holding only `session`. A session that reading
-/// would skip (a name that fails [`check_name`], too many panes or splits, an
-/// id that is too long) is an error too, so what is saved is always found
-/// again.
+/// would skip is an error too, whose text is a plain sentence ("a tab holds
+/// more than 32 panes"; it fits after "Could not save the session: "), so what
+/// is saved is always found again. So is one that would make the file larger
+/// than 4 MiB.
 // Used first by the sessions menu (task 5).
 #[allow(dead_code)]
 pub(crate) fn put(path: &Path, session: Session, replace_unreadable: bool) -> io::Result<()> {
-    if !is_storable(&session) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "the session cannot be saved: a name or an id is not allowed, or a tab \
-                 has more than {MAX_PANES} panes or splits more than {MAX_SPLIT_DEPTH} deep"
-            ),
-        ));
+    if let Some(why) = refusal(&session) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
     }
-    let mut sessions = match read(path) {
-        Ok(sessions) => sessions,
+    let mut entries = match read(path) {
+        Ok(entries) => entries,
         Err(_) if replace_unreadable => Vec::new(),
         Err(why) => return Err(unreadable_error(&why)),
     };
-    match sessions.iter_mut().find(|saved| saved.name == session.name) {
-        Some(saved) => *saved = session,
-        None => sessions.push(session),
+    // Only a session of this name counts: a skipped entry is not one.
+    let same = entries
+        .iter_mut()
+        .find(|entry| matches!(entry, Entry::Session(saved) if saved.name == session.name));
+    match same {
+        Some(entry) => *entry = Entry::Session(session),
+        None => entries.push(Entry::Session(session)),
     }
-    write(path, &sessions)
+    write(path, &entries)
 }
 
 /// Rename the session `from` to `to` (trimmed, and checked as
@@ -209,20 +227,25 @@ pub(crate) fn put(path: &Path, session: Session, replace_unreadable: bool) -> io
 #[allow(dead_code)]
 pub(crate) fn rename(path: &Path, from: &str, to: &str) -> Result<(), String> {
     let to = check_name(to).map_err(str::to_owned)?;
-    let mut sessions =
+    let mut entries =
         read(path).map_err(|why| format!("Could not read the saved sessions: {why}"))?;
-    let index = sessions
+    let index = entries
         .iter()
-        .position(|saved| saved.name == from)
+        .position(|entry| matches!(entry, Entry::Session(saved) if saved.name == from))
         .ok_or("That session is no longer saved.")?;
     if to == from {
         return Ok(());
     }
-    if sessions.iter().any(|saved| saved.name == to) {
+    if entries
+        .iter()
+        .any(|entry| matches!(entry, Entry::Session(saved) if saved.name == to))
+    {
         return Err("A session with this name exists.".to_owned());
     }
-    sessions[index].name = to;
-    write(path, &sessions).map_err(|err| format!("Could not save the sessions: {err}"))
+    if let Entry::Session(saved) = &mut entries[index] {
+        saved.name = to;
+    }
+    write(path, &entries).map_err(|err| format!("Could not save the sessions: {err}"))
 }
 
 /// Remove the session `name`; nothing to do if there is none (another window
@@ -231,13 +254,13 @@ pub(crate) fn rename(path: &Path, from: &str, to: &str) -> Result<(), String> {
 // Used first by the sessions menu (task 5).
 #[allow(dead_code)]
 pub(crate) fn delete(path: &Path, name: &str) -> io::Result<()> {
-    let mut sessions = read(path).map_err(|why| unreadable_error(&why))?;
-    let before = sessions.len();
-    sessions.retain(|saved| saved.name != name);
-    if sessions.len() == before {
+    let mut entries = read(path).map_err(|why| unreadable_error(&why))?;
+    let before = entries.len();
+    entries.retain(|entry| !matches!(entry, Entry::Session(saved) if saved.name == name));
+    if entries.len() == before {
         return Ok(());
     }
-    write(path, &sessions)
+    write(path, &entries)
 }
 
 /// "Session N" for the smallest N from 1 that no session in `sessions` uses.
@@ -262,16 +285,42 @@ fn unreadable_error(why: &str) -> io::Error {
     )
 }
 
+/// One entry of the file's list of sessions.
+enum Entry {
+    Session(Session),
+    /// An entry reading skipped (it makes no sense, or repeats a name): kept
+    /// exactly as the file had it, so that saving one session never destroys
+    /// one the person might fix by hand, or a newer Moniker might understand.
+    /// It is not a session: its name is free for another.
+    Skipped(Value),
+}
+
 // Reading
 
-/// The sessions in the file at `path` (none if there is no file), or why the
-/// file cannot be used.
-fn read(path: &Path) -> Result<Vec<Session>, String> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+const NOT_A_LIST: &str = "it is not a list of sessions";
+const TOO_LARGE: &str = "it is larger than 4 MiB";
+
+/// The entries in the file at `path`, in file order (none if there is no
+/// file), or why the file cannot be used.
+fn read(path: &Path) -> Result<Vec<Entry>, String> {
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(format!("it could not be read ({err})")),
     };
+    let unread = |err: io::Error| format!("it could not be read ({err})");
+    // A file that is too large is not read: not past a limit even when its
+    // length is not what it says (a device, a file that grows).
+    if file.metadata().map_err(unread)?.len() > MAX_FILE_BYTES {
+        return Err(TOO_LARGE.to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unread)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(TOO_LARGE.to_owned());
+    }
     // serde_json refuses nesting past 128 levels before it builds anything
     // deeper, so what follows recurses a bounded depth.
     let value: Value = serde_json::from_slice(&bytes).map_err(|err| {
@@ -297,40 +346,33 @@ fn read(path: &Path) -> Result<Vec<Session>, String> {
             ));
         }
     }
-    let entries = fields
+    let list = fields
         .get("sessions")
         .and_then(Value::as_array)
         .ok_or(NOT_A_LIST)?;
-    let mut sessions = Vec::new();
+    let mut entries = Vec::with_capacity(list.len());
     let mut names = HashSet::new();
-    for entry in entries {
-        // A name already seen is skipped: the first one stays.
-        if let Some(session) = session_from(entry)
-            && names.insert(session.name.clone())
-        {
-            sessions.push(session);
-        }
+    for value in list {
+        entries.push(match session_from(value) {
+            // A name already seen is skipped: the first one stays.
+            Some(session) if names.insert(session.name.clone()) => Entry::Session(session),
+            _ => Entry::Skipped(value.clone()),
+        });
     }
-    Ok(sessions)
+    Ok(entries)
 }
 
-const NOT_A_LIST: &str = "it is not a list of sessions";
-
 /// The session in `value`, or `None` if it makes no sense: a name that fails
-/// [`check_name`], no tab, or a tab [`tab_from`] refuses. (A name that is
-/// already taken is for the caller to see.)
+/// [`check_name`], no tab or more than [`MAX_TABS`], or a tab [`tab_from`]
+/// refuses. (A name that is already taken is for the caller to see.)
 fn session_from(value: &Value) -> Option<Session> {
     let fields = value.as_object()?;
     let name = check_name(fields.get("name")?.as_str()?).ok()?;
-    let tabs = fields
-        .get("tabs")?
-        .as_array()?
-        .iter()
-        .map(tab_from)
-        .collect::<Option<Vec<_>>>()?;
-    if tabs.is_empty() {
+    let tabs = fields.get("tabs")?.as_array()?;
+    if tabs.is_empty() || tabs.len() > MAX_TABS {
         return None;
     }
+    let tabs = tabs.iter().map(tab_from).collect::<Option<Vec<_>>>()?;
     Some(Session { name, tabs })
 }
 
@@ -441,65 +483,117 @@ fn label(text: &str) -> Option<String> {
     Some(text.to_owned())
 }
 
+// Refusing what reading would skip
+
+/// Why `session` cannot be saved, as a plain sentence, if it cannot: the
+/// reader's rules, checked on the typed session (so that no JSON is built from
+/// a tree of any depth).
+fn refusal(session: &Session) -> Option<String> {
+    if !check_name(&session.name).is_ok_and(|name| name == session.name) {
+        return Some("the name is not allowed".to_owned());
+    }
+    if session.tabs.is_empty() {
+        return Some("the session has no tab".to_owned());
+    }
+    if session.tabs.len() > MAX_TABS {
+        return Some(format!("the session has more than {MAX_TABS} tabs"));
+    }
+    session.tabs.iter().find_map(|tab| {
+        let mut panes = 0;
+        node_refusal(&tab.root, 0, &mut panes)
+    })
+}
+
+/// [`refusal`] for one node, `depth` splits down, `panes` counting the panes
+/// of the tab so far. Stops at the first split or pane past a limit.
+fn node_refusal(node: &Node, depth: usize, panes: &mut usize) -> Option<String> {
+    match node {
+        Node::Split { start, end, .. } => {
+            if depth >= MAX_SPLIT_DEPTH {
+                return Some(format!(
+                    "a tab's panes are split more than {MAX_SPLIT_DEPTH} deep"
+                ));
+            }
+            node_refusal(start, depth + 1, panes).or_else(|| node_refusal(end, depth + 1, panes))
+        }
+        Node::Pane(pane) => {
+            *panes += 1;
+            if *panes > MAX_PANES {
+                return Some(format!("a tab holds more than {MAX_PANES} panes"));
+            }
+            if let Kind::Profile { id, name } = &pane.kind {
+                if id.chars().count() > MAX_ID_CHARS {
+                    return Some(format!(
+                        "a profile id is longer than {MAX_ID_CHARS} characters"
+                    ));
+                }
+                if label(name).is_none() {
+                    return Some(
+                        "a profile name is too long or holds a control character".to_owned(),
+                    );
+                }
+            }
+            if pane
+                .name
+                .as_deref()
+                .is_some_and(|name| label(name).is_none())
+            {
+                return Some("a pane name is too long or holds a control character".to_owned());
+            }
+            None
+        }
+    }
+}
+
 // Writing
 
-/// Write `sessions` as the file at `path`: pretty JSON with a trailing
-/// newline, through [`write_private`].
-fn write(path: &Path, sessions: &[Session]) -> io::Result<()> {
-    let entries = sessions
+/// Write `entries` as the file at `path`: pretty JSON with a trailing newline,
+/// through [`write_private`]. A file that would be larger than
+/// [`MAX_FILE_BYTES`] is not written: reading would refuse it. Every session
+/// in `entries` was read or passed [`refusal`], so none is too deep to build.
+fn write(path: &Path, entries: &[Entry]) -> io::Result<()> {
+    let list: Vec<Value> = entries
         .iter()
-        .map(session_value)
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a session is too deep"))?;
-    let file = json!({ "version": VERSION, "sessions": entries });
+        .map(|entry| match entry {
+            Entry::Session(session) => session_value(session),
+            Entry::Skipped(value) => value.clone(),
+        })
+        .collect();
+    let file = json!({ "version": VERSION, "sessions": list });
     let mut bytes = serde_json::to_vec_pretty(&file).map_err(io::Error::other)?;
     bytes.push(b'\n');
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the saved sessions would be larger than 4 MiB",
+        ));
+    }
     write_private(path, &bytes)
 }
 
-/// Whether reading would find `session` again under the same name (its
-/// fractions and text sizes it would bring into range, the rest as it is).
-fn is_storable(session: &Session) -> bool {
-    session_value(session)
-        .and_then(|value| session_from(&value))
-        .is_some_and(|read| read.name == session.name)
-}
-
-/// `session` as JSON; `None` if it nests past [`MAX_SPLIT_DEPTH`] (so building
-/// the value takes a bounded depth of stack, whatever the tree).
-fn session_value(session: &Session) -> Option<Value> {
-    let tabs = session
+fn session_value(session: &Session) -> Value {
+    let tabs: Vec<Value> = session
         .tabs
         .iter()
-        .map(|tab| {
-            Some(json!({
-                "focused": tab.focused,
-                "root": node_value(&tab.root, 0)?,
-            }))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(json!({ "name": session.name, "tabs": tabs }))
+        .map(|tab| json!({ "focused": tab.focused, "root": node_value(&tab.root) }))
+        .collect();
+    json!({ "name": session.name, "tabs": tabs })
 }
 
-fn node_value(node: &Node, depth: usize) -> Option<Value> {
+fn node_value(node: &Node) -> Value {
     match node {
-        Node::Pane(pane) => Some(pane_value(pane)),
+        Node::Pane(pane) => pane_value(pane),
         Node::Split {
             horizontal,
             fraction,
             start,
             end,
-        } => {
-            if depth >= MAX_SPLIT_DEPTH {
-                return None;
-            }
-            Some(json!({
-                "split": if *horizontal { "horizontal" } else { "vertical" },
-                "fraction": fraction,
-                "start": node_value(start, depth + 1)?,
-                "end": node_value(end, depth + 1)?,
-            }))
-        }
+        } => json!({
+            "split": if *horizontal { "horizontal" } else { "vertical" },
+            "fraction": fraction,
+            "start": node_value(start),
+            "end": node_value(end),
+        }),
     }
 }
 
@@ -532,11 +626,15 @@ fn pane_value(pane: &PaneRecord) -> Value {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::PermissionsExt;
 
     const ID: &str = "0b7c6f4e-2f58-4c1b-9a51-3a1d9f3c2e10";
     const LIST: &str = r#"{"pane":"list"}"#;
+    /// A new-tab list pane as a write puts it, so that a session read from it
+    /// is written back as the same JSON value.
+    const WRITTEN_LIST: &str = r#"{"pane":"list","name":null,"scale":1.0,"transcript":false}"#;
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -951,6 +1049,18 @@ mod tests {
         );
         assert_eq!(names_at(&path), ["Good"], "500 panes");
 
+        // 64 tabs in a session are fine, 65 are not.
+        let tabs = |n: usize| {
+            let tab = r#"{"root":{"pane":"list"}}"#;
+            format!(r#"{{"name":"Tabs","tabs":[{}]}}"#, vec![tab; n].join(","))
+        };
+        write_text(&path, &file_text(&[tabs(64)]));
+        assert_eq!(sessions_at(&path)[0].tabs.len(), 64);
+        write_text(&path, &file_text(&[tabs(65), good.clone()]));
+        assert_eq!(names_at(&path), ["Good"], "65 tabs");
+        write_text(&path, &file_text(&[tabs(5000), good.clone()]));
+        assert_eq!(names_at(&path), ["Good"], "5000 tabs");
+
         // The limit is per tab: two tabs of 32 panes are fine.
         let two = format!(
             r#"{{"name":"Two","tabs":[{{"root":{t}}},{{"root":{t}}}]}}"#,
@@ -1205,80 +1315,155 @@ mod tests {
         assert_eq!(sessions_at(&path)[1], again);
     }
 
-    #[test]
-    fn a_session_that_would_not_read_back_is_not_saved() {
-        // `splits` splits one inside the other: `splits + 1` panes.
-        fn chain(splits: usize) -> Node {
-            let mut node = leaf(Kind::List);
-            for _ in 0..splits {
-                node = Node::Split {
-                    horizontal: true,
-                    fraction: 0.5,
-                    start: Box::new(node),
-                    end: Box::new(leaf(Kind::List)),
-                };
-            }
-            node
-        }
-        // Exactly `leaves` panes in the fewest splits deep.
-        fn balanced(leaves: usize) -> Node {
-            if leaves == 1 {
-                return leaf(Kind::List);
-            }
-            Node::Split {
-                horizontal: false,
+    /// `splits` splits one inside the other: `splits + 1` panes.
+    fn chain(splits: usize) -> Node {
+        let mut node = leaf(Kind::List);
+        for _ in 0..splits {
+            node = Node::Split {
+                horizontal: true,
                 fraction: 0.5,
-                start: Box::new(balanced(leaves / 2)),
-                end: Box::new(balanced(leaves - leaves / 2)),
-            }
+                start: Box::new(node),
+                end: Box::new(leaf(Kind::List)),
+            };
         }
-        fn with_root(root: Node) -> Session {
-            Session {
-                name: "S".to_owned(),
-                tabs: vec![TabRecord { root, focused: 0 }],
-            }
-        }
+        node
+    }
 
+    /// Exactly `leaves` panes in the fewest splits deep.
+    fn balanced(leaves: usize) -> Node {
+        if leaves == 1 {
+            return leaf(Kind::List);
+        }
+        Node::Split {
+            horizontal: false,
+            fraction: 0.5,
+            start: Box::new(balanced(leaves / 2)),
+            end: Box::new(balanced(leaves - leaves / 2)),
+        }
+    }
+
+    /// A session named "S" whose one tab holds `root`.
+    fn with_root(root: Node) -> Session {
+        Session {
+            name: "S".to_owned(),
+            tabs: vec![TabRecord { root, focused: 0 }],
+        }
+    }
+
+    /// A session named "S" of `n` tabs.
+    fn with_tabs(n: usize) -> Session {
+        Session {
+            name: "S".to_owned(),
+            tabs: vec![
+                TabRecord {
+                    root: leaf(Kind::List),
+                    focused: 0
+                };
+                n
+            ],
+        }
+    }
+
+    #[test]
+    fn a_session_that_would_not_read_back_is_refused_plainly() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
         put(&path, session("Kept"), false).unwrap();
         let before = fs::read(&path).unwrap();
 
-        let bad = [
-            session(""),
-            session("a\tb"),
-            session(" padded "),
-            session(&"n".repeat(101)),
-            Session {
-                name: "S".to_owned(),
-                tabs: vec![],
-            },
-            with_root(chain(17)),
-            with_root(chain(1000)),
-            with_root(balanced(33)),
+        let name = "the name is not allowed";
+        let profile_id = |len: usize| {
             with_root(leaf(Kind::Profile {
-                id: "x".repeat(65),
+                id: "x".repeat(len),
                 name: "web".to_owned(),
-            })),
+            }))
+        };
+        let profile_name = |len: usize| {
             with_root(leaf(Kind::Profile {
                 id: "x".to_owned(),
-                name: "x".repeat(201),
-            })),
+                name: "x".repeat(len),
+            }))
+        };
+        let pane_name = |name: &str| {
             with_root(Node::Pane(PaneRecord {
-                name: Some("a\nb".to_owned()),
+                name: Some(name.to_owned()),
                 ..pane(Kind::List)
-            })),
+            }))
+        };
+        // Each is refused with its own sentence, which Task 5 shows after
+        // "Could not save the session: ".
+        let bad = [
+            (session(""), name),
+            (session("a\tb"), name),
+            (session(" padded "), name),
+            (session(&"n".repeat(101)), name),
+            (
+                Session {
+                    name: "S".to_owned(),
+                    tabs: vec![],
+                },
+                "the session has no tab",
+            ),
+            (with_tabs(65), "the session has more than 64 tabs"),
+            (with_tabs(1000), "the session has more than 64 tabs"),
+            (
+                with_root(chain(17)),
+                "a tab's panes are split more than 16 deep",
+            ),
+            (
+                with_root(chain(1000)),
+                "a tab's panes are split more than 16 deep",
+            ),
+            (with_root(balanced(33)), "a tab holds more than 32 panes"),
+            (with_root(balanced(500)), "a tab holds more than 32 panes"),
+            (profile_id(65), "a profile id is longer than 64 characters"),
+            (
+                profile_name(201),
+                "a profile name is too long or holds a control character",
+            ),
+            (
+                with_root(leaf(Kind::Profile {
+                    id: "x".to_owned(),
+                    name: "a\u{7}b".to_owned(),
+                })),
+                "a profile name is too long or holds a control character",
+            ),
+            (
+                pane_name(&"x".repeat(201)),
+                "a pane name is too long or holds a control character",
+            ),
+            (
+                pane_name("a\nb"),
+                "a pane name is too long or holds a control character",
+            ),
         ];
-        for session in bad {
-            assert!(put(&path, session.clone(), false).is_err(), "{session:?}");
-            assert!(put(&path, session, true).is_err());
+        for (session, why) in bad {
+            for replace in [false, true] {
+                let error = put(&path, session.clone(), replace).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{session:?}");
+                assert_eq!(error.to_string(), why, "{session:?}");
+            }
             assert_eq!(fs::read(&path).unwrap(), before, "the file is as it was");
         }
 
-        // The edges of what is allowed are saved.
-        put(&path, with_root(chain(16)), false).unwrap();
-        put(&path, with_root(balanced(32)), false).unwrap();
-        assert_eq!(names_at(&path), ["Kept", "S"]);
+        // The edges of what is allowed are saved, and read back as they were.
+        let edges = [
+            with_root(chain(16)),
+            with_root(balanced(32)),
+            with_tabs(64),
+            profile_id(64),
+            profile_name(200),
+            pane_name(&"x".repeat(200)),
+            pane_name("with spaces, <b>markup</b> & more"),
+        ];
+        for edge in edges {
+            put(&path, edge.clone(), false).unwrap();
+            let saved = sessions_at(&path);
+            assert_eq!(saved.last().unwrap(), &edge, "{edge:?}");
+            assert_eq!(saved.len(), 2, "replaced in place: {edge:?}");
+        }
+        put(&path, session(&"n".repeat(100)), false).unwrap();
+        assert_eq!(names_at(&path), ["Kept", "S", &"n".repeat(100)]);
 
         // A refusal creates no file.
         let fresh = dir.path().join("fresh.json");
@@ -1432,5 +1617,189 @@ mod tests {
             next_default_name(&[session("Work"), session("session 1"), session("Session 01")]),
             "Session 1"
         );
+    }
+
+    fn entries_at(path: &Path) -> Vec<Value> {
+        let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        value["sessions"].as_array().unwrap().clone()
+    }
+
+    fn write_entries(path: &Path, entries: &[Value]) {
+        write_text(
+            path,
+            &json!({"version": 1, "sessions": entries}).to_string(),
+        );
+    }
+
+    fn session_json(name: &str, root: &str) -> Value {
+        serde_json::from_str(&session_text(name, root)).unwrap()
+    }
+
+    #[test]
+    fn an_entry_it_cannot_read_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        // Entries the reader skips, each with something a person might fix by
+        // hand or a newer Moniker might understand.
+        let telnet = session_json("Bad", r#"{"pane":"telnet","note":"fix me"}"#);
+        let wide = json!({"name": "Wide", "tabs": vec![json!({"root": {"pane": "list"}}); 65]});
+        let newer = json!({
+            "name": "Newer",
+            "tabs": [{"root": {"pane": "browser"}}],
+            "future": {"deep": [1, 2.5, "x", null, {"k": false}]},
+        });
+        let raw = [
+            telnet.clone(),                  // 0 skipped
+            session_json("A", WRITTEN_LIST), // 1
+            json!(5),                        // 2 skipped
+            session_json("B", WRITTEN_LIST), // 3
+            wide.clone(),                    // 4 skipped
+            Value::Null,                     // 5 skipped
+            newer.clone(),                   // 6 skipped
+        ];
+        let skipped = [telnet, json!(5), wide, Value::Null, newer];
+        write_entries(&path, &raw);
+        assert_eq!(names_at(&path), ["A", "B"], "only the readable ones show");
+        let kept_skipped = |path: &Path| -> Vec<Value> {
+            entries_at(path)
+                .into_iter()
+                .filter(|entry| skipped.contains(entry))
+                .collect()
+        };
+
+        // A new session goes at the end, and every entry is as it was.
+        put(&path, session("New"), false).unwrap();
+        let entries = entries_at(&path);
+        assert_eq!(entries.len(), 8);
+        assert_eq!(&entries[..7], &raw[..]);
+        assert_eq!(entries[7]["name"], "New");
+        assert_eq!(names_at(&path), ["A", "B", "New"]);
+
+        // A session saved again is replaced in its place.
+        let mut again = session("A");
+        again.tabs[0].root = leaf(Kind::Local {
+            dir: Some(PathBuf::from("/tmp")),
+        });
+        put(&path, again, false).unwrap();
+        let entries = entries_at(&path);
+        assert_eq!(entries.len(), 8);
+        assert_eq!(entries[1]["tabs"][0]["root"]["dir"], "/tmp");
+        for i in [0, 2, 3, 4, 5, 6] {
+            assert_eq!(entries[i], raw[i], "entry {i}");
+        }
+
+        // A name a skipped entry has is free: it is not a session.
+        rename(&path, "B", "Wide").unwrap();
+        let entries = entries_at(&path);
+        assert_eq!(entries[3]["name"], "Wide");
+        assert_eq!(entries[4], raw[4], "the skipped Wide stays where it was");
+        assert_eq!(names_at(&path), ["A", "Wide", "New"]);
+        put(&path, session("Bad"), false).unwrap();
+        assert_eq!(names_at(&path), ["A", "Wide", "New", "Bad"]);
+        assert_eq!(entries_at(&path)[0], raw[0]);
+        assert_eq!(kept_skipped(&path), skipped, "after the saves");
+
+        // Renaming and deleting others leave them too, and in their places.
+        rename(&path, "New", "Newer").unwrap();
+        assert_eq!(kept_skipped(&path), skipped, "after the rename");
+        delete(&path, "A").unwrap();
+        let entries = entries_at(&path);
+        assert_eq!(entries.len(), 8);
+        assert_eq!(entries[0], raw[0]);
+        assert_eq!(entries[1], raw[2], "the entries after it moved up by one");
+        assert_eq!(kept_skipped(&path), skipped, "after the delete");
+        delete(&path, "Wide").unwrap();
+        delete(&path, "Newer").unwrap();
+        delete(&path, "Bad").unwrap();
+        assert_eq!(entries_at(&path), skipped, "all that is left");
+        assert_eq!(names_at(&path), Vec::<String>::new());
+
+        // Nothing to delete writes nothing.
+        let bytes = fs::read(&path).unwrap();
+        delete(&path, "Nope").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_repeated_name_is_kept_like_any_skipped_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let raw = [
+            session_json("A", WRITTEN_LIST),
+            session_json("A", r#"{"pane":"local","dir":"/second"}"#),
+            session_json("B", WRITTEN_LIST),
+        ];
+        write_entries(&path, &raw);
+        assert_eq!(sessions_at(&path).len(), 2, "the first A and B");
+        assert_eq!(sessions_at(&path)[0].tabs[0].root, leaf(Kind::List));
+
+        put(&path, session("New"), false).unwrap();
+        assert_eq!(&entries_at(&path)[..3], &raw[..]);
+        rename(&path, "B", "C").unwrap();
+        let entries = entries_at(&path);
+        assert_eq!(entries[1], raw[1]);
+        assert_eq!(entries[2]["name"], "C");
+    }
+
+    #[test]
+    fn a_file_over_4_mib_is_not_read() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let padded = |len: usize| {
+            let head = r#"{"version":1,"sessions":[]}"#;
+            format!("{head}{}", " ".repeat(len - head.len()))
+        };
+        // 4 MiB is fine, one byte more is not.
+        write_text(&path, &padded(LIMIT));
+        assert_eq!(load(&path), Loaded::Sessions(vec![]));
+        write_text(&path, &padded(LIMIT + 1));
+        let large = Loaded::Unreadable("it is larger than 4 MiB".to_owned());
+        assert_eq!(load(&path), large);
+
+        // Nothing writes over it.
+        let told = "Could not read the saved sessions: it is larger than 4 MiB";
+        let error = put(&path, session("New"), false).unwrap_err();
+        assert_eq!(error.to_string(), told);
+        assert_eq!(rename(&path, "a", "b").unwrap_err(), told);
+        assert_eq!(delete(&path, "a").unwrap_err().to_string(), told);
+        assert_eq!(fs::read(&path).unwrap().len(), LIMIT + 1);
+
+        // Unless asked to.
+        put(&path, session("New"), true).unwrap();
+        assert_eq!(sessions_at(&path), [session("New")]);
+
+        // A file whose size is not known up front is cut off as well.
+        assert_eq!(load(Path::new("/dev/zero")), large);
+    }
+
+    #[test]
+    fn the_file_is_not_written_larger_than_4_mib() {
+        const LIMIT: usize = 4 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        // A skipped entry nearly as big as the file may be.
+        let junk = |len: usize| json!({"junk": "x".repeat(len)});
+        write_entries(&path, &[junk(LIMIT - 200)]);
+        assert_eq!(
+            load(&path),
+            Loaded::Sessions(vec![]),
+            "it is under the limit"
+        );
+        let before = fs::read(&path).unwrap();
+        let error = put(&path, session("A"), false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "the saved sessions would be larger than 4 MiB"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before, "the file is as it was");
+
+        // With room, the same entry is kept and the session fits.
+        write_entries(&path, &[junk(LIMIT - 100_000)]);
+        put(&path, session("A"), false).unwrap();
+        assert_eq!(names_at(&path), ["A"]);
+        assert_eq!(entries_at(&path)[0], junk(LIMIT - 100_000));
+        assert!(fs::read(&path).unwrap().len() <= LIMIT);
     }
 }
