@@ -10,9 +10,9 @@
 //! said of a tab holds for each pane of a tab with several: its own session,
 //! title, text size, transcript and askpass marker. The tab, the window's
 //! actions and the ☰ menu go by the tab's focused pane. The holder also keeps
-//! what its pane shows ([`PaneKind`]) and whether its session saves a
-//! transcript, which a saved session records (`crate::session_layout`, issue
-//! #12), with the folder a local shell last reported ([`current_folder`]).
+//! what its pane shows ([`PaneKind`]), which a saved session records
+//! (`crate::session_layout`, issue #12), with the folder a local shell last
+//! reported ([`current_folder`]).
 //!
 //! [`open_profile`] turns a profile into an `ssh` command with
 //! `moniker_core::ssh::terminal_command` and runs it in a VTE tab. The command
