@@ -45,6 +45,12 @@ pub struct Profile {
     pub sequences: Vec<StartupSequence>,
     /// Whether sessions are recorded to a transcript by default.
     pub transcript: bool,
+    /// Kept on this machine only: sync never sends it, password included. Left
+    /// out of the JSON when false, so a bundle or a version-1 profile file stays
+    /// byte for byte what it was; a profile file that holds one with it set is
+    /// written as format version 2 (see `store`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_only: bool,
     /// Last edit time, Unix milliseconds UTC. Newest edit wins when merging.
     pub updated_at: i64,
     /// Tombstone marker so deletions propagate through sync.
@@ -90,7 +96,7 @@ pub fn now_ms() -> i64 {
 
 impl Profile {
     /// A new live profile with a fresh id, port 22, no key file, no sequences,
-    /// transcripts off, and `updated_at` set to now.
+    /// transcripts off, synced with peers, and `updated_at` set to now.
     pub fn new(name: &str, host: &str, username: &str) -> Profile {
         Profile {
             id: Uuid::new_v4().to_string(),
@@ -101,6 +107,7 @@ impl Profile {
             key_file: None,
             sequences: Vec::new(),
             transcript: false,
+            local_only: false,
             updated_at: now_ms(),
             deleted: false,
         }
@@ -162,6 +169,7 @@ impl Profile {
             key_file: None,
             sequences: Vec::new(),
             transcript: false,
+            local_only: false,
             updated_at: now_ms,
             deleted: true,
         }
@@ -368,6 +376,22 @@ mod tests {
         assert!(t.sequences.is_empty());
         assert!(!t.transcript);
         assert_eq!(t.updated_at, 123_456);
+    }
+
+    #[test]
+    fn local_only_is_left_out_of_json_when_false() {
+        let p = valid();
+        assert!(!serde_json::to_string(&p).unwrap().contains("local_only"));
+        let kept = Profile {
+            local_only: true,
+            ..valid()
+        };
+        assert!(
+            serde_json::to_string(&kept)
+                .unwrap()
+                .contains("\"local_only\":true")
+        );
+        assert!(!kept.tombstone(5).local_only);
     }
 
     #[test]

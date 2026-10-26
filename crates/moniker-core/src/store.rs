@@ -5,6 +5,15 @@
 //! (see [`ProfileStore::default_path`]). A shell script may write the same
 //! format, so it is part of the interface: change it only with a version bump.
 //!
+//! Version 2, `{"version":2,"sync_off":<bool>,"profiles":[...]}`, is written
+//! exactly when the sync switch is not on (see [`SyncSwitch`]) or a profile is
+//! kept on this machine (`local_only`); otherwise the file is version 1, as it
+//! always was. Older versions refuse a file of another version and leave it
+//! alone, so none of them can serve or start a sync from a file that says sync
+//! is off or holds a profile that must not leave. Version 1 has no switch and
+//! reads as on. The switch lives in this file so that one atomic write under
+//! the store's lock changes it together with the profiles.
+//!
 //! Passwords are not stored here; they live in the system keyring.
 //!
 //! The file can change under an open store: `moniker-server sync-serve` run over ssh
@@ -38,8 +47,41 @@ use serde::Serialize;
 
 use crate::profile::{Profile, ProfileError, now_ms};
 
-/// The only on-disk format version this code reads or writes.
-const FORMAT_VERSION: u64 = 1;
+/// The format of a file that holds neither the sync switch off nor a profile
+/// kept on this machine: what every version before the switch wrote.
+const FORMAT_V1: u64 = 1;
+/// The format that carries `sync_off`. Written only when it matters (module docs).
+const FORMAT_V2: u64 = 2;
+
+/// Whether this machine syncs, as `profiles.json` records it.
+///
+/// A switch that is recorded but cannot be understood is `Unreadable`, not a
+/// guess: the callers treat it as off (the conservative reading for a setting
+/// whose purpose is security) and turning sync on or off rewrites it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSwitch {
+    /// Sync works. Also what a version-1 file or no file at all means.
+    On,
+    /// The person turned sync off.
+    Off,
+    /// A version-2 file whose `sync_off` is missing or not a boolean.
+    Unreadable,
+}
+
+impl SyncSwitch {
+    /// Only `On` lets a sync run.
+    pub fn is_on(self) -> bool {
+        self == SyncSwitch::On
+    }
+}
+
+/// Everything the profile file holds.
+#[derive(Debug)]
+struct Contents {
+    /// Keyed by profile id.
+    profiles: BTreeMap<String, Profile>,
+    sync: SyncSwitch,
+}
 
 /// Why a store operation failed.
 ///
@@ -52,7 +94,7 @@ pub enum StoreError {
     /// The file is not valid JSON, or not shaped like a profile store.
     #[error("profile store file is corrupt (not a valid profile list)")]
     Corrupt,
-    #[error("unsupported profile store version {0} (this build reads version 1)")]
+    #[error("unsupported profile store version {0} (this build reads versions 1 and 2)")]
     UnsupportedVersion(u64),
     #[error("profile store contains the same profile id twice")]
     DuplicateId,
@@ -72,6 +114,7 @@ pub struct ProfileStore {
     path: PathBuf,
     /// Keyed by profile id.
     profiles: BTreeMap<String, Profile>,
+    sync: SyncSwitch,
 }
 
 impl ProfileStore {
@@ -89,9 +132,11 @@ impl ProfileStore {
     /// holding a duplicate id or an invalid profile is an error, and the file
     /// is left untouched: a damaged store never silently becomes an empty one.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        let Contents { profiles, sync } = load(path)?;
         Ok(ProfileStore {
             path: path.to_path_buf(),
-            profiles: load(path)?,
+            profiles,
+            sync,
         })
     }
 
@@ -100,8 +145,29 @@ impl ProfileStore {
     /// file atomically, so this sees a complete file. On any error the
     /// in-memory snapshot is left as it was.
     pub fn reload(&mut self) -> Result<(), StoreError> {
-        self.profiles = load(&self.path)?;
+        let Contents { profiles, sync } = load(&self.path)?;
+        self.profiles = profiles;
+        self.sync = sync;
         Ok(())
+    }
+
+    /// The sync switch from the in-memory snapshot (see [`SyncSwitch`]).
+    pub fn sync_switch(&self) -> SyncSwitch {
+        self.sync
+    }
+
+    /// Turn sync on or off and save, as a locked read-modify-write like every
+    /// mutation, so the switch and the format version change in one atomic write
+    /// with the profiles exactly as the file has them now. Nothing is written when
+    /// the switch already says so; an `Unreadable` switch counts as a change either
+    /// way and is replaced by what was asked for.
+    pub fn set_sync(&mut self, on: bool) -> Result<(), StoreError> {
+        let want = if on { SyncSwitch::On } else { SyncSwitch::Off };
+        self.mutate(move |contents| {
+            let changed = contents.sync != want;
+            contents.sync = want;
+            Ok((changed, ()))
+        })
     }
 
     /// Non-deleted profiles from the in-memory snapshot, sorted by name without
@@ -136,7 +202,8 @@ impl ProfileStore {
     /// or commands in it.
     pub fn upsert(&mut self, p: Profile) -> Result<(), StoreError> {
         p.validate()?;
-        self.mutate(move |profiles| {
+        self.mutate(move |contents| {
+            let profiles = &mut contents.profiles;
             let now = next_stamp(profiles.get(&p.id));
             let p = if p.deleted {
                 p.tombstone(now)
@@ -157,7 +224,8 @@ impl ProfileStore {
     /// deletes a profile added by another process after this store was opened.
     /// An unknown or already-deleted id is `Ok(())` and writes no profile data.
     pub fn delete(&mut self, id: &str) -> Result<(), StoreError> {
-        self.mutate(|profiles| {
+        self.mutate(|contents| {
+            let profiles = &mut contents.profiles;
             let Some(existing) = profiles.get(id).filter(|p| !p.deleted) else {
                 return Ok((false, ()));
             };
@@ -188,8 +256,8 @@ impl ProfileStore {
     /// closure the file's current contents under the lock).
     pub fn replace_all(&mut self, ps: Vec<Profile>) -> Result<(), StoreError> {
         let next = index(ps, true)?;
-        self.mutate(move |profiles| {
-            *profiles = next;
+        self.mutate(move |contents| {
+            contents.profiles = next;
             Ok((true, ()))
         })
     }
@@ -207,16 +275,18 @@ impl ProfileStore {
     ///
     /// `f` runs while the store lock is held, so it must not mutate this store
     /// (from any handle, in this process or another); that would deadlock.
+    ///
+    /// The sync switch is not `f`'s to change: it stays as the file has it.
     pub fn update<R>(
         &mut self,
         f: impl FnOnce(&[Profile]) -> Result<(Vec<Profile>, R), StoreError>,
     ) -> Result<R, StoreError> {
-        self.mutate(move |profiles| {
-            let current: Vec<Profile> = profiles.values().cloned().collect();
+        self.mutate(move |contents| {
+            let current: Vec<Profile> = contents.profiles.values().cloned().collect();
             let (next, out) = f(&current)?;
             let next = index(next, true)?;
-            let changed = next != *profiles;
-            *profiles = next;
+            let changed = next != contents.profiles;
+            contents.profiles = next;
             Ok((changed, out))
         })
     }
@@ -227,21 +297,27 @@ impl ProfileStore {
     }
 
     /// The locked read-modify-write behind every mutation. `change` gets the
-    /// file's current profiles and returns whether it changed them (`false`
-    /// skips the write) and a value for the caller. The snapshot is replaced
-    /// only once everything worked.
+    /// file's current contents (profiles and switch) and returns whether it
+    /// changed them (`false` skips the write) and a value for the caller. The
+    /// snapshot is replaced only once everything worked.
     fn mutate<R>(
         &mut self,
-        change: impl FnOnce(&mut BTreeMap<String, Profile>) -> Result<(bool, R), StoreError>,
+        change: impl FnOnce(&mut Contents) -> Result<(bool, R), StoreError>,
     ) -> Result<R, StoreError> {
         ensure_parent_dir(&self.path)?;
         let _lock = lock_exclusive(&self.path)?;
         let mut fresh = load(&self.path)?;
         let (changed, out) = change(&mut fresh)?;
         if changed {
+            // A switch nobody could read is written as off, so off is what the
+            // file says from now on and what the snapshot must say too.
+            if fresh.sync == SyncSwitch::Unreadable {
+                fresh.sync = SyncSwitch::Off;
+            }
             write_atomic(&self.path, &encode(&fresh)?)?;
         }
-        self.profiles = fresh;
+        self.profiles = fresh.profiles;
+        self.sync = fresh.sync;
         Ok(out)
     }
 }
@@ -261,12 +337,21 @@ fn next_stamp(existing: Option<&Profile>) -> i64 {
     now_ms().max(floor)
 }
 
-/// Read the file into a validated map. A missing file is an empty map; any
-/// other problem is an error.
-fn load(path: &Path) -> Result<BTreeMap<String, Profile>, StoreError> {
+/// Read the file into validated contents. A missing file is an empty store
+/// with sync on; any other problem is an error.
+fn load(path: &Path) -> Result<Contents, StoreError> {
     match fs::read(path) {
-        Ok(bytes) => index(parse(&bytes)?, false),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Ok(bytes) => {
+            let (profiles, sync) = parse(&bytes)?;
+            Ok(Contents {
+                profiles: index(profiles, false)?,
+                sync,
+            })
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Contents {
+            profiles: BTreeMap::new(),
+            sync: SyncSwitch::On,
+        }),
         Err(e) => Err(e.into()),
     }
 }
@@ -293,34 +378,51 @@ fn index(
     Ok(map)
 }
 
-/// Parse the file. The version is checked before the profile list is looked
-/// at, so a newer format reports as unsupported rather than corrupt.
-fn parse(bytes: &[u8]) -> Result<Vec<Profile>, StoreError> {
+/// Parse the file. The version is checked before anything else is looked at,
+/// so a newer format reports as unsupported rather than corrupt, and `sync_off`
+/// is read in version 2 only (version 1 has no switch and reads as on).
+fn parse(bytes: &[u8]) -> Result<(Vec<Profile>, SyncSwitch), StoreError> {
     // Error values from serde_json are dropped on purpose: they can quote file contents.
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| StoreError::Corrupt)?;
     let serde_json::Value::Object(mut file) = value else {
         return Err(StoreError::Corrupt);
     };
-    match file.get("version").and_then(serde_json::Value::as_u64) {
-        Some(FORMAT_VERSION) => {}
+    let sync = match file.get("version").and_then(serde_json::Value::as_u64) {
+        Some(FORMAT_V1) => SyncSwitch::On,
+        Some(FORMAT_V2) => match file.get("sync_off") {
+            Some(serde_json::Value::Bool(true)) => SyncSwitch::Off,
+            Some(serde_json::Value::Bool(false)) => SyncSwitch::On,
+            // Missing or not a boolean: not understood, not guessed at.
+            _ => SyncSwitch::Unreadable,
+        },
         Some(other) => return Err(StoreError::UnsupportedVersion(other)),
         None => return Err(StoreError::Corrupt),
-    }
+    };
     let profiles = file.remove("profiles").ok_or(StoreError::Corrupt)?;
-    serde_json::from_value(profiles).map_err(|_| StoreError::Corrupt)
+    let profiles = serde_json::from_value(profiles).map_err(|_| StoreError::Corrupt)?;
+    Ok((profiles, sync))
 }
 
 /// The file's bytes: pretty-printed, profiles in id order, trailing newline.
-fn encode(profiles: &BTreeMap<String, Profile>) -> Result<Vec<u8>, StoreError> {
+///
+/// Version 2 exactly when the switch is not on or a profile is kept on this
+/// machine, else version 1 (module docs). An `Unreadable` switch is written as
+/// off: whatever rewrites the file must not turn a switch nobody could read into
+/// on.
+fn encode(contents: &Contents) -> Result<Vec<u8>, StoreError> {
     #[derive(Serialize)]
     struct File<'a> {
         version: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sync_off: Option<bool>,
         profiles: Vec<&'a Profile>,
     }
+    let v2 = !contents.sync.is_on() || contents.profiles.values().any(|p| p.local_only);
     let file = File {
-        version: FORMAT_VERSION,
-        profiles: profiles.values().collect(),
+        version: if v2 { FORMAT_V2 } else { FORMAT_V1 },
+        sync_off: v2.then_some(!contents.sync.is_on()),
+        profiles: contents.profiles.values().collect(),
     };
     let mut bytes = serde_json::to_vec_pretty(&file).map_err(|_| StoreError::Serialize)?;
     bytes.push(b'\n');
@@ -660,7 +762,7 @@ mod tests {
     #[test]
     fn open_rejects_wrong_version() {
         for (text, want) in [
-            (r#"{"version":2,"profiles":[]}"#, 2),
+            (r#"{"version":3,"profiles":[]}"#, 3),
             (r#"{"version":0,"profiles":[]}"#, 0),
             // A future format need not even have a compatible profile list.
             (r#"{"version":7,"profiles":"whatever"}"#, 7),
@@ -672,8 +774,330 @@ mod tests {
                 matches!(err, StoreError::UnsupportedVersion(v) if v == want),
                 "input {text:?} gave {err:?}"
             );
+            assert!(
+                err.to_string().contains("versions 1 and 2"),
+                "the message names what this build reads: {err}"
+            );
             assert_eq!(fs::read_to_string(&path).unwrap(), text);
         }
+    }
+
+    // ----- format version 2: the sync switch and profiles kept on this machine -----
+    //
+    // Older versions refuse a file of another version and leave it alone, so a
+    // file that holds the switch off or a profile kept here is version 2: no
+    // older `moniker-server` on this machine can serve it. Otherwise the file is
+    // version 1, byte for byte what it always was.
+
+    fn file_text(path: &Path) -> String {
+        fs::read_to_string(path).unwrap()
+    }
+
+    fn file_json(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn nothing_kept_here_stays_version_1() {
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(1, "A")).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("sync_off"), "{text}");
+        assert!(!text.contains("local_only"), "{text}");
+        assert_eq!(s.sync_switch(), SyncSwitch::On);
+        assert!(s.sync_switch().is_on());
+    }
+
+    #[test]
+    fn a_profile_kept_here_makes_version_2() {
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(1, "syncs")).unwrap();
+        s.upsert(Profile {
+            local_only: true,
+            ..profile(2, "stays")
+        })
+        .unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("\"sync_off\": false"), "{text}");
+        assert!(text.contains("\"local_only\": true"), "{text}");
+        let value = file_json(&path);
+        let profiles = value["profiles"].as_array().unwrap();
+        assert!(
+            profiles[0].get("local_only").is_none(),
+            "only the exception"
+        );
+        assert_eq!(profiles[1]["local_only"], true);
+
+        let reopened = ProfileStore::open(&path).unwrap();
+        assert!(reopened.get(&pid(2)).unwrap().local_only);
+        assert!(!reopened.get(&pid(1)).unwrap().local_only);
+        assert_eq!(reopened.sync_switch(), SyncSwitch::On);
+
+        // Back to nothing kept here: the file goes back to version 1.
+        s.upsert(Profile {
+            local_only: false,
+            ..profile(2, "stays")
+        })
+        .unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("sync_off") && !text.contains("local_only"));
+    }
+
+    #[test]
+    fn turning_sync_off_and_on_moves_the_version() {
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(1, "A")).unwrap();
+        s.upsert(profile(2, "B")).unwrap();
+        let profiles = s.all();
+
+        s.set_sync(false).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("\"sync_off\": true"), "{text}");
+        assert_eq!(s.sync_switch(), SyncSwitch::Off);
+        assert!(!s.sync_switch().is_on());
+        assert_eq!(s.all(), profiles, "the profiles are as they were");
+        let reopened = ProfileStore::open(&path).unwrap();
+        assert_eq!(reopened.sync_switch(), SyncSwitch::Off);
+        assert_eq!(reopened.all(), profiles);
+        assert_eq!(mode(&path), 0o600);
+
+        s.set_sync(true).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("sync_off"), "{text}");
+        assert_eq!(s.sync_switch(), SyncSwitch::On);
+        assert_eq!(s.all(), profiles, "the profiles are as they were");
+        let reopened = ProfileStore::open(&path).unwrap();
+        assert_eq!(reopened.sync_switch(), SyncSwitch::On);
+        assert_eq!(reopened.all(), profiles);
+    }
+
+    #[test]
+    fn turning_sync_on_keeps_version_2_while_a_profile_is_kept_here() {
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(Profile {
+            local_only: true,
+            ..profile(1, "stays")
+        })
+        .unwrap();
+        s.set_sync(false).unwrap();
+        s.set_sync(true).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("\"sync_off\": false"), "{text}");
+        assert_eq!(s.sync_switch(), SyncSwitch::On);
+    }
+
+    #[test]
+    fn a_switch_not_understood_reads_as_unreadable() {
+        for text in [
+            r#"{"version":2,"profiles":[]}"#,
+            r#"{"version":2,"sync_off":"no","profiles":[]}"#,
+            r#"{"version":2,"sync_off":null,"profiles":[]}"#,
+            r#"{"version":2,"sync_off":0,"profiles":[]}"#,
+            r#"{"version":2,"sync_off":[false],"profiles":[]}"#,
+        ] {
+            let (_d, path) = setup();
+            fs::write(&path, text).unwrap();
+            let s = ProfileStore::open(&path).expect(text);
+            assert_eq!(s.sync_switch(), SyncSwitch::Unreadable, "{text}");
+            assert!(!s.sync_switch().is_on(), "{text}");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                text,
+                "open writes nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn a_switch_that_is_understood_reads_as_it_says() {
+        for (text, want) in [
+            (
+                r#"{"version":2,"sync_off":true,"profiles":[]}"#,
+                SyncSwitch::Off,
+            ),
+            (
+                r#"{"version":2,"sync_off":false,"profiles":[]}"#,
+                SyncSwitch::On,
+            ),
+        ] {
+            let (_d, path) = setup();
+            fs::write(&path, text).unwrap();
+            assert_eq!(ProfileStore::open(&path).unwrap().sync_switch(), want);
+        }
+    }
+
+    #[test]
+    fn an_unreadable_switch_is_written_as_off() {
+        let (_d, path) = setup();
+        fs::write(&path, r#"{"version":2,"sync_off":"no","profiles":[]}"#).unwrap();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(1, "A")).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("\"sync_off\": true"), "{text}");
+        assert_eq!(
+            s.sync_switch(),
+            SyncSwitch::Off,
+            "the snapshot says what the file says"
+        );
+        assert_eq!(
+            ProfileStore::open(&path).unwrap().sync_switch(),
+            SyncSwitch::Off
+        );
+    }
+
+    #[test]
+    fn turning_sync_off_or_on_repairs_an_unreadable_switch() {
+        let broken = r#"{"version":2,"sync_off":"no","profiles":[]}"#;
+        let (_d, path) = setup();
+        fs::write(&path, broken).unwrap();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.set_sync(false).unwrap();
+        assert_eq!(s.sync_switch(), SyncSwitch::Off);
+        assert_eq!(file_json(&path)["sync_off"], true);
+
+        fs::write(&path, broken).unwrap();
+        let mut s = ProfileStore::open(&path).unwrap();
+        // Unreadable to On is a change, so it is written.
+        s.set_sync(true).unwrap();
+        assert_eq!(s.sync_switch(), SyncSwitch::On);
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("sync_off"), "{text}");
+    }
+
+    #[test]
+    fn sync_off_on_a_fresh_machine_writes_an_empty_v2_file() {
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        assert!(!path.exists());
+        s.set_sync(false).unwrap();
+        let value = file_json(&path);
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["sync_off"], true);
+        assert_eq!(value["profiles"], serde_json::json!([]));
+        assert_eq!(s.sync_switch(), SyncSwitch::Off);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn a_v1_file_reads_as_sync_on() {
+        let (_d, path) = setup();
+        fs::write(&path, r#"{"version":1,"profiles":[]}"#).unwrap();
+        let s = ProfileStore::open(&path).unwrap();
+        assert_eq!(s.sync_switch(), SyncSwitch::On);
+        assert!(s.sync_switch().is_on());
+
+        // The switch is read in version 2 only: a version-1 file that happens to
+        // carry the key is still a version-1 file.
+        fs::write(&path, r#"{"version":1,"sync_off":true,"profiles":[]}"#).unwrap();
+        assert_eq!(
+            ProfileStore::open(&path).unwrap().sync_switch(),
+            SyncSwitch::On
+        );
+
+        // And no file at all is on too.
+        let (_d, path) = setup();
+        assert_eq!(
+            ProfileStore::open(&path).unwrap().sync_switch(),
+            SyncSwitch::On
+        );
+    }
+
+    #[test]
+    fn a_switch_that_does_not_change_is_not_written() {
+        let (d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.set_sync(true).unwrap();
+        assert!(!path.exists(), "on to on writes no file");
+        assert!(!d.path().join("profiles.json.tmp").exists());
+
+        // A compact hand-written file: any rewrite would pretty-print it.
+        let text = r#"{"version":2,"sync_off":true,"profiles":[]}"#;
+        fs::write(&path, text).unwrap();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.set_sync(false).unwrap();
+        assert_eq!(file_text(&path), text);
+
+        let v1 = r#"{"version":1,"profiles":[]}"#;
+        fs::write(&path, v1).unwrap();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.set_sync(true).unwrap();
+        assert_eq!(file_text(&path), v1);
+    }
+
+    #[test]
+    fn the_switch_survives_other_mutations_and_stale_snapshots() {
+        let (_d, path) = setup();
+        let mut a = ProfileStore::open(&path).unwrap();
+        let mut b = ProfileStore::open(&path).unwrap();
+        b.set_sync(false).unwrap();
+        assert_eq!(a.sync_switch(), SyncSwitch::On, "A's snapshot is stale");
+
+        // A mutation starts from the file, not from A's snapshot, so it keeps the
+        // switch B turned off.
+        a.upsert(profile(1, "A")).unwrap();
+        assert_eq!(a.sync_switch(), SyncSwitch::Off);
+        assert_eq!(file_json(&path)["sync_off"], true);
+
+        a.delete(&pid(1)).unwrap();
+        assert_eq!(file_json(&path)["sync_off"], true);
+        a.replace_all(vec![profile(2, "B")]).unwrap();
+        assert_eq!(file_json(&path)["sync_off"], true);
+        a.update(|fresh| Ok((fresh.to_vec(), ()))).unwrap();
+        a.update(|fresh| {
+            let mut next = fresh.to_vec();
+            next.push(profile(3, "C"));
+            Ok((next, ()))
+        })
+        .unwrap();
+        let value = file_json(&path);
+        assert_eq!(value["version"], 2);
+        assert_eq!(value["sync_off"], true);
+        assert_eq!(value["profiles"].as_array().unwrap().len(), 2);
+        assert_eq!(a.sync_switch(), SyncSwitch::Off);
+    }
+
+    #[test]
+    fn reload_picks_up_the_switch() {
+        let (_d, path) = setup();
+        let mut a = ProfileStore::open(&path).unwrap();
+        let mut b = ProfileStore::open(&path).unwrap();
+        b.set_sync(false).unwrap();
+        assert_eq!(a.sync_switch(), SyncSwitch::On);
+        a.reload().unwrap();
+        assert_eq!(a.sync_switch(), SyncSwitch::Off);
+        b.set_sync(true).unwrap();
+        a.reload().unwrap();
+        assert_eq!(a.sync_switch(), SyncSwitch::On);
+
+        // A reload that fails keeps the switch as it was, like the profiles.
+        b.set_sync(false).unwrap();
+        a.reload().unwrap();
+        fs::write(&path, "garbage").unwrap();
+        assert!(matches!(a.reload(), Err(StoreError::Corrupt)));
+        assert_eq!(a.sync_switch(), SyncSwitch::Off);
+    }
+
+    #[test]
+    fn a_failed_switch_change_leaves_the_snapshot_and_the_file() {
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(1, "A")).unwrap();
+        fs::write(&path, "garbage").unwrap();
+        assert!(matches!(s.set_sync(false), Err(StoreError::Corrupt)));
+        assert_eq!(s.sync_switch(), SyncSwitch::On);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "garbage");
     }
 
     #[test]
@@ -719,6 +1143,7 @@ mod tests {
                 commands: vec!["apt update".to_string()],
             }],
             transcript: false,
+            local_only: false,
             updated_at: 1_700_000_000_000,
             deleted: false,
         };
@@ -1224,6 +1649,7 @@ mod tests {
                 commands: vec!["rm -rf ~\nls".to_string()],
             }],
             transcript: true,
+            local_only: true,
             updated_at: 42,
             deleted: true,
         };
@@ -1379,7 +1805,7 @@ mod tests {
         );
         for (bad, want) in [
             ("not json".to_string(), "corrupt"),
-            (r#"{"version":2,"profiles":[]}"#.to_string(), "version"),
+            (r#"{"version":3,"profiles":[]}"#.to_string(), "version"),
             (valid_but_invalid_host, "invalid"),
         ] {
             let (_d, path) = setup();
@@ -1397,7 +1823,7 @@ mod tests {
                 let err = r.unwrap_err();
                 let ok = match want {
                     "corrupt" => matches!(err, StoreError::Corrupt),
-                    "version" => matches!(err, StoreError::UnsupportedVersion(2)),
+                    "version" => matches!(err, StoreError::UnsupportedVersion(3)),
                     _ => matches!(err, StoreError::Invalid(ProfileError::Host)),
                 };
                 assert!(ok, "{want}: got {err:?}");
