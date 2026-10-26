@@ -73,6 +73,11 @@ fn percent_encoded(path: &str) -> String {
 /// changes folder (OSC 7, `file://HOST/PATH` percent-encoded, with this
 /// machine's name as the host), and wait until the terminal has it.
 fn report_folder(terminal: &Terminal, folder: &str) {
+    report_folder_from(terminal, &terminal_tab::local_host_name(), folder);
+}
+
+/// [`report_folder`] with the host `host`.
+fn report_folder_from(terminal: &Terminal, host: &str, folder: &str) {
     let encoded = percent_encoded(folder);
     assert!(
         encoded.contains("%20") && encoded.contains("%C3%9C"),
@@ -80,14 +85,35 @@ fn report_folder(terminal: &Terminal, folder: &str) {
     );
     // Input sent before the shell has started is lost.
     wait_for_text(terminal, "$");
-    terminal.feed_child(
-        format!("printf '\\033]7;file://%s%s\\007' \"$(uname -n)\" '{encoded}'\n").as_bytes(),
-    );
+    let uri = format!("file://{host}{encoded}");
+    terminal.feed_child(format!("printf '\\033]7;%s\\007' '{uri}'\n").as_bytes());
     pump_until("the folder to be reported", || {
-        terminal
-            .current_directory_uri()
-            .is_some_and(|uri| uri.ends_with(&encoded))
+        terminal.current_directory_uri().as_deref() == Some(uri.as_str())
     });
+}
+
+/// A folder reported for another machine (a shell over `ssh` run by hand in a
+/// local pane, or a printed escape sequence) is not saved: the pane is saved
+/// with no folder. One reported for this machine afterwards is.
+pub(super) fn a_folder_reported_for_another_machine_is_not_saved(dir: &Path) {
+    let folder = dir.join("My Files").join("Ünï");
+    fs::create_dir_all(&folder).expect("the folder");
+    let there = canonical(&folder);
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let terminal = session_in(&pane(&main.view.selected_page().expect("the launch tab")));
+    let local = |dir: Option<PathBuf>| Node::Pane(pane_record(Kind::Local { dir }, None, 1.0));
+    report_folder_from(&terminal, "elsewhere.example.test", &there);
+    assert_eq!(capture(&main.view)[0].root, local(None), "another host");
+    report_folder(&terminal, &there);
+    assert_eq!(
+        capture(&main.view)[0].root,
+        local(Some(PathBuf::from(&there))),
+        "this machine"
+    );
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
 }
 
 /// Wait until `terminal` shows the line `line`, exactly.
@@ -185,27 +211,26 @@ fn sequence_ran(terminal: &Terminal) -> Vec<String> {
         .collect()
 }
 
-fn pane_record(kind: Kind, name: Option<&str>, scale: f64, transcript: bool) -> PaneRecord {
+fn pane_record(kind: Kind, name: Option<&str>, scale: f64) -> PaneRecord {
     PaneRecord {
         kind,
         name: name.map(str::to_owned),
         scale,
-        transcript,
     }
 }
 
 /// A window saved and added back to another window: window A has a tab split
 /// three ways (a local pane in a folder whose name has a space and letters
 /// that are not ASCII, side by side with a profile pane renamed "Logs" at a
-/// larger text size over a new-tab list) and a tab with a profile pane saving
-/// its transcript. Its capture (saved and read back as the file does) is
-/// restored into window B: B gains two tabs after its own, the first added
-/// selected; the splits have the same arrangement and fractions once sized,
-/// the panes their names and sizes and the recorded pane the focus; the local
-/// pane's shell starts in the folder; both profile panes connect through the
-/// fake `ssh` with their default sequence; the second tab's pane saves a
-/// transcript again. Nothing of a host, a user, a command or a sequence is
-/// in the session.
+/// larger text size over a new-tab list) and a tab with a profile pane whose
+/// profile saves its transcripts. Its capture (saved and read back as the file
+/// does) is restored into window B: B gains two tabs after its own, the first
+/// added selected; the splits have the same arrangement and fractions once
+/// sized, the panes their names and sizes and the recorded pane the focus; the
+/// local pane's shell starts in the folder; both profile panes connect through
+/// the fake `ssh` with their default sequence; the second tab's pane saves a
+/// transcript, as its profile's switch says. Nothing of a host, a user, a
+/// command or a sequence is in the session.
 pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     let folder = dir.join("My Files").join("Ünï");
     fs::create_dir_all(&folder).expect("the folder");
@@ -219,6 +244,7 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     db.name = "db".to_owned();
     db.host = "db.example.test".to_owned();
     db.startup_sequence = Some(0);
+    db.transcript = true;
     let ctx = ctx_with(dir, &[web.clone(), db.clone()]);
     settings::update(&ctx.settings_path, |s| {
         s.transcripts_dir = Some(transcripts.clone());
@@ -246,7 +272,7 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     act(&a, panes::SPLIT_DOWN_ACTION);
     let below = layout_of(&first).focused_holder().expect("the new pane");
     assert!(list_in_pane(&below).is_some());
-    // Tab 2: a profile pane that saves its transcript.
+    // Tab 2: a profile pane that saves its transcript, as its profile says.
     open_profile(&a.view, &ctx, &db, db.startup_choice(), true);
     let second = a.view.selected_page().expect("the second tab");
     assert_eq!(sequence_ran(&session_in(&pane(&second))), ["echo X"]);
@@ -272,8 +298,8 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     assert!((outer_fraction - 0.3).abs() < 0.02, "{outer_fraction}");
     assert!((inner_fraction - 0.7).abs() < 0.02, "{inner_fraction}");
 
-    // Captured: what each pane was, its name, size and transcript, the splits
-    // and the focused pane; and nothing else.
+    // Captured: what each pane was, its name and size, the splits and the
+    // focused pane; and nothing else.
     let tabs = capture(&a.view);
     assert_eq!(tabs.len(), 2, "{tabs:?}");
     assert_eq!(tabs[0].focused, 1, "Logs, in reading order");
@@ -294,8 +320,7 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
                 dir: Some(PathBuf::from(&there))
             },
             None,
-            1.0,
-            false
+            1.0
         ))
     );
     let Node::Split {
@@ -314,12 +339,9 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     };
     assert_eq!(
         **upper,
-        Node::Pane(pane_record(web_kind, Some("Logs"), 1.5, false))
+        Node::Pane(pane_record(web_kind, Some("Logs"), 1.5))
     );
-    assert_eq!(
-        **lower,
-        Node::Pane(pane_record(Kind::List, None, 1.0, false))
-    );
+    assert_eq!(**lower, Node::Pane(pane_record(Kind::List, None, 1.0)));
     let db_kind = Kind::Profile {
         id: db.id.clone(),
         name: db.name.clone(),
@@ -327,7 +349,7 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     assert_eq!(
         tabs[1],
         TabRecord {
-            root: Node::Pane(pane_record(db_kind, None, 1.0, true)),
+            root: Node::Pane(pane_record(db_kind, None, 1.0)),
             focused: 0,
         }
     );
@@ -402,7 +424,7 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     // The local pane's shell starts in the folder it reported.
     let terminal = session_in(local);
     assert_shell_in(&terminal, &there);
-    assert!(!local.records().get());
+    assert!(!saves_a_transcript(&terminal));
     // Both profile panes connect, each running its default sequence; Logs has
     // the keyboard once its session is there.
     let terminal = session_in(logs);
@@ -415,14 +437,14 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
             .and_then(|root| root.focus())
             .is_some_and(|focus| focus == *terminal.upcast_ref::<gtk::Widget>())
     });
-    assert!(!logs.records().get());
+    assert!(!saves_a_transcript(&terminal), "web's switch is off");
     assert!(list_in_pane(below).is_some(), "the list pane is the list");
     let db_pane = pane(&second);
     let terminal = session_in(&db_pane);
     assert_eq!(sequence_ran(&terminal), ["echo X"], "db's default");
     assert!(ssh_args(&terminal).contains(&format!("{}@{}", db.username, db.host)));
-    // The second tab's pane saves its transcript, as it did.
-    assert!(db_pane.records().get());
+    // The second tab's pane saves its transcript, as db's switch says.
+    assert!(saves_a_transcript(&terminal));
     assert_eq!(files_in(&transcripts), Vec::<PathBuf>::new());
     b.view.close_page(&second);
     pump_until("the transcript", || files_in(&transcripts).len() == 1);
@@ -446,7 +468,7 @@ pub(super) fn a_tab_not_shown_yet_gets_its_split_when_shown(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
     let main = main_window(&app, &ctx);
-    let list = || Node::Pane(pane_record(Kind::List, None, 1.0, false));
+    let list = || Node::Pane(pane_record(Kind::List, None, 1.0));
     let split = Node::Split {
         horizontal: true,
         fraction: 0.3,
@@ -512,7 +534,7 @@ pub(super) fn a_restored_divider_is_put_within_its_limits(dir: &Path) {
     let main = main_window(&app, &ctx);
     main.window.set_default_size(420, 300);
     pump_for(Duration::from_millis(300));
-    let list = || Node::Pane(pane_record(Kind::List, None, 1.0, false));
+    let list = || Node::Pane(pane_record(Kind::List, None, 1.0));
     // Both orientations, at the nearest the start the file reader allows.
     for (horizontal, fraction) in [(true, 0.05), (false, 0.05)] {
         let tabs = [TabRecord {
@@ -590,7 +612,7 @@ pub(super) fn a_profile_gone_shows_the_list_with_a_note(dir: &Path) {
         name: MARKUP_NAME.to_owned(),
     };
     let tabs = [TabRecord {
-        root: Node::Pane(pane_record(gone, None, 1.0, true)),
+        root: Node::Pane(pane_record(gone, None, 1.0)),
         focused: 0,
     }];
     restore(&main.view, &ctx, &tabs);
@@ -619,7 +641,7 @@ pub(super) fn a_profile_gone_shows_the_list_with_a_note(dir: &Path) {
     let again = capture(&main.view);
     assert_eq!(
         again[1].root,
-        Node::Pane(pane_record(Kind::List, None, 1.0, false))
+        Node::Pane(pane_record(Kind::List, None, 1.0))
     );
 
     // No name recorded: the note says whose pane it is without one.
@@ -629,7 +651,7 @@ pub(super) fn a_profile_gone_shows_the_list_with_a_note(dir: &Path) {
             name: name.to_owned(),
         };
         let tabs = [TabRecord {
-            root: Node::Pane(pane_record(nameless, None, 1.0, false)),
+            root: Node::Pane(pane_record(nameless, None, 1.0)),
             focused: 0,
         }];
         restore(&main.view, &ctx, &tabs);
@@ -666,7 +688,6 @@ pub(super) fn a_renamed_profile_still_connects(bin: &Path, dir: &Path) {
             },
             name,
             1.0,
-            false,
         ))
     };
     let tabs = [TabRecord {
@@ -709,64 +730,190 @@ pub(super) fn a_renamed_profile_still_connects(bin: &Path, dir: &Path) {
 }
 
 /// A local pane whose folder no longer exists starts in the home folder, as
-/// one with no folder does, and nothing is said about it. A recorded name of
-/// nothing is no name: the pane is named as a local terminal is, and saved
-/// again with none. A local pane that saved a transcript saves one again.
+/// one with no folder does, and so does one whose folder is still there but
+/// cannot be entered (no search permission); nothing is said about either. A
+/// recorded name of nothing is no name: the pane is named as a local terminal
+/// is, and saved again with none.
 pub(super) fn a_folder_gone_starts_at_home(dir: &Path) {
     let gone = dir.join("gone");
     fs::create_dir_all(&gone).expect("the folder");
     fs::remove_dir(&gone).expect("the folder gone");
-    let transcripts = dir.join("transcripts");
+    // Root enters any folder, so the locked one is only tried as another user.
+    // Its mode is given back however the scenario ends.
+    struct Unlock(PathBuf);
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let locked = (!rustix::process::geteuid().is_root()).then(|| dir.join("locked"));
+    let _unlock = locked.as_ref().map(|locked| {
+        fs::create_dir_all(locked).expect("the folder");
+        fs::set_permissions(locked, fs::Permissions::from_mode(0o000)).expect("lock it");
+        Unlock(locked.clone())
+    });
     let ctx = ctx_with(dir, &[]);
-    settings::update(&ctx.settings_path, |s| {
-        s.transcripts_dir = Some(transcripts.clone());
-    })
-    .expect("write the settings");
     let app = test_app();
     let main = main_window(&app, &ctx);
-    let local = |dir: Option<PathBuf>, name: Option<&str>, transcript: bool| {
-        Node::Pane(pane_record(Kind::Local { dir }, name, 1.0, transcript))
+    let local = |dir: Option<PathBuf>, name: Option<&str>| {
+        Node::Pane(pane_record(Kind::Local { dir }, name, 1.0))
     };
-    let tabs = [
+    let mut tabs = vec![
         TabRecord {
-            root: local(Some(gone), Some(""), false),
+            root: local(Some(gone), Some("")),
             focused: 0,
         },
         TabRecord {
-            root: local(None, None, true),
+            root: local(None, None),
             focused: 0,
         },
     ];
+    if let Some(locked) = &locked {
+        tabs.push(TabRecord {
+            root: local(Some(locked.clone()), None),
+            focused: 0,
+        });
+    }
     let (delivered, printed) = (ctx.notice.delivered(), ctx.notice.printed().len());
     restore(&main.view, &ctx, &tabs);
     let home = canonical(&glib::home_dir());
-    for index in [1, 2] {
-        let page = main.view.nth_page(index);
-        let terminal = wait_for_session(&page);
+    assert_eq!(main.view.n_pages() as usize, 1 + tabs.len());
+    for index in 1..main.view.n_pages() {
+        let terminal = wait_for_session(&main.view.nth_page(index));
+        let failed = |terminal: &Terminal| {
+            shown(terminal)
+                .iter()
+                .any(|line| line.contains("could not start"))
+        };
+        pump_until("the shell or its failure", || {
+            failed(&terminal) || shown(&terminal).iter().any(|line| line.contains('$'))
+        });
+        assert!(!failed(&terminal), "tab {index}: {:?}", shown(&terminal));
         assert_shell_in(&terminal, &home);
     }
     pump_for(Duration::from_millis(200));
     assert_eq!(ctx.notice.delivered(), delivered, "no message");
     assert_eq!(ctx.notice.printed().len(), printed, "no message");
     assert_eq!(main.view.nth_page(1).title(), "Local terminal");
-    assert!(!pane(&main.view.nth_page(1)).records().get());
-    assert!(pane(&main.view.nth_page(2)).records().get());
     let again = capture(&main.view);
-    assert_eq!(again[1].root, local(None, None, false));
-    assert_eq!(again[2].root, local(None, None, true));
-    main.view.close_page(&main.view.nth_page(2));
-    pump_until("the transcript", || files_in(&transcripts).len() == 1);
-    main.view.close_page(&main.view.nth_page(1));
+    assert_eq!(again[1].root, local(None, None));
+    assert_eq!(again[2].root, local(None, None));
+    main.window.destroy();
     pump_for(Duration::from_millis(200));
-    assert_eq!(files_in(&transcripts).len(), 1, "only the one that saved");
+}
 
-    // With "Save transcripts of all sessions" on, every restored pane saves
-    // one, whatever the session says.
+/// Whether the session in `terminal` saves a transcript: one that does keeps all
+/// of its scrollback (`terminal_tab::start_recording`), an ordinary one the
+/// 10,000 lines of the settings.
+fn saves_a_transcript(terminal: &Terminal) -> bool {
+    !(0..=1_000_000_000).contains(&terminal.scrollback_lines())
+}
+
+/// Restored panes save a transcript exactly as a plain click would now (user,
+/// 2026-10-26): a profile's pane when its profile's "Save transcript" switch or
+/// "Save transcripts of all sessions" is on, a local pane only with the latter.
+/// What a pane did when the session was saved does not count: a session saved
+/// while a pane was saving one, with its profile's switch turned off since,
+/// restores that pane without one.
+pub(super) fn restored_panes_save_a_transcript_as_a_plain_click_would(bin: &Path, dir: &Path) {
+    let transcripts = dir.join("transcripts");
+    let fake = fake_ssh(bin, "sessions-transcripts", "echo FAKE-END\nexec sleep 600");
+    let mut on = profile(&[]);
+    on.name = "on".to_owned();
+    on.host = "on.example.test".to_owned();
+    on.transcript = true;
+    let mut off = profile(&[]);
+    off.name = "off".to_owned();
+    off.host = "off.example.test".to_owned();
+    let ctx = ctx_with(dir, &[on.clone(), off.clone()]);
+    settings::update(&ctx.settings_path, |s| {
+        s.transcripts_dir = Some(transcripts.clone());
+    })
+    .expect("write the settings");
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    set_test_ssh_program(Some(fake));
+    let of = |p: &Profile| {
+        Node::Pane(pane_record(
+            Kind::Profile {
+                id: p.id.clone(),
+                name: p.name.clone(),
+            },
+            None,
+            1.0,
+        ))
+    };
+    let local = || Node::Pane(pane_record(Kind::Local { dir: None }, None, 1.0));
+    let tabs = |roots: Vec<Node>| -> Vec<TabRecord> {
+        roots
+            .into_iter()
+            .map(|root| TabRecord { root, focused: 0 })
+            .collect()
+    };
+    // The sessions of the tabs `restore` adds after the `before` tabs there were.
+    let restored = |records: &[TabRecord]| -> Vec<Terminal> {
+        let before = main.view.n_pages();
+        restore(&main.view, &ctx, records);
+        (before..main.view.n_pages())
+            .map(|index| session_in(&pane(&main.view.nth_page(index))))
+            .collect()
+    };
+    let close_all_but_the_first = || {
+        for index in (1..main.view.n_pages()).rev() {
+            main.view.close_page(&main.view.nth_page(index));
+        }
+        pump_until("the tabs to close", || main.view.n_pages() == 1);
+    };
+
+    // "Save transcripts of all sessions" off: only the profile whose switch is
+    // on.
+    let terminals = restored(&tabs(vec![of(&on), of(&off), local()]));
+    wait_for_text(&terminals[0], "FAKE-END");
+    wait_for_text(&terminals[1], "FAKE-END");
+    wait_for_text(&terminals[2], "$");
+    assert!(saves_a_transcript(&terminals[0]), "its switch is on");
+    assert!(!saves_a_transcript(&terminals[1]), "its switch is off");
+    assert!(!saves_a_transcript(&terminals[2]), "a local pane");
+    close_all_but_the_first();
+    pump_until("the transcript", || !files_in(&transcripts).is_empty());
+    pump_for(Duration::from_millis(300));
+    let written = files_in(&transcripts);
+    assert_eq!(written.len(), 1, "only one: {written:?}");
+    assert!(
+        written[0].to_string_lossy().contains(&on.host),
+        "{written:?}"
+    );
+
+    // With it on, every restored pane saves one.
     settings::update(&ctx.settings_path, |s| s.save_all_transcripts = true)
         .expect("write the settings");
-    restore(&main.view, &ctx, &tabs[..1]);
-    let page = main.view.selected_page().expect("the restored tab");
-    assert!(pane(&page).records().get(), "save all");
+    let terminals = restored(&tabs(vec![of(&off), local()]));
+    assert!(saves_a_transcript(&terminals[0]), "save all: a profile's");
+    assert!(saves_a_transcript(&terminals[1]), "save all: a local pane");
+    close_all_but_the_first();
+    pump_until("the two transcripts", || files_in(&transcripts).len() == 3);
+    settings::update(&ctx.settings_path, |s| s.save_all_transcripts = false)
+        .expect("write the settings");
+
+    // Saved while it was saving one (its switch on), then the switch turned
+    // off: restored without one.
+    open_profile(&main.view, &ctx, &on, None, true);
+    let saving = session_in(&pane(&main.view.nth_page(1)));
+    assert!(saves_a_transcript(&saving));
+    let file = dir.join(session_file::FILE_NAME);
+    save_as(&file, "Work", capture(&main.view)[1..].to_vec());
+    close_all_but_the_first();
+    let mut switched_off = on.clone();
+    switched_off.transcript = false;
+    ProfileStore::open(&dir.join("profiles.json"))
+        .expect("the store")
+        .upsert(switched_off)
+        .expect("save");
+    ctx.profiles_changed();
+    let terminals = restored(&saved(&file)[0].tabs);
+    assert!(!saves_a_transcript(&terminals[0]), "its switch is off now");
+
+    set_test_ssh_program(None);
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }
@@ -802,8 +949,7 @@ pub(super) fn a_command_tab_is_saved_as_a_shell_in_its_folder(bin: &Path, dir: &
                 dir: Some(PathBuf::from(&there))
             },
             None,
-            1.0,
-            false
+            1.0
         ))
     );
     let file = dir.join(session_file::FILE_NAME);
@@ -832,9 +978,9 @@ pub(super) fn a_command_tab_is_saved_as_a_shell_in_its_folder(bin: &Path, dir: &
 }
 
 /// A profile pane that still waits for the keyring is saved as its profile,
-/// recording a transcript if it will, and so is one whose session has ended
-/// (the pane stays with the note). Names longer than the file keeps are cut to
-/// fit, so the session can still be saved.
+/// and so is one whose session has ended (the pane stays with the note). Names
+/// longer than the file keeps are cut to fit, so the session can still be
+/// saved.
 pub(super) fn a_pane_waiting_or_ended_is_still_its_profile(bin: &Path, dir: &Path) {
     let fake = fake_ssh(bin, "sessions-ends", "echo FAKE-END\nexit 1");
     let mut web = profile(&[]);
@@ -864,7 +1010,6 @@ pub(super) fn a_pane_waiting_or_ended_is_still_its_profile(bin: &Path, dir: &Pat
         },
         Some(&kept(&"n".repeat(250))),
         1.0,
-        true,
     ));
     let tabs = capture(&main.view);
     assert_eq!(tabs[1].root, expected, "waiting");
@@ -937,7 +1082,6 @@ pub(super) fn restored_connections_ask_the_keyring_in_pane_order(bin: &Path, dir
             },
             None,
             1.0,
-            false,
         ))
     };
     let tabs = [
@@ -1165,7 +1309,7 @@ fn save_as(file: &Path, name: &str, tabs: Vec<TabRecord>) {
 /// A session of one tab that shows the new-tab list.
 fn one_list_tab() -> Vec<TabRecord> {
     vec![TabRecord {
-        root: Node::Pane(pane_record(Kind::List, None, 1.0, false)),
+        root: Node::Pane(pane_record(Kind::List, None, 1.0)),
         focused: 0,
     }]
 }
@@ -1750,23 +1894,173 @@ pub(super) fn a_failed_write_is_told(dir: &Path) {
     pump_for(Duration::from_millis(200));
 }
 
-/// The widget that has the keyboard in `main`'s window, if it is not in a
-/// dialog or a popover.
-fn keyboard_in(main: &window::MainWindow) -> Option<gtk::Widget> {
-    gtk::prelude::GtkWindowExt::focus(&main.window).filter(|focus| {
-        focus.ancestor(adw::Dialog::static_type()).is_none()
-            && focus.ancestor(gtk::Popover::static_type()).is_none()
+/// Whether the keyboard is in the focused pane of `main`'s selected tab: its
+/// terminal, or what its new-tab list gives it to.
+fn keyboard_in_the_focused_pane(main: &window::MainWindow) -> bool {
+    let Some(holder) = main
+        .view
+        .selected_page()
+        .as_ref()
+        .and_then(terminal_tab::holder_of)
+    else {
+        return false;
+    };
+    gtk::prelude::GtkWindowExt::focus(&main.window).is_some_and(|focus| {
+        focus == *holder.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&holder)
     })
 }
 
-/// Wait until the keyboard is in `main`'s window again, not in a dialog or a
-/// menu, after the answer to a question. It comes back to the widget that had
-/// it when the menu was opened with a click, the Sessions button, as it does for
-/// any menu button.
+/// Wait until the keyboard is back in the terminal after the answer to a
+/// question: in the focused pane of the selected tab (user, 2026-10-26), not
+/// on the Sessions button where a menu button leaves it; and see that it stays
+/// there.
 fn assert_keyboard_back(main: &window::MainWindow, what: &str) {
-    pump_until(&format!("the keyboard to be back after {what}"), || {
-        keyboard_in(main).is_some()
+    pump_until(
+        &format!("the keyboard back in the terminal after {what}"),
+        || keyboard_in_the_focused_pane(main),
+    );
+    pump_for(Duration::from_millis(300));
+    assert!(
+        keyboard_in_the_focused_pane(main),
+        "the keyboard left the terminal again after {what}"
+    );
+}
+
+/// Answer `dialog` with `response`, or with Escape for `None`.
+fn answer_or_escape(main: &window::MainWindow, dialog: &adw::AlertDialog, response: Option<&str>) {
+    match response {
+        Some(response) => answer(main, dialog, response),
+        None => {
+            dialog.close();
+            pump_until("the dialog to go", || {
+                main.window.visible_dialog().as_ref() != Some(dialog.upcast_ref::<adw::Dialog>())
+            });
+        }
+    }
+}
+
+/// While a question chained to another is open, the keyboard is not given to
+/// the terminal behind it.
+fn assert_keyboard_stays_out_of_the_terminal(main: &window::MainWindow, what: &str) {
+    pump_for(Duration::from_millis(300));
+    assert!(
+        main.window.visible_dialog().is_some(),
+        "{what} is still open"
+    );
+    assert!(
+        !keyboard_in_the_focused_pane(main),
+        "the keyboard in the terminal behind {what}"
+    );
+}
+
+/// After every answer to the Sessions menu's questions (user, 2026-10-26): Save,
+/// Rename and Delete, each answered with its action, Cancel and Escape, and the
+/// chained "Replace “name”?" and "Replace the Saved Sessions File?" likewise,
+/// the keyboard goes back to the terminal: the focused pane of the tab in
+/// front, not the Sessions button. While a chained question is open it stays
+/// out of the terminal. In a split tab it goes to the focused pane, here one
+/// that shows the new-tab list.
+pub(super) fn every_answer_gives_the_keyboard_back_to_the_terminal(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    pump_until("the keyboard in the terminal to begin with", || {
+        keyboard_in_the_focused_pane(&a)
     });
+    let answers = |action: &'static str| {
+        [
+            (Some("Cancel"), "Cancel"),
+            (None, "Escape"),
+            (Some(action), action),
+        ]
+    };
+
+    // Save.
+    for (response, what) in answers("Save") {
+        let dialog = save_dialog(&a);
+        name_entry(&dialog).set_text("Work");
+        answer_or_escape(&a, &dialog, response);
+        assert_keyboard_back(&a, &format!("{what} on Save"));
+    }
+    assert_eq!(names_saved(&file), ["Work"]);
+
+    // A name in use: "Replace “Work”?".
+    for (response, what) in answers("Replace") {
+        let dialog = save_dialog(&a);
+        name_entry(&dialog).set_text("Work");
+        answer(&a, &dialog, "Save");
+        let ask = dialog_over(&a, "the Replace question");
+        assert_eq!(
+            ask.heading().as_deref(),
+            Some("Replace \u{201c}Work\u{201d}?")
+        );
+        assert_keyboard_stays_out_of_the_terminal(&a, "the Replace question");
+        answer_or_escape(&a, &ask, response);
+        assert_keyboard_back(&a, &format!("{what} on the Replace question"));
+    }
+
+    // A file that cannot be read: "Replace the Saved Sessions File?".
+    for (response, what) in answers("Replace") {
+        fs::write(&file, "not json").expect("damage the file");
+        let dialog = save_dialog(&a);
+        answer(&a, &dialog, "Save");
+        let ask = dialog_over(&a, "the question about the file");
+        assert_eq!(
+            ask.heading().as_deref(),
+            Some("Replace the Saved Sessions File?")
+        );
+        assert_keyboard_stays_out_of_the_terminal(&a, "the question about the file");
+        answer_or_escape(&a, &ask, response);
+        assert_keyboard_back(&a, &format!("{what} on the question about the file"));
+    }
+    assert_eq!(names_saved(&file), ["Session 1"], "a new file");
+
+    // Rename.
+    for (response, what) in answers("Rename") {
+        let popover = open_menu(&a);
+        from_session_menu(&popover, "Session 1", "Rename\u{2026}");
+        let dialog = dialog_over(&a, "the Rename dialog");
+        if response == Some("Rename") {
+            name_entry(&dialog).set_text("Renamed");
+        }
+        answer_or_escape(&a, &dialog, response);
+        assert_keyboard_back(&a, &format!("{what} on Rename"));
+    }
+    assert_eq!(names_saved(&file), ["Renamed"]);
+
+    // Delete.
+    for (response, what) in answers("Delete") {
+        let popover = open_menu(&a);
+        from_session_menu(&popover, "Renamed", "Delete\u{2026}");
+        let ask = dialog_over(&a, "the Delete question");
+        answer_or_escape(&a, &ask, response);
+        assert_keyboard_back(&a, &format!("{what} on Delete"));
+    }
+    assert_eq!(names_saved(&file), Vec::<String>::new());
+
+    // A split tab: the focused pane is the new one, which shows the list.
+    WidgetExt::activate_action(
+        &a.window,
+        &format!("win.{}", panes::SPLIT_RIGHT_ACTION),
+        None,
+    )
+    .expect("split right");
+    let page = a.view.selected_page().expect("the tab");
+    let right = layout_of(&page).focused_holder().expect("the new pane");
+    let left = layout_of(&page).holders()[0].clone();
+    assert_ne!(left, right);
+    assert!(list_in_pane(&right).is_some());
+    pump_until("the keyboard in the new pane", || {
+        keyboard_in_the_focused_pane(&a)
+    });
+    let dialog = save_dialog(&a);
+    answer(&a, &dialog, "Cancel");
+    assert_keyboard_back(&a, "Cancel in a split tab");
+    assert_eq!(layout_of(&page).focused_holder().as_ref(), Some(&right));
+
+    a.window.destroy();
+    pump_for(Duration::from_millis(200));
 }
 
 /// "Replace the Saved Sessions File?" is the last question when Save finds the
@@ -1775,17 +2069,16 @@ fn assert_keyboard_back(main: &window::MainWindow, what: &str) {
 /// still asked (Cancel keeps it all; Replace puts this window's layout in the
 /// old one's place and keeps the others); if not, the session is added to the
 /// repaired file; if the file is still damaged, a new file starts. After each
-/// answer the keyboard is back in the window.
+/// answer the keyboard is back in the terminal.
 pub(super) fn a_file_repaired_while_asking_still_asks_about_a_name(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
     let a = main_window(&app, &ctx);
     let file = dir.join(session_file::FILE_NAME);
     let old = one_list_tab();
-    assert!(
-        keyboard_in(&a).is_some(),
-        "the keyboard is in the window to begin with"
-    );
+    pump_until("the keyboard in the terminal to begin with", || {
+        keyboard_in_the_focused_pane(&a)
+    });
 
     // Save "Work" over a damaged file; the question about the file is open.
     let ask_about_the_file = || {

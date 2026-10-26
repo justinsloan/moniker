@@ -7,9 +7,10 @@
 //! [`capture`] reads every tab of a window, in order: the arrangement of its
 //! panes ([`panes::tree_of`]: each split's orientation and where its divider
 //! is) and, for each pane, what it shows ([`PaneKind`]), the name the person
-//! gave it, its text size and whether it saves a transcript, and which pane is
-//! the tab's focused one. A local pane is recorded with the folder its terminal
-//! last reported ([`terminal_tab::current_folder`], the shell's OSC 7); a
+//! gave it and its text size, and which pane is the tab's focused one. Not
+//! whether it saves a transcript: that is decided again when it is restored. A
+//! local pane is recorded with the folder its terminal last reported for this
+//! machine ([`terminal_tab::current_folder`], the shell's OSC 7); a
 //! command started with `moniker -- COMMAND` is recorded as a local pane in that
 //! folder, or the one it was started in, never as its command. A pane that
 //! waits for the keyring, or whose session has ended, is its profile; an empty
@@ -30,9 +31,15 @@
 //! other in pane order (issue #4) and nothing here reads the keyring or the
 //! profile file; a profile no longer saved shows the new-tab list with a note
 //! naming it as the session did; a local pane opens a shell in its folder, or
-//! in the home folder when it has none or it is gone; a list pane shows the
-//! list. A pane saves a transcript when the session says it did or "Save
-//! transcripts of all sessions" is on.
+//! in the home folder when it has none, or it is gone or cannot be entered; a
+//! list pane shows the list.
+//!
+//! A restored pane saves a transcript exactly as a plain click would now (user,
+//! 2026-10-26), whatever it did when the session was saved: a profile's pane as
+//! [`terminal_tab::default_save`] says for the profile's own "Save transcript"
+//! switch and "Save transcripts of all sessions", a local pane as it says for a
+//! local terminal (the latter only). Turning either off therefore stops
+//! restored panes too.
 
 use std::rc::Rc;
 
@@ -100,7 +107,6 @@ fn pane_record(holder: &PaneHolder) -> PaneRecord {
             .filter(|name| !name.is_empty())
             .map(kept),
         scale: holder.scale().get(),
-        transcript: holder.records().get(),
     }
 }
 
@@ -169,26 +175,31 @@ pub(crate) fn restore(view: &adw::TabView, ctx: &Rc<AppContext>, tabs: &[TabReco
     }
 }
 
-/// Fill the fresh pane of `holder` with what `record` says it was.
+/// Fill the fresh pane of `holder` with what `record` says it was. A
+/// transcript is saved as a plain click would save one (module docs).
 fn fill(holder: &PaneHolder, record: &PaneRecord, ctx: &Rc<AppContext>, save_all: bool) {
-    let save = terminal_tab::default_save(record.transcript, save_all);
     match &record.kind {
         Kind::Profile { id, name } => {
             // Bind first so the store borrow ends before connecting.
             let profile = ctx.store.borrow().get(id).cloned();
             match profile {
-                Some(profile) => terminal_tab::start_profile(
-                    holder,
-                    ctx,
-                    &profile,
-                    profile.startup_choice(),
-                    save,
-                ),
+                Some(profile) => {
+                    let save = terminal_tab::default_save(profile.transcript, save_all);
+                    terminal_tab::start_profile(
+                        holder,
+                        ctx,
+                        &profile,
+                        profile.startup_choice(),
+                        save,
+                    );
+                }
                 None => new_tab::fill_with_note(holder, ctx, &gone_note(name)),
             }
         }
         Kind::Local { dir } => {
             let dir = dir.clone().unwrap_or_else(glib::home_dir);
+            // A local terminal has no setting of its own.
+            let save = terminal_tab::default_save(false, save_all);
             let transcript = terminal_tab::local_transcript_spec(ctx, save);
             terminal_tab::start_local_shell_in(holder, &dir, transcript);
         }
@@ -254,12 +265,11 @@ mod tests {
     use super::*;
     use crate::session_file::Kind;
 
-    fn pane(kind: Kind, name: Option<&str>, scale: f64, transcript: bool) -> PaneRecord {
+    fn pane(kind: Kind, name: Option<&str>, scale: f64) -> PaneRecord {
         PaneRecord {
             kind,
             name: name.map(str::to_owned),
             scale,
-            transcript,
         }
     }
 
@@ -275,7 +285,6 @@ mod tests {
                 },
                 None,
                 1.0,
-                false,
             ))),
             end: Box::new(Node::Split {
                 horizontal: false,
@@ -287,9 +296,8 @@ mod tests {
                     },
                     Some("Logs"),
                     1.5,
-                    true,
                 ))),
-                end: Box::new(Node::Pane(pane(Kind::List, None, 0.8, false))),
+                end: Box::new(Node::Pane(pane(Kind::List, None, 0.8))),
             }),
         }
     }
@@ -366,7 +374,7 @@ mod tests {
         assert_eq!(back, node, "and back again, the same");
 
         // A tab of one pane is that pane.
-        let alone = Node::Pane(pane(Kind::List, Some("x"), 1.0, false));
+        let alone = Node::Pane(pane(Kind::List, Some("x"), 1.0));
         let tree = tree_of_record(&alone);
         assert!(matches!(tree, Tree::Leaf(_)));
         assert_eq!(record_of_tree(tree.map(&mut |pane| pane.clone())), alone);

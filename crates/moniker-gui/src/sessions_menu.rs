@@ -22,6 +22,14 @@
 //! loses the keyboard to one of its buttons, and a restored pane that takes the
 //! keyboard would have it taken back by the closing menu.
 //!
+//! When a question closes, whatever the answer (its action, Cancel or Escape),
+//! the keyboard goes back to the terminal: the focused pane of the tab in front
+//! (user, 2026-10-26), not the Sessions button, where libadwaita puts it back
+//! for a menu button. Only if that pane may have it (`panes::in_front`): not
+//! while another question is open, as the next one of a chain is. A pick keeps
+//! its own rule: the restored tab's recorded pane takes it
+//! ([`session_layout::restore`]).
+//!
 //! Session names are chosen by the person but may come from a file that was
 //! edited or written by another Moniker: every label and dialog here shows
 //! them as plain text, never as Pango markup. A message goes to the
@@ -41,9 +49,10 @@ use crate::connect_menu::entry_button;
 use crate::context::AppContext;
 use crate::new_tab::more_button;
 use crate::notify::NotificationArea;
+use crate::panes;
 use crate::session_file::{self, Loaded, Session};
 use crate::session_layout;
-use crate::terminal_tab::after_the_menu_lets_go;
+use crate::terminal_tab::{self, after_the_menu_lets_go};
 use crate::window::MainWindow;
 
 /// Widget name of the box that holds one saved session's button and its › in
@@ -111,6 +120,33 @@ impl Menu {
             .upgrade()
             .and_then(|button| button.root())
             .and_downcast::<gtk::Window>()
+    }
+
+    /// Once `dialog` has closed, whatever the answer, give the keyboard to the
+    /// focused pane of the tab in front (its terminal, or the first thing in it
+    /// that takes the keyboard: the new-tab list's search entry), if it may have
+    /// it (`panes::in_front`: never a tab out of sight, never while another
+    /// dialog is open, such as the next question of a chain, whose own closing
+    /// does it). From an idle callback: by then the dialog has gone from the
+    /// window, and libadwaita has given the keyboard back to the widget that
+    /// had it before the dialog opened, which this then overrides.
+    fn give_the_keyboard_back_when_closed(&self, dialog: &adw::AlertDialog) {
+        let view = self.view.clone();
+        dialog.connect_closed(move |_| {
+            let view = view.clone();
+            glib::idle_add_local_once(move || {
+                let holder = view
+                    .upgrade()
+                    .and_then(|view| view.selected_page())
+                    .as_ref()
+                    .and_then(terminal_tab::holder_of);
+                if let Some(holder) = holder
+                    && panes::in_front(&holder)
+                {
+                    panes::focus_pane(&holder);
+                }
+            });
+        });
     }
 
     /// Show `text` (plain) in this window.
@@ -277,6 +313,7 @@ impl Menu {
             &start,
             Vec::new(),
         );
+        self.give_the_keyboard_back_when_closed(&dialog);
         let menu = Rc::clone(self);
         dialog.choose(
             Some(&window),
@@ -337,6 +374,7 @@ impl Menu {
             return;
         };
         let dialog = question(heading, body, action);
+        self.give_the_keyboard_back_when_closed(&dialog);
         let menu = Rc::clone(self);
         let id = action.0.to_owned();
         dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
@@ -398,6 +436,7 @@ impl Menu {
         };
         let (dialog, entry) =
             name_dialog("Rename Session", None, ("rename", "Rename"), from, taken);
+        self.give_the_keyboard_back_when_closed(&dialog);
         let menu = Rc::clone(self);
         let from = from.to_owned();
         dialog.choose(

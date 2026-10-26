@@ -4,10 +4,13 @@
 //! A session is a name and a list of tabs; a tab is a tree of splits with a
 //! pane at each leaf. Per pane the file says what it was (a profile by id, with
 //! its name only to say which profile is gone; a local terminal and the folder
-//! its shell reported; or the new-tab list), the name the person gave it, its
-//! text size and whether it saved a transcript. The types are the whole of what
-//! can be written, so the file never holds a password, a host, a user name, a
-//! command line, a sequence, an environment or any text from a terminal.
+//! its shell reported; or the new-tab list), the name the person gave it and its
+//! text size. Not whether it saved a transcript: a restored pane decides that as
+//! a plain click does (user, 2026-10-26), and a `transcript` field in a file an
+//! earlier build wrote is read past like any field the reader does not know. The
+//! types are the whole of what can be written, so the file never holds a
+//! password, a host, a user name, a command line, a sequence, an environment or
+//! any text from a terminal.
 //!
 //! Like the settings, the file is this machine's own: never synced, mode 0600,
 //! written atomically ([`crate::settings::write_private`]). It is
@@ -15,8 +18,9 @@
 //! makes no sense is skipped and costs the others nothing; a file that is not
 //! JSON, is of another version or is not a list of sessions is
 //! [`Loaded::Unreadable`] and is never written over unless the caller says so.
-//! A skipped entry is kept: every write puts it back as it was (as a JSON
-//! value), in its place, so saving one session never destroys one the person
+//! A skipped entry is kept: every write puts it back, with its contents (as
+//! the JSON value it was read as: its keys may come back in another order), in
+//! its place, so saving one session never destroys one the person
 //! might fix by hand or a newer Moniker might understand. It is not a session,
 //! so its name does not block another session's.
 //!
@@ -113,8 +117,6 @@ pub(crate) struct PaneRecord {
     pub(crate) name: Option<String>,
     /// The text size, within `zoom::MIN..=zoom::MAX`.
     pub(crate) scale: f64,
-    /// Whether the pane saved a transcript.
-    pub(crate) transcript: bool,
 }
 
 /// What a pane was.
@@ -267,10 +269,12 @@ fn unreadable_error(why: &str) -> io::Error {
 /// One entry of the file's list of sessions.
 enum Entry {
     Session(Session),
-    /// An entry reading skipped (it makes no sense, or repeats a name): kept
-    /// exactly as the file had it, so that saving one session never destroys
-    /// one the person might fix by hand, or a newer Moniker might understand.
-    /// It is not a session: its name is free for another.
+    /// An entry reading skipped (it makes no sense, or repeats a name): kept,
+    /// with its contents, so that saving one session never destroys one the
+    /// person might fix by hand, or a newer Moniker might understand (it is
+    /// written back as the JSON value it was read as, so its keys may come
+    /// back in another order). It is not a session: its name is free for
+    /// another.
     Skipped(Value),
 }
 
@@ -409,8 +413,8 @@ fn node_from(value: &Value, depth: usize, panes: &mut usize) -> Option<Node> {
 }
 
 /// A pane. The kind and the texts that say which profile it was must make
-/// sense; the name, text size and transcript fall back to none, the normal
-/// size and no when they are missing or of the wrong type.
+/// sense; the name and text size fall back to none and the normal size when
+/// they are missing or of the wrong type. Any other field is read past.
 fn pane_from(fields: &Map<String, Value>) -> Option<PaneRecord> {
     let kind = match fields.get("pane")?.as_str()? {
         "profile" => {
@@ -446,10 +450,6 @@ fn pane_from(fields: &Map<String, Value>) -> Option<PaneRecord> {
             .get("scale")
             .and_then(Value::as_f64)
             .map_or(zoom::DEFAULT, zoom::clamp),
-        transcript: fields
-            .get("transcript")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
     })
 }
 
@@ -597,7 +597,6 @@ fn pane_value(pane: &PaneRecord) -> Value {
     }
     fields.insert("name".to_owned(), json!(pane.name));
     fields.insert("scale".to_owned(), json!(pane.scale));
-    fields.insert("transcript".to_owned(), json!(pane.transcript));
     Value::Object(fields)
 }
 
@@ -613,7 +612,7 @@ mod tests {
     const LIST: &str = r#"{"pane":"list"}"#;
     /// A new-tab list pane as a write puts it, so that a session read from it
     /// is written back as the same JSON value.
-    const WRITTEN_LIST: &str = r#"{"pane":"list","name":null,"scale":1.0,"transcript":false}"#;
+    const WRITTEN_LIST: &str = r#"{"pane":"list","name":null,"scale":1.0}"#;
 
     fn mode(path: &Path) -> u32 {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -624,7 +623,6 @@ mod tests {
             kind,
             name: None,
             scale: 1.0,
-            transcript: false,
         }
     }
 
@@ -738,7 +736,6 @@ mod tests {
                             },
                             name: Some("Front <end>".to_owned()),
                             scale: 1.5,
-                            transcript: true,
                         })),
                         end: Box::new(Node::Split {
                             horizontal: false,
@@ -749,7 +746,6 @@ mod tests {
                                 },
                                 name: None,
                                 scale: 0.8,
-                                transcript: false,
                             })),
                             end: Box::new(leaf(Kind::List)),
                         }),
@@ -761,7 +757,6 @@ mod tests {
                         kind: Kind::Local { dir: None },
                         name: Some("Notes".to_owned()),
                         scale: 1.0,
-                        transcript: false,
                     }),
                     focused: 0,
                 },
@@ -920,7 +915,7 @@ mod tests {
     #[test]
     fn a_pane_is_read_field_by_field() {
         let pane = pane_of(&format!(
-            r#"{{"pane":"profile","profile":"{ID}","profile_name":"web","name":"Front","scale":1.2,"transcript":true}}"#
+            r#"{{"pane":"profile","profile":"{ID}","profile_name":"web","name":"Front","scale":1.2}}"#
         ))
         .unwrap();
         assert_eq!(
@@ -932,15 +927,16 @@ mod tests {
                 },
                 name: Some("Front".to_owned()),
                 scale: 1.2,
-                transcript: true,
             }
         );
 
-        // Everything but the kind may be missing or of the wrong type.
+        // Everything but the kind may be missing or of the wrong type, and a
+        // field the reader does not know is read past.
         for extras in [
             "",
-            r#","name":null,"scale":null,"transcript":null"#,
-            r#","name":5,"scale":"big","transcript":"yes""#,
+            r#","name":null,"scale":null"#,
+            r#","name":5,"scale":"big""#,
+            r#","transcript":true,"future":{"x":[1]}"#,
         ] {
             let pane = pane_of(&format!(r#"{{"pane":"list"{extras}}}"#)).unwrap();
             assert_eq!(pane, self::pane(Kind::List), "{extras}");
@@ -1554,7 +1550,6 @@ mod tests {
             },
             name: Some("Front".to_owned()),
             scale: 1.0,
-            transcript: true,
         });
         put(&path, saved, false).unwrap();
         let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1572,7 +1567,6 @@ mod tests {
                             "profile_name": "web",
                             "name": "Front",
                             "scale": 1.0,
-                            "transcript": true,
                         },
                     }],
                 }],
@@ -1697,6 +1691,39 @@ mod tests {
         let bytes = fs::read(&path).unwrap();
         delete(&path, "Nope").unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_transcript_in_an_older_file_is_read_past_and_not_written_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        // A file an earlier build of this branch wrote: each pane said whether
+        // it saved a transcript. A restored pane now decides as a plain click
+        // does, so the field means nothing any more.
+        let old = session_json(
+            "Old",
+            r#"{"pane":"list","name":null,"scale":1.0,"transcript":true}"#,
+        );
+        let odd = session_json("Odd", r#"{"pane":"telnet","transcript":true}"#);
+        write_entries(&path, &[old, odd.clone()]);
+        assert_eq!(names_at(&path), ["Old"], "it still loads");
+        assert_eq!(sessions_at(&path)[0], session("Old"));
+
+        // Saving another session writes the valid one back without it; the
+        // entry the reader skips keeps everything it had.
+        put(&path, session("New"), false).unwrap();
+        let entries = entries_at(&path);
+        assert_eq!(entries.len(), 3);
+        for i in [0, 2] {
+            let root = &entries[i]["tabs"][0]["root"];
+            assert_eq!(
+                *root,
+                json!({"pane": "list", "name": null, "scale": 1.0}),
+                "entry {i}"
+            );
+        }
+        assert_eq!(entries[1], odd, "the skipped entry is as it was");
+        assert_eq!(names_at(&path), ["Old", "New"]);
     }
 
     #[test]

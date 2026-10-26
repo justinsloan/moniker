@@ -389,9 +389,8 @@ pub(crate) enum PaneKind {
 
 /// The holder of one pane's session: an empty box that fills the pane, which
 /// later receives a chooser or a terminal. It also keeps the pane's
-/// [`TabTitle`], text size, askpass marker, what it shows ([`PaneKind`]) and
-/// whether it saves a transcript, so they move with the pane when it or its
-/// tab is dragged elsewhere.
+/// [`TabTitle`], text size, askpass marker and what it shows ([`PaneKind`]),
+/// so they move with the pane when it or its tab is dragged elsewhere.
 mod holder {
     use std::cell::{Cell, RefCell};
 
@@ -416,8 +415,6 @@ mod holder {
             pub(super) scale: Cell<f64>,
             /// What the pane shows.
             pub(super) kind: RefCell<PaneKind>,
-            /// Whether its session saves a transcript (decided when it starts).
-            pub(super) records: Cell<bool>,
         }
 
         impl Default for PaneHolder {
@@ -428,7 +425,6 @@ mod holder {
                     child_gone: Cell::new(false),
                     scale: Cell::new(zoom::DEFAULT),
                     kind: RefCell::new(PaneKind::Empty),
-                    records: Cell::new(false),
                 }
             }
         }
@@ -486,11 +482,6 @@ mod holder {
         /// What the pane shows.
         pub(crate) fn kind(&self) -> &RefCell<PaneKind> {
             &self.imp().kind
-        }
-
-        /// Whether the pane's session saves a transcript.
-        pub(crate) fn records(&self) -> &Cell<bool> {
-            &self.imp().records
         }
     }
 }
@@ -976,16 +967,10 @@ impl Session {
     }
 }
 
-/// Make `terminal`'s session (in `holder`'s pane) a recording one if it has a
-/// `transcript` spec: the terminal keeps unlimited scrollback and the returned
-/// [`Session`] writes its text once (module docs). `None` leaves the terminal
-/// as it is. The pane remembers which it is, for a saved session.
-fn start_recording(
-    holder: &PaneHolder,
-    terminal: &Terminal,
-    transcript: Option<TranscriptSpec>,
-) -> Option<Rc<Session>> {
-    holder.records().set(transcript.is_some());
+/// Make `terminal`'s session a recording one if it has a `transcript` spec: the
+/// terminal keeps unlimited scrollback and the returned [`Session`] writes its
+/// text once (module docs). `None` leaves the terminal as it is.
+fn start_recording(terminal: &Terminal, transcript: Option<TranscriptSpec>) -> Option<Rc<Session>> {
     transcript.map(|spec| {
         terminal.set_scrollback_lines(-1);
         let session = Rc::new(Session {
@@ -1761,8 +1746,10 @@ pub(crate) fn start_local_shell(
 }
 
 /// [`start_local_shell`] in the folder `dir`, or in the home folder when `dir`
-/// is not a folder (any more: a restored session's folder may have gone), with
-/// nothing said about it.
+/// is not a folder (any more: a restored session's folder may have gone) or is
+/// one this process may not enter (no search permission), with nothing said
+/// about it. (VTE falls back to the home folder by itself when it cannot enter
+/// a folder; this does not leave the rule to it.)
 pub(crate) fn start_local_shell_in(
     holder: &PaneHolder,
     dir: &Path,
@@ -1770,7 +1757,7 @@ pub(crate) fn start_local_shell_in(
 ) -> Terminal {
     let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
     let home = glib::home_dir();
-    let dir = if folder_to_spawn_in(dir).is_some() {
+    let dir = if folder_to_spawn_in(dir).is_some() && can_enter(dir) {
         dir
     } else {
         &home
@@ -1778,14 +1765,33 @@ pub(crate) fn start_local_shell_in(
     start_shell_in(holder, &shell, dir, transcript)
 }
 
+/// Whether this process may enter the folder `dir`, as a shell started in it
+/// must (search permission, `access(X_OK)`).
+fn can_enter(dir: &Path) -> bool {
+    rustix::fs::access(dir, rustix::fs::Access::EXEC_OK).is_ok()
+}
+
 /// The folder the program in `terminal` last reported as its own (the shell's
 /// OSC 7, VTE's current directory: `file://HOST/PATH`, percent-encoded), if it
-/// did, whatever host the address names. Read when a session is saved, never
-/// followed.
+/// did ([`folder_of_uri`]). Read when a session is saved, never followed.
 pub(crate) fn current_folder(terminal: &Terminal) -> Option<PathBuf> {
-    let uri = terminal.current_directory_uri()?;
-    let (path, _host) = glib::filename_from_uri(&uri).ok()?;
-    path.is_absolute().then_some(path)
+    folder_of_uri(&terminal.current_directory_uri()?, &local_host_name())
+}
+
+/// The folder that the OSC 7 address `uri` names, an absolute path, if the
+/// address is one on this machine: a host that is empty, `localhost` or
+/// `node_name` (this machine's name as `uname` reports it, which names local
+/// transcripts too: [`local_host_name`]), in any case. Any other host is none:
+/// a shell over `ssh` run by hand in a local pane reports the remote machine's
+/// folders, and a program can print the sequence, and neither may choose the
+/// folder a restored local shell starts in.
+fn folder_of_uri(uri: &str, node_name: &str) -> Option<PathBuf> {
+    let (path, host) = glib::filename_from_uri(uri).ok()?;
+    let here = host.as_deref().is_none_or(|host| {
+        let host = host.to_lowercase();
+        host.is_empty() || host == "localhost" || host == node_name.to_lowercase()
+    });
+    (here && path.is_absolute()).then_some(path)
 }
 
 /// [`start_local_shell`] with the shell and the directory given (the tests run a
@@ -1803,7 +1809,7 @@ pub(crate) fn start_shell_in(
     // A shell that exits closes its pane, and closing a pane or a tab writes
     // the transcript ([`close_pane`], `setup_tab_view`), so there is nothing
     // more to do when it exits.
-    start_recording(holder, &terminal, transcript);
+    start_recording(&terminal, transcript);
     terminal.connect_child_exited(glib::clone!(
         #[weak]
         holder,
@@ -1847,7 +1853,7 @@ pub(crate) fn start_command_in(
             .map(PathBuf::from)
             .filter(|dir| dir.is_absolute()),
     });
-    let session = start_recording(holder, &terminal, transcript);
+    let session = start_recording(&terminal, transcript);
     terminal.connect_child_exited(glib::clone!(
         #[weak]
         holder,
@@ -2057,12 +2063,11 @@ pub(crate) fn start_profile(
 ) {
     let waiting = show_waiting(holder);
     // The profile's pane from now on, also while it waits and after its
-    // session has ended; it saves a transcript as `record` says.
+    // session has ended.
     holder.kind().replace(PaneKind::Profile {
         id: profile.id.clone(),
         name: profile.name.clone(),
     });
-    holder.records().set(record);
     // Named after the profile at once, while it waits (a name the person gave
     // the pane is kept).
     holder
@@ -2240,7 +2245,7 @@ pub(crate) fn start_command(
 ) -> Terminal {
     let terminal = begin_session(holder, TabTitle::remote(title.to_owned()));
     holder.marker().replace(marker);
-    let session = start_recording(holder, &terminal, transcript);
+    let session = start_recording(&terminal, transcript);
 
     terminal.connect_child_exited(glib::clone!(
         #[weak]
@@ -2645,6 +2650,65 @@ mod tests {
         assert_eq!(spec.host, "secret-host.example.com");
         assert_eq!(spec.dir, Path::new("/t"));
         assert!(spec.notice == notice, "reports to the given notice board");
+    }
+
+    #[test]
+    fn a_folder_is_taken_only_from_this_machine() {
+        let folder = |uri: &str, node: &str| folder_of_uri(uri, node);
+        let tmp = Some(PathBuf::from("/tmp/My Files/Ü"));
+        let encoded = "/tmp/My%20Files/%C3%9C";
+        // No host, localhost, or this machine's node name, in any case.
+        for host in ["", "localhost", "LocalHost", "box", "BOX", "Box"] {
+            assert_eq!(
+                folder(&format!("file://{host}{encoded}"), "box"),
+                tmp,
+                "{host:?}"
+            );
+        }
+        assert_eq!(
+            folder(&format!("file://box{encoded}"), "BOX"),
+            tmp,
+            "a node name in capitals"
+        );
+        // Any other host is not this machine: a shell over ssh run by hand in
+        // a local pane, or a printed escape sequence, reports one.
+        for host in [
+            "other",
+            "box.example.org",
+            "boxes",
+            "bo",
+            "127.0.0.1",
+            "[::1]",
+        ] {
+            assert_eq!(
+                folder(&format!("file://{host}{encoded}"), "box"),
+                None,
+                "{host:?}"
+            );
+        }
+        // Not a file address, or not one at all.
+        for uri in ["http://box/tmp", "/tmp", "", "file:tmp"] {
+            assert_eq!(folder(uri, "box"), None, "{uri:?}");
+        }
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_entered_is_not_entered() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        assert!(can_enter(dir.path()));
+        assert!(!can_enter(&dir.path().join("gone")));
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        // Search permission is what counts: read permission alone is not.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o100)).unwrap();
+        assert!(can_enter(&locked), "search only");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let root = rustix::process::geteuid().is_root();
+        assert_eq!(can_enter(&locked), root, "read and write, no search");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(can_enter(&locked), root, "nothing");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
