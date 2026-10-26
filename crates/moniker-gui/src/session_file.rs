@@ -96,7 +96,9 @@ pub(crate) enum Node {
         /// Side by side (a horizontal `gtk::Paned`) rather than one above the
         /// other.
         horizontal: bool,
-        /// Where the divider was, as a fraction of the split's size.
+        /// Where the divider was, as a fraction of how far it can go: its
+        /// position over its `max-position` (the split's size less what the
+        /// second side needs), not over the split's size.
         fraction: f64,
         start: Box<Node>,
         end: Box<Node>,

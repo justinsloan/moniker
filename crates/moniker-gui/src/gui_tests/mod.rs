@@ -452,9 +452,13 @@ fn gui_integration() {
     sessions::two_windows_saving_keep_both(&tmp.path().join("sm-two"));
     sessions::a_session_changed_since_the_menu_opened_is_read_again(&tmp.path().join("sm-gone"));
     sessions::a_failed_write_is_told(&tmp.path().join("sm-fail"));
+    sessions::a_file_repaired_while_asking_still_asks_about_a_name(&tmp.path().join("sm-repaired"));
+    sessions::a_pick_after_the_file_went_bad_is_told(&tmp.path().join("sm-bad-pick"));
+    sessions::a_long_name_has_its_whole_name_in_a_tooltip(&tmp.path().join("sm-tooltip"));
     // Issue #12, saved sessions: a window captured and added back.
     sessions::a_window_comes_back_as_saved(&bin, &tmp.path().join("sess-saved"));
     sessions::a_tab_not_shown_yet_gets_its_split_when_shown(&tmp.path().join("sess-hidden"));
+    sessions::a_restored_divider_is_put_within_its_limits(&tmp.path().join("sess-limits"));
     sessions::a_profile_gone_shows_the_list_with_a_note(&tmp.path().join("sess-gone"));
     sessions::a_renamed_profile_still_connects(&bin, &tmp.path().join("sess-renamed"));
     sessions::a_folder_gone_starts_at_home(&tmp.path().join("sess-folder"));
@@ -927,6 +931,17 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     let sessions_menu = sessions::open_menu(&main);
     assert_eq!(sessions::listed(&sessions_menu), [MARKUP_NAME]);
     literal_labels("sessions menu", &sessions_menu, MARKUP_NAME);
+    // Its tooltip (the whole name, for a long one cut short) is plain text too.
+    let pick = sessions::row_of(&sessions_menu, MARKUP_NAME)
+        .first_child()
+        .and_downcast::<gtk::Button>()
+        .expect("the session's button");
+    assert_eq!(pick.tooltip_text().as_deref(), Some(MARKUP_NAME));
+    assert_eq!(
+        pick.tooltip_markup().as_deref(),
+        Some(glib::markup_escape_text(MARKUP_NAME).as_str()),
+        "sessions menu tooltip"
+    );
     let tabs = main.view.n_pages();
     sessions::pick_session(&sessions_menu, MARKUP_NAME);
     pump_until("the session's tab", || main.view.n_pages() == tabs + 1);

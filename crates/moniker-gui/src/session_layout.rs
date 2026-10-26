@@ -184,9 +184,7 @@ fn fill(holder: &PaneHolder, record: &PaneRecord, ctx: &Rc<AppContext>, save_all
                     profile.startup_choice(),
                     save,
                 ),
-                None => {
-                    new_tab::fill_with_note(holder, ctx, &format!("{name} is no longer saved."));
-                }
+                None => new_tab::fill_with_note(holder, ctx, &gone_note(name)),
             }
         }
         Kind::Local { dir } => {
@@ -195,6 +193,17 @@ fn fill(holder: &PaneHolder, record: &PaneRecord, ctx: &Rc<AppContext>, save_all
             terminal_tab::start_local_shell_in(holder, &dir, transcript);
         }
         Kind::List => new_tab::fill(holder, ctx),
+    }
+}
+
+/// What a pane whose profile has gone says above the list: the profile named
+/// as the session recorded it (plain text), or, for a record with no name at
+/// all (only a hand-edited file has one), the pane itself.
+fn gone_note(name: &str) -> String {
+    if name.trim().is_empty() {
+        "This pane's profile is no longer saved.".to_owned()
+    } else {
+        format!("{name} is no longer saved.")
     }
 }
 
@@ -282,6 +291,23 @@ mod tests {
                 ))),
                 end: Box::new(Node::Pane(pane(Kind::List, None, 0.8, false))),
             }),
+        }
+    }
+
+    #[test]
+    fn a_gone_profile_is_named_or_the_pane_is() {
+        assert_eq!(gone_note("web"), "web is no longer saved.");
+        assert_eq!(
+            gone_note("<b>x</b> &amp;"),
+            "<b>x</b> &amp; is no longer saved.",
+            "as it is"
+        );
+        for none in ["", "  ", "\t"] {
+            assert_eq!(
+                gone_note(none),
+                "This pane's profile is no longer saved.",
+                "{none:?}"
+            );
         }
     }
 

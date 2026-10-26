@@ -18,6 +18,7 @@
 //! cannot be read, two windows saving at once, a session gone since the menu
 //! was built, and a write that fails.
 
+use std::cell::RefCell;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -501,9 +502,85 @@ pub(super) fn a_tab_not_shown_yet_gets_its_split_when_shown(dir: &Path) {
     pump_for(Duration::from_millis(200));
 }
 
+/// A split saved in a wide window and restored into a narrow one: the divider
+/// is not put nearer the start than the first side can go (the fraction of the
+/// narrow window's room would leave the side less than its least width). Every
+/// position the split is given while it takes its fraction is within its limits.
+pub(super) fn a_restored_divider_is_put_within_its_limits(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    main.window.set_default_size(420, 300);
+    pump_for(Duration::from_millis(300));
+    let list = || Node::Pane(pane_record(Kind::List, None, 1.0, false));
+    // Both orientations, at the nearest the start the file reader allows.
+    for (horizontal, fraction) in [(true, 0.05), (false, 0.05)] {
+        let tabs = [TabRecord {
+            root: Node::Split {
+                horizontal,
+                fraction,
+                start: Box::new(list()),
+                end: Box::new(list()),
+            },
+            focused: 0,
+        }];
+        restore(&main.view, &ctx, &tabs);
+        let page = main.view.selected_page().expect("the restored tab");
+        let (split, _, _) = top_split(&layout_of(&page));
+        let given = Rc::new(RefCell::new(Vec::new()));
+        split.connect_position_notify(glib::clone!(
+            #[strong]
+            given,
+            move |split| given.borrow_mut().push((
+                split.position(),
+                split.min_position(),
+                split.max_position()
+            ))
+        ));
+        pump_until("the split to be sized", || sized(&split));
+        pump_for(Duration::from_millis(300));
+        let what = format!(
+            "{} split at {fraction}",
+            if horizontal {
+                "side by side"
+            } else {
+                "stacked"
+            }
+        );
+        let (min, max) = (split.min_position(), split.max_position());
+        let wanted = (fraction * f64::from(max)).round() as i32;
+        assert!(
+            wanted < min,
+            "{what}: the window is narrow enough for the fraction to be out of reach \
+             ({wanted} of {min}..={max})"
+        );
+        let given = given.borrow();
+        assert!(
+            !given.is_empty(),
+            "{what}: the divider was given a position"
+        );
+        for (position, min, max) in given.iter() {
+            assert!(
+                position >= min && position <= max,
+                "{what}: given {position}, limits {min}..={max}"
+            );
+        }
+        let final_position = split.position();
+        assert!(
+            (min..=max).contains(&final_position),
+            "{what}: ended at {final_position}, limits {min}..={max}"
+        );
+        main.view.close_page(&page);
+    }
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
 /// A profile pane whose profile has been deleted since the session was saved
 /// comes back as the new-tab list with a note above the search entry naming
-/// the profile as the session recorded it, as plain text. Nothing connects.
+/// the profile as the session recorded it, as plain text. Nothing connects. A
+/// record with no profile name (only a hand-edited file has one) gets a note
+/// that does not begin with a space.
 pub(super) fn a_profile_gone_shows_the_list_with_a_note(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
@@ -544,6 +621,28 @@ pub(super) fn a_profile_gone_shows_the_list_with_a_note(dir: &Path) {
         again[1].root,
         Node::Pane(pane_record(Kind::List, None, 1.0, false))
     );
+
+    // No name recorded: the note says whose pane it is without one.
+    for name in ["", "  "] {
+        let nameless = Kind::Profile {
+            id: "no-longer-saved".to_owned(),
+            name: name.to_owned(),
+        };
+        let tabs = [TabRecord {
+            root: Node::Pane(pane_record(nameless, None, 1.0, false)),
+            focused: 0,
+        }];
+        restore(&main.view, &ctx, &tabs);
+        let page = main.view.selected_page().expect("the restored tab");
+        pump_for(Duration::from_millis(300));
+        assert!(list_in(&page).is_some(), "the new-tab list");
+        literal_labels(
+            "the note without a name",
+            &page.child(),
+            "This pane's profile is no longer saved.",
+        );
+        main.view.close_page(&page);
+    }
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }
@@ -1647,6 +1746,170 @@ pub(super) fn a_failed_write_is_told(dir: &Path) {
 
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("make it writable again");
     assert_eq!(fs::read(&file).expect("the file"), before, "as it was");
+    a.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The widget that has the keyboard in `main`'s window, if it is not in a
+/// dialog or a popover.
+fn keyboard_in(main: &window::MainWindow) -> Option<gtk::Widget> {
+    gtk::prelude::GtkWindowExt::focus(&main.window).filter(|focus| {
+        focus.ancestor(adw::Dialog::static_type()).is_none()
+            && focus.ancestor(gtk::Popover::static_type()).is_none()
+    })
+}
+
+/// Wait until the keyboard is in `main`'s window again, not in a dialog or a
+/// menu, after the answer to a question. It comes back to the widget that had
+/// it when the menu was opened with a click, the Sessions button, as it does for
+/// any menu button.
+fn assert_keyboard_back(main: &window::MainWindow, what: &str) {
+    pump_until(&format!("the keyboard to be back after {what}"), || {
+        keyboard_in(main).is_some()
+    });
+}
+
+/// "Replace the Saved Sessions File?" is the last question when Save finds the
+/// file damaged, and it is answered after another window repaired the file: if
+/// that file now has a session of the name being saved, "Replace the name?" is
+/// still asked (Cancel keeps it all; Replace puts this window's layout in the
+/// old one's place and keeps the others); if not, the session is added to the
+/// repaired file; if the file is still damaged, a new file starts. After each
+/// answer the keyboard is back in the window.
+pub(super) fn a_file_repaired_while_asking_still_asks_about_a_name(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    let old = one_list_tab();
+    assert!(
+        keyboard_in(&a).is_some(),
+        "the keyboard is in the window to begin with"
+    );
+
+    // Save "Work" over a damaged file; the question about the file is open.
+    let ask_about_the_file = || {
+        fs::write(&file, "not json").expect("damage the file");
+        let dialog = save_dialog(&a);
+        name_entry(&dialog).set_text("Work");
+        answer(&a, &dialog, "Save");
+        let ask = dialog_over(&a, "the question about the file");
+        assert_eq!(
+            ask.heading().as_deref(),
+            Some("Replace the Saved Sessions File?")
+        );
+        ask
+    };
+    // Another window repairs it.
+    let repair = |names: &[&str]| {
+        fs::remove_file(&file).expect("remove the damaged file");
+        for name in names {
+            save_as(&file, name, old.clone());
+        }
+    };
+
+    // Repaired with a session of this name: asked about it; Cancel keeps all.
+    let ask = ask_about_the_file();
+    repair(&["Work", "Keep"]);
+    let before = fs::read(&file).expect("the file");
+    answer(&a, &ask, "Replace");
+    let ask = dialog_over(&a, "the question about the name");
+    assert_eq!(
+        ask.heading().as_deref(),
+        Some("Replace \u{201c}Work\u{201d}?")
+    );
+    assert_eq!(fs::read(&file).expect("the file"), before, "not yet");
+    answer(&a, &ask, "Cancel");
+    pump_for(Duration::from_millis(300));
+    assert_eq!(fs::read(&file).expect("the file"), before, "kept");
+    assert_keyboard_back(&a, "Cancel");
+
+    // The same, answered Replace: this window's layout in the old one's place.
+    let ask = ask_about_the_file();
+    repair(&["Work", "Keep"]);
+    answer(&a, &ask, "Replace");
+    let ask = dialog_over(&a, "the question about the name");
+    answer(&a, &ask, "Replace");
+    assert_eq!(names_saved(&file), ["Work", "Keep"], "in its place");
+    let sessions = saved(&file);
+    assert!(
+        matches!(kind_of(&sessions[0].tabs[0]), Kind::Local { .. }),
+        "this window's layout"
+    );
+    assert_eq!(sessions[1].tabs, old, "the other is as it was");
+    assert_keyboard_back(&a, "Replace");
+
+    // Repaired without that name: added, with no further question.
+    let ask = ask_about_the_file();
+    repair(&["Keep"]);
+    answer(&a, &ask, "Replace");
+    pump_for(Duration::from_millis(300));
+    assert!(a.window.visible_dialog().is_none(), "nothing more to ask");
+    assert_eq!(names_saved(&file), ["Keep", "Work"], "added");
+    assert_keyboard_back(&a, "Replace");
+
+    // Still damaged: a new file starts, as it was said.
+    let ask = ask_about_the_file();
+    answer(&a, &ask, "Replace");
+    assert_eq!(names_saved(&file), ["Work"], "a new file");
+    assert_keyboard_back(&a, "Replace");
+    a.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A session picked after the file went bad (the menu was built before) is not
+/// added: what is wrong with the file is told, as for a menu opened then.
+pub(super) fn a_pick_after_the_file_went_bad_is_told(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    save_as(&file, "Work", one_list_tab());
+    let popover = open_menu(&a);
+    assert_eq!(listed(&popover), ["Work"]);
+    fs::write(&file, "not json").expect("damage the file");
+    let Loaded::Unreadable(why) = session_file::load(&file) else {
+        panic!("the file cannot be read");
+    };
+    let since = ctx.notice.delivered();
+    pick_session(&popover, "Work");
+    assert_eq!(
+        told(&ctx, &a, since),
+        format!("Could not read the saved sessions: {why}")
+    );
+    pump_for(Duration::from_millis(300));
+    assert_eq!(a.view.n_pages(), 1, "nothing added");
+    assert_eq!(fs::read(&file).expect("the file"), b"not json", "kept");
+    a.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A session's button in the menu cuts a long name short, so its tooltip has
+/// the whole name, as plain text.
+pub(super) fn a_long_name_has_its_whole_name_in_a_tooltip(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    let long = "A session named for what it is for, which is a good deal too long to fit";
+    assert!(long.chars().count() > 40 && long.chars().count() <= 100);
+    for name in ["short", long] {
+        save_as(&file, name, one_list_tab());
+    }
+    let popover = open_menu(&a);
+    for name in ["short", long] {
+        let button = row_of(&popover, name)
+            .first_child()
+            .and_downcast::<gtk::Button>()
+            .expect("the session's button");
+        assert_eq!(button.tooltip_text().as_deref(), Some(name));
+        assert_eq!(
+            button.tooltip_markup().as_deref(),
+            Some(glib::markup_escape_text(name).as_str()),
+            "plain text"
+        );
+    }
+    close_popover(&popover);
     a.window.destroy();
     pump_for(Duration::from_millis(200));
 }

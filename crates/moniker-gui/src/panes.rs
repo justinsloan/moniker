@@ -1210,6 +1210,16 @@ fn build_node(tree: Tree<PaneHolder>, first: &mut Option<PaneHolder>) -> gtk::Wi
     }
 }
 
+/// The position for a divider `fraction` of the way along a split whose divider
+/// can go from `min` (what its first side needs) to `max`: a session saved in a
+/// large window and restored into a small one has less room than the fraction
+/// would leave that side, so the position stays within the split's own limits
+/// (as GTK's own, `max` first when the sides need more than there is).
+fn restored_position(fraction: f64, min: i32, max: i32) -> i32 {
+    let wanted = (fraction * f64::from(max)).round() as i32;
+    wanted.max(min).min(max)
+}
+
 /// Put the divider of `split` `fraction` of the way along once it has a size:
 /// at its first `max-position` above 0, after which it stops listening.
 fn take_fraction_when_sized(split: &gtk::Paned, fraction: f64) {
@@ -1231,7 +1241,7 @@ fn take_fraction_when_sized(split: &gtk::Paned, fraction: f64) {
                     waiting.upgrade().is_some_and(|waiting| &waiting != split)
                 });
             });
-            split.set_position((fraction * f64::from(max)).round() as i32);
+            split.set_position(restored_position(fraction, split.min_position(), max));
             if let Some(id) = handler.take() {
                 split.disconnect(id);
             }
@@ -2130,6 +2140,22 @@ mod tests {
             bounds(401.0, 500.0, 400.0, 100.0),
         ];
         assert_eq!(neighbor(p[0], &p, Direction::Right), Some(1));
+    }
+
+    #[test]
+    fn a_restored_divider_stays_within_the_limits_of_its_split() {
+        // Room for the fraction: where it says.
+        assert_eq!(restored_position(0.5, 100, 800), 400);
+        assert_eq!(restored_position(0.3, 100, 800), 240);
+        assert_eq!(restored_position(0.05, 20, 800), 40);
+        // A smaller window than it was saved in: the first side's least size.
+        assert_eq!(restored_position(0.05, 137, 272), 137);
+        assert_eq!(restored_position(0.0, 137, 272), 137);
+        // Never past the other end.
+        assert_eq!(restored_position(0.95, 100, 800), 760);
+        assert_eq!(restored_position(2.0, 100, 800), 800);
+        // The sides need more than there is: GTK's own order, the end first.
+        assert_eq!(restored_position(0.5, 300, 200), 200);
     }
 
     #[test]

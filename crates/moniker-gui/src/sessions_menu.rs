@@ -174,8 +174,11 @@ impl Menu {
         let row = gtk::Box::builder().name(ROW_NAME).spacing(2).build();
         let name = name.to_owned();
 
+        // The button cuts a long name short: the tooltip has all of it (plain
+        // text: `set_tooltip_text` is never markup).
         let pick = entry_button(&name);
         pick.set_hexpand(true);
+        pick.set_tooltip_text(Some(&name));
         let menu = Rc::clone(self);
         pick.connect_clicked(glib::clone!(
             #[weak]
@@ -320,43 +323,62 @@ impl Menu {
         }
     }
 
-    /// Ask before a session of the same name is replaced.
-    fn ask_to_replace(self: &Rc<Self>, name: String) {
+    /// Ask `heading` and `body` over the window, with Cancel (the default and
+    /// the answer to Escape) and the destructive `action` (id, label); `then`
+    /// runs only on that answer.
+    fn confirm(
+        self: &Rc<Self>,
+        heading: &str,
+        body: &str,
+        action: (&str, &str),
+        then: impl FnOnce(&Rc<Menu>) + 'static,
+    ) {
         let Some(window) = self.window() else {
             return;
         };
-        let dialog = question(
-            &format!("Replace \u{201c}{name}\u{201d}?"),
-            REPLACE_BODY,
-            ("replace", "Replace"),
-        );
+        let dialog = question(heading, body, action);
         let menu = Rc::clone(self);
+        let id = action.0.to_owned();
         dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-            if response == "replace" {
-                menu.put(name, false);
+            if response == id {
+                then(&menu);
             }
         });
     }
 
+    /// Ask before a session of the same name is replaced.
+    fn ask_to_replace(self: &Rc<Self>, name: String) {
+        self.confirm(
+            &format!("Replace \u{201c}{name}\u{201d}?"),
+            REPLACE_BODY,
+            ("replace", "Replace"),
+            move |menu| menu.put(name, false),
+        );
+    }
+
     /// Ask before a file that cannot be read (`why`) is replaced by a new one.
     fn ask_to_replace_the_file(self: &Rc<Self>, name: String, why: &str) {
-        let Some(window) = self.window() else {
-            return;
-        };
-        let dialog = question(
+        self.confirm(
             "Replace the Saved Sessions File?",
             &format!(
                 "Moniker could not read it: {why}. Saving starts a new file without the \
                  sessions that were in it."
             ),
             ("replace", "Replace"),
+            move |menu| menu.replace_the_file(name),
         );
-        let menu = Rc::clone(self);
-        dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-            if response == "replace" {
-                menu.put(name, true);
-            }
-        });
+    }
+
+    /// The person said to start a new file. The file is read again: another
+    /// window may have repaired it while the question was open, and a file that
+    /// can be read is never replaced on that answer, so it goes through the
+    /// ordinary save (which asks about a name already in it); only a file that
+    /// still cannot be read is started anew.
+    fn replace_the_file(self: &Rc<Self>, name: String) {
+        match session_file::load(&self.path()) {
+            Loaded::Sessions(_) => self.save(name),
+            Loaded::Unreadable(_) => self.put(name, true),
+        }
     }
 
     /// Ask for a new name for the session `from`.
@@ -397,23 +419,17 @@ impl Menu {
 
     /// Ask before the session `name` is deleted.
     fn ask_delete(self: &Rc<Self>, name: &str) {
-        let Some(window) = self.window() else {
-            return;
-        };
-        let dialog = question(
+        let name_to_delete = name.to_owned();
+        self.confirm(
             &format!("Delete \u{201c}{name}\u{201d}?"),
             DELETE_BODY,
             ("delete", "Delete"),
+            move |menu| {
+                if let Err(err) = session_file::delete(&menu.path(), &name_to_delete) {
+                    menu.tell(&write_error(&err));
+                }
+            },
         );
-        let menu = Rc::clone(self);
-        let name = name.to_owned();
-        dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-            if response == "delete"
-                && let Err(err) = session_file::delete(&menu.path(), &name)
-            {
-                menu.tell(&write_error(&err));
-            }
-        });
     }
 }
 
@@ -513,6 +529,10 @@ fn name_dialog(
         .css_classes(["error"])
         .visible(false)
         .build();
+    // A screen reader says the reason with the field, not only to someone who
+    // finds the label.
+    let reason = [error.upcast_ref::<gtk::Accessible>()];
+    entry.update_relation(&[gtk::accessible::Relation::DescribedBy(&reason)]);
     let extra = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
