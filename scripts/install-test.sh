@@ -74,8 +74,8 @@ for file in /usr/share/applications/org.moniker.Moniker.desktop \
 done
 
 # The .deb registers Moniker as an x-terminal-emulator alternative at priority
-# 20 (below Ptyxis's 40, so it never changes the system's own choice); the RPM
-# has no such mechanism.
+# 20 (it never outranks a terminal at 40 or above, as Ubuntu's Ptyxis is); the
+# RPM has no such mechanism.
 if $deb; then
     query=$(update-alternatives --query x-terminal-emulator) ||
         fail "update-alternatives does not know x-terminal-emulator"

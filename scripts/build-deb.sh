@@ -153,10 +153,10 @@ install -D -m 644 "$METAINFO" "$STAGE/moniker/usr/share/metainfo/org.moniker.Mon
 install -D -m 644 data/org.moniker.Moniker.desktop "$STAGE/moniker/usr/share/applications/org.moniker.Moniker.desktop"
 # The x-terminal-emulator alternative (issue #15): programs that start "the
 # terminal" through Debian's mechanism find Moniker among the choices, and
-# `update-alternatives --config x-terminal-emulator` picks it. Priority 20 is
-# below Ptyxis's 40 (Ubuntu's own terminal), so installing Moniker never changes
-# which terminal the system chooses by itself. Plain scripts, no #DEBHELPER#
-# (nothing here is built by debhelper).
+# `update-alternatives --config x-terminal-emulator` picks it. Priority 20 never
+# outranks a terminal at 40 or above (Ubuntu's Ptyxis is 40), so on Ubuntu
+# installing Moniker does not change which terminal the system chooses by itself.
+# Plain scripts, no #DEBHELPER# (nothing here is built by debhelper).
 install -D -m 755 /dev/stdin "$STAGE/moniker/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
