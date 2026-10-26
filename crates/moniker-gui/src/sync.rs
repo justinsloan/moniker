@@ -9,8 +9,10 @@
 //!   store) is read on the main thread FIRST, into a plain [`SyncRequest`]
 //!   ([`sync_request`]). That is never the keyring: a locked keyring's unlock
 //!   prompt would block the main loop, and with it every terminal.
-//! * [`start_sync`] moves only that value to a worker thread. The worker opens
-//!   its own keyring handle, reads the sync key and the stored-password flag
+//! * [`start_sync`] moves only that value to a worker thread. The worker first
+//!   looks at the profile file itself and stops if sync has been turned off since
+//!   the request was made ([`check_switch_is_on`], issue #10), then opens its own
+//!   keyring handle and reads the sync key and the stored-password flag
 //!   ([`complete_inputs`]), then opens its own profile store ([`run_with`]);
 //!   it shares nothing with the main thread.
 //! * The result comes back through a one-slot [`async_channel`] that a future on
@@ -261,9 +263,10 @@ pub(crate) struct SyncRequest {
 /// the profile file and the askpass helper. Reads no secret.
 ///
 /// Refused while sync is turned off, here and now, so that no worker starts and
-/// the keyring is not read for a sync that cannot run (issue #10). The core
-/// refuses again, from the file as the worker finds it, which is what protects
-/// the data; this is the courtesy in front of it.
+/// the keyring is not read for a sync that cannot run (issue #10). This is the
+/// snapshot's word, which can be a moment behind the file: the worker looks at
+/// the file itself before it reads the keyring ([`check_switch_is_on`]), and the
+/// core refuses again before anything is sent, which is what protects the data.
 pub(crate) fn sync_request(
     store: &ProfileStore,
     askpass: &Path,
@@ -290,6 +293,26 @@ pub(crate) fn sync_request(
         store_path,
         stale: StaleSync::Refuse,
     })
+}
+
+/// On the worker, before anything is read from the keyring: whether the profile
+/// file, as it is now, still has sync turned on (issue #10). The request was made
+/// on the main thread from its snapshot of the file, which another process (the
+/// command line) can have outdated: the file watch reloads the snapshot only
+/// after its delay, and later when a reload fails. A sync that started in that
+/// while stops here, so the sync key and the partner's password stay in the
+/// keyring, and the person is told as for any refusal. Fails closed like the
+/// core: a switch that cannot be read counts as off, and a file that cannot be
+/// opened is a store error, as [`run_with`] would say.
+pub(crate) fn check_switch_is_on(store_path: &Path) -> Result<(), SyncFailure> {
+    // StoreError messages carry no file contents.
+    let store = ProfileStore::open(store_path)
+        .map_err(|err| SyncFailure::Sync(SyncError::Store(err.to_string())))?;
+    if store.sync_switch().is_on() {
+        Ok(())
+    } else {
+        Err(SyncFailure::Sync(SyncError::SyncOff))
+    }
 }
 
 /// On the worker: complete `request` from `secrets`, in the CLI's order: the
@@ -502,11 +525,14 @@ pub(crate) enum SyncEvent<'a> {
 /// `stale` says whether it goes ahead when a machine has been away (issue #8).
 ///
 /// `Err` (a plain sentence) if it does not start: [`ALREADY_RUNNING`] while
-/// another sync of this app runs, or what is wrong with the profile (gone,
-/// or its file path not absolute). Nothing here reads the keyring: the worker
-/// reads the sync key and the stored-password flag ([`complete_inputs`]), and
-/// what it finds missing (no key, no askpass helper, an unreadable keyring)
-/// comes back as the sync's result, like any failure of the exchange.
+/// another sync of this app runs, [`SYNC_IS_OFF`] while sync is turned off or a
+/// request to turn it off is still being saved ([`AppContext::sync_is_on`]),
+/// or what is wrong with the profile (gone, or its file path not absolute).
+/// Nothing here reads the keyring: the worker reads the sync key and the
+/// stored-password flag ([`complete_inputs`]), after it has looked at the
+/// profile file ([`check_switch_is_on`]), and what it finds missing (no key, no
+/// askpass helper, an unreadable keyring, sync turned off meanwhile) comes back
+/// as the sync's result, like any failure of the exchange.
 ///
 /// Once started, listeners hear [`SyncEvent::Started`]. When the worker is
 /// done (on the main thread): the running flag is cleared, a success reloads
@@ -525,6 +551,10 @@ where
     if ctx.sync_running.get() {
         return Err(ALREADY_RUNNING.to_owned());
     }
+    // A request to turn sync off counts before its save has landed in the file.
+    if !ctx.sync_is_on() {
+        return Err(SYNC_IS_OFF.to_owned());
+    }
     // Bind first so the store borrow ends here.
     let mut request = {
         let store = ctx.store.borrow();
@@ -536,6 +566,7 @@ where
     ctx.sync_event(&SyncEvent::Started);
     let ctx = Rc::clone(ctx);
     let work = move || {
+        check_switch_is_on(&request.store_path)?;
         let secrets = open_secrets();
         let inputs = complete_inputs(request, secrets.as_ref())?;
         run(inputs).map_err(SyncFailure::Sync)
@@ -1178,6 +1209,45 @@ mod tests {
         assert_eq!(auto_sync_target(&partner, &unreadable), None);
         let err = sync_request(&unreadable, &w.askpass, &w.profile.id);
         assert_eq!(err.err().as_deref(), Some(SYNC_IS_OFF));
+    }
+
+    #[test]
+    fn the_worker_looks_at_the_file_not_at_the_main_threads_snapshot() {
+        let mut w = world();
+        // On, as the file says.
+        assert!(check_switch_is_on(w.store.path()).is_ok());
+        // Turned off through another handle: `w.store` is a stale snapshot, as
+        // the main thread's is until the file watch reloads it.
+        ProfileStore::open(w.store.path())
+            .unwrap()
+            .set_sync(false)
+            .unwrap();
+        assert!(w.store.sync_switch().is_on(), "stale");
+        assert!(sync_request(&w.store, &w.askpass, &w.profile.id).is_ok());
+        match check_switch_is_on(w.store.path()) {
+            Err(SyncFailure::Sync(SyncError::SyncOff)) => {}
+            other => panic!("{:?}", other.err()),
+        }
+        // Back on, and a switch nobody can read counts as off.
+        w.store.set_sync(true).unwrap();
+        assert!(check_switch_is_on(w.store.path()).is_ok());
+        fs::write(w.store.path(), r#"{"version":2,"profiles":[]}"#).unwrap();
+        assert!(matches!(
+            check_switch_is_on(w.store.path()),
+            Err(SyncFailure::Sync(SyncError::SyncOff))
+        ));
+    }
+
+    #[test]
+    fn a_profile_file_that_cannot_be_opened_stops_the_worker_without_quoting_it() {
+        let w = world();
+        fs::write(w.store.path(), "{ not json SENTINEL").unwrap();
+        match check_switch_is_on(w.store.path()) {
+            Err(SyncFailure::Sync(SyncError::Store(message))) => {
+                assert!(!message.contains("SENTINEL"), "{message}");
+            }
+            other => panic!("{:?}", other.err()),
+        }
     }
 
     #[test]

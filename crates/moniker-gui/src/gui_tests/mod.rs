@@ -24,7 +24,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -149,6 +149,65 @@ impl SecretStore for HeldKeyring {
     fn probe(&self) -> Result<(), moniker_core::secrets::SecretError> {
         self.wait();
         self.inner.probe()
+    }
+}
+
+/// How long [`HeldProfileFile`] holds the lock at most: a save that waits for
+/// it on the main thread then fails the test instead of hanging it.
+const HELD_AT_MOST: Duration = Duration::from_secs(10);
+
+/// The profile file's lock, held by another thread as a sync that waits for
+/// the keyring holds it (issue #7), until released (or dropped, or
+/// [`HELD_AT_MOST`] has passed).
+struct HeldProfileFile {
+    release: Option<mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HeldProfileFile {
+    fn hold(dir: &Path) -> HeldProfileFile {
+        HeldProfileFile::hold_then_write(dir, None)
+    }
+
+    /// [`hold`](Self::hold), and replace the file with `contents` (if any)
+    /// just before letting go, as a sync does.
+    fn hold_then_write(dir: &Path, contents: Option<Vec<u8>>) -> HeldProfileFile {
+        let lock = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("profiles.json.lock"))
+            .expect("the profile file's lock file");
+        let file = dir.join("profiles.json");
+        let (held, is_held) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            lock.lock().expect("take the lock");
+            held.send(()).expect("say it is held");
+            let _ = released.recv_timeout(HELD_AT_MOST);
+            if let Some(contents) = contents {
+                let temp = file.with_extension("json.by-sync");
+                fs::write(&temp, contents).expect("write the new file");
+                fs::rename(&temp, &file).expect("put it in place");
+            }
+            lock.unlock().expect("let go of the lock");
+        });
+        is_held.recv().expect("the lock taken");
+        HeldProfileFile {
+            release: Some(release),
+            thread: Some(thread),
+        }
+    }
+
+    fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for HeldProfileFile {
+    fn drop(&mut self) {
+        drop(self.release.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -387,6 +446,9 @@ fn gui_integration() {
     sync::a_damaged_switch_shows_off_and_says_so(&tmp.path().join("s-sw-damaged"));
     sync::a_switch_that_cannot_be_saved_goes_back_and_says_so(&tmp.path().join("s-sw-fail"));
     sync::the_sync_switch_does_not_wait_for_the_keyring(&tmp.path().join("s-sw-held"));
+    sync::a_sync_started_on_a_stale_snapshot_stops_before_the_keyring(&tmp.path().join("s-stale"));
+    sync::an_off_request_counts_before_its_save_is_back(&tmp.path().join("s-asked"));
+    sync::cancelling_the_question_leaves_the_row_at_the_last_request(&tmp.path().join("s-last"));
     // Issue #6, the panes of a tab.
     panes::splitting_puts_a_new_pane_beside_the_focused_one(&bin, &tmp.path().join("s-split"));
     panes::the_tab_follows_its_focused_pane(&bin, &tmp.path().join("s-focus"));
@@ -637,6 +699,12 @@ fn alert_in(window: &impl IsA<gtk::Widget>) -> adw::AlertDialog {
         .into_iter()
         .next()
         .expect("the alert")
+}
+
+/// Whether the keyboard focus is in `row`.
+fn has_focus_in(window: &adw::Window, row: &impl IsA<gtk::Widget>) -> bool {
+    gtk::prelude::GtkWindowExt::focus(window)
+        .is_some_and(|f| f.is_ancestor(row) || &f == row.upcast_ref())
 }
 
 /// The action row of `root` whose widget name is `id` (a profile's id).

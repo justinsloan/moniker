@@ -25,8 +25,8 @@ use zeroize::Zeroizing;
 
 use super::main_window::test_app;
 use super::{
-    HeldKeyring, WAIT, alert_in, all_widgets, button_labeled, find_widget, labels_in, make_helper,
-    pump_for, pump_until, widgets_of_type,
+    HeldKeyring, HeldProfileFile, WAIT, alert_in, all_widgets, button_labeled, find_widget,
+    has_focus_in, labels_in, make_helper, pump_for, pump_until, widgets_of_type,
 };
 use crate::context::AppContext;
 use crate::profiles::{self, sync_page};
@@ -1301,7 +1301,13 @@ pub(super) fn the_sync_page_turns_sync_off_and_asks_to_turn_it_on(dir: &Path) {
         "the key and the other machine can still be chosen"
     );
 
-    // On: asks first. Nothing is written yet.
+    // On: asks first. Nothing is written yet. The keyboard is on the row, as a
+    // person who reached it with Tab and pressed Space has it.
+    page.sync_switch.grab_focus();
+    assert!(
+        has_focus_in(window, &page.sync_switch),
+        "the row has the keyboard before the question"
+    );
     page.sync_switch.set_active(true);
     let alert = alert_in(window);
     assert_eq!(alert.heading().as_deref(), Some("Turn Sync On?"));
@@ -1324,6 +1330,10 @@ pub(super) fn the_sync_page_turns_sync_off_and_asks_to_turn_it_on(dir: &Path) {
     );
     pump_for(Duration::from_millis(300));
     assert_eq!(switch_on_disk(ctx), SyncSwitch::Off);
+    assert!(
+        !has_focus_in(window, &page.sync_switch),
+        "the question has the keyboard while it is open"
+    );
 
     // Cancel: the switch goes back, nothing is written.
     button_labeled(&alert, "Cancel")
@@ -1335,6 +1345,11 @@ pub(super) fn the_sync_page_turns_sync_off_and_asks_to_turn_it_on(dir: &Path) {
     assert!(!page.sync_switch.is_active(), "back to off");
     assert_eq!(switch_on_disk(ctx), SyncSwitch::Off);
     assert!(!page.sync_button.is_sensitive());
+    // The row stays sensitive, so the keyboard comes back to it: Space again
+    // asks again, with no mouse.
+    pump_until("the keyboard back on the row after Cancel", || {
+        has_focus_in(window, &page.sync_switch)
+    });
 
     // Closing the alert (Escape) is Cancel.
     page.sync_switch.set_active(true);
@@ -1345,6 +1360,9 @@ pub(super) fn the_sync_page_turns_sync_off_and_asks_to_turn_it_on(dir: &Path) {
     });
     assert!(!page.sync_switch.is_active(), "back to off");
     assert_eq!(switch_on_disk(ctx), SyncSwitch::Off);
+    pump_until("the keyboard back on the row after Escape", || {
+        has_focus_in(window, &page.sync_switch)
+    });
 
     // Turn Sync On: saved, and everything comes back.
     page.sync_switch.set_active(true);
@@ -1854,6 +1872,216 @@ pub(super) fn the_sync_switch_does_not_wait_for_the_keyring(dir: &Path) {
     drop(page);
     window.destroy();
     pump_for(Duration::from_millis(100));
+}
+
+/// Issue #10: the main thread's snapshot of the profile file follows it only
+/// when the file watch reloads it, a moment after another process (the command
+/// line) turned sync off. A sync that starts in that moment is stopped by its
+/// worker, which looks at the file before it asks the keyring for anything:
+/// neither the sync key nor the partner's password is read, no ssh runs, and
+/// the person is told the same sentence as for any refusal.
+pub(super) fn a_sync_started_on_a_stale_snapshot_stops_before_the_keyring(dir: &Path) {
+    let reads = Reads::default();
+    let (ctx, secrets, profile) = sync_ctx_counting(dir, true, Some(SYNC_KEY), &reads);
+    let profile = profile.expect("a profile");
+    secrets
+        .set(&password_key(&profile.id), "pw-for-ssh")
+        .unwrap();
+    set_partner(&ctx, &profile, true);
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
+    let area = super::bare_area();
+    ctx.notice.attach(&area);
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
+    assert!(page.sync_button.is_sensitive());
+
+    // Another process turns sync off. Nobody reloads the snapshot (the file
+    // watch would, after its delay): it still says on.
+    ProfileStore::open(ctx.store.borrow().path())
+        .unwrap()
+        .set_sync(false)
+        .unwrap();
+    assert_eq!(switch_on_disk(&ctx), SyncSwitch::Off);
+    assert!(ctx.store.borrow().sync_switch().is_on(), "a stale snapshot");
+    assert!(page.sync_button.is_sensitive());
+    assert!(sync_now_enabled(&app));
+
+    // The Sync button: the sync starts, and its worker stops it.
+    let runs = Arc::new(AtomicUsize::new(0));
+    let worker_reads = reads.worker.load(Ordering::SeqCst);
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    page.sync_button.emit_clicked();
+    assert!(
+        ctx.sync_running.get(),
+        "the snapshot said on, so it started"
+    );
+    pump_until("the sync to stop", || !ctx.sync_running.get());
+    assert_eq!(page.result.label(), sync::SYNC_IS_OFF);
+    assert!(has_css(&page.result, "error"));
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "no ssh");
+    assert_eq!(
+        reads.worker.load(Ordering::SeqCst),
+        worker_reads,
+        "neither the sync key nor the partner's password was read"
+    );
+
+    // Sync Now.
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    app.activate_action("sync-now", None);
+    pump_until("Sync Now to say why", || {
+        ctx.notice.last_text().as_deref()
+            == Some("Sync failed: Sync is turned off on this machine.")
+    });
+    pump_until("it to stop", || !ctx.sync_running.get());
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "no ssh");
+    assert_eq!(
+        reads.worker.load(Ordering::SeqCst),
+        worker_reads,
+        "nothing read for Sync Now either"
+    );
+    drop(page);
+    close_all(&app);
+}
+
+/// Issue #10: while the save of a switch turned off is still out (it runs on
+/// the keyring worker, queued here behind the profile file's lock, which a sync
+/// holds while it waits at the keyring's unlock prompt), the snapshot still says
+/// on. What the person asked for counts at once: Sync, Sync Automatically and
+/// Sync Now go off with the hint, and no sync starts, whichever way it is asked
+/// for.
+pub(super) fn an_off_request_counts_before_its_save_is_back(dir: &Path) {
+    let reads = Reads::default();
+    let (ctx, _secrets, profile) = sync_ctx_counting(dir, true, Some(SYNC_KEY), &reads);
+    set_partner(&ctx, &profile.expect("a profile"), true);
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
+    let area = super::bare_area();
+    ctx.notice.attach(&area);
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
+    assert!(page.sync_button.is_sensitive());
+    assert!(page.auto_sync.is_sensitive());
+    assert!(sync_now_enabled(&app));
+    let (runs, delivered) = (Arc::new(AtomicUsize::new(0)), ctx.notice.delivered());
+
+    let held = HeldProfileFile::hold(dir);
+    page.sync_switch.set_active(false);
+    // The save is waiting for the file: it and the snapshot say on still.
+    assert_eq!(switch_on_disk(&ctx), SyncSwitch::On);
+    assert!(ctx.store.borrow().sync_switch().is_on());
+    assert!(!page.sync_switch.is_active());
+    assert!(!page.sync_button.is_sensitive(), "Sync is off at once");
+    assert!(
+        !page.auto_sync.is_sensitive(),
+        "and so is Sync Automatically"
+    );
+    assert!(page.hint.is_visible());
+    assert_eq!(page.hint.label(), sync::SYNC_IS_OFF);
+    assert!(sync_now_exists(&app));
+    assert!(!sync_now_enabled(&app), "Sync Now is grayed out at once");
+
+    // Whichever way a sync is asked for, nothing starts and nothing is read.
+    let worker_reads = reads.worker.load(Ordering::SeqCst);
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    page.sync_button.emit_clicked();
+    assert_eq!(page.result.label(), sync::SYNC_IS_OFF);
+    assert!(!ctx.sync_running.get());
+    crate::sync_now(&app, &ctx);
+    assert!(!ctx.sync_running.get());
+    assert_eq!(
+        ctx.notice.last_text().as_deref(),
+        Some("Sync failed: Sync is turned off on this machine.")
+    );
+    let told = ctx.notice.delivered();
+    assert_eq!(told, delivered + 1);
+    crate::sync_on_launch(&ctx);
+    pump_for(Duration::from_millis(300));
+    assert!(!ctx.sync_running.get(), "no sync on launch");
+    assert_eq!(ctx.notice.delivered(), told, "and nothing said about it");
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.worker.load(Ordering::SeqCst), worker_reads);
+    assert_eq!(switch_on_disk(&ctx), SyncSwitch::On, "still waiting");
+
+    // The save lands: the page and the menu agree with the file.
+    held.release();
+    pump_until("the file to say off", || {
+        switch_on_disk(&ctx) == SyncSwitch::Off
+    });
+    pump_until("the page to follow the file", || {
+        ctx.store.borrow().sync_switch() == SyncSwitch::Off
+    });
+    assert!(!page.sync_switch.is_active());
+    assert!(!page.sync_button.is_sensitive());
+    assert!(!sync_now_enabled(&app));
+    assert_eq!(page.hint.label(), sync::SYNC_IS_OFF);
+    drop(page);
+    close_all(&app);
+}
+
+/// Issue #10: Cancel on "Turn Sync On?" (or Escape) while an earlier off-save
+/// is still out leaves the row showing the last thing asked for, off, and not
+/// what the file still says, on. Turn Sync On in the same state is the last
+/// thing asked for, and ends on.
+pub(super) fn cancelling_the_question_leaves_the_row_at_the_last_request(dir: &Path) {
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    let (ctx, page, window) = (&rig.ctx, &rig.page, &rig.window);
+    let held = HeldProfileFile::hold(dir);
+
+    page.sync_switch.set_active(false);
+    assert!(!page.sync_switch.is_active());
+    assert_eq!(switch_on_disk(ctx), SyncSwitch::On, "the save is out");
+
+    // Flip it on again: the question. Cancel puts the row back to off.
+    page.sync_switch.set_active(true);
+    let alert = alert_in(window);
+    button_labeled(&alert, "Cancel")
+        .expect("the Cancel button")
+        .emit_clicked();
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(window).is_empty()
+    });
+    assert!(
+        !page.sync_switch.is_active(),
+        "off, what was last asked for: not on, which the file still says"
+    );
+    assert!(!page.sync_button.is_sensitive());
+
+    // Escape is Cancel.
+    page.sync_switch.set_active(true);
+    alert_in(window).close();
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(window).is_empty()
+    });
+    assert!(!page.sync_switch.is_active(), "off after Escape too");
+    assert_eq!(switch_on_disk(ctx), SyncSwitch::On, "nothing written yet");
+
+    // Turn Sync On: the last request is on, and both saves land in order.
+    page.sync_switch.set_active(true);
+    let alert = alert_in(window);
+    button_labeled(&alert, "Turn Sync On")
+        .expect("the Turn Sync On button")
+        .emit_clicked();
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(window).is_empty()
+    });
+    assert!(page.sync_switch.is_active());
+    held.release();
+    pump_until("the saves to land", || keyring::pending() == 0);
+    pump_until("the page to follow the file", || {
+        page.sync_button.is_sensitive()
+    });
+    assert_eq!(switch_on_disk(ctx), SyncSwitch::On);
+    assert!(page.sync_switch.is_active());
+    assert!(page.auto_sync.is_sensitive());
+    assert!(!page.hint.is_visible());
+    rig.finish();
 }
 
 /// What a runner of these scenarios saw: whether each sync it ran accepted a

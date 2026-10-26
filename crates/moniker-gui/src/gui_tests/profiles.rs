@@ -9,8 +9,8 @@ use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
@@ -23,8 +23,8 @@ use zeroize::Zeroizing;
 
 use super::windows::list_in;
 use super::{
-    HeldKeyring, MARKUP_NAME, alert_in, all_widgets, button_labeled, find_widget, make_helper,
-    pump_for, pump_until, row_for,
+    HeldKeyring, HeldProfileFile, MARKUP_NAME, alert_in, all_widgets, button_labeled, find_widget,
+    has_focus_in, make_helper, pump_for, pump_until, row_for,
 };
 use crate::context::AppContext;
 use crate::profiles::{self, ConnectFn};
@@ -1501,65 +1501,6 @@ pub(super) fn the_keyring_workers_answers_are_never_lost(dir: &Path) {
     s.close();
 }
 
-/// How long [`HeldProfileFile`] holds the lock at most: a save that waits for
-/// it on the main thread then fails the test instead of hanging it.
-const HELD_AT_MOST: Duration = Duration::from_secs(10);
-
-/// The profile file's lock, held by another thread as a sync that waits for
-/// the keyring holds it (issue #7), until released (or dropped, or
-/// [`HELD_AT_MOST`] has passed).
-struct HeldProfileFile {
-    release: Option<mpsc::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl HeldProfileFile {
-    fn hold(dir: &Path) -> HeldProfileFile {
-        HeldProfileFile::hold_then_write(dir, None)
-    }
-
-    /// [`hold`](Self::hold), and replace the file with `contents` (if any)
-    /// just before letting go, as a sync does.
-    fn hold_then_write(dir: &Path, contents: Option<Vec<u8>>) -> HeldProfileFile {
-        let lock = fs::OpenOptions::new()
-            .write(true)
-            .open(dir.join("profiles.json.lock"))
-            .expect("the profile file's lock file");
-        let file = dir.join("profiles.json");
-        let (held, is_held) = mpsc::channel();
-        let (release, released) = mpsc::channel::<()>();
-        let thread = std::thread::spawn(move || {
-            lock.lock().expect("take the lock");
-            held.send(()).expect("say it is held");
-            let _ = released.recv_timeout(HELD_AT_MOST);
-            if let Some(contents) = contents {
-                let temp = file.with_extension("json.by-sync");
-                fs::write(&temp, contents).expect("write the new file");
-                fs::rename(&temp, &file).expect("put it in place");
-            }
-            lock.unlock().expect("let go of the lock");
-        });
-        is_held.recv().expect("the lock taken");
-        HeldProfileFile {
-            release: Some(release),
-            thread: Some(thread),
-        }
-    }
-
-    fn release(self) {
-        drop(self);
-    }
-}
-
-impl Drop for HeldProfileFile {
-    fn drop(&mut self) {
-        drop(self.release.take());
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 /// The profile file as a sync elsewhere would write it, with `change` made to
 /// profile `id`: written in a copy beside it, so the file itself is untouched.
 fn written_elsewhere(s: &Setup, id: &str, change: impl FnOnce(&mut Profile)) -> Vec<u8> {
@@ -1590,12 +1531,6 @@ fn spinner_shown(root: &impl IsA<gtk::Widget>) -> bool {
     all_widgets::<adw::Spinner>(root)
         .iter()
         .any(|spinner| spinner.is_visible())
-}
-
-/// Whether the keyboard focus is in `row`.
-fn has_focus_in(window: &adw::Window, row: &impl IsA<gtk::Widget>) -> bool {
-    gtk::prelude::GtkWindowExt::focus(window)
-        .is_some_and(|f| f.is_ancestor(row) || &f == row.upcast_ref())
 }
 
 /// Saving waits for the profile file, not the window (issue #7). With the

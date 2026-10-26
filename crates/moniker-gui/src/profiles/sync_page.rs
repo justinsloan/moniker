@@ -40,6 +40,7 @@ use adw::prelude::*;
 use gtk::{glib, pango};
 use gtk4 as gtk;
 use libadwaita as adw;
+use moniker_core::store::SyncSwitch;
 use moniker_core::sync::StaleSync;
 use zeroize::Zeroizing;
 
@@ -101,9 +102,6 @@ pub(crate) struct SyncPage {
     key_known: Cell<bool>,
     /// A switch is being set to what a file says, not by the person.
     loading: Cell<bool>,
-    /// Saves of `sync_switch` that have not come back. While any is out the row
-    /// shows what the person asked for, not what the file still says.
-    switch_saves: Cell<u32>,
 }
 
 impl SyncPage {
@@ -204,7 +202,6 @@ impl SyncPage {
             key_set: Cell::new(false),
             key_known: Cell::new(false),
             loading: Cell::new(false),
-            switch_saves: Cell::new(0),
         });
         page.wire();
         page.refresh_key_status();
@@ -409,22 +406,35 @@ impl SyncPage {
 
     /// Set the sync switch, and its subtitle, to what the profile file says (as
     /// the context last read it). A switch that could not be read shows off and
-    /// says so. Left alone while a save of the row is out: the row shows what
-    /// the person asked for until the file has it.
+    /// says so. While a save of the row is out the row shows what the person
+    /// asked for last, not what the file still says
+    /// ([`AppContext::ask_sync_switch`]), and the line under it what is so
+    /// meanwhile.
     fn refresh_sync_switch(&self) {
-        if self.switch_saves.get() > 0 {
-            return;
-        }
-        let switch = self.ctx.store.borrow().sync_switch();
-        self.sync_switch.set_subtitle(sync::switch_subtitle(switch));
+        let (active, subtitle) = match self.ctx.asked_sync_switch() {
+            Some(asked) => {
+                let meanwhile = if self.ctx.sync_is_on() {
+                    SyncSwitch::On
+                } else {
+                    SyncSwitch::Off
+                };
+                (asked, sync::switch_subtitle(meanwhile))
+            }
+            None => {
+                let switch = self.ctx.store.borrow().sync_switch();
+                (switch.is_on(), sync::switch_subtitle(switch))
+            }
+        };
+        self.sync_switch.set_subtitle(subtitle);
         self.loading.set(true);
-        self.sync_switch.set_active(switch.is_on());
+        self.sync_switch.set_active(active);
         self.loading.set(false);
     }
 
     /// The person flipped the sync switch. Off is saved at once: it only stops
     /// data leaving. On asks first ([`ask_to_turn_sync_on`]); Cancel, or closing
-    /// the alert, puts the row back to what the file says.
+    /// the alert, puts the row back to what the file says, or to what was asked
+    /// for last if a save is still out.
     fn sync_switch_changed(self: &Rc<Self>) {
         if self.loading.get() {
             return;
@@ -451,15 +461,17 @@ impl SyncPage {
 
     /// Save the switch in the profile file on the keyring worker (the main
     /// thread never writes it: a sync can hold the file's lock at the keyring).
-    /// The row shows `on` meanwhile. When the save is back, a failure is told
+    /// The row shows `on` meanwhile, and the app counts the request at once
+    /// ([`AppContext::ask_sync_switch`]): Sync, Sync Automatically and Sync Now
+    /// follow it before the file does. When the save is back, a failure is told
     /// near the page, or in a window if the page has gone, and everything
     /// showing the switch re-reads the file, so the row ends up as the file has
     /// it whether the save worked or not.
     fn save_sync_switch(self: &Rc<Self>, on: bool) {
-        self.switch_saves.set(self.switch_saves.get() + 1);
         self.loading.set(true);
         self.sync_switch.set_active(on);
         self.loading.set(false);
+        self.ctx.ask_sync_switch(on);
         let weak = Rc::downgrade(self);
         let ctx = Rc::clone(&self.ctx);
         keyring::write_profiles(
@@ -471,8 +483,8 @@ impl SyncPage {
                     .map_err(|err| format!("Could not save the sync setting: {err}"))
             },
             move |saved| {
+                ctx.sync_switch_saved();
                 if let Some(page) = weak.upgrade() {
-                    page.switch_saves.set(page.switch_saves.get() - 1);
                     if let Err(message) = &saved {
                         ctx.notice.show_near(&page.widget, message);
                     }
@@ -493,8 +505,9 @@ impl SyncPage {
         let profiles = self.ids.borrow().len();
         let known = self.key_known.get();
         let key_set = self.key_set.get();
-        // The switch is in the profile file, which the context keeps current.
-        let sync_on = self.ctx.store.borrow().sync_switch().is_on();
+        // The switch is in the profile file, which the context keeps current,
+        // except that a request to turn it off counts before its save is back.
+        let sync_on = self.ctx.sync_is_on();
         let hint = (known || !sync_on)
             .then(|| sync::sync_hint(sync_on, key_set, profiles))
             .flatten();

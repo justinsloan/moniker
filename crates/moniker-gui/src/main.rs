@@ -294,13 +294,10 @@ fn follow_sync_partner(app: &adw::Application, ctx: &Rc<AppContext>) {
 fn refresh_sync_now(app: &adw::Application, ctx: &Rc<AppContext>) {
     let settings = settings::load(&ctx.settings_path);
     // Bind first so the store borrow ends here.
-    let (has_partner, sync_on) = {
-        let store = ctx.store.borrow();
-        (
-            sync::live_partner(&settings, &store).is_some(),
-            store.sync_switch().is_on(),
-        )
-    };
+    let has_partner = sync::live_partner(&settings, &ctx.store.borrow()).is_some();
+    // The file's word, except that a request to turn sync off counts before its
+    // save has landed.
+    let sync_on = ctx.sync_is_on();
     if !has_partner {
         app.remove_action("sync-now");
         return;
@@ -413,8 +410,12 @@ pub(crate) fn launch(app: &adw::Application, ctx: &Rc<AppContext>) {
 /// running (started by hand meanwhile), this one is skipped.
 fn sync_on_launch(ctx: &Rc<AppContext>) {
     let settings = settings::load(&ctx.settings_path);
-    // Bind first so the store borrow ends here.
-    let target = sync::auto_sync_target(&settings, &ctx.store.borrow());
+    // Bind first so the store borrow ends here. A request to turn sync off that
+    // has not landed in the file yet counts too.
+    let target = ctx
+        .sync_is_on()
+        .then(|| sync::auto_sync_target(&settings, &ctx.store.borrow()))
+        .flatten();
     let Some(partner) = target else {
         return;
     };

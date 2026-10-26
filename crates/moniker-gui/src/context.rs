@@ -133,6 +133,11 @@ pub struct AppContext {
     /// The GUI's settings file ([`settings`]): the sync partner and the
     /// automatic-sync switch. Beside the profile file.
     pub settings_path: PathBuf,
+    /// Saves of the sync switch (the sync page's row) that have not come back,
+    /// and the value the last of them carries. See
+    /// [`ask_sync_switch`](Self::ask_sync_switch).
+    sync_switch_saves: Cell<u32>,
+    sync_switch_asked: Cell<bool>,
     /// Called by [`profiles_changed`](Self::profiles_changed).
     listeners: RefCell<Vec<Listener<dyn Fn()>>>,
     /// Called when a sync starts and ends ([`sync_event`](Self::sync_event)).
@@ -227,6 +232,8 @@ impl AppContext {
             notice: Notice::default(),
             sync_running: Cell::new(false),
             settings_path,
+            sync_switch_saves: Cell::new(0),
+            sync_switch_asked: Cell::new(true),
             listeners: RefCell::new(Vec::new()),
             sync_listeners: RefCell::new(Vec::new()),
             #[cfg(test)]
@@ -303,9 +310,55 @@ impl AppContext {
             self.notice
                 .show(&format!("Could not re-read the profile file: {err}"));
         }
+        self.tell_profile_listeners();
+    }
+
+    /// Call every profile listener whose owner still exists.
+    fn tell_profile_listeners(&self) {
         for call in live_calls(&self.listeners) {
             call();
         }
+    }
+
+    /// The sync page's row asked for the sync switch to be `on`, and the save
+    /// that carries it is queued ([`crate::keyring::write_profiles`]). Until it
+    /// is back ([`sync_switch_saved`](Self::sync_switch_saved)) the snapshot still
+    /// says what the file says, and the save can be long coming: it runs behind
+    /// whatever the keyring worker is doing (a key read stuck at an unlock
+    /// prompt) and the file's lock (a sync waiting at the same prompt). What was
+    /// asked for counts meanwhile ([`sync_is_on`](Self::sync_is_on) and
+    /// [`asked_sync_switch`](Self::asked_sync_switch)): a switch just turned off
+    /// stops Sync Now, the Sync button and an automatic sync at once, not when
+    /// the file has it (issue #10). Whoever shows the profiles is told, without
+    /// the file being read again, so that it takes the request into account.
+    pub(crate) fn ask_sync_switch(&self, on: bool) {
+        self.sync_switch_saves
+            .set(self.sync_switch_saves.get().saturating_add(1));
+        self.sync_switch_asked.set(on);
+        self.tell_profile_listeners();
+    }
+
+    /// A save counted by [`ask_sync_switch`](Self::ask_sync_switch) has come
+    /// back, whether it worked or not. The caller reads the file again
+    /// ([`profiles_changed`](Self::profiles_changed)), which is what the request
+    /// stops standing in for.
+    pub(crate) fn sync_switch_saved(&self) {
+        self.sync_switch_saves
+            .set(self.sync_switch_saves.get().saturating_sub(1));
+    }
+
+    /// What the last request for the sync switch was, while any save of it is
+    /// still out; `None` once all are back.
+    pub(crate) fn asked_sync_switch(&self) -> Option<bool> {
+        (self.sync_switch_saves.get() > 0).then(|| self.sync_switch_asked.get())
+    }
+
+    /// Whether sync is turned on, as far as this app can tell without the file:
+    /// the snapshot says so and no request to turn it off is still out. An on
+    /// request still out changes nothing, since the file (the snapshot) says off
+    /// until it lands, and the core refuses a sync until then.
+    pub(crate) fn sync_is_on(&self) -> bool {
+        self.asked_sync_switch() != Some(false) && self.store.borrow().sync_switch().is_on()
     }
 
     /// Watch the profile file for changes made by anyone (a sync from this
@@ -594,6 +647,68 @@ mod tests {
             Arc::new(MemorySecretStore::default()),
             dir.join("askpass"),
         )
+    }
+
+    #[test]
+    fn a_request_to_turn_sync_off_counts_before_its_save_is_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context_in(dir.path());
+        assert!(ctx.sync_is_on(), "a file that records nothing means on");
+        assert_eq!(ctx.asked_sync_switch(), None);
+
+        // Off is asked for: the snapshot still says on, the request counts.
+        ctx.ask_sync_switch(false);
+        assert!(ctx.store.borrow().sync_switch().is_on());
+        assert!(!ctx.sync_is_on());
+        assert_eq!(ctx.asked_sync_switch(), Some(false));
+
+        // Asked for on again before the first save is back: the last one
+        // counts, and the requests are counted, not just the last.
+        ctx.ask_sync_switch(true);
+        assert_eq!(ctx.asked_sync_switch(), Some(true));
+        assert!(ctx.sync_is_on());
+        ctx.sync_switch_saved();
+        assert_eq!(ctx.asked_sync_switch(), Some(true), "one save is still out");
+        ctx.sync_switch_saved();
+        assert_eq!(ctx.asked_sync_switch(), None, "all back");
+        ctx.sync_switch_saved();
+        assert_eq!(ctx.asked_sync_switch(), None, "never below none");
+
+        // Once the file says off (a reload), a request to turn it on does not
+        // count until the file has it: the core would refuse a sync until then.
+        ProfileStore::open(ctx.store.borrow().path())
+            .unwrap()
+            .set_sync(false)
+            .unwrap();
+        ctx.profiles_changed();
+        assert!(!ctx.sync_is_on());
+        ctx.ask_sync_switch(true);
+        assert!(!ctx.sync_is_on());
+        ctx.sync_switch_saved();
+        assert!(!ctx.sync_is_on());
+    }
+
+    #[test]
+    fn asking_for_the_switch_tells_the_listeners_without_reading_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context_in(dir.path());
+        let owner = glib::Object::new::<glib::Object>();
+        let heard = Rc::new(Cell::new(0));
+        ctx.on_profiles_changed(&owner, {
+            let heard = Rc::clone(&heard);
+            move || heard.set(heard.get() + 1)
+        });
+        // The file changes behind the snapshot's back.
+        ProfileStore::open(ctx.store.borrow().path())
+            .unwrap()
+            .set_sync(false)
+            .unwrap();
+        ctx.ask_sync_switch(false);
+        assert_eq!(heard.get(), 1, "the listeners were told");
+        assert!(
+            ctx.store.borrow().sync_switch().is_on(),
+            "but the snapshot was not read again"
+        );
     }
 
     #[test]
