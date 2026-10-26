@@ -132,13 +132,7 @@ pub fn build_with(app: &adw::Application, ctx: &Rc<AppContext>, start: &Start) -
         terminal_tab::local_transcript_spec(ctx, save),
     );
     if let Some(refused) = &start.dir_refused {
-        ctx.notice.show_near(
-            &main.notifications,
-            &format!(
-                "Could not open {}: it is not a folder. The terminal started in your home folder.",
-                refused.display()
-            ),
-        );
+        ctx.notice.show_near(&main.notifications, &refused.note());
     }
     main
 }

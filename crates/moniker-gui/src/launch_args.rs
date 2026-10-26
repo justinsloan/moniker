@@ -13,11 +13,12 @@
 //!
 //! A command is always an argument list; nothing here builds a shell string.
 //!
-//! This module is pure: no GTK, no environment reads. [`parse`] turns the
-//! arguments (without `argv[0]`) into a [`Request`], [`start`] turns a request
-//! into a [`Start`] with the folder chosen (the launching process's directory
-//! and the home folder come from the caller), so everything runs under
-//! `cargo test` without a display.
+//! This module has no GTK and reads no environment variables; it looks at the
+//! file system only to check folders ([`start`]). [`parse`] turns the arguments
+//! (without `argv[0]`) into a [`Request`], [`start`] turns a request into a
+//! [`Start`] with the folder chosen (the launching process's directory and the
+//! home folder come from the caller), so everything runs under `cargo test`
+//! without a display.
 //!
 //! The launching process does all of that itself, first of all ([`local`]): it
 //! prints the usage text, the version or a mistake and exits, without reading
@@ -39,9 +40,52 @@ pub(crate) struct Start {
     pub(crate) title: Option<String>,
     /// The shell, or a command.
     pub(crate) run: Run,
-    /// The folder that was asked for but is not a folder (so `dir` is the home
-    /// folder); the window says so in a notification.
-    pub(crate) dir_refused: Option<PathBuf>,
+    /// The folder that could not be used (so `dir` is the home folder), and
+    /// why; the window says so in a notification.
+    pub(crate) dir_refused: Option<Refused>,
+}
+
+/// A folder the terminal could not start in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Refused {
+    /// The folder, as the notification names it: as asked for, or the one
+    /// `moniker` was started in, shown lossily when its name is not UTF-8.
+    pub(crate) dir: PathBuf,
+    pub(crate) reason: Reason,
+}
+
+/// Why a folder could not be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reason {
+    /// It is not a folder (or, with a relative path, there is no launching
+    /// directory to take it from).
+    NotAFolder,
+    /// Its name is not valid UTF-8, so it cannot be handed to a running
+    /// Moniker. Only the folder `moniker` was started in can be like that: a
+    /// `-w` value that is not UTF-8 is a mistake ([`parse`]).
+    NotUtf8,
+}
+
+impl Refused {
+    /// A folder that is not one.
+    pub(crate) fn not_a_folder(dir: impl Into<PathBuf>) -> Refused {
+        Refused {
+            dir: dir.into(),
+            reason: Reason::NotAFolder,
+        }
+    }
+
+    /// What the window says (plain text; the folder is shown lossily).
+    pub(crate) fn note(&self) -> String {
+        let why = match self.reason {
+            Reason::NotAFolder => "it is not a folder",
+            Reason::NotUtf8 => "its name is not valid UTF-8",
+        };
+        format!(
+            "Could not open {}: {why}. The terminal started in your home folder.",
+            self.dir.display()
+        )
+    }
 }
 
 /// What the terminal runs.
@@ -136,6 +180,19 @@ fn asks_for_text(args: &[OsString]) -> Option<Parsed> {
     None
 }
 
+/// `text` with every control character (an escape sequence, a newline, a bell)
+/// turned into a space, so that showing it, or feeding it to a terminal, cannot
+/// act as a command. Whatever came from outside Moniker (an argument, a
+/// program's name, a reason) goes through this before it is written into a
+/// terminal, onto the standard error that is often one, or into a one-line
+/// title. It is here, with no GTK, so that the launching process's mistakes use
+/// it too.
+pub(crate) fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 fn text(arg: &OsStr) -> Result<&str, String> {
     arg.to_str()
         .ok_or_else(|| "arguments must be valid UTF-8".to_string())
@@ -151,7 +208,8 @@ fn text(arg: &OsStr) -> Result<&str, String> {
 /// value is a value (an empty folder is none, an empty title is none).
 /// `--help` and `--version` before the command win over everything else.
 /// Anything else wrong is one line saying why, for the launching process's
-/// stderr.
+/// stderr, which is often a terminal: an argument it names is cleaned with
+/// [`one_line`] first, so that it cannot act as an escape sequence there.
 pub(crate) fn parse(args: &[OsString]) -> Result<Parsed, String> {
     if let Some(asked) = asks_for_text(args) {
         return Ok(asked);
@@ -202,10 +260,11 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Parsed, String> {
         } else if arg.starts_with('-') && arg != "-" {
             // (`--help` and `--version` were taken above, so they never get
             // here; `--help=1` and the like are unknown.)
-            return Err(format!("unknown option: {arg}"));
+            return Err(format!("unknown option: {}", one_line(arg)));
         } else {
             return Err(format!(
-                "unexpected argument: {arg} (to run a command, put it after --)"
+                "unexpected argument: {} (to run a command, put it after --)",
+                one_line(arg)
             ));
         }
     }
@@ -248,8 +307,8 @@ pub(crate) fn start(request: Request, cwd: Option<&Path>, home: &Path) -> Start 
             };
             match chosen {
                 Some(chosen) if is_folder(&chosen) => (chosen, None),
-                Some(chosen) => (home.to_path_buf(), Some(chosen)),
-                None => (home.to_path_buf(), Some(asked)),
+                Some(chosen) => (home.to_path_buf(), Some(Refused::not_a_folder(chosen))),
+                None => (home.to_path_buf(), Some(Refused::not_a_folder(asked))),
             }
         }
         // Nothing asked for, so nothing is refused: a launching directory that
@@ -333,33 +392,45 @@ pub(crate) fn local(args: &[OsString], cwd: Option<&Path>, home: &Path) -> Local
 // and nothing else.
 const DIR: &str = "--moniker-dir=";
 const REFUSED: &str = "--moniker-refused=";
+const NOT_UTF8: &str = "--moniker-not-utf8=";
 const TITLE: &str = "--moniker-title=";
 const ARG: &str = "--moniker-arg=";
 const HOLD: &str = "--moniker-hold";
 
 /// The arguments that carry a [`Start`] to the Moniker that opens the window,
 /// one for each field, in this order: the folder (`--moniker-dir=`), the folder
-/// that was refused (`--moniker-refused=`), the title (`--moniker-title=`), each
-/// element of a command, in order and exactly (`--moniker-arg=`, an empty one
-/// too), and `--moniker-hold`, only with a command.
+/// that was refused (`--moniker-refused=`, or `--moniker-not-utf8=` when the
+/// reason is its name), the title (`--moniker-title=`), each element of a
+/// command, in order and exactly (`--moniker-arg=`, an empty one too), and
+/// `--moniker-hold`, only with a command.
 ///
 /// A folder that is not valid UTF-8 cannot travel: it is left out, so that the
 /// terminal starts in the home folder ([`decode`]), and named, shown lossily, as
-/// the folder refused (one already named stays the one named). A command with
-/// no program (which [`start`] never makes) is a shell.
+/// a folder refused for its name (one already named stays the one named). Only
+/// the folder `moniker` was started in can be like that, as a `-w` value must
+/// be UTF-8. A folder that is not an absolute path is left out as well (never
+/// made by [`start`] but for a relative home folder). A command with no program
+/// (which [`start`] never makes) is a shell.
 pub(crate) fn encode(start: &Start) -> Vec<String> {
     let mut words = Vec::new();
     let dir = start.dir.to_str();
-    if let Some(dir) = dir {
+    // Only an absolute folder travels ([`decode`] takes no other): a relative
+    // one (the launcher's $HOME is relative, say) is left out, and the terminal
+    // starts in the running Moniker's own home folder.
+    if let Some(dir) = dir.filter(|_| start.dir.is_absolute()) {
         words.push(format!("{DIR}{dir}"));
     }
     let refused = match (&start.dir_refused, dir) {
-        (Some(refused), _) => Some(refused.as_path()),
-        (None, None) => Some(start.dir.as_path()),
+        (Some(refused), _) => Some((refused.reason, refused.dir.as_path())),
+        (None, None) => Some((Reason::NotUtf8, start.dir.as_path())),
         (None, Some(_)) => None,
     };
-    if let Some(refused) = refused {
-        words.push(format!("{REFUSED}{}", refused.to_string_lossy()));
+    if let Some((reason, dir)) = refused {
+        let word = match reason {
+            Reason::NotAFolder => REFUSED,
+            Reason::NotUtf8 => NOT_UTF8,
+        };
+        words.push(format!("{word}{}", dir.to_string_lossy()));
     }
     if let Some(title) = &start.title {
         words.push(format!("{TITLE}{title}"));
@@ -379,22 +450,38 @@ pub(crate) fn encode(start: &Start) -> Vec<String> {
 /// the folder when none came (an empty list is a plain window in the home
 /// folder). An empty folder, title or refused folder counts as none, as in
 /// [`parse`]. The fields may come in any order; the command's arguments keep
-/// theirs. Anything else is `unexpected handover: <word>`: a word that is not
-/// one of these, a field twice, or a hold with no command.
+/// theirs. Anything else is `unexpected handover: <word>` (the word cleaned
+/// with [`one_line`]): a word that is not one of these, a field twice, a folder
+/// that is not an absolute path (`encode` never writes one), or a hold with no
+/// command.
 pub(crate) fn decode(args: &[String], home: &Path) -> Result<Start, String> {
-    let unexpected = |word: &str| format!("unexpected handover: {word}");
+    // The word is cleaned: this line is printed on the launching process's
+    // stderr, which is often a terminal (see [`parse`]).
+    let unexpected = |word: &str| format!("unexpected handover: {}", one_line(word));
     let mut dir: Option<&str> = None;
-    let mut refused: Option<&str> = None;
+    let mut refused: Option<(Reason, &str)> = None;
     let mut title: Option<&str> = None;
     let mut argv: Vec<String> = Vec::new();
     let mut hold = false;
     for word in args {
         if let Some(value) = word.strip_prefix(DIR) {
-            if dir.replace(value).is_some() {
+            // `local` hands over a folder only as an absolute path (a relative
+            // one is joined to the launching directory there), or none at all
+            // (an empty value): anything else did not come from it.
+            let relative = !value.is_empty() && !Path::new(value).is_absolute();
+            if relative || dir.replace(value).is_some() {
                 return Err(unexpected(word));
             }
-        } else if let Some(value) = word.strip_prefix(REFUSED) {
-            if refused.replace(value).is_some() {
+        } else if let Some((reason, value)) = word
+            .strip_prefix(REFUSED)
+            .map(|value| (Reason::NotAFolder, value))
+            .or_else(|| {
+                word.strip_prefix(NOT_UTF8)
+                    .map(|value| (Reason::NotUtf8, value))
+            })
+        {
+            // One folder, one reason: a second of either word is too many.
+            if refused.replace((reason, value)).is_some() {
                 return Err(unexpected(word));
             }
         } else if let Some(value) = word.strip_prefix(TITLE) {
@@ -425,7 +512,12 @@ pub(crate) fn decode(args: &[String], home: &Path) -> Result<Start, String> {
         } else {
             Run::Command { argv, hold }
         },
-        dir_refused: non_empty(refused).map(PathBuf::from),
+        dir_refused: refused
+            .filter(|(_, dir)| !dir.is_empty())
+            .map(|(reason, dir)| Refused {
+                dir: PathBuf::from(dir),
+                reason,
+            }),
     })
 }
 
@@ -433,6 +525,11 @@ pub(crate) fn decode(args: &[String], home: &Path) -> Result<Start, String> {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStringExt;
+
+    /// A folder that is not one, as `start` names it.
+    fn refused(dir: impl Into<PathBuf>) -> Option<Refused> {
+        Some(Refused::not_a_folder(dir))
+    }
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -865,7 +962,7 @@ mod tests {
         let started = at("./nope");
         assert_eq!(started.dir, home);
         assert_eq!(
-            shown(&started.dir_refused.expect("refused")),
+            shown(&started.dir_refused.expect("refused").dir),
             format!("{c}/nope")
         );
         // `..` stays: it is a real step (and a link's parent is not the
@@ -895,29 +992,29 @@ mod tests {
         // A file.
         let started = at(&file, Some(&cwd));
         assert_eq!(started.dir, home);
-        assert_eq!(started.dir_refused, Some(file.clone()));
+        assert_eq!(started.dir_refused, refused(file.clone()));
         // A path that does not exist.
         let missing = tmp.path().join("missing");
         let started = at(&missing, None);
         assert_eq!(started.dir, home);
-        assert_eq!(started.dir_refused, Some(missing));
+        assert_eq!(started.dir_refused, refused(missing));
         // A relative one that is not a folder: the refusal names the path that
         // was looked at.
         let started = at(Path::new("plain"), Some(&cwd));
         assert_eq!(started.dir, home);
-        assert_eq!(started.dir_refused, Some(cwd.join("plain")));
+        assert_eq!(started.dir_refused, refused(cwd.join("plain")));
         let started = at(Path::new("nope"), Some(&cwd));
-        assert_eq!(started.dir_refused, Some(cwd.join("nope")));
+        assert_eq!(started.dir_refused, refused(cwd.join("nope")));
         // A relative one when the launcher's folder is unknown cannot be
         // resolved, so it is refused as typed.
         let started = at(Path::new("rel"), None);
         assert_eq!(started.dir, home);
-        assert_eq!(started.dir_refused, Some(PathBuf::from("rel")));
+        assert_eq!(started.dir_refused, refused("rel"));
         // A refused folder does not change what runs or the title.
         let request = open(&["-w", file.to_str().unwrap(), "-T", "t", "--", "ls"]);
         let started = start(request, None, &home);
         assert_eq!(started.dir, home);
-        assert_eq!(started.dir_refused, Some(file));
+        assert_eq!(started.dir_refused, refused(file));
         assert_eq!(started.title.as_deref(), Some("t"));
         assert_eq!(
             started.run,
@@ -937,7 +1034,7 @@ mod tests {
         std::os::unix::fs::symlink(tmp.path().join("gone"), &dangling).unwrap();
         let started = at(&dangling, None);
         assert_eq!(started.dir, home);
-        assert_eq!(started.dir_refused, Some(dangling));
+        assert_eq!(started.dir_refused, refused(dangling));
     }
 
     #[test]
@@ -1081,14 +1178,14 @@ mod tests {
     #[test]
     fn a_refused_folder_round_trips() {
         let start = Start {
-            dir_refused: Some(PathBuf::from("/home/u/My Files/not a folder")),
+            dir_refused: refused("/home/u/My Files/not a folder"),
             ..Start::home(Path::new(HOME))
         };
         assert_eq!(round(&start), start);
         // With the other fields too.
         let start = Start {
             title: Some("t".into()),
-            dir_refused: Some(PathBuf::from("rel/ünï")),
+            dir_refused: refused("rel/ünï"),
             ..a_start(HOME, awkward_command(true))
         };
         assert_eq!(round(&start), start);
@@ -1103,7 +1200,7 @@ mod tests {
                 argv: vec!["tail".into(), "-f".into(), "".into(), "a b".into()],
                 hold: true,
             },
-            dir_refused: Some(PathBuf::from("/nope")),
+            dir_refused: refused("/nope"),
         };
         assert_eq!(
             encode(&start),
@@ -1116,6 +1213,22 @@ mod tests {
                 "--moniker-arg=",
                 "--moniker-arg=a b",
                 "--moniker-hold",
+            ])
+        );
+        // A folder refused for its name has a word of its own, in the same place.
+        let unnamed = Start {
+            dir_refused: Some(Refused {
+                dir: PathBuf::from("/nope"),
+                reason: Reason::NotUtf8,
+            }),
+            ..start
+        };
+        assert_eq!(
+            encode(&unnamed)[..3],
+            tokens(&[
+                "--moniker-dir=/home/u",
+                "--moniker-not-utf8=/nope",
+                "--moniker-title=-- x",
             ])
         );
         assert_eq!(
@@ -1148,12 +1261,19 @@ mod tests {
             a_start("/tmp", awkward_command(false)),
             Start {
                 title: Some("-- x".into()),
-                dir_refused: Some(PathBuf::from("--")),
+                dir_refused: refused("--"),
                 ..a_start("/tmp", awkward_command(true))
             },
             Start {
                 title: Some("".into()),
                 ..a_start("--", Run::Shell)
+            },
+            Start {
+                dir_refused: Some(Refused {
+                    dir: PathBuf::from("--"),
+                    reason: Reason::NotUtf8,
+                }),
+                ..a_start("/tmp", awkward_command(true))
             },
         ];
         for start in &starts {
@@ -1215,6 +1335,19 @@ mod tests {
             ),
             (
                 &["--moniker-refused=/a", "--moniker-refused=/b"],
+                "--moniker-refused=/b",
+            ),
+            (
+                &["--moniker-not-utf8=/a", "--moniker-not-utf8=/b"],
+                "--moniker-not-utf8=/b",
+            ),
+            // One folder is refused for one reason.
+            (
+                &["--moniker-refused=/a", "--moniker-not-utf8=/b"],
+                "--moniker-not-utf8=/b",
+            ),
+            (
+                &["--moniker-not-utf8=/a", "--moniker-refused=/b"],
                 "--moniker-refused=/b",
             ),
             (
@@ -1297,7 +1430,7 @@ mod tests {
                     argv: vec!["c".into(), "a".into(), "b".into()],
                     hold: true
                 },
-                dir_refused: Some(PathBuf::from("/x")),
+                dir_refused: refused("/x"),
             }
         );
     }
@@ -1312,19 +1445,25 @@ mod tests {
         let written = encode(&start);
         assert_eq!(
             written,
-            tokens(&["--moniker-refused=/tmp/b\u{fffd}d"]),
-            "no folder is handed over, and the notification can name it"
+            tokens(&["--moniker-not-utf8=/tmp/b\u{fffd}d"]),
+            "no folder is handed over, and the notification can name it and say why"
         );
         let back = decode(&written, Path::new(HOME)).expect("decodes");
         assert_eq!(back.dir, Path::new(HOME));
-        assert_eq!(back.dir_refused, Some(PathBuf::from("/tmp/b\u{fffd}d")));
+        assert_eq!(
+            back.dir_refused,
+            Some(Refused {
+                dir: PathBuf::from("/tmp/b\u{fffd}d"),
+                reason: Reason::NotUtf8,
+            })
+        );
         assert_eq!(back.run, Run::Shell);
 
         // A refused path that is not UTF-8 is shown the same way, and it
         // stays the one named when the folder is odd as well.
         let both = Start {
             dir: odd,
-            dir_refused: Some(PathBuf::from(OsString::from_vec(b"/x/\xfe".to_vec()))),
+            dir_refused: refused(OsString::from_vec(b"/x/\xfe".to_vec())),
             ..start
         };
         assert_eq!(encode(&both), tokens(&["--moniker-refused=/x/\u{fffd}"]));
@@ -1336,6 +1475,116 @@ mod tests {
             encode(&just_refused),
             tokens(&["--moniker-dir=/tmp", "--moniker-refused=/x/\u{fffd}"])
         );
+    }
+
+    #[test]
+    fn what_the_window_says_of_a_folder_it_could_not_use() {
+        assert_eq!(
+            Refused::not_a_folder("/home/u/My Files/x").note(),
+            "Could not open /home/u/My Files/x: it is not a folder. \
+             The terminal started in your home folder."
+        );
+        // Its own words for a name that cannot be handed over, not "it is not
+        // a folder": the folder is there, and so are the characters shown.
+        let odd = Refused {
+            dir: PathBuf::from("/tmp/b\u{fffd}d"),
+            reason: Reason::NotUtf8,
+        };
+        assert_eq!(
+            odd.note(),
+            "Could not open /tmp/b\u{fffd}d: its name is not valid UTF-8. \
+             The terminal started in your home folder."
+        );
+        // A path that is not UTF-8 is shown lossily, never as an error.
+        let raw = Refused {
+            dir: PathBuf::from(OsString::from_vec(b"/tmp/b\xffd".to_vec())),
+            reason: Reason::NotUtf8,
+        };
+        assert_eq!(raw.note(), odd.note());
+    }
+
+    #[test]
+    fn the_folder_moniker_started_in_with_a_name_that_is_not_utf8() {
+        // The one way a folder that is not UTF-8 gets this far: `-w` and every
+        // other argument must be UTF-8 (a mistake otherwise, below), but the
+        // folder the launching process is in is whatever it is. It cannot be
+        // handed to a running Moniker, so the terminal starts in the home
+        // folder, and the note says why: not that it is "not a folder".
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let odd = tmp.path().join(OsString::from_vec(b"b\xffd".to_vec()));
+        std::fs::create_dir_all(odd.join("sub")).unwrap();
+        let lossy = format!("{}/b\u{fffd}d", tmp.path().display());
+
+        let handed = |list: &[&str], cwd: &Path| match local(&args(list), Some(cwd), &home) {
+            Local::HandOver(words) => words,
+            other => panic!("{list:?} should open a window, got {other:?}"),
+        };
+        for (list, named) in [
+            (vec![], lossy.clone()),
+            // A relative `-w` that is a folder there: the same.
+            (vec!["-w", "sub"], format!("{lossy}/sub")),
+        ] {
+            let words = handed(&list, &odd);
+            assert_eq!(
+                words,
+                vec![format!("--moniker-not-utf8={named}")],
+                "{list:?}: no folder, and the reason"
+            );
+            let back = decode(&words, &home).expect("decodes");
+            assert_eq!(back.dir, home, "{list:?}");
+            assert_eq!(back.run, Run::Shell, "{list:?}");
+            assert_eq!(
+                back.dir_refused,
+                Some(Refused {
+                    dir: PathBuf::from(&named),
+                    reason: Reason::NotUtf8,
+                }),
+                "{list:?}"
+            );
+            assert_eq!(
+                back.dir_refused.expect("named").note(),
+                format!(
+                    "Could not open {named}: its name is not valid UTF-8. \
+                     The terminal started in your home folder."
+                ),
+                "{list:?}"
+            );
+        }
+        // A relative `-w` that is no folder there is the other reason.
+        let words = handed(&["-w", "nope"], &odd);
+        assert_eq!(
+            words,
+            vec![
+                format!("--moniker-dir={}", home.display()),
+                format!("--moniker-refused={lossy}/nope"),
+            ],
+            "not a folder, whatever its name"
+        );
+        assert_eq!(
+            decode(&words, &home).expect("decodes").dir_refused,
+            refused(format!("{lossy}/nope"))
+        );
+
+        // And a `-w` whose own text is not UTF-8 is a mistake, as any other
+        // argument that is not: exit status 2, and nothing opens.
+        let bad = OsString::from_vec(b"/tmp/b\xffd".to_vec());
+        let attached = OsString::from_vec(b"--working-directory=/tmp/b\xffd".to_vec());
+        for list in [
+            vec![OsString::from("-w"), bad.clone()],
+            vec![OsString::from("--working-directory"), bad],
+            vec![attached],
+        ] {
+            assert_eq!(
+                local(&list, Some(&odd), &home),
+                Local::Print {
+                    status: 2,
+                    to_stdout: false,
+                    text: "moniker: arguments must be valid UTF-8\n".to_string()
+                },
+                "{list:?}"
+            );
+        }
     }
 
     #[test]
@@ -1482,8 +1731,12 @@ mod tests {
 
     #[test]
     fn a_person_cannot_type_the_handover() {
-        // Only `local` makes these tokens: the same words typed as options are
-        // mistakes, so a window can be asked for only through the options.
+        // What a person types is never taken for a handover: the same words
+        // typed as options are mistakes, so the command line asks for a window
+        // only through the options. (Any other client of the same user on the
+        // session bus can still send these words to a running Moniker; that is
+        // why `decode` is what limits a handover to opening one local
+        // terminal.)
         let home = Path::new(HOME);
         for token in [
             "--moniker-dir=/tmp",
@@ -1501,5 +1754,84 @@ mod tests {
                 "{token}"
             );
         }
+    }
+
+    #[test]
+    fn an_error_line_cannot_act_on_the_terminal_that_shows_it() {
+        // The launching process prints a mistake to its standard error, often
+        // the terminal it was typed in, which acts on an escape sequence or a
+        // line break in the argument that is named. They come out as spaces,
+        // the way a failed program's name is cleaned for the tab and the log.
+        let nasty = "\x1b]0;x\x07\nrest";
+        assert_eq!(
+            why(&[&format!("--frob{nasty}")]),
+            "unknown option: --frob ]0;x  rest"
+        );
+        assert_eq!(
+            why(&[nasty]),
+            "unexpected argument:  ]0;x  rest (to run a command, put it after --)"
+        );
+        let home = Path::new(HOME);
+        for typed in [nasty.to_string(), format!("-x{nasty}")] {
+            let Local::Print { status, text, .. } = local(&args(&[&typed]), None, home) else {
+                panic!("{typed:?} is a mistake");
+            };
+            assert_eq!(status, 2);
+            let line = text
+                .strip_suffix('\n')
+                .expect("one line, ended by a newline");
+            assert!(
+                !line.chars().any(char::is_control),
+                "{text:?} holds a control character"
+            );
+        }
+        // What the running Moniker says back for a handover it does not know
+        // reaches the launching process's standard error the same way.
+        assert_eq!(
+            decode(&tokens(&[&format!("--moniker-frob{nasty}")]), home),
+            Err("unexpected handover: --moniker-frob ]0;x  rest".to_string())
+        );
+        // Text with nothing to clean stays as it is.
+        assert_eq!(one_line("ünï <b> & 'x'"), "ünï <b> & 'x'");
+        assert_eq!(one_line("a\tb\r\nc\u{7f}d"), "a b  c d");
+    }
+
+    #[test]
+    fn a_handover_with_a_relative_folder_is_refused() {
+        // `local` always hands over an absolute folder (a relative one is
+        // joined to the launching directory first), so the running Moniker
+        // takes a relative one for what it is: not from `local`.
+        let home = Path::new(HOME);
+        for token in [
+            "--moniker-dir=rel",
+            "--moniker-dir=./here",
+            "--moniker-dir=../up",
+            "--moniker-dir=~",
+            "--moniker-dir=ünï/x",
+            "--moniker-dir= /tmp",
+        ] {
+            assert_eq!(
+                decode(&tokens(&[token]), home),
+                Err(format!("unexpected handover: {token}")),
+                "{token:?}"
+            );
+        }
+        // An absolute one, and none at all (the empty value), are fine; a
+        // folder named only for the notification may be relative.
+        assert!(decode(&tokens(&["--moniker-dir=/a/b"]), home).is_ok());
+        assert!(decode(&tokens(&["--moniker-dir="]), home).is_ok());
+        assert!(decode(&tokens(&["--moniker-refused=rel"]), home).is_ok());
+        // And `encode` never writes one: a launch is always one the running
+        // Moniker accepts. A relative folder (the launcher's $HOME is relative,
+        // say; its directory never is) is left out, and the terminal starts in
+        // the running Moniker's own home folder.
+        let relative = a_start("rel/x", Run::Shell);
+        assert_eq!(encode(&relative), Vec::<String>::new());
+        assert_eq!(round(&relative), Start::home(home));
+        let named = Start {
+            title: Some("t".into()),
+            ..relative
+        };
+        assert_eq!(encode(&named), tokens(&["--moniker-title=t"]));
     }
 }

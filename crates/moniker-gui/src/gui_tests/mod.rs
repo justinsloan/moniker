@@ -447,6 +447,7 @@ fn gui_integration() {
     main_window::a_launch_while_a_dialog_is_open_still_opens(&tmp.path().join("c-dialog-open"));
     main_window::a_launch_as_the_last_window_closes_still_opens(&tmp.path().join("c-last"));
     sync::a_command_line_launches_once_and_then_opens_windows(&tmp.path().join("c-once"));
+    sync::the_launch_sync_holds_the_application_until_it_ends(&tmp.path().join("c-hold"));
     // Issue #15, a local tab that starts in a folder or runs a command.
     tabs::a_local_tab_starts_in_its_folder(&bin, &tmp.path().join("l-folder"));
     tabs::a_command_tab_closes_on_success_and_keeps_failures(&bin, &tmp.path().join("l-command"));

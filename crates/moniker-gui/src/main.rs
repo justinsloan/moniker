@@ -211,7 +211,9 @@ fn main() -> glib::ExitCode {
         launched,
         move |app, cmdline| {
             // Not `cmdline.environ()` or `cmdline.cwd()`: the folder was chosen
-            // in the launching process, and its environment is not wanted here.
+            // in the launching process, and a launch handed to a running
+            // Moniker passes its environment on to nobody (the new terminal
+            // gets this process's own).
             let (status, stderr) = match handed_over_words(&cmdline.arguments()) {
                 Ok(words) => handle_command_line(app, &ctx, &launched, &words),
                 Err(why) => (2, Some(format!("moniker: {why}\n"))),
@@ -263,9 +265,11 @@ fn handed_over_words(arguments: &[OsString]) -> Result<Vec<String>, String> {
         .iter()
         .skip(1)
         .map(|word| {
-            word.to_str()
-                .map(str::to_owned)
-                .ok_or_else(|| format!("unexpected handover: {} (not valid UTF-8)", word.display()))
+            word.to_str().map(str::to_owned).ok_or_else(|| {
+                // Printed on the launching process's stderr: cleaned.
+                let shown = launch_args::one_line(&word.display().to_string());
+                format!("unexpected handover: {shown} (not valid UTF-8)")
+            })
         })
         .collect()
 }
@@ -513,11 +517,21 @@ pub(crate) fn handle_command_line(
 /// window (a shell in the home folder, or what `start` says), and once it is
 /// shown (from an idle callback, so the window and its terminal come first), the
 /// automatic sync.
+///
+/// The application is held from here until that sync is over, or until it is
+/// known there is none ([`sync_on_launch`]). A launch whose command ends at
+/// once (`moniker -- true`, `x-terminal-emulator -e quick-command`) closes its
+/// only window a moment later, and an application with no window and nothing
+/// holding it quits: before the idle callback has even started the sync, or
+/// between the secrets a sync stores and the profile file it writes after them,
+/// which skips its rollback. (A keyring job holds it the same way, see
+/// `keyring::change`.)
 pub(crate) fn launch(app: &adw::Application, ctx: &Rc<AppContext>, start: &Start) {
     terminal_tab::use_preferences(&ctx.settings());
+    let hold = app.hold();
     window::new_window_with(app, ctx, start);
     let ctx = Rc::clone(ctx);
-    glib::idle_add_local_once(move || sync_on_launch(&ctx));
+    glib::idle_add_local_once(move || sync_on_launch(&ctx, hold));
 }
 
 /// The automatic sync: with the partner, if there is one, the automatic sync
@@ -527,7 +541,11 @@ pub(crate) fn launch(app: &adw::Application, ctx: &Rc<AppContext>, start: &Start
 /// exchange, so the new window and its terminal never wait for either. A
 /// success is silent; a failure is one notification. If a sync is already
 /// running (started by hand meanwhile), this one is skipped.
-fn sync_on_launch(ctx: &Rc<AppContext>) {
+///
+/// `hold` is [`launch`]'s hold on the application. It goes on to the sync's
+/// callback, which drops it when the sync is over, however it ended; when there
+/// is no sync, or none could start, it is dropped here.
+fn sync_on_launch(ctx: &Rc<AppContext>, hold: gio::ApplicationHoldGuard) {
     let settings = settings::load(&ctx.settings_path);
     // Bind first so the store borrow ends here. A request to turn sync off that
     // has not landed in the file yet counts too.
@@ -543,14 +561,18 @@ fn sync_on_launch(ctx: &Rc<AppContext>) {
     let started = sync::begin_app_sync(ctx, &partner, StaleSync::Refuse, sync::runner(ctx), {
         let report = report.clone();
         let notice = ctx.notice.clone();
-        move |result| match result {
-            // Never asked at launch: Sync Now is where the person decides.
-            Err(failure) if sync::is_away(failure) => notice.show(&format!(
-                "Did not sync automatically. {} Use Sync Now to sync anyway.",
-                sync::failure_text(failure)
-            )),
-            Err(failure) => report(&sync::failure_text(failure)),
-            Ok(_) => {}
+        move |result| {
+            // Dropped when this callback ends (or, if no sync starts, with it).
+            let _hold = hold;
+            match result {
+                // Never asked at launch: Sync Now is where the person decides.
+                Err(failure) if sync::is_away(failure) => notice.show(&format!(
+                    "Did not sync automatically. {} Use Sync Now to sync anyway.",
+                    sync::failure_text(failure)
+                )),
+                Err(failure) => report(&sync::failure_text(failure)),
+                Ok(_) => {}
+            }
         }
     });
     match started {
@@ -624,6 +646,13 @@ mod tests {
         assert_eq!(
             handed_over_words(&[OsString::from("moniker"), bad]),
             Err("unexpected handover: a\u{fffd}b (not valid UTF-8)".to_owned())
+        );
+        // It is printed on the launching process's stderr, often a terminal:
+        // an escape sequence or a line break in the word comes out as spaces.
+        let nasty = OsString::from_vec(b"\x1b]0;x\x07\n\xffb".to_vec());
+        assert_eq!(
+            handed_over_words(&[OsString::from("moniker"), nasty]),
+            Err("unexpected handover:  ]0;x  \u{fffd}b (not valid UTF-8)".to_owned())
         );
     }
 

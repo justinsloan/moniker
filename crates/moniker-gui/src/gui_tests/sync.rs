@@ -1179,6 +1179,155 @@ pub(super) fn a_command_line_launches_once_and_then_opens_windows(dir: &Path) {
     close_all(&app);
 }
 
+/// Runs the application's own main loop (`run`, not the tests' pumping) over
+/// `ctx`: the launch (`launch_at_home`), then `after`, which gets the
+/// application and may close its windows. Returns whether the loop had to be
+/// stopped after `give_up` instead of ending by itself, which is what an
+/// application still held does. The loop ends by itself exactly when the last
+/// window is gone and nothing holds the application.
+fn run_a_launch(
+    ctx: &Rc<AppContext>,
+    give_up: Duration,
+    after: impl FnOnce(&adw::Application) + 'static,
+) -> bool {
+    let app = adw::Application::builder()
+        .application_id("org.moniker.GuiTest.LaunchHold")
+        .flags(gio::ApplicationFlags::NON_UNIQUE)
+        .build();
+    let timed_out = Rc::new(Cell::new(false));
+    let after = RefCell::new(Some(after));
+    app.connect_activate({
+        let (ctx, timed_out) = (Rc::clone(ctx), Rc::clone(&timed_out));
+        move |app| {
+            super::launch_at_home(app, &ctx);
+            glib::timeout_add_local_once(
+                give_up,
+                glib::clone!(
+                    #[weak]
+                    app,
+                    #[strong]
+                    timed_out,
+                    move || {
+                        timed_out.set(true);
+                        app.quit();
+                    }
+                ),
+            );
+            if let Some(after) = after.borrow_mut().take() {
+                after(app);
+            }
+        }
+    });
+    app.run_with_args(&["moniker"]);
+    timed_out.get()
+}
+
+/// Closes every window of `app`, as a command that ends at once does to its
+/// window.
+fn close_every_window(app: &adw::Application) {
+    for window in app.windows() {
+        window.destroy();
+    }
+}
+
+/// Issue #15: a launch whose command ends at once (`moniker -- true` with
+/// Moniker closed, `x-terminal-emulator -e quick-command`) closes its only
+/// window while the automatic sync of that launch is still to start or still
+/// running. The application stays until that sync is over, so that it is not
+/// cut off between the secrets it stores and the profile file it writes after
+/// them, and goes when the sync ends, however it ends, and at once if there is
+/// no sync to wait for. Run on the application's real main loop.
+pub(super) fn the_launch_sync_holds_the_application_until_it_ends(dir: &Path) {
+    // The only window closes at once and the sync is slow: the application
+    // stays while it runs, with no window, and leaves when it is over.
+    let (ctx, _secrets, profile) = sync_ctx(&dir.join("slow"), true, Some(SYNC_KEY));
+    set_partner(&ctx, &profile.expect("a profile"), true);
+    let (started, runs) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (release, wait) = mpsc::channel::<()>();
+    set_runner(&ctx, {
+        let (started, runs) = (Arc::clone(&started), Arc::clone(&runs));
+        move |_| {
+            started.fetch_add(1, Ordering::SeqCst);
+            // Slow: it ends when the test lets it (or after a minute).
+            let _ = wait.recv_timeout(Duration::from_secs(60));
+            runs.fetch_add(1, Ordering::SeqCst);
+            Ok(added(1))
+        }
+    });
+    let released = Rc::new(Cell::new(false));
+    let release = Rc::new(release);
+    let timed_out = run_a_launch(&ctx, Duration::from_secs(30), {
+        let (started, released, release) = (
+            Arc::clone(&started),
+            Rc::clone(&released),
+            Rc::clone(&release),
+        );
+        move |app| {
+            close_every_window(app);
+            glib::timeout_add_local(Duration::from_millis(20), move || {
+                if started.load(Ordering::SeqCst) == 0 {
+                    return glib::ControlFlow::Continue;
+                }
+                // The sync is running and no window is left. Give a
+                // wrongly released application time to quit (it does so at
+                // once), then let the sync end.
+                let (released, release) = (Rc::clone(&released), Rc::clone(&release));
+                glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                    released.set(true);
+                    let _ = release.send(());
+                });
+                glib::ControlFlow::Break
+            });
+        }
+    });
+    let _ = release.send(());
+    assert!(!timed_out, "the application was never let go");
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "the sync of the launch started, though its window was already gone"
+    );
+    assert!(
+        released.get(),
+        "the application quit while its sync was still running"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the sync ran to its end");
+    assert!(!ctx.sync_running.get(), "and was told so");
+
+    // A sync that fails lets go too.
+    let (ctx, _secrets, profile) = sync_ctx(&dir.join("fails"), true, Some(SYNC_KEY));
+    set_partner(&ctx, &profile.expect("a profile"), true);
+    let runs = Arc::new(AtomicUsize::new(0));
+    set_runner(&ctx, counting(&runs, || Err(SyncError::WrongSyncKey)));
+    let timed_out = run_a_launch(&ctx, Duration::from_secs(20), close_every_window);
+    assert!(
+        !timed_out,
+        "a failed sync did not let go of the application"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert!(!ctx.sync_running.get());
+
+    // Nothing to sync (no partner is set up): no wait at all.
+    let (ctx, _secrets, _profile) = sync_ctx(&dir.join("none"), true, Some(SYNC_KEY));
+    let runs = Arc::new(AtomicUsize::new(0));
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    let timed_out = run_a_launch(&ctx, Duration::from_secs(20), close_every_window);
+    assert!(!timed_out, "the launch held the application for no sync");
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "nothing synced");
+
+    // A sync that cannot start because one is running already (started by
+    // hand a moment ago): the launch's own wait is over at once as well.
+    let (ctx, _secrets, profile) = sync_ctx(&dir.join("busy"), true, Some(SYNC_KEY));
+    set_partner(&ctx, &profile.expect("a profile"), true);
+    let runs = Arc::new(AtomicUsize::new(0));
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    ctx.sync_running.set(true);
+    let timed_out = run_a_launch(&ctx, Duration::from_secs(20), close_every_window);
+    assert!(!timed_out, "a sync that did not start held the application");
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "no second sync");
+    ctx.sync_running.set(false);
+}
+
 /// Issue #10: while sync is turned off (as the command line or another Moniker
 /// wrote it in the profile file) nothing starts a sync: not the launch, not Sync
 /// Now, not the sync page's button, and the keyring is not even read for one.
@@ -2064,7 +2213,7 @@ pub(super) fn an_off_request_counts_before_its_save_is_back(dir: &Path) {
     );
     let told = ctx.notice.delivered();
     assert_eq!(told, delivered + 1);
-    crate::sync_on_launch(&ctx);
+    crate::sync_on_launch(&ctx, app.hold());
     pump_for(Duration::from_millis(300));
     assert!(!ctx.sync_running.get(), "no sync on launch");
     assert_eq!(ctx.notice.delivered(), told, "and nothing said about it");

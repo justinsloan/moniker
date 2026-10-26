@@ -109,6 +109,43 @@ fn a_mistake_is_one_line_on_stderr_with_status_2() {
 }
 
 #[test]
+fn a_mistake_cannot_act_on_the_terminal_it_is_printed_in() {
+    // The line goes to this process's standard error, often the terminal it
+    // was typed in: an escape sequence or a line break in the argument it
+    // names comes out as spaces, so there is one line, with nothing to act on.
+    let home = tempfile::tempdir().expect("a home");
+    for (args, line) in [
+        (
+            vec!["--frob\x1b]0;x\x07\nrest"],
+            "moniker: unknown option: --frob ]0;x  rest\n",
+        ),
+        (
+            vec!["\x1b[2J\x1b]0;x\x07\nrest"],
+            "moniker: unexpected argument:  [2J ]0;x  rest (to run a command, put it after --)\n",
+        ),
+    ] {
+        let out = run(home.path(), &words(&args));
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert_eq!(text(&out.stdout), "", "{args:?}");
+        assert_eq!(text(&out.stderr), line, "{args:?}");
+    }
+    // A `-w` folder whose name is not valid UTF-8 is a mistake too: nothing
+    // opens (the folder `moniker` was started in is the only one that can be
+    // odd, and it is the notification's business, in a window).
+    let odd = vec![
+        OsString::from("-w"),
+        OsString::from_vec(b"/tmp/b\xffd".to_vec()),
+    ];
+    let out = run(home.path(), &odd);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        text(&out.stderr),
+        "moniker: arguments must be valid UTF-8\n"
+    );
+    assert_untouched(home.path());
+}
+
+#[test]
 fn help_beats_a_mistake() {
     let home = tempfile::tempdir().expect("a home");
     let out = run(home.path(), &words(&["--frob", "--help"]));

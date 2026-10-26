@@ -9,7 +9,8 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::fs;
-use std::path::Path;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +33,7 @@ use super::{
 };
 use crate::connect_menu::{self, RECORD_LABEL};
 use crate::context::AppContext;
-use crate::launch_args::{Run, Start, decode, encode};
+use crate::launch_args::{Refused, Run, Start, decode, encode};
 use crate::terminal_tab::{
     launch, new_holder_page, rename_page, start_command, tab_title, terminal_of,
 };
@@ -859,7 +860,7 @@ pub(super) fn the_command_line_opens_a_window_where_asked(bin: &Path, dir: &Path
     let file = dir.join("<b>x<b> &amp; a file");
     fs::write(&file, "x").expect("a file");
     let refused = Start {
-        dir_refused: Some(file.clone()),
+        dir_refused: Some(Refused::not_a_folder(file.clone())),
         ..shell_in(&glib::home_dir())
     };
     assert_eq!(handle(&app, &ctx, &launched, &refused), (0, None));
@@ -883,7 +884,30 @@ pub(super) fn the_command_line_opens_a_window_where_asked(bin: &Path, dir: &Path
         "the other windows said nothing"
     );
 
-    for main in [first, second, third, fourth] {
+    // The folder `moniker` was started in has a name that is not valid UTF-8
+    // (a `-w` value like that is a mistake, so this is the only way): it
+    // cannot be handed over, the shell starts in home, and the note says why in
+    // its own words, with the name shown lossily, as plain text.
+    let odd = Start {
+        dir: PathBuf::from(OsString::from_vec(b"/tmp/<b>b\xffd</b> &amp;".to_vec())),
+        ..shell_in(&glib::home_dir())
+    };
+    assert_eq!(handle(&app, &ctx, &launched, &odd), (0, None));
+    let fifth = window::last_active(&app).expect("the new window");
+    assert_eq!(main_windows(&app), 5);
+    assert_shell_is_in(&first_terminal(&fifth), &home);
+    let text = "Could not open /tmp/<b>b\u{fffd}d</b> &amp;: its name is not valid UTF-8. \
+                The terminal started in your home folder.";
+    assert_eq!(ctx.notice.last_text().as_deref(), Some(text));
+    assert_eq!(ctx.notice.last_area().as_ref(), Some(&fifth.notifications));
+    assert_eq!(fifth.notifications.shown_text().as_deref(), Some(text));
+    assert!(
+        !fifth.notifications.label().uses_markup(),
+        "the notification is plain text"
+    );
+    assert_eq!(ctx.notice.delivered(), delivered + 2);
+
+    for main in [first, second, third, fourth, fifth] {
         main.window.destroy();
     }
     pump_for(Duration::from_millis(200));
@@ -992,7 +1016,7 @@ pub(super) fn glib_leaves_the_handed_over_arguments_alone(dir: &Path) {
             argv: awkward.iter().map(|a| a.to_string()).collect(),
             hold: true,
         },
-        dir_refused: Some(dir.join("not a folder")),
+        dir_refused: Some(Refused::not_a_folder(dir.join("not a folder"))),
         ..shell_in(&folder)
     };
     let sent = encode(&start);

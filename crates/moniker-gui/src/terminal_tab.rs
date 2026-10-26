@@ -26,9 +26,13 @@
 //! # Local tabs and commands
 //!
 //! A local tab ([`open_local`]) runs the person's shell, or a command given on
-//! the command line, in a folder, as a [`Start`] says. The environment is
-//! Moniker's own either way, never the launching process's; nothing here
-//! reaches a profile, a password or a remote session. A command
+//! the command line, in a folder, as a [`Start`] says. A launch handed to a
+//! Moniker that is already running passes no environment on: the terminal gets
+//! that Moniker's own (GApplication's `SEND_ENVIRONMENT` flag is not set). The
+//! launch that starts Moniker is different: the launching process is Moniker
+//! then, so it has its launcher's environment, as any program has, and every
+//! terminal of that run inherits it. Nothing here reaches a profile, a password
+//! or a remote session. A command
 //! ([`start_command_in`]) is an argument list, never a shell string, and is named
 //! after its program until it sets a title; a title given with it is fixed as a
 //! rename is. When it ends, success closes the tab and any other end keeps it
@@ -145,7 +149,7 @@ use vte4::prelude::*;
 use vte4::{Format, PtyFlags, Terminal};
 
 use crate::context::{AppContext, Notice};
-use crate::launch_args::{Run, Start};
+use crate::launch_args::{Run, Start, one_line};
 use crate::settings::{self, GuiSettings};
 use crate::{panes, theme, zoom};
 
@@ -242,15 +246,6 @@ pub fn clean_title(raw: &str) -> Option<String> {
     let flat = one_line(raw);
     let title = flat.trim();
     (!title.is_empty()).then(|| title.to_owned())
-}
-
-/// `text` with every control character (an escape sequence, a newline, a bell)
-/// turned into a space, so that showing it, or feeding it to a terminal, cannot
-/// act as a command.
-fn one_line(text: &str) -> String {
-    text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect()
 }
 
 /// The note a program that could not be started leaves in its terminal. The
@@ -1739,8 +1734,9 @@ pub(crate) fn start_shell_in(
 /// nothing here builds a shell string) in `holder`'s pane, in the folder `dir`
 /// (as [`start_shell_in`] takes it). The pane is named after the program's file
 /// name and follows the title the program sets ([`TabTitle::program`]). The
-/// environment is Moniker's own, as a local shell's is; the launching process's
-/// is never used.
+/// environment is the inherited one, as a local shell's is: Moniker's own,
+/// which is its launcher's if this launch started Moniker. A launch handed to a
+/// running Moniker brings none.
 ///
 /// When the command ends: a clean exit closes the pane (and the window with its
 /// last one), any other end keeps it with the note a connection shows
