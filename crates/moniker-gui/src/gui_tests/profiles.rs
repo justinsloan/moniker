@@ -5,7 +5,7 @@
 //! keyring that counts reads, and a [`ConnectFn`] that only records what it
 //! was asked to connect.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,8 +22,8 @@ use moniker_core::store::ProfileStore;
 use zeroize::Zeroizing;
 
 use super::{
-    HeldKeyring, MARKUP_NAME, all_widgets, button_labeled, find_widget, make_helper, pump_for,
-    pump_until,
+    HeldKeyring, MARKUP_NAME, alert_in, all_widgets, button_labeled, find_widget, make_helper,
+    pump_for, pump_until,
 };
 use crate::context::AppContext;
 use crate::profiles::{self, ConnectFn};
@@ -164,6 +164,14 @@ impl Setup {
             .into_iter()
             .find(|row| row.title() == title)
             .unwrap_or_else(|| panic!("no {title:?} row"))
+    }
+
+    /// The switch row titled `title` on the shown page.
+    fn switch(&self, title: &str) -> adw::SwitchRow {
+        all_widgets::<adw::SwitchRow>(&self.window)
+            .into_iter()
+            .find(|row| row.title() == title)
+            .unwrap_or_else(|| panic!("no {title:?} switch"))
     }
 
     /// The profile `id` as it is in the file now.
@@ -547,7 +555,7 @@ pub(super) fn switch_port_and_key_file_save_when_changed(dir: &Path) {
     let s = Setup::open(dir, std::slice::from_ref(&p));
     s.select(&p.id);
 
-    let switch: adw::SwitchRow = find_widget(&s.window).expect("the transcript switch");
+    let switch = s.switch("Save transcript");
     assert_eq!(switch.title(), "Save transcript");
     assert!(!switch.is_active());
     switch.set_active(true);
@@ -1619,7 +1627,7 @@ pub(super) fn saving_waits_for_the_profile_file_not_the_window(dir: &Path) {
     assert!(has_focus_in(&s.window, &name), "the row keeps the focus");
     assert_eq!(name.text(), "  renamed ");
 
-    let switch: adw::SwitchRow = find_widget(&s.window).expect("the transcript switch");
+    let switch = s.switch("Save transcript");
     at_once("turning the switch on", || switch.set_active(true));
     let port: adw::SpinRow = find_widget(&s.window).expect("the port row");
     at_once("changing the port", || port.set_value(2222.0));
@@ -1793,7 +1801,7 @@ pub(super) fn a_failed_save_puts_the_switch_and_the_port_back(dir: &Path) {
     // The file cannot be replaced (its folder is read-only): every save fails.
     fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("chmod");
 
-    let switch: adw::SwitchRow = find_widget(&s.window).expect("the transcript switch");
+    let switch = s.switch("Save transcript");
     switch.set_active(true);
     saved();
     assert!(!switch.is_active(), "back to what is stored");
@@ -1815,7 +1823,337 @@ pub(super) fn a_failed_save_puts_the_switch_and_the_port_back(dir: &Path) {
     assert_eq!(port.value(), 22.0, "back to what is stored");
     assert!(port.has_css_class("error"));
 
+    // The same for "Sync to other machines", after its question.
+    let sync = s.switch("Sync to other machines");
+    sync.set_active(false);
+    button_labeled(&alert_in(&s.window), "Keep on This Machine Only")
+        .expect("the Keep button")
+        .emit_clicked();
+    saved();
+    pump_until("the row to be ready again", || sync.is_sensitive());
+    assert!(sync.is_active(), "back to what is stored");
+    assert!(sync.has_css_class("error"));
+    assert!(
+        s.ctx
+            .notice
+            .last_text()
+            .is_some_and(|text| text.starts_with("Could not save the profile")),
+        "{:?}",
+        s.ctx.notice.last_text()
+    );
+
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+    assert!(!s.on_disk(&p.id).expect("there").local_only);
     assert_eq!(s.on_disk(&p.id).expect("there").port, 22);
+    s.close();
+}
+
+const SYNC_ROW: &str = "Sync to other machines";
+const SYNCS_SUBTITLE: &str = "Copied to your other machines when they sync";
+const KEPT_SUBTITLE: &str = "On this machine only";
+
+/// The alert in `s`'s window is gone, and the profile page is ready again.
+fn wait_for_the_alert_to_go(s: &Setup) {
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(&s.window).is_empty()
+    });
+}
+
+/// The "Sync to other machines" switch of the profile page (issue #10). On
+/// means the profile syncs, as every profile does; turning it off keeps the
+/// profile on this machine only, which deletes it from the other machines at
+/// their next sync, with its stored password, so the person is told first:
+/// nothing is written until they say so, Cancel and Escape put the switch back,
+/// and the row waits (insensitive) from the flip until the question is answered
+/// and the save is back.
+pub(super) fn keeping_a_profile_here_asks_first(dir: &Path) {
+    let p = Profile::new("Box", "box.example.test", "alice");
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    s.select(&p.id);
+
+    // A group of its own after Session; on, with a subtitle that says so.
+    let groups = all_widgets::<adw::PreferencesGroup>(&s.window);
+    let at = |title: &str| {
+        groups
+            .iter()
+            .position(|g| g.title() == title)
+            .unwrap_or_else(|| panic!("no {title:?} group"))
+    };
+    assert_eq!(at("Sync"), at("Session") + 1, "the Sync group follows");
+    let row = s.switch(SYNC_ROW);
+    assert!(
+        all_widgets::<adw::SwitchRow>(&groups[at("Sync")]).contains(&row),
+        "the switch is in the Sync group"
+    );
+    assert!(row.is_active(), "a profile syncs unless it is kept here");
+    assert!(row.is_sensitive());
+    assert!(!row.uses_markup());
+    assert_eq!(row.subtitle().as_deref(), Some(SYNCS_SUBTITLE));
+    let before = s.file_bytes();
+
+    // Turning it off asks first, saying what will happen. Nothing is written.
+    row.grab_focus();
+    row.set_active(false);
+    let alert = alert_in(&s.window);
+    assert_eq!(
+        alert.heading().as_deref(),
+        Some("Keep \"Box\" on This Machine Only?")
+    );
+    assert!(!alert.is_heading_use_markup());
+    assert_eq!(
+        alert.body().as_str(),
+        "It will be deleted from your other machines, with its stored password, the next time \
+         they sync. It stays on this machine."
+    );
+    assert!(!alert.is_body_use_markup());
+    assert_eq!(alert.default_response().as_deref(), Some("cancel"));
+    assert_eq!(alert.close_response().as_str(), "cancel");
+    assert_eq!(alert.response_label("cancel").as_str(), "Cancel");
+    assert_eq!(
+        alert.response_label("keep").as_str(),
+        "Keep on This Machine Only"
+    );
+    assert_eq!(
+        alert.response_appearance("keep"),
+        adw::ResponseAppearance::Destructive
+    );
+    assert!(!row.is_sensitive(), "the row waits for the answer");
+    pump_for(Duration::from_millis(300));
+    assert_eq!(s.file_bytes(), before, "nothing written before the answer");
+    assert_eq!(keyring::pending(), 0, "and no save asked for");
+    // A refresh meanwhile (a sync elsewhere, say) leaves the row as asked.
+    s.ctx.profiles_changed();
+    pump_for(Duration::from_millis(100));
+    assert!(!row.is_active(), "still showing the question's switch");
+
+    // Cancel puts the switch back and writes nothing.
+    button_labeled(&alert, "Cancel")
+        .expect("the Cancel button")
+        .emit_clicked();
+    wait_for_the_alert_to_go(&s);
+    assert!(row.is_active(), "back on");
+    assert!(row.is_sensitive());
+    pump_until("the keyboard to be back on the row", || {
+        has_focus_in(&s.window, &row)
+    });
+    assert_eq!(row.subtitle().as_deref(), Some(SYNCS_SUBTITLE));
+    pump_for(Duration::from_millis(200));
+    assert_eq!(s.file_bytes(), before, "Cancel writes nothing");
+    assert_eq!(keyring::pending(), 0);
+
+    // Closing the alert (Escape) is Cancel.
+    row.set_active(false);
+    alert_in(&s.window).close();
+    wait_for_the_alert_to_go(&s);
+    assert!(row.is_active() && row.is_sensitive());
+    assert_eq!(s.file_bytes(), before);
+
+    // Keep on This Machine Only saves it, and the row waits for the save.
+    row.grab_focus();
+    row.set_active(false);
+    let alert = alert_in(&s.window);
+    button_labeled(&alert, "Keep on This Machine Only")
+        .expect("the Keep button")
+        .emit_clicked();
+    pump_until("the file to say kept", || {
+        s.on_disk(&p.id).is_some_and(|stored| stored.local_only)
+    });
+    saved();
+    pump_until("the row to be ready again", || row.is_sensitive());
+    pump_until(
+        "the keyboard to be back on the row once it is saved",
+        || has_focus_in(&s.window, &row),
+    );
+    let kept = s.on_disk(&p.id).expect("there");
+    assert!(kept.local_only);
+    assert!(kept.updated_at > p.updated_at, "an edit like any other");
+    assert_eq!(kept.host, p.host, "nothing else changed");
+    assert!(!row.is_active());
+    assert_eq!(row.subtitle().as_deref(), Some(KEPT_SUBTITLE));
+    assert!(!row.has_css_class("error"));
+    assert!(!spinner_shown(&row));
+
+    // A cancelled question after that goes back to what is saved now: kept.
+    wait_for_the_alert_to_go(&s);
+    let saved_bytes = s.file_bytes();
+    row.set_active(true);
+    let alert = alert_in(&s.window);
+    assert_eq!(
+        alert.heading().as_deref(),
+        Some("Sync \"Box\" to Your Other Machines?")
+    );
+    button_labeled(&alert, "Cancel")
+        .expect("the Cancel button")
+        .emit_clicked();
+    wait_for_the_alert_to_go(&s);
+    assert!(!row.is_active() && row.is_sensitive());
+    assert_eq!(row.subtitle().as_deref(), Some(KEPT_SUBTITLE));
+    pump_for(Duration::from_millis(200));
+    assert_eq!(s.file_bytes(), saved_bytes, "Cancel writes nothing");
+    s.close();
+}
+
+/// Syncing a kept profile again copies it, password and all, to the other
+/// machines, which cannot be called back, so that asks too (issue #10).
+pub(super) fn syncing_it_again_asks_too(dir: &Path) {
+    let mut p = Profile::new("Box", "box.example.test", "alice");
+    p.local_only = true;
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    s.select(&p.id);
+    let row = s.switch(SYNC_ROW);
+    assert!(!row.is_active(), "kept here");
+    assert_eq!(row.subtitle().as_deref(), Some(KEPT_SUBTITLE));
+    let before = s.file_bytes();
+
+    row.set_active(true);
+    let alert = alert_in(&s.window);
+    assert_eq!(
+        alert.heading().as_deref(),
+        Some("Sync \"Box\" to Your Other Machines?")
+    );
+    assert!(!alert.is_heading_use_markup());
+    assert_eq!(
+        alert.body().as_str(),
+        "It will be copied to your other machines the next time they sync, with its stored \
+         password."
+    );
+    assert!(!alert.is_body_use_markup());
+    assert_eq!(alert.default_response().as_deref(), Some("cancel"));
+    assert_eq!(alert.close_response().as_str(), "cancel");
+    assert_eq!(alert.response_label("cancel").as_str(), "Cancel");
+    assert_eq!(alert.response_label("sync").as_str(), "Sync");
+    assert_eq!(
+        alert.response_appearance("sync"),
+        adw::ResponseAppearance::Suggested
+    );
+    assert!(!row.is_sensitive());
+    pump_for(Duration::from_millis(300));
+    assert_eq!(s.file_bytes(), before, "nothing written before the answer");
+
+    // Cancel: still kept here, nothing written.
+    button_labeled(&alert, "Cancel")
+        .expect("the Cancel button")
+        .emit_clicked();
+    wait_for_the_alert_to_go(&s);
+    assert!(!row.is_active() && row.is_sensitive());
+    assert_eq!(row.subtitle().as_deref(), Some(KEPT_SUBTITLE));
+    pump_for(Duration::from_millis(200));
+    assert_eq!(s.file_bytes(), before);
+
+    // Sync: saved.
+    row.set_active(true);
+    let alert = alert_in(&s.window);
+    button_labeled(&alert, "Sync")
+        .expect("the Sync button")
+        .emit_clicked();
+    pump_until("the file to say it syncs", || {
+        s.on_disk(&p.id).is_some_and(|stored| !stored.local_only)
+    });
+    saved();
+    pump_until("the row to be ready again", || row.is_sensitive());
+    assert!(row.is_active());
+    assert_eq!(row.subtitle().as_deref(), Some(SYNCS_SUBTITLE));
+    assert!(s.on_disk(&p.id).expect("there").updated_at > p.updated_at);
+    s.close();
+}
+
+/// A profile pinned at the largest version by another machine cannot sync
+/// again (`form::CANNOT_SYNC_AGAIN`): the switch says why and goes back.
+pub(super) fn a_profile_that_cannot_sync_again_says_so(dir: &Path) {
+    let mut p = Profile::new("Box", "box.example.test", "alice");
+    p.local_only = true;
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    // Pinned the way a peer's edit would: `upsert` restamps, so write it whole.
+    let mut pinned = p.clone();
+    pinned.updated_at = i64::MAX;
+    s.other_store()
+        .replace_all(vec![pinned])
+        .expect("pin the version");
+    s.ctx.profiles_changed();
+    s.select(&p.id);
+    let row = s.switch(SYNC_ROW);
+    let before = s.file_bytes();
+
+    row.set_active(true);
+    button_labeled(&alert_in(&s.window), "Sync")
+        .expect("the Sync button")
+        .emit_clicked();
+    saved();
+    pump_until("the row to be ready again", || row.is_sensitive());
+
+    assert!(!row.is_active(), "back to kept");
+    assert!(row.has_css_class("error"));
+    assert_eq!(
+        s.ctx.notice.last_text().as_deref(),
+        Some(form::CANNOT_SYNC_AGAIN)
+    );
+    assert_eq!(s.file_bytes(), before, "nothing written");
+    s.close();
+}
+
+/// A second flip while the first is still being saved starts nothing (review
+/// focus 5): the row is insensitive from the first flip until its save is
+/// back, a flip that gets in anyway (code, not a pointer) opens no second
+/// question and asks for no second save, and the file ends as the first
+/// confirmed it.
+pub(super) fn a_second_flip_waits_for_the_first(dir: &Path) {
+    let p = Profile::new("Box", "box.example.test", "alice");
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    s.select(&p.id);
+    let row = s.switch(SYNC_ROW);
+    let before = s.file_bytes();
+    let held = HeldProfileFile::hold(dir);
+
+    row.grab_focus();
+    row.set_active(false);
+    let alert = alert_in(&s.window);
+    let closed = Rc::new(Cell::new(false));
+    alert.connect_closed({
+        let closed = Rc::clone(&closed);
+        move |_| closed.set(true)
+    });
+    button_labeled(&alert, "Keep on This Machine Only")
+        .expect("the Keep button")
+        .emit_clicked();
+    pump_until("the question to close", || closed.get());
+    wait_for_the_alert_to_go(&s);
+    assert_eq!(keyring::pending(), 1, "one save, waiting for the file");
+    assert!(!row.is_sensitive(), "the row waits for its save");
+    pump_until("the row's spinner", || spinner_shown(&row));
+    assert!(!row.is_active(), "it shows what was asked");
+
+    // Flipped back by code while the save waits: no question, no second save.
+    row.set_active(true);
+    pump_for(Duration::from_millis(300));
+    assert!(
+        all_widgets::<adw::AlertDialog>(&s.window).is_empty(),
+        "no second question"
+    );
+    assert_eq!(keyring::pending(), 1, "and no second save");
+    assert!(!row.is_active(), "still showing what was confirmed");
+    assert!(!row.is_sensitive());
+    // A refresh meanwhile (a sync elsewhere, say) puts nothing back.
+    s.ctx.profiles_changed();
+    pump_for(Duration::from_millis(100));
+    assert!(!row.is_active());
+    assert_eq!(s.file_bytes(), before, "nothing written while it is held");
+
+    // The person moves on while the save waits: the keyboard stays where they
+    // put it, it is not pulled back to the row when the save is.
+    let host = s.entry("Host");
+    host.grab_focus();
+
+    held.release();
+    saved();
+    pump_until("the row to be ready again", || row.is_sensitive());
+    assert!(s.on_disk(&p.id).expect("there").local_only);
+    assert!(!row.is_active());
+    assert_eq!(row.subtitle().as_deref(), Some(KEPT_SUBTITLE));
+    assert!(!spinner_shown(&row));
+    assert!(all_widgets::<adw::AlertDialog>(&s.window).is_empty());
+    assert!(
+        has_focus_in(&s.window, &host) && !has_focus_in(&s.window, &row),
+        "the keyboard stays where the person put it"
+    );
     s.close();
 }

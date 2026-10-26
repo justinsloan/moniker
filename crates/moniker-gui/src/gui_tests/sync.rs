@@ -25,8 +25,8 @@ use zeroize::Zeroizing;
 
 use super::main_window::test_app;
 use super::{
-    HeldKeyring, WAIT, all_widgets, button_labeled, find_widget, labels_in, make_helper, pump_for,
-    pump_until, widgets_of_type,
+    HeldKeyring, WAIT, alert_in, all_widgets, button_labeled, find_widget, labels_in, make_helper,
+    pump_for, pump_until, widgets_of_type,
 };
 use crate::context::AppContext;
 use crate::profiles::{self, sync_page};
@@ -1870,17 +1870,6 @@ fn away_unless_allowed(ctx: &AppContext, seen: &Choices) {
             StaleSync::Allow => Ok(added(1)),
         }
     });
-}
-
-/// The alert in `window`, once it shows.
-fn alert_in(window: &impl IsA<gtk::Widget>) -> adw::AlertDialog {
-    pump_until("the alert", || {
-        !all_widgets::<adw::AlertDialog>(window).is_empty()
-    });
-    all_widgets::<adw::AlertDialog>(window)
-        .into_iter()
-        .next()
-        .expect("the alert")
 }
 
 const AWAY: &str = "This machine has not synced for 200 days. Moniker forgets a deletion a year \

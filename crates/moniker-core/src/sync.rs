@@ -549,9 +549,10 @@ impl UndoLog {
 /// or keeps it too) raises the stamp as well, so it is never below any
 /// version this machine has heard of: turning sync back on, an ordinary edit
 /// stamped one above it, then beats those deletions too, not only the
-/// tombstones this machine sent, whatever the clocks say. Two machines that
-/// both keep the profile each keep their own copy and settle on the same
-/// stamp, after which a sync between them writes nothing.
+/// tombstones this machine sent, whatever the clocks say (except at
+/// `i64::MAX`, where turning sync back on is refused). Two machines that both
+/// keep the profile each keep their own copy and settle on the same stamp,
+/// after which a sync between them writes nothing.
 ///
 /// The kept profile is live, so the pruning above never touches it.
 fn plan_apply(

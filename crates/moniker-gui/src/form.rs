@@ -176,6 +176,12 @@ pub fn save_profile(
 pub const GONE: &str =
     "This profile no longer exists. It may have been deleted on another machine and synced here.";
 
+/// What the person sees when a profile cannot be synced again (issue #10):
+/// another machine pinned its version at the largest possible value, so the
+/// live profile would only tie with the deletions sent for it while it was
+/// kept here, and a tie goes to the deletion.
+pub const CANNOT_SYNC_AGAIN: &str = "This profile cannot sync again: another machine gave it the largest possible version. Delete it and create it again to sync it.";
+
 /// One field of a profile, as the Connection Profiles window saves it: each row of the
 /// profile page applies its own field on its own (see [`apply_field`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -187,6 +193,9 @@ pub enum Field {
     /// `None`, or a path that is empty once trimmed, means no key file.
     KeyFile(Option<PathBuf>),
     Transcript(bool),
+    /// Keep the profile on this machine only (`true`), or sync it again
+    /// (`false`). Syncing again can be refused: see [`CANNOT_SYNC_AGAIN`].
+    LocalOnly(bool),
 }
 
 impl Field {
@@ -205,6 +214,7 @@ impl Field {
                 });
             }
             Field::Transcript(on) => profile.transcript = on,
+            Field::LocalOnly(kept) => profile.local_only = kept,
         }
     }
 }
@@ -216,12 +226,27 @@ impl Field {
 /// changes. A profile that is missing or deleted in the file is [`GONE`]: an
 /// apply never brings back a profile that a sync deleted. The whole profile is
 /// validated with the field changed; on any error nothing is written.
+///
+/// Syncing a kept profile again is refused when its stored version is the
+/// largest possible ([`CANNOT_SYNC_AGAIN`]): the store's stamp rule can only
+/// saturate there, so the live profile would tie with the deletions the other
+/// machines hold for it, a tie goes to the deletion, and the next sync would
+/// delete the profile here. The check is made on the profile under the store's
+/// lock, so a version that arrives while the save waits is the one judged.
 pub fn apply_field(
     store: &RefCell<ProfileStore>,
     id: &str,
     field: Field,
 ) -> Result<Profile, String> {
-    rewrite_live(store, id, |profile| field.set_on(profile))
+    let saved = rewrite_live_if(store, id, |profile| {
+        if field == Field::LocalOnly(false) && profile.updated_at == i64::MAX {
+            return Err(CANNOT_SYNC_AGAIN.to_owned());
+        }
+        field.set_on(profile);
+        Ok(true)
+    })?;
+    // `None` only for a change that says it changed nothing; this one never does.
+    saved.ok_or_else(|| GONE.to_owned())
 }
 
 /// Store a newly typed password for the live profile `id`.
@@ -1256,6 +1281,52 @@ mod tests {
 
         assert_eq!(saved.updated_at, i64::MAX);
         assert_eq!(on_disk(&dir, &p.id).unwrap().port, 2222);
+    }
+
+    #[test]
+    fn a_profile_can_be_kept_here_and_synced_again() {
+        let (dir, store, p) = store_with_profile();
+        assert!(!p.local_only);
+
+        let kept = apply_field(&store, &p.id, Field::LocalOnly(true)).unwrap();
+
+        assert!(kept.local_only);
+        assert!(kept.updated_at > p.updated_at, "an edit like any other");
+        assert_eq!(on_disk(&dir, &p.id), Some(kept.clone()));
+        assert_eq!(kept.host, p.host, "nothing else changed");
+
+        let synced = apply_field(&store, &p.id, Field::LocalOnly(false)).unwrap();
+
+        assert!(!synced.local_only);
+        assert!(synced.updated_at > kept.updated_at);
+        assert_eq!(on_disk(&dir, &p.id), Some(synced));
+    }
+
+    #[test]
+    fn syncing_again_is_refused_at_the_largest_version() {
+        let (dir, store, p) = store_with_profile();
+        let mut kept = p.clone();
+        kept.local_only = true;
+        seed_with_stamp(&store, &kept, i64::MAX);
+        let before = file_bytes(&dir);
+
+        let err = apply_field(&store, &p.id, Field::LocalOnly(false)).unwrap_err();
+
+        assert_eq!(err, CANNOT_SYNC_AGAIN);
+        assert_eq!(file_bytes(&dir), before, "nothing written");
+        assert!(on_disk(&dir, &p.id).unwrap().local_only);
+
+        // One below the largest is an ordinary edit: it can still go out.
+        seed_with_stamp(&store, &kept, i64::MAX - 1);
+        let synced = apply_field(&store, &p.id, Field::LocalOnly(false)).unwrap();
+        assert!(!synced.local_only);
+        assert_eq!(synced.updated_at, i64::MAX, "one above, saturating there");
+
+        // Keeping it here at the largest version is no problem: the tombstone
+        // it sends wins a tie.
+        seed_with_stamp(&store, &p, i64::MAX);
+        let kept_again = apply_field(&store, &p.id, Field::LocalOnly(true)).unwrap();
+        assert!(kept_again.local_only);
     }
 
     #[test]

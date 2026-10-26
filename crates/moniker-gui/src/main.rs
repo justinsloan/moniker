@@ -21,6 +21,7 @@ mod form;
 mod gui_tests;
 mod hosts;
 mod keyring;
+mod local_only;
 mod new_tab;
 mod notify;
 mod panes;

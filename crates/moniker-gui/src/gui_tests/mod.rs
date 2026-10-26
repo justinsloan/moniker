@@ -372,6 +372,11 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #10, a profile kept on this machine only.
+    profiles::keeping_a_profile_here_asks_first(&tmp.path().join("k-keep"));
+    profiles::syncing_it_again_asks_too(&tmp.path().join("k-again"));
+    profiles::a_profile_that_cannot_sync_again_says_so(&tmp.path().join("k-max"));
+    profiles::a_second_flip_waits_for_the_first(&tmp.path().join("k-second"));
     // Issue #10, sync turned off.
     sync::sync_off_grays_out_sync_now_and_skips_launch(&tmp.path().join("s-off"));
     sync::the_sync_page_turns_sync_off_and_asks_to_turn_it_on(&tmp.path().join("s-sw-ask"));
@@ -620,6 +625,17 @@ fn assert_plain_row(what: &str, row: &adw::ActionRow, title: &str, subtitle: Opt
     }
 }
 
+/// The alert in `window`, once it shows.
+fn alert_in(window: &impl IsA<gtk::Widget>) -> adw::AlertDialog {
+    pump_until("the alert", || {
+        !all_widgets::<adw::AlertDialog>(window).is_empty()
+    });
+    all_widgets::<adw::AlertDialog>(window)
+        .into_iter()
+        .next()
+        .expect("the alert")
+}
+
 /// The action row of `root` whose widget name is `id` (a profile's id).
 fn row_for(root: &impl IsA<gtk::Widget>, id: &str) -> adw::ActionRow {
     all_widgets::<adw::ActionRow>(root)
@@ -854,6 +870,44 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         .emit_clicked();
     pump_for(Duration::from_millis(200));
     assert!(ctx.store.borrow().get(&p.id).is_some(), "nothing deleted");
+
+    // The two questions of "Sync to other machines" name the profile as it is
+    // too: keeping it here, then (once it is kept) syncing it again.
+    let sync_row = all_widgets::<adw::SwitchRow>(&profiles_window)
+        .into_iter()
+        .find(|row| row.title() == "Sync to other machines")
+        .expect("the Sync to other machines switch");
+    assert!(!sync_row.uses_markup(), "sync switch parses markup");
+    sync_row.set_active(false);
+    let dialog = alert_in(&profiles_window);
+    let heading = format!("Keep \"{MARKUP_NAME}\" on This Machine Only?");
+    assert_eq!(dialog.heading().as_deref(), Some(heading.as_str()));
+    assert!(!dialog.is_heading_use_markup(), "keep dialog heading");
+    assert!(!dialog.is_body_use_markup(), "keep dialog body");
+    literal_labels("keep dialog", &dialog, &heading);
+    button_labeled(&dialog, "Keep on This Machine Only")
+        .expect("the Keep button")
+        .emit_clicked();
+    pump_until("the save", || {
+        crate::keyring::pending() == 0 && sync_row.is_sensitive()
+    });
+    assert!(ctx.store.borrow().get(&p.id).expect("there").local_only);
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(&profiles_window).is_empty()
+    });
+    sync_row.set_active(true);
+    let dialog = alert_in(&profiles_window);
+    let heading = format!("Sync \"{MARKUP_NAME}\" to Your Other Machines?");
+    assert_eq!(dialog.heading().as_deref(), Some(heading.as_str()));
+    assert!(!dialog.is_heading_use_markup(), "sync dialog heading");
+    assert!(!dialog.is_body_use_markup(), "sync dialog body");
+    literal_labels("sync dialog", &dialog, &heading);
+    button_labeled(&dialog, "Cancel")
+        .expect("the dialog's Cancel button")
+        .emit_clicked();
+    pump_until("the alert to go", || {
+        all_widgets::<adw::AlertDialog>(&profiles_window).is_empty()
+    });
 
     profiles_window.close();
     main.window.destroy();

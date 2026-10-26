@@ -20,6 +20,12 @@
 //! then, so a failed save's switch or port goes back to what is stored. A
 //! failure is still told when the page has gone.
 //!
+//! "Sync to other machines" is the one switch that asks first (issue #10):
+//! keeping a profile on this machine only deletes it, password included, from
+//! the other machines at their next sync, and syncing it again copies it out
+//! with its password. The row waits (insensitive) from the flip until the
+//! question is answered and, on yes, its save is back ([`local_only`]).
+//!
 //! The startup sequences are listed here and edited on a sub-page of their own
 //! ([`sequence_page`]) that opens over this one.
 //!
@@ -51,6 +57,7 @@ use super::sequence_page;
 use crate::context::AppContext;
 use crate::form::{self, Field};
 use crate::keyring;
+use crate::local_only;
 
 /// The startup-sequence group's description: what can leak.
 pub(crate) const SECRETS_WARNING: &str = "\
@@ -117,6 +124,39 @@ struct Inner {
     /// What the file says, or will say once the saves asked for are back.
     transcript_stored: Cell<bool>,
     transcript_saving: Rc<Saving>,
+    /// "Sync to other machines" (issue #10). Off means the profile is kept on
+    /// this machine only, which deletes it from the others: both ways ask first.
+    sync_here: adw::SwitchRow,
+    /// Whether the profile is kept here, as the file said at the last refresh:
+    /// what a cancelled question goes back to.
+    kept_stored: Cell<bool>,
+    /// The row is being set to what the file says, not flipped by the person.
+    sync_loading: Cell<bool>,
+    /// What the person asked for ("kept here" or not), from the flip until its
+    /// save is back (the question, then the save). The row is insensitive all
+    /// that time, a flip that gets in anyway is put back, and a refresh leaves
+    /// the row alone.
+    sync_asked: Cell<Option<bool>>,
+    sync_saving: Rc<Saving>,
+    /// Where the keyboard is while the row waits (see [`RowFocus`]).
+    sync_focus: RowFocus,
+}
+
+/// The keyboard while "Sync to other machines" waits. The question that opens
+/// over the row takes the keyboard, and the row goes insensitive, which does
+/// too, so the page notes whether the row had it and gives it back
+/// ([`Inner::settle_focus`]) once the row can take it: the question has closed
+/// and the row is sensitive again (Cancel, or the save is back).
+#[derive(Default)]
+struct RowFocus {
+    /// The keyboard was on the row when it was flipped.
+    had: Cell<bool>,
+    /// The question is still on screen.
+    question_open: Cell<bool>,
+    /// Where the keyboard was left when the question closed. The row gets it
+    /// back only if it is still there: a person who moved on while the save
+    /// was out is not pulled back.
+    parked: RefCell<Option<gtk::Widget>>,
 }
 
 impl ProfilePage {
@@ -224,6 +264,17 @@ impl ProfilePage {
         session.add(&transcript);
         widget.add(&session);
 
+        // Its subtitle and state are set by `set_sync_here`.
+        let sync_here = adw::SwitchRow::builder()
+            .title(local_only::ROW_TITLE)
+            .use_markup(false)
+            .build();
+        let sync_saving = Saving::new();
+        sync_here.add_suffix(&sync_saving.spinner);
+        let sync = adw::PreferencesGroup::builder().title("Sync").build();
+        sync.add(&sync_here);
+        widget.add(&sync);
+
         let delete = gtk::Button::builder()
             .label("Delete Profile")
             .halign(gtk::Align::Center)
@@ -252,7 +303,14 @@ impl ProfilePage {
             transcript,
             transcript_stored: Cell::new(profile.transcript),
             transcript_saving,
+            sync_here,
+            kept_stored: Cell::new(profile.local_only),
+            sync_loading: Cell::new(false),
+            sync_asked: Cell::new(None),
+            sync_saving,
+            sync_focus: RowFocus::default(),
         });
+        inner.set_sync_here(profile.local_only);
         inner.show_key_file(profile.key_file.as_ref());
         inner.show_sequences(profile);
         inner.connect(&remove, &choose, &delete);
@@ -286,6 +344,13 @@ impl ProfilePage {
         }
         if !inner.key_saving.busy() {
             inner.show_key_file(profile.key_file.as_ref());
+        }
+        // A question or a save of the row under way keeps what the person
+        // asked for on show; a question that is cancelled meanwhile goes back
+        // to what the file says now.
+        inner.kept_stored.set(profile.local_only);
+        if inner.sync_asked.get().is_none() {
+            inner.set_sync_here(profile.local_only);
         }
         inner.show_sequences(profile);
     }
@@ -376,6 +441,8 @@ impl Inner {
         self.port.connect_value_notify(move |_| changed());
         let changed = with(|inner| inner.transcript_changed());
         self.transcript.connect_active_notify(move |_| changed());
+        let changed = with(|inner| inner.sync_here_changed());
+        self.sync_here.connect_active_notify(move |_| changed());
 
         let ask = with(|inner| inner.ask_remove_password());
         remove.connect_clicked(move |_| ask());
@@ -565,6 +632,139 @@ impl Inner {
             Field::Transcript(on),
             |_, _| {},
         );
+    }
+
+    /// Show the profile as kept here (`kept`, the switch off) or syncing, with
+    /// the subtitle that says so, without that counting as a flip.
+    fn set_sync_here(&self, kept: bool) {
+        self.sync_loading.set(true);
+        self.sync_here.set_active(!kept);
+        self.sync_loading.set(false);
+        self.sync_here.set_subtitle(if kept {
+            local_only::KEPT_SUBTITLE
+        } else {
+            local_only::SYNCS_SUBTITLE
+        });
+    }
+
+    /// The person flipped "Sync to other machines". Either way changes what
+    /// the other machines hold, and a copied-out password cannot be called back,
+    /// so nothing is saved until the question is answered
+    /// ([`local_only::keep_here_dialog`], [`local_only::sync_again_dialog`]). The
+    /// row is insensitive from here until the answer and, on yes, its save are
+    /// back: a second flip waits for the first. Cancel, or closing the question,
+    /// puts the switch back.
+    fn sync_here_changed(self: &Rc<Self>) {
+        if self.sync_loading.get() {
+            return;
+        }
+        let kept = !self.sync_here.is_active();
+        if let Some(asked) = self.sync_asked.get() {
+            // The row is insensitive, so only code gets here: put it back.
+            self.set_sync_here(asked);
+            return;
+        }
+        if kept == self.kept_stored.get() {
+            return;
+        }
+        // Bind first so the store borrow ends here.
+        let name = self
+            .ctx
+            .store
+            .borrow()
+            .get(&self.id)
+            .map(|p| p.name.clone());
+        let Some(name) = name else {
+            self.ctx.notice.show_near(&self.sync_here, form::GONE);
+            self.set_sync_here(self.kept_stored.get());
+            return;
+        };
+        let (dialog, yes) = if kept {
+            (local_only::keep_here_dialog(&name), "keep")
+        } else {
+            (local_only::sync_again_dialog(&name), "sync")
+        };
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(Some(yes), {
+            let weak = weak.clone();
+            move |_, _| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.save_sync_here(kept);
+                }
+            }
+        });
+        dialog.connect_response(Some("cancel"), {
+            let weak = weak.clone();
+            move |_, _| {
+                if let Some(inner) = weak.upgrade() {
+                    inner.sync_asked.set(None);
+                    inner.set_sync_here(inner.kept_stored.get());
+                    inner.sync_here.set_sensitive(true);
+                    inner.settle_focus();
+                }
+            }
+        });
+        // `closed` and the response come in an order that is the dialog's
+        // business (a response follows `closed`), so each of them settles the
+        // keyboard once everything it waits for has happened.
+        dialog.connect_closed(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                inner.sync_focus.question_open.set(false);
+                inner.sync_focus.parked.replace(inner.focus_widget());
+                inner.settle_focus();
+            }
+        });
+        // The question takes the keyboard, so note first where it was (the
+        // window's focus widget, whether or not the window is the active one).
+        let row: &gtk::Widget = self.sync_here.upcast_ref();
+        self.sync_focus.had.set(
+            row.root()
+                .and_then(|root| root.focus())
+                .is_some_and(|focus| &focus == row || focus.is_ancestor(row)),
+        );
+        self.sync_focus.question_open.set(true);
+        self.sync_asked.set(Some(kept));
+        dialog.present(Some(&self.sync_here));
+        self.sync_here.set_sensitive(false);
+    }
+
+    /// Save the answer "yes" on the keyring worker like any other field. The
+    /// row shows it meanwhile and stays insensitive until the save is back;
+    /// then it shows what the file has, so a save that failed (and told why)
+    /// puts the switch back.
+    fn save_sync_here(self: &Rc<Self>, kept: bool) {
+        self.set_sync_here(kept);
+        self.save(
+            &self.sync_here,
+            &self.sync_saving,
+            Field::LocalOnly(kept),
+            |inner, _| {
+                inner.sync_asked.set(None);
+                inner.sync_here.set_sensitive(true);
+                inner.settle_focus();
+            },
+        );
+    }
+
+    /// The window's focus widget (`None`: nothing has the keyboard).
+    fn focus_widget(&self) -> Option<gtk::Widget> {
+        self.sync_here.root().and_then(|root| root.focus())
+    }
+
+    /// Give the keyboard back to the row, once every one of these holds: it
+    /// had it before the question, the question has closed, and the row is
+    /// sensitive again (no answer or save is out). It gets it only if it is
+    /// still where the closing question left it. Called whenever one of them
+    /// has just become true.
+    fn settle_focus(&self) {
+        let focus = &self.sync_focus;
+        if !focus.had.get() || focus.question_open.get() || self.sync_asked.get().is_some() {
+            return;
+        }
+        focus.had.set(false);
+        if self.focus_widget() == focus.parked.take() {
+            self.sync_here.grab_focus();
+        }
     }
 
     fn show_key_file(&self, key_file: Option<&PathBuf>) {
