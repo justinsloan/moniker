@@ -1236,7 +1236,9 @@ pub(super) fn rename_sets_title_and_escaped_tooltip() {
 }
 
 /// The rename dialog open over `window`, if there is one.
-fn rename_dialog(window: &impl IsA<gtk::Widget>) -> Option<(adw::AlertDialog, gtk::Entry)> {
+pub(super) fn rename_dialog(
+    window: &impl IsA<gtk::Widget>,
+) -> Option<(adw::AlertDialog, gtk::Entry)> {
     let dialog: adw::AlertDialog = find_widget(window)?;
     let entry = dialog.extra_child().and_downcast::<gtk::Entry>()?;
     Some((dialog, entry))

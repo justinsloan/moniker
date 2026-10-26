@@ -117,7 +117,7 @@ fn local_parts(widget: &gtk::Widget) -> LocalParts {
 
 /// Have `/bin/sh` in `terminal` print a line with `word` in it and wait for it.
 /// Input sent before the shell has started is lost, so this waits for the prompt.
-fn say(terminal: &Terminal, word: &str) {
+pub(super) fn say(terminal: &Terminal, word: &str) {
     wait_for_text(terminal, "$");
     terminal.feed_child(format!("echo {word}-$((40+2))\n").as_bytes());
     wait_for_text(terminal, &format!("{word}-42"));

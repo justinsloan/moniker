@@ -12,21 +12,21 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adw::prelude::*;
 use gtk::gio;
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::profile::Profile;
 use moniker_core::secrets::MemorySecretStore;
-use vte4::Terminal;
 use vte4::prelude::*;
 
 use super::main_window::{ctx_with, ctx_with_secrets, test_app};
-use super::save_transcripts::{click, configure, connect_plainly, new_list, set_save_all};
+use super::save_transcripts::{click, configure, connect_plainly, new_list, say, set_save_all};
+use super::sessions::answer;
+use super::tabs::rename_dialog;
 use super::windows::main_window;
 use super::{
-    HeldKeyring, all_widgets, button_labeled, fake_ssh, files_in, find_widget, pane, pump_for,
-    pump_until, wait_for_session, wait_for_text,
+    HeldKeyring, all_widgets, fake_ssh, files_in, find_widget, pane, pump_for, pump_until,
+    wait_for_session, wait_for_text,
 };
 use crate::launch_args::{Run, Start};
 use crate::panes::{self, Pane, REC_PREFIX, RECORDING_ICON, RECORDING_TOOLTIP, TabLayout};
@@ -118,35 +118,12 @@ fn split_with_local(main: &window::MainWindow, page: &adw::TabPage) -> PaneHolde
     holder
 }
 
-/// Have `/bin/sh` in `terminal` show `word` once its prompt is there (input
-/// sent before the shell has started is lost).
-fn say(terminal: &Terminal, word: &str) {
-    wait_for_text(terminal, "$");
-    terminal.feed_child(format!("echo {word}-$((40+2))\n").as_bytes());
-    wait_for_text(terminal, &format!("{word}-42"));
-}
-
 /// The Rename dialog over `main` and its field, once it shows.
-fn rename_dialog(main: &window::MainWindow) -> (adw::AlertDialog, gtk::Entry) {
+fn wait_for_rename_dialog(main: &window::MainWindow) -> (adw::AlertDialog, gtk::Entry) {
     pump_until("the Rename dialog", || {
-        find_widget::<adw::AlertDialog>(&main.window).is_some()
+        rename_dialog(&main.window).is_some()
     });
-    let dialog: adw::AlertDialog = find_widget(&main.window).expect("the Rename dialog");
-    let entry = dialog
-        .extra_child()
-        .and_downcast::<gtk::Entry>()
-        .expect("its name field");
-    (dialog, entry)
-}
-
-/// Press `label` in `dialog` and wait for it to go.
-fn answer(main: &window::MainWindow, dialog: &adw::AlertDialog, label: &str) {
-    button_labeled(dialog, label)
-        .unwrap_or_else(|| panic!("no {label} button"))
-        .emit_clicked();
-    pump_until("the dialog to close", || {
-        main.window.visible_dialog().is_none()
-    });
+    rename_dialog(&main.window).expect("the Rename dialog")
 }
 
 /// With "Save transcripts of all sessions" on, a window's first tab (a local
@@ -390,7 +367,7 @@ pub(super) fn rec_is_not_part_of_the_name(dir: &Path) {
 
     // Rename: the field starts with the name alone.
     terminal_tab::ask_rename(&page);
-    let (dialog, entry) = rename_dialog(&main);
+    let (dialog, entry) = wait_for_rename_dialog(&main);
     assert_eq!(entry.text(), shown_title(&pane(&page)));
     assert!(!entry.text().starts_with("REC"), "{}", entry.text());
     entry.set_text("Build");
@@ -403,7 +380,7 @@ pub(super) fn rec_is_not_part_of_the_name(dir: &Path) {
 
     // Asked again, the field holds the name, without REC.
     terminal_tab::ask_rename(&page);
-    let (dialog, entry) = rename_dialog(&main);
+    let (dialog, entry) = wait_for_rename_dialog(&main);
     assert_eq!(entry.text(), "Build");
     answer(&main, &dialog, "Cancel");
     assert_eq!(page.title(), "REC  Build");
