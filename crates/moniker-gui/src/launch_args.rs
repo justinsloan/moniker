@@ -214,12 +214,13 @@ pub(crate) fn parse(args: &[OsString]) -> Result<Parsed, String> {
 ///
 /// `cwd` is the launching process's current directory (`None` if unknown) and
 /// `home` the home folder. A folder that was asked for and is a folder is
-/// used; a relative one is taken from `cwd`. With none asked for (or an empty
-/// one), the terminal starts in `cwd`, unless that is `/` (launchers that
-/// start everything there) or unknown, and then in `home`. A folder asked for
-/// that is not a folder, or is relative with no `cwd` to take it from, gives
-/// `home` and is named in `dir_refused` (as an absolute path when it could be
-/// made one). `hold` counts only with a command.
+/// used; a relative one is taken from `cwd` (joined without its `.`
+/// components). With none asked for (or an empty one), the terminal starts in
+/// `cwd`, unless that is `/` (launchers that start everything there), unknown
+/// or not a folder here, and then in `home`, with nothing refused. A folder
+/// asked for that is not a folder, or is relative with no `cwd` to take it
+/// from, gives `home` and is named in `dir_refused` (as an absolute path when
+/// it could be made one). `hold` counts only with a command.
 pub(crate) fn start(request: Request, cwd: Option<&Path>, home: &Path) -> Start {
     let Request {
         dir,
@@ -237,7 +238,10 @@ pub(crate) fn start(request: Request, cwd: Option<&Path>, home: &Path) -> Start 
         Some(asked) => {
             let chosen = match (asked.is_absolute(), cwd) {
                 (true, _) => Some(asked.clone()),
-                (false, Some(cwd)) => Some(cwd.join(&asked)),
+                // `components` drops the `.` of `./nope` (and a doubled or
+                // trailing slash) and keeps `..`, so the notification reads
+                // "/home/u/proj/nope", not "/home/u/proj/./nope".
+                (false, Some(cwd)) => Some(cwd.join(&asked).components().collect::<PathBuf>()),
                 (false, None) => None,
             };
             match chosen {
@@ -246,8 +250,11 @@ pub(crate) fn start(request: Request, cwd: Option<&Path>, home: &Path) -> Start 
                 None => (home.to_path_buf(), Some(asked)),
             }
         }
+        // Nothing asked for, so nothing is refused: a launching directory that
+        // is `/`, unknown or not a folder on this machine (a launcher in
+        // another container, say) starts in home, and silently.
         None => match cwd {
-            Some(cwd) if cwd != Path::new("/") => (cwd.to_path_buf(), None),
+            Some(cwd) if cwd != Path::new("/") && is_folder(cwd) => (cwd.to_path_buf(), None),
             _ => (home.to_path_buf(), None),
         },
     };
@@ -650,8 +657,64 @@ mod tests {
             at(Some(Path::new("tmp")), Some(Path::new("/"))).dir,
             Path::new("/tmp")
         );
-        // Where the launcher stood is not checked when no folder was asked for.
-        assert_eq!(at(None, Some(Path::new("/c"))).dir, Path::new("/c"));
+        // A launching directory that is not a folder here (a missing path, or
+        // a file) is no place to start: home, and nothing is refused, because
+        // the person asked for no folder.
+        let gone = tmp.path().join("gone");
+        let started = at(None, Some(&gone));
+        assert_eq!(started.dir, home);
+        assert_eq!(started.dir_refused, None);
+        let file = tmp.path().join("a file");
+        std::fs::write(&file, "x").unwrap();
+        let started = at(None, Some(&file));
+        assert_eq!(started.dir, home);
+        assert_eq!(started.dir_refused, None);
+        assert_eq!(at(empty, Some(&gone)).dir, home);
+        assert_eq!(at(empty, Some(&gone)).dir_refused, None);
+    }
+
+    #[test]
+    fn a_relative_folder_is_joined_without_its_dots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("c");
+        std::fs::create_dir_all(cwd.join("rel")).unwrap();
+        std::fs::create_dir(tmp.path().join("other")).unwrap();
+        let home = tmp.path().join("home");
+        let at = |dir: &str| {
+            let request = Request {
+                dir: Some(PathBuf::from(dir)),
+                ..Request::default()
+            };
+            start(request, Some(&cwd), &home)
+        };
+
+        // Paths compare by their components, which ignore a `.`, so the text
+        // is compared: what the notification will show.
+        let shown = |path: &Path| path.to_str().unwrap().to_string();
+        let c = shown(&cwd);
+
+        // `.` is the launching directory itself.
+        let started = at(".");
+        assert_eq!(shown(&started.dir), c);
+        assert_eq!(started.dir_refused, None);
+        let started = at("./rel");
+        assert_eq!(shown(&started.dir), format!("{c}/rel"));
+        assert_eq!(started.dir_refused, None);
+        // A trailing slash goes too.
+        assert_eq!(shown(&at("rel/").dir), format!("{c}/rel"));
+        // A refusal names the folder without the dot, so the notification
+        // reads ".../c/nope".
+        let started = at("./nope");
+        assert_eq!(started.dir, home);
+        assert_eq!(
+            shown(&started.dir_refused.expect("refused")),
+            format!("{c}/nope")
+        );
+        // `..` stays: it is a real step (and a link's parent is not the
+        // folder above it, so it is not for this module to fold away).
+        let started = at("../other");
+        assert_eq!(shown(&started.dir), format!("{c}/../other"));
+        assert_eq!(started.dir_refused, None);
     }
 
     #[test]
