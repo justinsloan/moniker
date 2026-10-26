@@ -16,8 +16,9 @@
 //!
 //! Error codes: 1 wrong sync key, 2 version mismatch, 3 no secret store,
 //! 4 the server has been away ([`SyncError::Stale`] there,
-//! [`SyncError::PeerStale`] here), 255 anything else. Messages are fixed,
-//! non-secret text.
+//! [`SyncError::PeerStale`] here), 5 sync is turned off on the server
+//! ([`SyncError::SyncOff`] there, [`SyncError::PeerSyncOff`] here), 255
+//! anything else. Messages are fixed, non-secret text.
 //!
 //! The client's HELLO flags byte has one flag, bit 0: the person accepted
 //! syncing with a machine that has been away ([`StaleSync::Allow`]). A client
@@ -29,7 +30,7 @@
 //!
 //! ```text
 //! client                                  server
-//!   HELLO [1]  ───────────────────────▶   ready()? passphrase set? version 1?
+//!   HELLO [1]  ───────────────────────▶   sync on? passphrase set? ready()? version 1?
 //!              ◀───────────────────────   HELLO [1]            (or ERROR, stop)
 //!   BUNDLE(seal(export))  ────────────▶   open, validate, merge with export,
 //!                                         seal the merged set, apply
@@ -82,6 +83,23 @@
 //! by [`crate::sync_state`]; a client records it after applying, a server
 //! after sending its reply.
 //!
+//! # Sync turned off (issue #10)
+//!
+//! The person can turn sync off on a machine (the switch lives in
+//! `profiles.json`, see [`crate::store::SyncSwitch`]). Then that machine
+//! takes part in no sync, in either role, whoever starts it: a client stops
+//! before it connects and sends nothing ([`SyncError::SyncOff`]), a server
+//! answers the HELLO with error 5 and goes no further, so the client reports
+//! [`SyncError::PeerSyncOff`]. The switch is the first thing either side
+//! looks at, before the sync key, the secret store or how long the machine
+//! has been away, and it is read from the file each time
+//! ([`SyncTarget::sync_on`]), so turning it off in the app stops a
+//! `moniker-server sync-serve` that is only now answering. A switch that is
+//! in the file but cannot be understood counts as off. Old servers know no
+//! code 5 and show its text as it is; the HELLO is unchanged, so there is no
+//! new protocol version. [`refuse`] lets `sync-serve` answer this way before
+//! it asks the keyring for the sync key.
+//!
 //! # Passwords: set and changed travel, removal does not
 //!
 //! A password reaches the other machine by being set or changed. Clearing one
@@ -125,6 +143,7 @@ const CODE_WRONG_SYNC_KEY: u8 = 1;
 const CODE_VERSION_MISMATCH: u8 = 2;
 const CODE_NO_SECRET_STORE: u8 = 3;
 const CODE_STALE: u8 = 4;
+const CODE_SYNC_OFF: u8 = 5;
 const CODE_OTHER: u8 = 255;
 
 /// The bit of the client's HELLO flags byte that says the person accepted
@@ -206,6 +225,14 @@ pub enum SyncError {
         "the other machine has not synced for more than 180 days, so a profile deleted on another machine more than a year ago could come back on every machine"
     )]
     PeerStale,
+    /// The person turned sync off on this machine (issue #10); nothing was
+    /// sent.
+    #[error("sync is turned off on this machine")]
+    SyncOff,
+    /// Sync is turned off on the other machine; nothing was sent but the
+    /// HELLO.
+    #[error("sync is turned off on the other machine")]
+    PeerSyncOff,
     /// The peer broke the frame protocol (bad length, unexpected frame).
     #[error("sync protocol error: {0}")]
     Protocol(String),
@@ -234,6 +261,12 @@ pub struct SyncOutcome {
 
 /// One side's data, as the protocol sees it.
 pub trait SyncTarget {
+    /// `Ok` unless the person turned sync off on this side (issue #10), which
+    /// is [`SyncError::SyncOff`]. Looked at before anything else, in either
+    /// role.
+    fn sync_on(&self) -> Result<(), SyncError> {
+        Ok(())
+    }
     /// `Ok` if received data can be stored (the secret store is usable).
     fn ready(&self) -> Result<(), SyncError>;
     /// Every profile, tombstones included, live ones with their passwords.
@@ -286,6 +319,22 @@ impl LocalState {
 }
 
 impl SyncTarget for LocalState {
+    /// Reads the profile file afresh (not the snapshot): the switch is turned
+    /// off by the app or by `moniker-server` in another process, and a sync
+    /// that runs on must see it at once. A switch the file holds but that
+    /// cannot be understood counts as off ([`SyncSwitch`]); a file that cannot
+    /// be read is the store's error, as for every other read of it.
+    ///
+    /// [`SyncSwitch`]: crate::store::SyncSwitch
+    fn sync_on(&self) -> Result<(), SyncError> {
+        let fresh = ProfileStore::open(self.store.path()).map_err(store_error)?;
+        if fresh.sync_switch().is_on() {
+            Ok(())
+        } else {
+            Err(SyncError::SyncOff)
+        }
+    }
+
     fn ready(&self) -> Result<(), SyncError> {
         self.secrets.probe().map_err(|_| SyncError::NoSecretStore)
     }
@@ -634,6 +683,7 @@ fn error_from_payload(payload: &[u8]) -> SyncError {
         CODE_VERSION_MISMATCH => SyncError::VersionMismatch,
         CODE_NO_SECRET_STORE => SyncError::NoSecretStore,
         CODE_STALE => SyncError::PeerStale,
+        CODE_SYNC_OFF => SyncError::PeerSyncOff,
         _ => {
             let text = clean(&String::from_utf8_lossy(message));
             SyncError::Remote(first_bytes(&text, MAX_SHOWN_MESSAGE).to_string())
@@ -649,11 +699,13 @@ fn send_error(w: &mut impl Write, err: &SyncError) {
         SyncError::VersionMismatch => CODE_VERSION_MISMATCH,
         SyncError::NoSecretStore => CODE_NO_SECRET_STORE,
         SyncError::Stale { .. } | SyncError::PeerStale => CODE_STALE,
+        SyncError::SyncOff | SyncError::PeerSyncOff => CODE_SYNC_OFF,
         _ => CODE_OTHER,
     };
     let text = match err {
-        // Said from the peer's side, for a Moniker that knows no code 4 and
-        // shows the text as it is.
+        // Said from the peer's side, for a Moniker that knows no code 4 or 5
+        // and shows the text as it is.
+        SyncError::SyncOff => SyncError::PeerSyncOff.to_string(),
         SyncError::Stale { days } => format!(
             "the other machine has not synced for {days} days, so a profile deleted on another \
              machine more than a year ago could come back on every machine; a newer Moniker can \
@@ -768,7 +820,9 @@ pub fn serve(
     let hello = read_expected(&mut r, KIND_HELLO)?;
     tell(
         &mut w,
-        check_passphrase(passphrase)
+        local
+            .sync_on()
+            .and_then(|()| check_passphrase(passphrase))
             .and_then(|()| local.ready())
             .and_then(|()| check_version(&hello))
             .and_then(|()| check_not_away(&*local, stale_from_hello(&hello))),
@@ -781,6 +835,17 @@ pub fn serve(
     write_frame(&mut w, KIND_BUNDLE, &reply)?;
     local.record_sync();
     Ok(outcome)
+}
+
+/// Answer the client's HELLO with `err` and do nothing else, for a server that
+/// knows it will not take part before it has what [`serve`] needs: `sync-serve`
+/// with sync turned off must not even ask the keyring for the sync key (issue
+/// #10). The HELLO is read first so that the ERROR is the answer to something
+/// the client said, as in [`serve`]. Returns `Err(err)`, or the reason the
+/// HELLO could not be read.
+pub fn refuse(mut r: impl Read, mut w: impl Write, err: SyncError) -> Result<(), SyncError> {
+    read_expected(&mut r, KIND_HELLO)?;
+    tell(&mut w, Err(err))
 }
 
 /// Open and check the client's bundle, merge it with the local export, and
@@ -806,6 +871,7 @@ pub fn run_client(
     passphrase: &str,
     stale: StaleSync,
 ) -> Result<SyncOutcome, SyncError> {
+    local.sync_on()?;
     check_passphrase(passphrase)?;
     local.ready()?;
     check_not_away(&*local, stale)?;
@@ -879,9 +945,11 @@ fn sync_over_ssh_with_timeout(
     stale: StaleSync,
     timeout: Duration,
 ) -> Result<SyncOutcome, SyncError> {
+    // No point connecting if sync is turned off, if received passwords could
+    // not be stored, or if this machine has been away and the person has not
+    // accepted that.
+    local.sync_on()?;
     check_passphrase(passphrase)?;
-    // No point connecting if received passwords could not be stored, or if
-    // this machine has been away and the person has not accepted that.
     local.ready()?;
     check_not_away(&*local, stale)?;
     let deadline = Instant::now() + timeout;
@@ -2551,6 +2619,11 @@ mod tests {
             error_from_payload(b"\x03x"),
             SyncError::NoSecretStore
         ));
+        assert!(matches!(error_from_payload(b"\x04x"), SyncError::PeerStale));
+        assert!(matches!(
+            error_from_payload(b"\x05x"),
+            SyncError::PeerSyncOff
+        ));
         assert!(matches!(error_from_payload(b""), SyncError::Protocol(_)));
         let SyncError::Remote(msg) = error_from_payload(b"\xffdisk \x1b[2Jfull\n\xff") else {
             panic!("expected Remote");
@@ -2709,6 +2782,15 @@ mod tests {
 
         fn last_sync(&self) -> Option<i64> {
             crate::sync_state::last_sync(&self.path)
+        }
+
+        /// Turn sync off as the app does, through a store of its own: the
+        /// machine's `LocalState` was opened before and has to notice.
+        fn sync_off(&self) {
+            ProfileStore::open(&self.path)
+                .unwrap()
+                .set_sync(false)
+                .unwrap();
         }
     }
 
@@ -3081,6 +3163,203 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SyncError::Stale { days: 181 }), "{err:?}");
+        assert!(!marker.exists(), "ssh must not be started");
+    }
+
+    // ----- sync turned off (issue #10) -----
+
+    #[test]
+    fn a_client_with_sync_off_sends_nothing() {
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[(prof("two"), Some("pw"))]);
+        a.sync_off();
+        let (a_file, b_file) = (file_of(&a.path), file_of(&b.path));
+
+        // The server's read times out instead of waiting for ever, were the
+        // client to leave the connection open.
+        let (cs, ss) = pair();
+        ss.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let served = spawn_server(ss, b.state.take().unwrap(), PASS);
+        let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+        drop(cs);
+        let (served, back) = served.join().unwrap();
+        b.state = Some(back);
+
+        assert!(matches!(out, Err(SyncError::SyncOff)), "got {out:?}");
+        assert!(
+            served.is_err(),
+            "no HELLO came, so the server has no sync: {served:?}"
+        );
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(file_of(&b.path), b_file);
+        assert_eq!((a.last_sync(), b.last_sync()), (None, None));
+    }
+
+    #[test]
+    fn a_server_with_sync_off_answers_code_5() {
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw"))]);
+        let mut b = Machine::new(&clock, &[(prof("two"), Some("pw"))]);
+        b.sync_off();
+        let (a_file, b_file) = (file_of(&a.path), file_of(&b.path));
+
+        let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
+
+        assert!(matches!(out, Err(SyncError::PeerSyncOff)), "got {out:?}");
+        assert!(matches!(served, Err(SyncError::SyncOff)), "got {served:?}");
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(file_of(&b.path), b_file);
+        assert_eq!((a.last_sync(), b.last_sync()), (None, None));
+    }
+
+    #[test]
+    fn sync_off_is_said_before_anything_else_is_checked() {
+        // With no sync key, and on a machine that has been away: the switch
+        // is the first thing either role looks at.
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[]);
+        crate::sync_state::record_sync(&a.path, clock.now() - 300 * DAY_MS).unwrap();
+        a.sync_off();
+
+        let (cs, ss) = pair();
+        let err = run_client(&cs, &cs, a.state.as_mut().unwrap(), "", StaleSync::Refuse);
+        assert!(matches!(err, Err(SyncError::SyncOff)), "got {err:?}");
+        drop((cs, ss));
+
+        let (cs, ss) = pair();
+        write_frame(&mut &cs, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
+        let err = serve(&ss, &ss, a.state.as_mut().unwrap(), "");
+        assert!(matches!(err, Err(SyncError::SyncOff)), "got {err:?}");
+        let (kind, payload) = read_frame(&mut &cs).unwrap();
+        assert_eq!((kind, payload[0]), (KIND_ERROR, CODE_SYNC_OFF));
+    }
+
+    #[test]
+    fn sync_off_is_read_from_the_file_when_asked_not_from_a_snapshot() {
+        let clock = Clock::starting_now();
+        let a = Machine::new(&clock, &[]);
+        let state = a.state.as_ref().unwrap();
+        assert!(state.sync_on().is_ok());
+        // Another process (the app, `moniker-server`) turns it off, and on.
+        a.sync_off();
+        assert!(matches!(state.sync_on(), Err(SyncError::SyncOff)));
+        ProfileStore::open(&a.path).unwrap().set_sync(true).unwrap();
+        assert!(state.sync_on().is_ok());
+    }
+
+    #[test]
+    fn a_switch_not_understood_or_a_damaged_file_stops_a_sync() {
+        let clock = Clock::starting_now();
+        let a = Machine::new(&clock, &[]);
+        let state = a.state.as_ref().unwrap();
+        // Not understood: off, as the store reads it.
+        fs::write(&a.path, r#"{"version":2,"profiles":[]}"#).unwrap();
+        assert!(matches!(state.sync_on(), Err(SyncError::SyncOff)));
+        // Damaged: the store's error, as for every other read of the file.
+        fs::write(&a.path, "{").unwrap();
+        assert!(matches!(state.sync_on(), Err(SyncError::Store(_))));
+    }
+
+    #[test]
+    fn refuse_answers_the_hello_with_code_5() {
+        let (cs, ss) = pair();
+        write_frame(&mut &cs, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
+        let err = refuse(&ss, &ss, SyncError::SyncOff).unwrap_err();
+        assert!(matches!(err, SyncError::SyncOff), "got {err:?}");
+        drop(ss);
+
+        let (kind, payload) = read_frame(&mut &cs).unwrap();
+        assert_eq!(kind, KIND_ERROR);
+        assert_eq!(payload[0], CODE_SYNC_OFF);
+        let text = String::from_utf8_lossy(&payload[1..]).into_owned();
+        assert!(text.contains("turned off on the other machine"), "{text}");
+        assert!(matches!(
+            error_from_payload(&payload),
+            SyncError::PeerSyncOff
+        ));
+        // Nothing else was said.
+        let mut rest = Vec::new();
+        (&cs).read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn refuse_says_nothing_to_a_connection_that_did_not_speak_first() {
+        let (cs, ss) = pair();
+        drop(cs);
+        let err = refuse(&ss, &ss, SyncError::SyncOff).unwrap_err();
+        assert!(matches!(err, SyncError::Io(_)), "got {err:?}");
+
+        let (cs, ss) = pair();
+        write_frame(&mut &cs, KIND_BUNDLE, b"zzz").unwrap();
+        let err = refuse(&ss, &ss, SyncError::SyncOff).unwrap_err();
+        assert!(matches!(err, SyncError::Protocol(_)), "got {err:?}");
+        drop(ss);
+        let mut said = Vec::new();
+        (&cs).read_to_end(&mut said).unwrap();
+        assert!(said.is_empty());
+    }
+
+    #[test]
+    fn an_old_one_byte_hello_is_refused_the_same() {
+        let clock = Clock::starting_now();
+        let mut b = Machine::new(&clock, &[]);
+        b.sync_off();
+        let b_file = file_of(&b.path);
+        for hello in [vec![PROTOCOL_VERSION], client_hello(StaleSync::Allow)] {
+            let (cs, ss) = pair();
+            let served = spawn_server(ss, b.state.take().unwrap(), PASS);
+            write_frame(&mut &cs, KIND_HELLO, &hello).unwrap();
+            let (kind, payload) = read_frame(&mut &cs).unwrap();
+            drop(cs);
+            let (served, back) = served.join().unwrap();
+            b.state = Some(back);
+
+            assert_eq!(kind, KIND_ERROR);
+            assert_eq!(payload[0], CODE_SYNC_OFF);
+            assert!(matches!(served, Err(SyncError::SyncOff)), "got {served:?}");
+            // Said from the peer's side: a Moniker that knows no code 5
+            // shows the text as it is.
+            let text = String::from_utf8_lossy(&payload[1..]).into_owned();
+            assert_eq!(text, "sync is turned off on the other machine");
+            let unknown_code = [&[9u8][..], &payload[1..]].concat();
+            let SyncError::Remote(shown) = error_from_payload(&unknown_code) else {
+                panic!("expected Remote");
+            };
+            assert_eq!(shown, text);
+        }
+        assert_eq!(file_of(&b.path), b_file);
+    }
+
+    #[test]
+    fn sync_over_ssh_with_sync_off_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let cmd = SshCommand {
+            program: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                r#"touch "$1""#.to_string(),
+                "sh".to_string(),
+                marker.to_str().unwrap().to_string(),
+            ],
+            env: vec![],
+        };
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[]);
+        a.sync_off();
+        for terminal in [SshTerminal::Inherit, SshTerminal::Detached] {
+            let err = sync_over_ssh(
+                a.state.as_mut().unwrap(),
+                &cmd,
+                PASS,
+                terminal,
+                StaleSync::Allow,
+            )
+            .unwrap_err();
+            assert!(matches!(err, SyncError::SyncOff), "{err:?}");
+        }
         assert!(!marker.exists(), "ssh must not be started");
     }
 }
