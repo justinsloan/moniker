@@ -32,7 +32,7 @@ const SYNC_BODY: &str =
 /// Escape) is the default; "Keep on This Machine Only" is the response `keep`.
 pub(crate) fn keep_here_dialog(name: &str) -> adw::AlertDialog {
     let dialog = adw::AlertDialog::builder()
-        .heading(format!("Keep \"{name}\" on This Machine Only?"))
+        .heading(format!("Keep \u{201c}{name}\u{201d} on This Machine Only?"))
         .heading_use_markup(false)
         .body(KEEP_BODY)
         .body_use_markup(false)
@@ -49,7 +49,9 @@ pub(crate) fn keep_here_dialog(name: &str) -> adw::AlertDialog {
 /// default; "Sync" is the response `sync`.
 pub(crate) fn sync_again_dialog(name: &str) -> adw::AlertDialog {
     let dialog = adw::AlertDialog::builder()
-        .heading(format!("Sync \"{name}\" to Your Other Machines?"))
+        .heading(format!(
+            "Sync \u{201c}{name}\u{201d} to Your Other Machines?"
+        ))
         .heading_use_markup(false)
         .body(SYNC_BODY)
         .body_use_markup(false)

@@ -138,6 +138,9 @@ struct Inner {
     /// the row alone.
     sync_asked: Cell<Option<bool>>,
     sync_saving: Rc<Saving>,
+    /// The question on screen, if there is one. A page that goes away closes
+    /// it ([`ProfilePage`]'s `Drop`): its answer would have no page to act on.
+    sync_question: RefCell<Option<adw::AlertDialog>>,
     /// Where the keyboard is while the row waits (see [`RowFocus`]).
     sync_focus: RowFocus,
 }
@@ -153,9 +156,10 @@ struct RowFocus {
     had: Cell<bool>,
     /// The question is still on screen.
     question_open: Cell<bool>,
-    /// Where the keyboard was left when the question closed. The row gets it
-    /// back only if it is still there: a person who moved on while the save
-    /// was out is not pulled back.
+    /// Where the keyboard was left when the question closed, noted only when
+    /// the row had it (`None` otherwise: no widget is kept alive for nothing).
+    /// The row gets it back only if it is still there: a person who moved on
+    /// while the save was out is not pulled back.
     parked: RefCell<Option<gtk::Widget>>,
 }
 
@@ -308,6 +312,7 @@ impl ProfilePage {
             sync_loading: Cell::new(false),
             sync_asked: Cell::new(None),
             sync_saving,
+            sync_question: RefCell::new(None),
             sync_focus: RowFocus::default(),
         });
         inner.set_sync_here(profile.local_only);
@@ -394,11 +399,17 @@ impl ProfilePage {
 }
 
 impl Drop for ProfilePage {
-    /// A page that goes away (another profile selected, the window closed)
-    /// saves a settling port change and keeps no typed password.
+    /// A page that goes away (another profile selected, the window closed, its
+    /// profile deleted by a sync) saves a settling port change, keeps no typed
+    /// password, and takes the "Sync to other machines" question with it, so
+    /// that no button is left on screen that does nothing.
     fn drop(&mut self) {
         self.flush();
         self.inner.clear_password();
+        let question = self.inner.sync_question.take();
+        if let Some(question) = question {
+            question.force_close();
+        }
     }
 }
 
@@ -709,8 +720,14 @@ impl Inner {
         // keyboard once everything it waits for has happened.
         dialog.connect_closed(move |_| {
             if let Some(inner) = weak.upgrade() {
-                inner.sync_focus.question_open.set(false);
-                inner.sync_focus.parked.replace(inner.focus_widget());
+                let focus = &inner.sync_focus;
+                focus.question_open.set(false);
+                inner.sync_question.take();
+                // Only a row that had the keyboard is given it back, so only
+                // then is there anything to note (and to keep alive).
+                focus
+                    .parked
+                    .replace(focus.had.get().then(|| inner.focus_widget()).flatten());
                 inner.settle_focus();
             }
         });
@@ -724,6 +741,7 @@ impl Inner {
         );
         self.sync_focus.question_open.set(true);
         self.sync_asked.set(Some(kept));
+        self.sync_question.replace(Some(dialog.clone()));
         dialog.present(Some(&self.sync_here));
         self.sync_here.set_sensitive(false);
     }

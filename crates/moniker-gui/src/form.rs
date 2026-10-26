@@ -239,7 +239,7 @@ pub fn apply_field(
     field: Field,
 ) -> Result<Profile, String> {
     let saved = rewrite_live_if(store, id, |profile| {
-        if field == Field::LocalOnly(false) && profile.updated_at == i64::MAX {
+        if matches!(field, Field::LocalOnly(false)) && profile.updated_at == i64::MAX {
             return Err(CANNOT_SYNC_AGAIN.to_owned());
         }
         field.set_on(profile);

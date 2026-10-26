@@ -377,6 +377,7 @@ fn gui_integration() {
     profiles::syncing_it_again_asks_too(&tmp.path().join("k-again"));
     profiles::a_profile_that_cannot_sync_again_says_so(&tmp.path().join("k-max"));
     profiles::a_second_flip_waits_for_the_first(&tmp.path().join("k-second"));
+    profiles::a_question_closes_with_its_profile(&tmp.path().join("k-gone"));
     // Issue #10, sync turned off.
     sync::sync_off_grays_out_sync_now_and_skips_launch(&tmp.path().join("s-off"));
     sync::the_sync_page_turns_sync_off_and_asks_to_turn_it_on(&tmp.path().join("s-sw-ask"));
@@ -880,7 +881,7 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     assert!(!sync_row.uses_markup(), "sync switch parses markup");
     sync_row.set_active(false);
     let dialog = alert_in(&profiles_window);
-    let heading = format!("Keep \"{MARKUP_NAME}\" on This Machine Only?");
+    let heading = format!("Keep \u{201c}{MARKUP_NAME}\u{201d} on This Machine Only?");
     assert_eq!(dialog.heading().as_deref(), Some(heading.as_str()));
     assert!(!dialog.is_heading_use_markup(), "keep dialog heading");
     assert!(!dialog.is_body_use_markup(), "keep dialog body");
@@ -897,7 +898,7 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     });
     sync_row.set_active(true);
     let dialog = alert_in(&profiles_window);
-    let heading = format!("Sync \"{MARKUP_NAME}\" to Your Other Machines?");
+    let heading = format!("Sync \u{201c}{MARKUP_NAME}\u{201d} to Your Other Machines?");
     assert_eq!(dialog.heading().as_deref(), Some(heading.as_str()));
     assert!(!dialog.is_heading_use_markup(), "sync dialog heading");
     assert!(!dialog.is_body_use_markup(), "sync dialog body");

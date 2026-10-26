@@ -1897,7 +1897,7 @@ pub(super) fn keeping_a_profile_here_asks_first(dir: &Path) {
     let alert = alert_in(&s.window);
     assert_eq!(
         alert.heading().as_deref(),
-        Some("Keep \"Box\" on This Machine Only?")
+        Some("Keep \u{201c}Box\u{201d} on This Machine Only?")
     );
     assert!(!alert.is_heading_use_markup());
     assert_eq!(
@@ -1980,7 +1980,7 @@ pub(super) fn keeping_a_profile_here_asks_first(dir: &Path) {
     let alert = alert_in(&s.window);
     assert_eq!(
         alert.heading().as_deref(),
-        Some("Sync \"Box\" to Your Other Machines?")
+        Some("Sync \u{201c}Box\u{201d} to Your Other Machines?")
     );
     button_labeled(&alert, "Cancel")
         .expect("the Cancel button")
@@ -2009,7 +2009,7 @@ pub(super) fn syncing_it_again_asks_too(dir: &Path) {
     let alert = alert_in(&s.window);
     assert_eq!(
         alert.heading().as_deref(),
-        Some("Sync \"Box\" to Your Other Machines?")
+        Some("Sync \u{201c}Box\u{201d} to Your Other Machines?")
     );
     assert!(!alert.is_heading_use_markup());
     assert_eq!(
@@ -2155,5 +2155,37 @@ pub(super) fn a_second_flip_waits_for_the_first(dir: &Path) {
         has_focus_in(&s.window, &host) && !has_focus_in(&s.window, &row),
         "the keyboard stays where the person put it"
     );
+    s.close();
+}
+
+/// A question that is open when its profile goes (a sync elsewhere deleted it)
+/// goes with it: its Keep or Sync button would have nothing to act on, and a
+/// question naming a profile that is gone only misleads. Nothing is written.
+pub(super) fn a_question_closes_with_its_profile(dir: &Path) {
+    let p = Profile::new("Box", "box.example.test", "alice");
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    s.ctx.watch_profile_file();
+    s.select(&p.id);
+    let row = s.switch(SYNC_ROW);
+
+    row.set_active(false);
+    let alert = alert_in(&s.window);
+    assert_eq!(
+        alert.heading().as_deref(),
+        Some("Keep \u{201c}Box\u{201d} on This Machine Only?")
+    );
+
+    // Another process (a sync) deletes the profile; nobody calls
+    // `profiles_changed`, the file watch does.
+    s.other_store().delete(&p.id).expect("delete");
+    pump_until("the window to follow the file", || s.shows_empty_state());
+    wait_for_the_alert_to_go(&s);
+    let after_delete = s.file_bytes();
+
+    // Nothing is written back, now or later.
+    pump_for(Duration::from_millis(300));
+    assert_eq!(keyring::pending(), 0, "no save was asked for");
+    assert_eq!(s.file_bytes(), after_delete, "nothing written");
+    assert!(s.on_disk(&p.id).is_none(), "the profile stays deleted");
     s.close();
 }
