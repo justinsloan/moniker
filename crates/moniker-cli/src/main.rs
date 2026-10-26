@@ -113,7 +113,7 @@ enum SyncKeyCommand {
 enum SyncSwitchCommand {
     /// Turn sync on (warns, and asks first when run in a terminal)
     On {
-        /// Do not ask: turn sync on after showing the warning
+        /// Do not ask: turn sync on and print the warning
         #[arg(long)]
         yes: bool,
     },
@@ -299,12 +299,20 @@ fn turn_sync_on(
 }
 
 /// Show the warning on the terminal, then ask. Only `y` or `yes`, in any case,
-/// is a yes. A terminal that cannot be reached is no terminal.
+/// is a yes. The end of the input (Ctrl-D) is a no, like Enter: the person is
+/// there and did not say yes. A terminal that cannot be reached is no terminal.
 fn confirmed(tty: &mut dyn TtyPrompter) -> Result<bool, String> {
     tty.notify(TURN_ON_WARNING)
-        .and_then(|()| tty.ask(TURN_ON_QUESTION, true))
-        .map(|answer| matches!(answer.trim().to_lowercase().as_str(), "y" | "yes"))
-        .map_err(|_| NO_TERMINAL_TO_ASK.to_owned())
+        .map_err(|_| NO_TERMINAL_TO_ASK.to_owned())?;
+    match tty.ask(TURN_ON_QUESTION, true) {
+        Ok(answer) => Ok(matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")),
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+            // Ctrl-D leaves the cursor on the prompt's line: end it.
+            let _ = tty.notify("");
+            Ok(false)
+        }
+        Err(_) => Err(NO_TERMINAL_TO_ASK.to_owned()),
+    }
 }
 
 /// `sync-switch off`: the text to print. Off needs no confirmation: it sends
@@ -1026,6 +1034,29 @@ mod tests {
         let text = turn_sync_on(&path, true, None).unwrap();
         assert_eq!(text, format!("{TURN_ON_WARNING}Sync is on.\n"));
         assert_eq!(switch_at(&path), SyncSwitch::On);
+    }
+
+    #[test]
+    fn end_of_input_at_the_question_is_a_no() {
+        // Ctrl-D at "Turn sync on? [y/N]": the person is there and did not say
+        // yes. That is a decline, not a missing terminal.
+        let (_dir, path) = off_path();
+        let before = std::fs::read(&path).unwrap();
+        let mut tty = ScriptedTty::new(vec![Err(io::Error::from(io::ErrorKind::UnexpectedEof))]);
+        let text = turn_sync_on(&path, false, Some(&mut tty)).unwrap();
+        assert_eq!(text, "Sync stays off.\n");
+        assert_eq!(switch_at(&path), SyncSwitch::Off);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "nothing was written");
+        assert_eq!(
+            tty.asked,
+            vec![("Turn sync on? [y/N] ".to_owned(), true)],
+            "it did ask"
+        );
+        // Ctrl-D leaves the cursor on the prompt's line: the line is ended.
+        assert_eq!(
+            tty.notified,
+            vec![TURN_ON_WARNING.to_owned(), String::new()]
+        );
     }
 
     #[test]
