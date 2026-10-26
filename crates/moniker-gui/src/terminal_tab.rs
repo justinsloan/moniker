@@ -1651,7 +1651,10 @@ fn shell_choice(env_shell: Option<&str>) -> String {
 /// selected in `view`, or at `fallback_scale` if there is none (the first tab of
 /// a window). Closing it, or the shell exiting, closes the tab; the last tab
 /// closing closes the window. With a `transcript` the session is saved like a
-/// connection's (module docs).
+/// connection's (module docs). The application opens its tabs through
+/// [`open_local`] (a window's first tab: `window::build_with`), so this is for
+/// the tests.
+#[cfg(test)]
 pub fn open_local_shell(
     view: &adw::TabView,
     fallback_scale: f64,
@@ -1667,9 +1670,11 @@ pub fn open_local_shell(
 
 /// A new tab for a local terminal as `start` says: the shell, or a command, in
 /// the folder `start.dir`, named `start.title` if it has one (a name given, which
-/// the program's own title never changes, as after a rename). The text size and
-/// the transcript are as for [`open_local_shell`]. Everything is local: nothing
-/// here reaches a profile or a password.
+/// the program's own title never changes, as after a rename). The text size is
+/// that of the tab selected in `view`, or `fallback_scale` if there is none (the
+/// first tab of a window), and the session is saved when a `transcript` is given,
+/// as for a connection. Everything is local: nothing here reaches a profile or
+/// a password.
 pub(crate) fn open_local(
     view: &adw::TabView,
     fallback_scale: f64,

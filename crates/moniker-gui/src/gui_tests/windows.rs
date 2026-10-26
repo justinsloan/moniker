@@ -1095,7 +1095,7 @@ pub(super) fn launch_starts_at_the_saved_size(bin: &Path, dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
     fs::write(&ctx.settings_path, r#"{"font_scale": 1.5}"#).expect("write the settings");
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     pump_for(Duration::from_millis(400));
     let first = window::last_active(&app).expect("the launch window");
     let page = first.view.selected_page().expect("its tab");

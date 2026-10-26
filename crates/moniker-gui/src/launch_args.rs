@@ -18,13 +18,13 @@
 //! into a [`Start`] with the folder chosen (the launching process's directory
 //! and the home folder come from the caller), so everything runs under
 //! `cargo test` without a display.
-
-// `terminal_tab::open_local` uses `Start`, `Run` and `Start::home`; Task 3
-// (`handle_command_line` in `main.rs`) will use `parse`, `start`, `Parsed`,
-// `Request`, `HELP` and `Start::dir_refused`. Until then the binary does not
-// call them (so `Run::Command` is never built outside the tests), and this
-// allow stays.
-#![allow(dead_code)]
+//!
+//! The launching process does all of that itself, first of all ([`local`]): it
+//! prints the usage text, the version or a mistake and exits, without reading
+//! the profile file or starting GTK or touching the bus; or it turns the
+//! request into a [`Start`] and hands that over, as the words [`encode`] makes,
+//! to the application, which gives them to the Moniker that is already running
+//! (GApplication) or opens the window itself. [`decode`] reads them there.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -271,6 +271,157 @@ pub(crate) fn start(request: Request, cwd: Option<&Path>, home: &Path) -> Start 
 /// Whether `path` is a folder, or a link to one.
 fn is_folder(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_dir())
+}
+
+/// What the launching process does with its command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Local {
+    /// Print `text` (to stdout or stderr) and exit with `status`. Nothing is
+    /// opened, and nothing else is touched: no profile file, no GTK, no bus.
+    Print {
+        status: i32,
+        to_stdout: bool,
+        text: String,
+    },
+    /// Open a window: the arguments to give to the application, which hands
+    /// them to the running Moniker if there is one (see [`encode`]).
+    HandOver(Vec<String>),
+}
+
+/// Decides, in the launching process and before anything else starts, what its
+/// command line asks for: the usage text, the version, a one-line mistake (all
+/// printed there, with the exit status the shell sees) or a window, whose
+/// request is made complete here with [`start`] (the launching process's
+/// directory is only known to this process) and put into [`encode`]'s words.
+/// `cwd` and `home` are as for [`start`].
+pub(crate) fn local(args: &[OsString], cwd: Option<&Path>, home: &Path) -> Local {
+    match parse(args) {
+        Ok(Parsed::Help) => Local::Print {
+            status: 0,
+            to_stdout: true,
+            text: HELP.to_owned(),
+        },
+        Ok(Parsed::Version) => Local::Print {
+            status: 0,
+            to_stdout: true,
+            text: format!("moniker {}\n", env!("CARGO_PKG_VERSION")),
+        },
+        Err(why) => Local::Print {
+            status: 2,
+            to_stdout: false,
+            text: format!("moniker: {why}\n"),
+        },
+        Ok(Parsed::Open(request)) => Local::HandOver(encode(&start(request, cwd, home))),
+    }
+}
+
+// The words of the handover. GApplication parses the command line itself
+// before Moniker's handler sees it, and it drops a `--` in some places
+// (`-- htop` arrives as `htop`, `--working-directory=/tmp -- true` as
+// `--working-directory=/tmp true`: the very form `xdg-terminal-exec` sends), so
+// the user's own arguments cannot be what travels. What travels is one word for
+// each field of a [`Start`], every one starting with `--moniker-` and, except
+// the flag, carrying its value after an `=`: a word GLib's parser does not know
+// is kept as it is, and a value attached to its option cannot be read as
+// another argument, whatever it looks like (`--`, `-e`, `--help`, empty). A
+// person cannot type them: [`parse`] refuses every `--moniker-` word, so only
+// [`local`] makes a handover.
+const DIR: &str = "--moniker-dir=";
+const REFUSED: &str = "--moniker-refused=";
+const TITLE: &str = "--moniker-title=";
+const ARG: &str = "--moniker-arg=";
+const HOLD: &str = "--moniker-hold";
+
+/// The arguments that carry a [`Start`] to the Moniker that opens the window,
+/// one for each field, in this order: the folder (`--moniker-dir=`), the folder
+/// that was refused (`--moniker-refused=`), the title (`--moniker-title=`), each
+/// element of a command, in order and exactly (`--moniker-arg=`, an empty one
+/// too), and `--moniker-hold`, only with a command.
+///
+/// A folder that is not valid UTF-8 cannot travel: it is left out, so that the
+/// terminal starts in the home folder ([`decode`]), and named, shown lossily, as
+/// the folder refused (one already named stays the one named). A command with
+/// no program (which [`start`] never makes) is a shell.
+pub(crate) fn encode(start: &Start) -> Vec<String> {
+    let mut words = Vec::new();
+    let dir = start.dir.to_str();
+    if let Some(dir) = dir {
+        words.push(format!("{DIR}{dir}"));
+    }
+    let refused = match (&start.dir_refused, dir) {
+        (Some(refused), _) => Some(refused.as_path()),
+        (None, None) => Some(start.dir.as_path()),
+        (None, Some(_)) => None,
+    };
+    if let Some(refused) = refused {
+        words.push(format!("{REFUSED}{}", refused.to_string_lossy()));
+    }
+    if let Some(title) = &start.title {
+        words.push(format!("{TITLE}{title}"));
+    }
+    if let Run::Command { argv, hold } = &start.run
+        && !argv.is_empty()
+    {
+        words.extend(argv.iter().map(|arg| format!("{ARG}{arg}")));
+        if *hold {
+            words.push(HOLD.to_owned());
+        }
+    }
+    words
+}
+
+/// The inverse of [`encode`], for the Moniker that opens the window. `home` is
+/// the folder when none came (an empty list is a plain window in the home
+/// folder). An empty folder, title or refused folder counts as none, as in
+/// [`parse`]. The fields may come in any order; the command's arguments keep
+/// theirs. Anything else is `unexpected handover: <word>`: a word that is not
+/// one of these, a field twice, or a hold with no command.
+pub(crate) fn decode(args: &[String], home: &Path) -> Result<Start, String> {
+    let unexpected = |word: &str| format!("unexpected handover: {word}");
+    let mut dir: Option<&str> = None;
+    let mut refused: Option<&str> = None;
+    let mut title: Option<&str> = None;
+    let mut argv: Vec<String> = Vec::new();
+    let mut hold = false;
+    for word in args {
+        if let Some(value) = word.strip_prefix(DIR) {
+            if dir.replace(value).is_some() {
+                return Err(unexpected(word));
+            }
+        } else if let Some(value) = word.strip_prefix(REFUSED) {
+            if refused.replace(value).is_some() {
+                return Err(unexpected(word));
+            }
+        } else if let Some(value) = word.strip_prefix(TITLE) {
+            if title.replace(value).is_some() {
+                return Err(unexpected(word));
+            }
+        } else if let Some(value) = word.strip_prefix(ARG) {
+            argv.push(value.to_owned());
+        } else if word == HOLD {
+            if std::mem::replace(&mut hold, true) {
+                return Err(unexpected(word));
+            }
+        } else {
+            return Err(unexpected(word));
+        }
+    }
+    if hold && argv.is_empty() {
+        return Err(unexpected(HOLD));
+    }
+    fn non_empty(value: Option<&str>) -> Option<&str> {
+        value.filter(|value| !value.is_empty())
+    }
+    Ok(Start {
+        dir: non_empty(dir).map_or_else(|| home.to_path_buf(), PathBuf::from),
+        title: non_empty(title).map(str::to_owned),
+        run: if argv.is_empty() {
+            Run::Shell
+        } else {
+            Run::Command { argv, hold }
+        },
+        dir_refused: non_empty(refused).map(PathBuf::from),
+    })
 }
 
 #[cfg(test)]
@@ -806,5 +957,544 @@ mod tests {
         let started = start(open(&["-w", "Ünï code"]), folder.parent(), &home);
         assert_eq!(started.dir, folder);
         assert_eq!(started.dir_refused, None);
+    }
+
+    // ----- handing the request to the running Moniker -----
+
+    const HOME: &str = "/home/u";
+
+    fn round(start: &Start) -> Start {
+        decode(&encode(start), Path::new(HOME)).expect("what encode wrote decodes")
+    }
+
+    fn tokens(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn a_start(dir: &str, run: Run) -> Start {
+        Start {
+            dir: PathBuf::from(dir),
+            title: None,
+            run,
+            dir_refused: None,
+        }
+    }
+
+    /// Arguments that are only data after `--moniker-arg=`, though they look
+    /// like options, option terminators, GLib's own options or shell syntax.
+    const AWKWARD: &[&str] = &[
+        "prog",
+        "--",
+        "-e",
+        "--help",
+        "--help-all",
+        "--help-gapplication",
+        "--gapplication-service",
+        "--version",
+        "-h",
+        "",
+        " ",
+        "a b",
+        "  leading and trailing  ",
+        "$HOME",
+        "it's \"quoted\"",
+        "x; echo INJECTED",
+        "ünï",
+        "=",
+        "--moniker-arg=x",
+        "--moniker-hold",
+        "tab\there",
+        "line\nbreak",
+    ];
+
+    fn awkward_command(hold: bool) -> Run {
+        Run::Command {
+            argv: AWKWARD.iter().map(|a| a.to_string()).collect(),
+            hold,
+        }
+    }
+
+    #[test]
+    fn a_shell_start_round_trips() {
+        let plain = a_start("/home/u/My Files/Ünï", Run::Shell);
+        assert_eq!(round(&plain), plain);
+        assert_eq!(
+            round(&Start::home(Path::new(HOME))),
+            Start::home(Path::new(HOME))
+        );
+        let titled = Start {
+            title: Some("Logs".into()),
+            ..plain.clone()
+        };
+        assert_eq!(round(&titled), titled);
+    }
+
+    #[test]
+    fn a_command_with_awkward_arguments_round_trips_in_order() {
+        for hold in [false, true] {
+            let start = a_start("/tmp", awkward_command(hold));
+            let back = round(&start);
+            assert_eq!(back, start, "hold {hold}");
+            let Run::Command { argv, .. } = back.run else {
+                panic!("a command");
+            };
+            let expected: Vec<String> = AWKWARD.iter().map(|a| a.to_string()).collect();
+            assert_eq!(argv, expected, "every argument, none dropped, in order");
+        }
+        // One argument is a command with no arguments; an empty one stays.
+        for argv in [vec!["htop"], vec![""], vec!["-"], vec!["--", "--"]] {
+            let start = a_start(
+                "/tmp",
+                Run::Command {
+                    argv: argv.iter().map(|a| a.to_string()).collect(),
+                    hold: false,
+                },
+            );
+            assert_eq!(round(&start), start, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_title_that_looks_like_an_option_round_trips() {
+        for title in [
+            "-- x",
+            "-e",
+            "--help",
+            "--moniker-dir=/x",
+            "a=b",
+            " ",
+            "ünï\ttab",
+        ] {
+            let start = Start {
+                title: Some(title.into()),
+                ..a_start("/tmp", awkward_command(true))
+            };
+            assert_eq!(round(&start), start, "{title:?}");
+        }
+    }
+
+    #[test]
+    fn a_refused_folder_round_trips() {
+        let start = Start {
+            dir_refused: Some(PathBuf::from("/home/u/My Files/not a folder")),
+            ..Start::home(Path::new(HOME))
+        };
+        assert_eq!(round(&start), start);
+        // With the other fields too.
+        let start = Start {
+            title: Some("t".into()),
+            dir_refused: Some(PathBuf::from("rel/ünï")),
+            ..a_start(HOME, awkward_command(true))
+        };
+        assert_eq!(round(&start), start);
+    }
+
+    #[test]
+    fn the_tokens_have_the_documented_form_and_order() {
+        let start = Start {
+            dir: PathBuf::from("/home/u"),
+            title: Some("-- x".into()),
+            run: Run::Command {
+                argv: vec!["tail".into(), "-f".into(), "".into(), "a b".into()],
+                hold: true,
+            },
+            dir_refused: Some(PathBuf::from("/nope")),
+        };
+        assert_eq!(
+            encode(&start),
+            tokens(&[
+                "--moniker-dir=/home/u",
+                "--moniker-refused=/nope",
+                "--moniker-title=-- x",
+                "--moniker-arg=tail",
+                "--moniker-arg=-f",
+                "--moniker-arg=",
+                "--moniker-arg=a b",
+                "--moniker-hold",
+            ])
+        );
+        assert_eq!(
+            encode(&Start::home(Path::new(HOME))),
+            tokens(&["--moniker-dir=/home/u"])
+        );
+        // A command with nothing to run is a shell, and a shell has nothing to
+        // hold (`start` never makes one).
+        let held_shell = a_start(
+            "/tmp",
+            Run::Command {
+                argv: Vec::new(),
+                hold: true,
+            },
+        );
+        assert_eq!(encode(&held_shell), tokens(&["--moniker-dir=/tmp"]));
+        assert_eq!(round(&held_shell).run, Run::Shell);
+    }
+
+    #[test]
+    fn every_token_is_one_that_glib_leaves_alone() {
+        // GLib parses the arguments before Moniker sees them: it drops a `--`
+        // in some places and may read an unknown option and the argument after
+        // it as a pair. A token that starts with `--moniker-` and is either
+        // the flag `--moniker-hold` or holds an `=` (so its value is attached)
+        // arrived intact in the builder's probe, and the window suite checks
+        // it against GLib itself; this is the property the handover relies on.
+        let starts = [
+            Start::home(Path::new(HOME)),
+            a_start("/tmp", awkward_command(false)),
+            Start {
+                title: Some("-- x".into()),
+                dir_refused: Some(PathBuf::from("--")),
+                ..a_start("/tmp", awkward_command(true))
+            },
+            Start {
+                title: Some("".into()),
+                ..a_start("--", Run::Shell)
+            },
+        ];
+        for start in &starts {
+            let written = encode(start);
+            assert!(!written.is_empty());
+            for token in written {
+                assert!(token.starts_with("--moniker-"), "{token:?}");
+                assert!(
+                    token == "--moniker-hold" || token.contains('='),
+                    "{token:?} is neither the flag nor attached"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn decode_refuses_what_it_does_not_know() {
+        let home = Path::new(HOME);
+        for token in [
+            "--moniker-frob=1",
+            "--moniker-frob",
+            "--moniker-",
+            "--moniker-dir",
+            "--moniker-holdx",
+            "--moniker-hold=1",
+            "--moniker-command",
+            "--help",
+            "--version",
+            "-e",
+            "--",
+            "-w",
+            "ls",
+            "",
+            "moniker-dir=/tmp",
+        ] {
+            let refused = Err(format!("unexpected handover: {token}"));
+            assert_eq!(
+                decode(&tokens(&["--moniker-dir=/tmp", token]), home),
+                refused,
+                "{token:?}"
+            );
+            // Alone, too.
+            assert_eq!(decode(&tokens(&[token]), home), refused, "{token:?}");
+        }
+    }
+
+    #[test]
+    fn decode_refuses_a_field_given_twice_and_a_hold_without_a_command() {
+        let home = Path::new(HOME);
+        // (the tokens, the one named in the error: the second of the field)
+        for (list, second) in [
+            (
+                &["--moniker-dir=/a", "--moniker-dir=/b"][..],
+                "--moniker-dir=/b",
+            ),
+            (
+                &["--moniker-dir=/a", "--moniker-dir=/a"],
+                "--moniker-dir=/a",
+            ),
+            (
+                &["--moniker-refused=/a", "--moniker-refused=/b"],
+                "--moniker-refused=/b",
+            ),
+            (
+                &["--moniker-title=a", "--moniker-title=b"],
+                "--moniker-title=b",
+            ),
+            (
+                &["--moniker-title=", "--moniker-title="],
+                "--moniker-title=",
+            ),
+            (
+                &["--moniker-arg=x", "--moniker-hold", "--moniker-hold"],
+                "--moniker-hold",
+            ),
+        ] {
+            assert_eq!(
+                decode(&tokens(list), home),
+                Err(format!("unexpected handover: {second}")),
+                "{list:?}"
+            );
+        }
+        // A hold needs a command to hold.
+        assert_eq!(
+            decode(&tokens(&["--moniker-hold"]), home),
+            Err("unexpected handover: --moniker-hold".to_string())
+        );
+        assert_eq!(
+            decode(&tokens(&["--moniker-dir=/tmp", "--moniker-hold"]), home),
+            Err("unexpected handover: --moniker-hold".to_string())
+        );
+        // The argument may stand anywhere: it is still a command.
+        assert!(decode(&tokens(&["--moniker-hold", "--moniker-arg=x"]), home).is_ok());
+    }
+
+    #[test]
+    fn no_arguments_decode_to_the_home_start() {
+        let home = Path::new(HOME);
+        assert_eq!(decode(&[], home), Ok(Start::home(home)));
+        // An empty value is no value: the home folder, no title, nothing
+        // refused (`start` never makes one).
+        assert_eq!(
+            decode(
+                &tokens(&["--moniker-dir=", "--moniker-title=", "--moniker-refused="]),
+                home
+            ),
+            Ok(Start::home(home))
+        );
+        // With no folder given it is the home folder, whatever else is said.
+        assert_eq!(
+            decode(&tokens(&["--moniker-title=T"]), home),
+            Ok(Start {
+                title: Some("T".into()),
+                ..Start::home(home)
+            })
+        );
+    }
+
+    #[test]
+    fn the_fields_may_come_in_any_order_and_the_arguments_keep_theirs() {
+        let home = Path::new(HOME);
+        let got = decode(
+            &tokens(&[
+                "--moniker-hold",
+                "--moniker-arg=c",
+                "--moniker-title=T",
+                "--moniker-arg=a",
+                "--moniker-dir=/tmp",
+                "--moniker-arg=b",
+                "--moniker-refused=/x",
+            ]),
+            home,
+        )
+        .expect("decodes");
+        assert_eq!(
+            got,
+            Start {
+                dir: PathBuf::from("/tmp"),
+                title: Some("T".into()),
+                run: Run::Command {
+                    argv: vec!["c".into(), "a".into(), "b".into()],
+                    hold: true
+                },
+                dir_refused: Some(PathBuf::from("/x")),
+            }
+        );
+    }
+
+    #[test]
+    fn a_folder_that_is_not_utf8_starts_at_home_and_is_named() {
+        let odd = PathBuf::from(OsString::from_vec(b"/tmp/b\xffd".to_vec()));
+        let start = Start {
+            dir: odd.clone(),
+            ..a_start("/tmp", Run::Shell)
+        };
+        let written = encode(&start);
+        assert_eq!(
+            written,
+            tokens(&["--moniker-refused=/tmp/b\u{fffd}d"]),
+            "no folder is handed over, and the notification can name it"
+        );
+        let back = decode(&written, Path::new(HOME)).expect("decodes");
+        assert_eq!(back.dir, Path::new(HOME));
+        assert_eq!(back.dir_refused, Some(PathBuf::from("/tmp/b\u{fffd}d")));
+        assert_eq!(back.run, Run::Shell);
+
+        // A refused path that is not UTF-8 is shown the same way, and it
+        // stays the one named when the folder is odd as well.
+        let both = Start {
+            dir: odd,
+            dir_refused: Some(PathBuf::from(OsString::from_vec(b"/x/\xfe".to_vec()))),
+            ..start
+        };
+        assert_eq!(encode(&both), tokens(&["--moniker-refused=/x/\u{fffd}"]));
+        let just_refused = Start {
+            dir_refused: both.dir_refused.clone(),
+            ..a_start("/tmp", Run::Shell)
+        };
+        assert_eq!(
+            encode(&just_refused),
+            tokens(&["--moniker-dir=/tmp", "--moniker-refused=/x/\u{fffd}"])
+        );
+    }
+
+    #[test]
+    fn local_prints_the_help_the_version_and_mistakes() {
+        let home = Path::new(HOME);
+        let said = |list: &[&str]| local(&args(list), None, home);
+        assert_eq!(
+            said(&["--help"]),
+            Local::Print {
+                status: 0,
+                to_stdout: true,
+                text: HELP.to_string()
+            }
+        );
+        assert_eq!(
+            said(&["--version"]),
+            Local::Print {
+                status: 0,
+                to_stdout: true,
+                text: format!("moniker {}\n", env!("CARGO_PKG_VERSION"))
+            }
+        );
+        assert_eq!(
+            said(&["--frob"]),
+            Local::Print {
+                status: 2,
+                to_stdout: false,
+                text: "moniker: unknown option: --frob\n".to_string()
+            }
+        );
+        assert_eq!(
+            said(&["-e"]),
+            Local::Print {
+                status: 2,
+                to_stdout: false,
+                text: "moniker: -e needs a command to run\n".to_string()
+            }
+        );
+        let bad = OsString::from_vec(vec![b'a', 0xff]);
+        assert_eq!(
+            local(&[OsString::from("--"), bad], None, home),
+            Local::Print {
+                status: 2,
+                to_stdout: false,
+                text: "moniker: arguments must be valid UTF-8\n".to_string()
+            }
+        );
+        // The version is the package's, which is a version number.
+        let Local::Print { text, .. } = said(&["--version"]) else {
+            panic!("printed");
+        };
+        assert!(text.starts_with("moniker 0."), "{text:?}");
+    }
+
+    #[test]
+    fn local_opens_a_window_by_handing_the_request_over() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("My Files").join("Ünï");
+        std::fs::create_dir_all(&folder).unwrap();
+        let text = folder.to_str().unwrap();
+        let home = tmp.path().join("home");
+
+        let handed = |list: &[&str], cwd: Option<&Path>| match local(&args(list), cwd, &home) {
+            Local::HandOver(tokens) => tokens,
+            other => panic!("{list:?} should open a window, got {other:?}"),
+        };
+        // What the desktop sends: a folder, then `--` and the command.
+        let got = handed(
+            &[
+                &format!("--working-directory={text}"),
+                "--title=Logs",
+                "--hold",
+                "--",
+                "tail",
+                "-f",
+                "x y",
+            ],
+            None,
+        );
+        assert_eq!(
+            got,
+            vec![
+                format!("--moniker-dir={text}"),
+                "--moniker-title=Logs".to_string(),
+                "--moniker-arg=tail".to_string(),
+                "--moniker-arg=-f".to_string(),
+                "--moniker-arg=x y".to_string(),
+                "--moniker-hold".to_string(),
+            ]
+        );
+        // The launching directory is resolved here, in the launching process.
+        assert_eq!(
+            handed(&[], Some(&folder)),
+            vec![format!("--moniker-dir={text}")]
+        );
+        assert_eq!(
+            handed(&["-w", "Ünï"], folder.parent()),
+            vec![format!("--moniker-dir={text}")]
+        );
+        // `/` and an unknown directory give the home folder.
+        let at_home = vec![format!("--moniker-dir={}", home.display())];
+        assert_eq!(handed(&[], Some(Path::new("/"))), at_home);
+        assert_eq!(handed(&[], None), at_home);
+        // A folder that is not one is named, and the terminal starts at home.
+        let missing = tmp.path().join("missing");
+        assert_eq!(
+            handed(&["-w", missing.to_str().unwrap()], None),
+            vec![
+                format!("--moniker-dir={}", home.display()),
+                format!("--moniker-refused={}", missing.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn what_local_hands_over_decodes_to_what_start_chooses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("a b");
+        std::fs::create_dir_all(&folder).unwrap();
+        let home = tmp.path().join("home");
+        let text = folder.to_str().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "x").unwrap();
+        for list in [
+            vec![],
+            vec!["--hold"],
+            vec!["-w", text],
+            vec!["-w", file.to_str().unwrap(), "-T", "t"],
+            vec!["-T", "-- x", "-e", "sh", "-c", "echo $HOME; exit 3"],
+            vec!["--", "--", "-e", "--help", ""],
+            vec!["--hold", "-w", text, "--", "ls"],
+        ] {
+            let parsed = open(&list);
+            let Local::HandOver(handed) = local(&args(&list), Some(&folder), &home) else {
+                panic!("{list:?}");
+            };
+            assert_eq!(
+                decode(&handed, &home),
+                Ok(start(parsed, Some(&folder), &home)),
+                "{list:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_person_cannot_type_the_handover() {
+        // Only `local` makes these tokens: the same words typed as options are
+        // mistakes, so a window can be asked for only through the options.
+        let home = Path::new(HOME);
+        for token in [
+            "--moniker-dir=/tmp",
+            "--moniker-arg=x",
+            "--moniker-hold",
+            "--moniker-title=t",
+        ] {
+            assert_eq!(
+                local(&args(&[token]), None, home),
+                Local::Print {
+                    status: 2,
+                    to_stdout: false,
+                    text: format!("moniker: unknown option: {token}\n")
+                },
+                "{token}"
+            );
+        }
     }
 }

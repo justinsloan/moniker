@@ -400,7 +400,7 @@ pub(super) fn the_launch_tab_saves_when_save_all_is_on(dir: &Path) {
     let app = test_app();
 
     // The launch.
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     pump_for(Duration::from_millis(400));
     let launched = window::last_active(&app).expect("the launch window");
     let page = launched.view.selected_page().expect("its tab");

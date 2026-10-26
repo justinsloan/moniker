@@ -266,6 +266,16 @@ fn fake_ssh(dir: &Path, name: &str, tail: &str) -> String {
     path.to_str().expect("utf-8 temp path").to_owned()
 }
 
+/// The launch as a Moniker started with no arguments does it: the first window
+/// a shell in the home folder, then the automatic sync.
+fn launch_at_home(app: &adw::Application, ctx: &Rc<AppContext>) {
+    crate::launch(
+        app,
+        ctx,
+        &crate::launch_args::Start::home(&glib::home_dir()),
+    );
+}
+
 /// Write an executable stand-in for a login shell that runs `body`.
 fn fake_shell(dir: &Path, name: &str, body: &str) -> String {
     let path = dir.join(name);
@@ -431,6 +441,12 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #15, the command line, also when Moniker is already running.
+    main_window::glib_leaves_the_handed_over_arguments_alone(&tmp.path().join("c-glib"));
+    main_window::the_command_line_opens_a_window_where_asked(&bin, &tmp.path().join("c-where"));
+    main_window::a_launch_while_a_dialog_is_open_still_opens(&tmp.path().join("c-dialog-open"));
+    main_window::a_launch_as_the_last_window_closes_still_opens(&tmp.path().join("c-last"));
+    sync::a_command_line_launches_once_and_then_opens_windows(&tmp.path().join("c-once"));
     // Issue #15, a local tab that starts in a folder or runs a command.
     tabs::a_local_tab_starts_in_its_folder(&bin, &tmp.path().join("l-folder"));
     tabs::a_command_tab_closes_on_success_and_keeps_failures(&bin, &tmp.path().join("l-command"));

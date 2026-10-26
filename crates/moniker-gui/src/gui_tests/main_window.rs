@@ -6,7 +6,8 @@
 //! they were asked to do, so nothing connects anywhere. Where a session really
 //! starts, it is a fake `ssh`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -15,23 +16,27 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::glib::translate::IntoGlib;
-use gtk::{gdk, gio};
+use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::profile::{Profile, StartupSequence};
 use moniker_core::secrets::{MemorySecretStore, SecretStore};
 use moniker_core::store::ProfileStore;
+use vte4::Terminal;
+use vte4::prelude::*;
 
+use super::windows::main_window;
 use super::{
-    MARKUP_NAME, all_widgets, button_labeled, fake_ssh, files_in, find_widget, fixture, labels_in,
-    make_helper, pane, pump_for, pump_until, wait_for_text,
+    MARKUP_NAME, all_widgets, button_labeled, fake_shell, fake_ssh, files_in, find_widget, fixture,
+    labels_in, make_helper, pane, pump_for, pump_until, shown, wait_for_text,
 };
 use crate::connect_menu::{self, RECORD_LABEL};
 use crate::context::AppContext;
+use crate::launch_args::{Run, Start, decode, encode};
 use crate::terminal_tab::{
     launch, new_holder_page, rename_page, start_command, tab_title, terminal_of,
 };
-use crate::{ABOUT_COPYRIGHT, REPOSITORY_URL, profiles, window};
+use crate::{ABOUT_COPYRIGHT, REPOSITORY_URL, preferences, profiles, window};
 
 fn sequence(name: &str) -> StartupSequence {
     StartupSequence {
@@ -704,4 +709,316 @@ pub(super) fn wording_uses_transcripts_and_connection_profiles(dir: &Path) {
     }
     window.close();
     pump_for(Duration::from_millis(200));
+}
+
+// ----- Issue #15: the command line -----
+
+/// The real path of `dir`, as a shell's `pwd -P` prints it.
+fn canonical(dir: &Path) -> String {
+    fs::canonicalize(dir)
+        .expect("an existing directory")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// How many main windows `app` has.
+fn main_windows(app: &adw::Application) -> usize {
+    app.windows()
+        .iter()
+        .filter(|w| w.widget_name() == "moniker-main")
+        .count()
+}
+
+/// A shell in `dir`, nothing else asked for.
+fn shell_in(dir: &Path) -> Start {
+    Start {
+        dir: dir.to_path_buf(),
+        title: None,
+        run: Run::Shell,
+        dir_refused: None,
+    }
+}
+
+/// What the application's `command-line` handler does, in a Moniker that is
+/// already running (`launched`), when a launch asked for `start`: the launching
+/// process hands over `encode(start)` and Moniker decodes it.
+fn handle(
+    app: &adw::Application,
+    ctx: &Rc<AppContext>,
+    launched: &Cell<bool>,
+    start: &Start,
+) -> (i32, Option<String>) {
+    crate::handle_command_line(app, ctx, launched, &encode(start))
+}
+
+/// The shell in `terminal` is in the folder `real` (its real path): ask it.
+fn assert_shell_is_in(terminal: &Terminal, real: &str) {
+    wait_for_text(terminal, "$");
+    terminal.feed_child(b"echo SHELL-IN:$(pwd -P)\n");
+    wait_for_text(terminal, &format!("SHELL-IN:{real}"));
+}
+
+/// The terminal of the tab `main` opened with.
+fn first_terminal(main: &window::MainWindow) -> Terminal {
+    assert_eq!(main.view.n_pages(), 1, "one tab");
+    terminal_of(&main.view.selected_page().expect("a tab")).expect("a local terminal")
+}
+
+/// Handing a command line to a running Moniker opens a new window where it
+/// says: a shell in a folder with a space and a non-ASCII name (what Files
+/// sends), a command with its arguments as they are and a title that stays, a
+/// folder that is not one (home, and the window says so in plain text). A
+/// mistake in what was handed over says so for the launcher's stderr and opens
+/// nothing.
+pub(super) fn the_command_line_opens_a_window_where_asked(bin: &Path, dir: &Path) {
+    let folder = dir.join("My Files").join("Ünï");
+    fs::create_dir_all(&folder).expect("the folder");
+    let there = canonical(&folder);
+    let home = canonical(&glib::home_dir());
+    assert_ne!(there, home);
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let launched = Cell::new(true);
+    let first = main_window(&app, &ctx);
+    assert_eq!(main_windows(&app), 1);
+    let delivered = ctx.notice.delivered();
+
+    // A folder: one more window, its shell there.
+    assert_eq!(handle(&app, &ctx, &launched, &shell_in(&folder)), (0, None));
+    assert_eq!(main_windows(&app), 2, "one more window");
+    let second = window::last_active(&app).expect("the new window");
+    assert_ne!(second.window, first.window);
+    assert!(second.window.is_visible());
+    assert_shell_is_in(&first_terminal(&second), &there);
+    assert!(launched.get(), "still running");
+
+    // A command: its arguments reach it as they are, in that folder, and the
+    // title given stays.
+    let args = fake_shell(
+        bin,
+        "handed-over",
+        "for a in \"$@\"; do printf 'ARG:%s\\n' \"$a\"; done\n\
+         printf 'PWD:%s\\n' \"$(pwd -P)\"\n\
+         exec sleep 600",
+    );
+    let tricky = ["a b", "$HOME", "-e", "--", "--help", "x; echo INJECTED", ""];
+    let mut argv = vec![args];
+    argv.extend(tricky.iter().map(|a| a.to_string()));
+    let command = Start {
+        title: Some("A fixed name".into()),
+        run: Run::Command { argv, hold: false },
+        ..shell_in(&folder)
+    };
+    assert_eq!(handle(&app, &ctx, &launched, &command), (0, None));
+    assert_eq!(main_windows(&app), 3);
+    let third = window::last_active(&app).expect("the new window");
+    let terminal = first_terminal(&third);
+    wait_for_text(&terminal, &format!("PWD:{there}"));
+    let lines = shown(&terminal);
+    let printed: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("ARG:"))
+        .collect();
+    assert_eq!(printed, tricky, "the arguments, one by one");
+    assert!(!lines.iter().any(|l| l == "INJECTED"), "nothing ran twice");
+    assert_eq!(
+        third.view.selected_page().expect("a tab").title(),
+        "A fixed name"
+    );
+
+    // A mistake in what was handed over: one line for the launcher's stderr,
+    // status 2, and no window.
+    for (words, text) in [
+        (
+            vec!["--moniker-frob=1"],
+            "moniker: unexpected handover: --moniker-frob=1\n",
+        ),
+        (
+            vec!["--moniker-dir=/tmp", "--moniker-dir=/var"],
+            "moniker: unexpected handover: --moniker-dir=/var\n",
+        ),
+        (
+            vec!["--moniker-hold"],
+            "moniker: unexpected handover: --moniker-hold\n",
+        ),
+        (vec!["--", "ls"], "moniker: unexpected handover: --\n"),
+        (vec!["--help"], "moniker: unexpected handover: --help\n"),
+    ] {
+        let words: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+        assert_eq!(
+            crate::handle_command_line(&app, &ctx, &launched, &words),
+            (2, Some(text.to_owned())),
+            "{words:?}"
+        );
+    }
+    pump_for(Duration::from_millis(300));
+    assert_eq!(main_windows(&app), 3, "a mistake opens no window");
+
+    // A folder that is not one: the shell starts in home, and the window says
+    // so, as plain text, in its own notification area.
+    let file = dir.join("<b>x<b> &amp; a file");
+    fs::write(&file, "x").expect("a file");
+    let refused = Start {
+        dir_refused: Some(file.clone()),
+        ..shell_in(&glib::home_dir())
+    };
+    assert_eq!(handle(&app, &ctx, &launched, &refused), (0, None));
+    let fourth = window::last_active(&app).expect("the new window");
+    assert_eq!(main_windows(&app), 4);
+    assert_shell_is_in(&first_terminal(&fourth), &home);
+    let text = format!(
+        "Could not open {}: it is not a folder. The terminal started in your home folder.",
+        file.display()
+    );
+    assert_eq!(ctx.notice.last_text().as_deref(), Some(text.as_str()));
+    assert_eq!(ctx.notice.last_area().as_ref(), Some(&fourth.notifications));
+    assert_eq!(fourth.notifications.shown_text().as_deref(), Some(&*text));
+    assert!(
+        !fourth.notifications.label().uses_markup(),
+        "the notification is plain text"
+    );
+    assert_eq!(
+        ctx.notice.delivered(),
+        delivered + 1,
+        "the other windows said nothing"
+    );
+
+    for main in [first, second, third, fourth] {
+        main.window.destroy();
+    }
+    pump_for(Duration::from_millis(200));
+}
+
+/// A launch while a dialog is open in the running Moniker (Preferences, say)
+/// still opens its window, which is presented and active; the dialog stays on
+/// its own window.
+pub(super) fn a_launch_while_a_dialog_is_open_still_opens(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let launched = Cell::new(true);
+    let a = main_window(&app, &ctx);
+    a.window.present();
+    pump_until("the first window to be active", || a.window.is_active());
+    let dialog = preferences::present(&a.window, &app, &ctx);
+    pump_until("the Preferences dialog", || {
+        a.window.visible_dialog().as_ref() == Some(dialog.upcast_ref())
+    });
+
+    assert_eq!(
+        crate::handle_command_line(&app, &ctx, &launched, &[]),
+        (0, None)
+    );
+    assert_eq!(main_windows(&app), 2);
+    let b = window::last_active(&app).expect("the new window");
+    assert_ne!(b.window, a.window);
+    pump_until("the new window to be active", || b.window.is_active());
+    assert!(b.window.is_visible());
+    assert!(!a.window.is_active(), "the focus moved to the new window");
+    assert!(b.window.visible_dialog().is_none(), "no dialog over it");
+    assert_eq!(
+        a.window.visible_dialog().as_ref(),
+        Some(dialog.upcast_ref()),
+        "the dialog stays with its own window"
+    );
+    assert!(terminal_of(&b.view.selected_page().expect("a tab")).is_some());
+
+    dialog.force_close();
+    pump_until("the dialog to close", || {
+        a.window.visible_dialog().is_none()
+    });
+    for main in [a, b] {
+        main.window.destroy();
+    }
+    pump_for(Duration::from_millis(200));
+}
+
+/// A launch as the last window closes still opens a window: the handler opens
+/// it before it returns, so the request is not lost with the window that went.
+pub(super) fn a_launch_as_the_last_window_closes_still_opens(dir: &Path) {
+    let folder = dir.join("My Files").join("Ünï");
+    fs::create_dir_all(&folder).expect("the folder");
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    // As the running application does: the side windows go with the last main
+    // window.
+    window::close_side_windows_with_last_main_window(&app);
+    let launched = Cell::new(true);
+    let only = main_window(&app, &ctx);
+    assert_eq!(main_windows(&app), 1);
+
+    // In one turn of the main loop: the person closes the window, and the
+    // command line arrives.
+    only.window.close();
+    assert_eq!(main_windows(&app), 0, "the last window went");
+    assert_eq!(handle(&app, &ctx, &launched, &shell_in(&folder)), (0, None));
+    assert_eq!(main_windows(&app), 1, "and one is open at once");
+    pump_for(Duration::from_millis(300));
+    assert_eq!(main_windows(&app), 1);
+    let made = window::last_active(&app).expect("the new window");
+    assert_ne!(made.window, only.window);
+    assert!(made.window.is_visible());
+    assert_shell_is_in(&first_terminal(&made), &canonical(&folder));
+
+    made.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// GLib parses the arguments of an application before the application's
+/// handler sees them, and the handover depends on it leaving `encode`'s words
+/// alone: a command with `--`, `-e`, `--help`, GLib's own `--help-all` and
+/// `--gapplication-service`, `-h` and an empty argument, a title with `-- x`,
+/// a folder with spaces and non-ASCII letters, a refused folder. Run against
+/// GLib itself with the flags the application has.
+pub(super) fn glib_leaves_the_handed_over_arguments_alone(dir: &Path) {
+    let folder = dir.join("My Files").join("Ünï");
+    let awkward = [
+        "prog",
+        "--",
+        "-e",
+        "--help",
+        "--help-all",
+        "--help-gapplication",
+        "--gapplication-service",
+        "--version",
+        "-h",
+        "",
+        "a b",
+        "ünï",
+        "--moniker-arg=x",
+    ];
+    let start = Start {
+        title: Some("-- x".into()),
+        run: Run::Command {
+            argv: awkward.iter().map(|a| a.to_string()).collect(),
+            hold: true,
+        },
+        dir_refused: Some(dir.join("not a folder")),
+        ..shell_in(&folder)
+    };
+    let sent = encode(&start);
+    let mut argv = vec!["moniker".to_owned()];
+    argv.extend(sent.iter().cloned());
+
+    let seen: Rc<RefCell<Option<Vec<OsString>>>> = Rc::default();
+    let app = gio::Application::new(
+        Some("org.moniker.GuiTest.Handover"),
+        gio::ApplicationFlags::HANDLES_COMMAND_LINE | gio::ApplicationFlags::NON_UNIQUE,
+    );
+    app.connect_command_line({
+        let seen = Rc::clone(&seen);
+        move |_, cmdline| {
+            *seen.borrow_mut() = Some(cmdline.arguments());
+            glib::ExitCode::SUCCESS
+        }
+    });
+    assert_eq!(app.run_with_args(&argv), glib::ExitCode::SUCCESS);
+
+    let seen = seen.take().expect("the command-line handler ran");
+    assert_eq!(seen[0], "moniker");
+    let words: Vec<String> = seen[1..]
+        .iter()
+        .map(|w| w.to_str().expect("UTF-8 words").to_owned())
+        .collect();
+    assert_eq!(words, sent, "GLib changed the words");
+    assert_eq!(decode(&words, &glib::home_dir()), Ok(start));
 }

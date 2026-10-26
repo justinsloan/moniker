@@ -7,6 +7,12 @@
 //! ([`SHORTCUTS`]), which are the accelerators of those and of the main
 //! window's tab, clipboard and text size actions.
 //!
+//! It reads the command line too ([`launch_args`], [`handle_command_line`]): the
+//! launching process answers `--help`, `--version` and a mistake itself, and for
+//! a window hands a [`launch_args::Start`] to the application, which gives it to
+//! the Moniker already running (GApplication, `HANDLES_COMMAND_LINE`) or opens
+//! the window itself; every launch opens a new window.
+//!
 //! It also starts the automatic sync on launch ([`launch`]). Sync Now and the
 //! sync on launch both sync with the partner recorded in the GUI settings
 //! ([`settings`]) by the first successful sync from the sync page; until then
@@ -38,6 +44,8 @@ mod window_size;
 mod zoom;
 
 use std::cell::Cell;
+use std::ffi::OsString;
+use std::io::Write;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -46,6 +54,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 
 use crate::context::AppContext;
+use crate::launch_args::{Local, Start};
 use crate::sync::SyncEvent;
 use moniker_core::sync::StaleSync;
 
@@ -149,6 +158,22 @@ pub(crate) const SHORTCUTS: &[(&str, &[Shortcut])] = &[
 ];
 
 fn main() -> glib::ExitCode {
+    // What the command line asks for is decided first, before the profile file
+    // is read or anything of GTK or the bus is started (see `launch_args`), so
+    // `moniker --help` and a mistake in the options need none of them.
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let cwd = std::env::current_dir().ok();
+    let words = match launch_args::local(&args, cwd.as_deref(), &glib::home_dir()) {
+        Local::Print {
+            status,
+            to_stdout,
+            text,
+        } => {
+            print_text(to_stdout, &text);
+            return glib::ExitCode::from(exit_status(status));
+        }
+        Local::HandOver(words) => words,
+    };
     // A window running on a broken store would be worse than no window.
     let ctx = match AppContext::new() {
         Ok(ctx) => Rc::new(ctx),
@@ -159,7 +184,14 @@ fn main() -> glib::ExitCode {
     };
     // Live updates: every window that shows profiles follows the file.
     ctx.watch_profile_file();
-    let app = adw::Application::builder().application_id(APP_ID).build();
+    // HANDLES_COMMAND_LINE: the window a launch asks for is opened by the
+    // `command-line` handler, in this process if it is the first Moniker and in
+    // the running one otherwise (GApplication hands the line over the session
+    // bus and gives back the status and the text printed there).
+    let app = adw::Application::builder()
+        .application_id(APP_ID)
+        .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
     app.connect_startup(glib::clone!(
         #[strong]
         ctx,
@@ -169,17 +201,73 @@ fn main() -> glib::ExitCode {
             window::close_side_windows_with_last_main_window(app);
         }
     ));
-    // The first activation is the launch; a later one (`moniker` started
-    // again while this one runs) only opens another window.
-    let launched = Cell::new(false);
+    // The first command line (or activation) is the launch; a later one, while
+    // this one runs, only opens another window.
+    let launched = Rc::new(Cell::new(false));
+    app.connect_command_line(glib::clone!(
+        #[strong]
+        ctx,
+        #[strong]
+        launched,
+        move |app, cmdline| {
+            // Not `cmdline.environ()` or `cmdline.cwd()`: the folder was chosen
+            // in the launching process, and its environment is not wanted here.
+            let (status, stderr) = match handed_over_words(&cmdline.arguments()) {
+                Ok(words) => handle_command_line(app, &ctx, &launched, &words),
+                Err(why) => (2, Some(format!("moniker: {why}\n"))),
+            };
+            if let Some(text) = stderr {
+                cmdline.printerr_literal(&text);
+            }
+            glib::ExitCode::from(exit_status(status))
+        }
+    ));
+    // An activation with no command line (`gapplication launch`, a D-Bus
+    // activation): a window in the home folder, the first one as the launch.
     app.connect_activate(move |app| {
+        let start = Start::home(&glib::home_dir());
         if launched.replace(true) {
-            window::new_window(app, &ctx);
+            window::new_window_with(app, &ctx, &start);
         } else {
-            launch(app, &ctx);
+            launch(app, &ctx, &start);
         }
     });
-    app.run()
+    let mut argv = vec!["moniker".to_owned()];
+    argv.extend(words);
+    app.run_with_args(&argv)
+}
+
+/// Write `text` to stdout or stderr. A reader that has gone (`moniker --help |
+/// head -1`) is no reason to panic, so a failed write is dropped.
+fn print_text(to_stdout: bool, text: &str) {
+    let written = if to_stdout {
+        let mut out = std::io::stdout().lock();
+        out.write_all(text.as_bytes()).and_then(|()| out.flush())
+    } else {
+        let mut err = std::io::stderr().lock();
+        err.write_all(text.as_bytes()).and_then(|()| err.flush())
+    };
+    drop(written);
+}
+
+/// An exit status as the byte a process exits with.
+fn exit_status(status: i32) -> u8 {
+    u8::try_from(status).unwrap_or(1)
+}
+
+/// The words a command line handed over, after the program's name, as text.
+/// The launching process hands over only text, so a word that is not valid
+/// UTF-8 is a mistake in what was handed over.
+fn handed_over_words(arguments: &[OsString]) -> Result<Vec<String>, String> {
+    arguments
+        .iter()
+        .skip(1)
+        .map(|word| {
+            word.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("unexpected handover: {} (not valid UTF-8)", word.display()))
+        })
+        .collect()
 }
 
 /// Give the actions in [`SHORTCUTS`] their accelerators.
@@ -392,12 +480,42 @@ fn sync_now_with(app: &adw::Application, ctx: &Rc<AppContext>, stale: StaleSync)
     }
 }
 
+/// A command line reached this Moniker (its own, when it is the first, or one
+/// handed over by another process): `args` are the words
+/// [`launch_args::encode`] made. The first one is the launch, which opens the
+/// first window and runs the automatic sync; every later one opens a window and
+/// nothing else. Returns the exit status of the command line and what to print
+/// on the launching process's stderr, if anything. A mistake in what was handed
+/// over opens no window and is no launch.
+///
+/// The window is opened here, before this returns, so the line is not lost with
+/// a window that closed a moment ago; it is presented, so it has the focus (a
+/// dialog stays with the window it is over).
+pub(crate) fn handle_command_line(
+    app: &adw::Application,
+    ctx: &Rc<AppContext>,
+    launched: &Cell<bool>,
+    args: &[String],
+) -> (i32, Option<String>) {
+    let start = match launch_args::decode(args, &glib::home_dir()) {
+        Ok(start) => start,
+        Err(why) => return (2, Some(format!("moniker: {why}\n"))),
+    };
+    if launched.replace(true) {
+        window::new_window_with(app, ctx, &start);
+    } else {
+        launch(app, ctx, &start);
+    }
+    (0, None)
+}
+
 /// The launch: the terminal font and scrollback of the Preferences, the first
-/// window, and once it is shown (from an idle callback, so the window and its
-/// terminal come first), the automatic sync.
-pub(crate) fn launch(app: &adw::Application, ctx: &Rc<AppContext>) {
+/// window (a shell in the home folder, or what `start` says), and once it is
+/// shown (from an idle callback, so the window and its terminal come first), the
+/// automatic sync.
+pub(crate) fn launch(app: &adw::Application, ctx: &Rc<AppContext>, start: &Start) {
     terminal_tab::use_preferences(&ctx.settings());
-    window::new_window(app, ctx);
+    window::new_window_with(app, ctx, start);
     let ctx = Rc::clone(ctx);
     glib::idle_add_local_once(move || sync_on_launch(&ctx));
 }
@@ -486,5 +604,36 @@ mod tests {
     #[test]
     fn the_about_box_links_the_repository() {
         assert_eq!(REPOSITORY_URL, "https://github.com/justinsloan/moniker");
+    }
+
+    #[test]
+    fn a_handover_is_the_words_after_the_program_name() {
+        use std::os::unix::ffi::OsStringExt;
+        let line = |words: &[&str]| -> Vec<OsString> { words.iter().map(OsString::from).collect() };
+        assert_eq!(
+            handed_over_words(&line(&["moniker", "--moniker-dir=/tmp", "--moniker-hold"])),
+            Ok(vec![
+                "--moniker-dir=/tmp".to_owned(),
+                "--moniker-hold".to_owned()
+            ])
+        );
+        assert_eq!(handed_over_words(&line(&["moniker"])), Ok(Vec::new()));
+        assert_eq!(handed_over_words(&[]), Ok(Vec::new()));
+        // Only text is handed over: anything else is a mistake that names it.
+        let bad = OsString::from_vec(vec![b'a', 0xff, b'b']);
+        assert_eq!(
+            handed_over_words(&[OsString::from("moniker"), bad]),
+            Err("unexpected handover: a\u{fffd}b (not valid UTF-8)".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_exit_status_is_a_byte() {
+        assert_eq!(exit_status(0), 0);
+        assert_eq!(exit_status(2), 2);
+        assert_eq!(exit_status(255), 255);
+        // Out of range is a failure, not a different status that happens to fit.
+        assert_eq!(exit_status(256), 1);
+        assert_eq!(exit_status(-1), 1);
     }
 }

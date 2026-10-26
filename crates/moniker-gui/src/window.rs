@@ -60,6 +60,7 @@ use libadwaita as adw;
 use moniker_core::profile::Profile;
 
 use crate::context::AppContext;
+use crate::launch_args::Start;
 use crate::notify::NotificationArea;
 use crate::window_size::{self, Kind};
 use crate::{new_tab, panes, profiles, recordings, settings, terminal_tab, zoom};
@@ -107,25 +108,53 @@ impl MainWindow {
     }
 }
 
-/// Build a main window with one local tab. The caller presents it. The tab
-/// saves its transcript when "Save transcripts of all sessions" is on: that
-/// covers the tab a window opens with, at launch and for New Window too, and is
-/// decided here, before the shell starts.
+/// Build a main window with one local tab: a shell in the home folder. The
+/// caller presents it. See [`build_with`].
 pub fn build(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
+    build_with(app, ctx, &Start::home(&glib::home_dir()))
+}
+
+/// Build a main window whose one local tab is as `start` says (the command
+/// line, [`crate::launch_args`]): the shell or a command, in a folder, with a
+/// name given or not. The caller presents it. The tab saves its transcript when
+/// "Save transcripts of all sessions" is on: that covers the tab a window opens
+/// with, at launch and for New Window too, and is decided here, before the shell
+/// starts. A folder asked for that was not a folder is said so in the window's
+/// own notification area (plain text); the terminal started in the home folder.
+pub fn build_with(app: &adw::Application, ctx: &Rc<AppContext>, start: &Start) -> MainWindow {
     let main = build_empty(app, ctx);
     let settings = ctx.settings();
     let save = terminal_tab::default_save(false, settings.save_all_transcripts);
-    terminal_tab::open_local_shell(
+    terminal_tab::open_local(
         &main.view,
         settings.font_scale,
+        start,
         terminal_tab::local_transcript_spec(ctx, save),
     );
+    if let Some(refused) = &start.dir_refused {
+        ctx.notice.show_near(
+            &main.notifications,
+            &format!(
+                "Could not open {}: it is not a folder. The terminal started in your home folder.",
+                refused.display()
+            ),
+        );
+    }
     main
 }
 
 /// Open another main window with one local tab (☰ → New Window).
 pub fn new_window(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
     let main = build(app, ctx);
+    main.window.present();
+    main
+}
+
+/// Open another main window whose one tab is as `start` says, presented (and
+/// so, as any window shown by a launch, given the focus; the windows already
+/// open keep their dialogs).
+pub fn new_window_with(app: &adw::Application, ctx: &Rc<AppContext>, start: &Start) -> MainWindow {
+    let main = build_with(app, ctx, start);
     main.window.present();
     main
 }

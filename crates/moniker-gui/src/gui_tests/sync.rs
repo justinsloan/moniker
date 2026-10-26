@@ -29,6 +29,7 @@ use super::{
     has_focus_in, labels_in, make_helper, pump_for, pump_until, widgets_of_type,
 };
 use crate::context::AppContext;
+use crate::launch_args::{Run, Start, encode};
 use crate::profiles::{self, sync_page};
 use crate::settings::{self, GuiSettings};
 use crate::sync::{self, Runner, SyncInputs};
@@ -1037,7 +1038,7 @@ pub(super) fn auto_sync_starts_after_the_window_is_shown(dir: &Path) {
     }));
     let delivered = ctx.notice.delivered();
 
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     assert_eq!(main_windows(&app), 1, "the first window");
     assert!(
         shown.borrow().is_empty(),
@@ -1066,7 +1067,7 @@ pub(super) fn auto_sync_failure_is_one_notification(dir: &Path) {
     // The exchange fails: one notification.
     set_runner(&ctx, counting(&runs, || Err(SyncError::WrongSyncKey)));
     let delivered = ctx.notice.delivered();
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     pump_until("the automatic sync", || runs.load(Ordering::SeqCst) == 1);
     pump_until("it to finish", || !ctx.sync_running.get());
     pump_for(Duration::from_millis(300));
@@ -1086,7 +1087,7 @@ pub(super) fn auto_sync_failure_is_one_notification(dir: &Path) {
     secrets.delete(SYNC_PASSPHRASE_KEY).unwrap();
     set_runner(&ctx, counting(&runs, || Ok(added(1))));
     let delivered = ctx.notice.delivered();
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     // Wait for the notification itself, not a fixed time: the launch sync
     // starts from an idle callback after the window, which a slow machine
     // reaches late. Then a little longer, to see that nothing else comes.
@@ -1108,11 +1109,73 @@ pub(super) fn auto_sync_failure_is_one_notification(dir: &Path) {
     secrets.set(SYNC_PASSPHRASE_KEY, SYNC_KEY).unwrap();
     set_runner(&ctx, counting(&runs, || Ok(added(1))));
     let delivered = ctx.notice.delivered();
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     pump_until("the automatic sync", || runs.load(Ordering::SeqCst) == 2);
     pump_until("it to finish", || !ctx.sync_running.get());
     pump_for(Duration::from_millis(300));
     assert_eq!(ctx.notice.delivered(), delivered, "a success is silent");
+    close_all(&app);
+}
+
+/// Issue #15: the first command line Moniker handles is the launch (its first
+/// window, and the automatic sync once that window is shown); one that comes
+/// while Moniker runs opens a window and nothing else, whatever it asks for
+/// (no second sync). A line that was a mistake is no launch at all: it opens
+/// nothing, starts nothing, and the next line is still the first.
+pub(super) fn a_command_line_launches_once_and_then_opens_windows(dir: &Path) {
+    let (ctx, _secrets, profile) = sync_ctx(dir, true, Some(SYNC_KEY));
+    set_partner(&ctx, &profile.expect("a profile"), true);
+    let app = test_app();
+    let folder = dir.join("My Files");
+    fs::create_dir_all(&folder).expect("the folder");
+    let runs = Arc::new(AtomicUsize::new(0));
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    let launched = Cell::new(false);
+    let asking = |dir: &Path| {
+        encode(&Start {
+            dir: dir.to_path_buf(),
+            title: None,
+            run: Run::Shell,
+            dir_refused: None,
+        })
+    };
+
+    // A mistake first: no window, no sync, and still no launch.
+    let mistake = vec!["--moniker-frob=1".to_owned()];
+    assert_eq!(
+        crate::handle_command_line(&app, &ctx, &launched, &mistake),
+        (
+            2,
+            Some("moniker: unexpected handover: --moniker-frob=1\n".to_owned())
+        )
+    );
+    assert!(!launched.get(), "a mistake is not the launch");
+    assert_eq!(main_windows(&app), 0);
+    pump_for(Duration::from_millis(300));
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "no sync for a mistake");
+
+    // The first line is the launch: one window, then the automatic sync.
+    assert_eq!(
+        crate::handle_command_line(&app, &ctx, &launched, &asking(&folder)),
+        (0, None)
+    );
+    assert!(launched.get());
+    assert_eq!(main_windows(&app), 1, "the first window");
+    pump_until("the automatic sync", || runs.load(Ordering::SeqCst) == 1);
+    pump_until("it to finish", || !ctx.sync_running.get());
+
+    // The next ones are windows, and nothing syncs again (a runner is ready:
+    // a second sync would use it and show in the count).
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    for line in [asking(&folder), Vec::new()] {
+        assert_eq!(
+            crate::handle_command_line(&app, &ctx, &launched, &line),
+            (0, None)
+        );
+    }
+    assert_eq!(main_windows(&app), 3, "one window for each line");
+    pump_for(Duration::from_millis(500));
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "only the launch syncs");
     close_all(&app);
 }
 
@@ -1139,7 +1202,7 @@ pub(super) fn sync_off_grays_out_sync_now_and_skips_launch(dir: &Path) {
 
     // Launch: nothing runs, and the person, who turned it off on purpose, is
     // told nothing.
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     let main = window::last_active(&app).expect("the first window");
     pump_for(Duration::from_secs(1));
     assert_eq!(runs.load(Ordering::SeqCst), 0, "no sync on launch");
@@ -1214,7 +1277,7 @@ pub(super) fn sync_off_grays_out_sync_now_and_skips_launch(dir: &Path) {
     assert!(page.sync_button.is_sensitive());
     // (The press above asked for its runner before it was refused.)
     set_runner(&ctx, counting(&runs, || Ok(added(1))));
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     pump_until("the sync on launch", || runs.load(Ordering::SeqCst) == 1);
     pump_until("it to finish", || !ctx.sync_running.get());
     assert_eq!(ctx.notice.delivered(), delivered, "a success is silent");
@@ -1554,7 +1617,7 @@ pub(super) fn switch_off_stops_auto_sync(dir: &Path) {
         }));
     };
     count_syncs(&ctx);
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     pump_for(Duration::from_millis(400));
     assert_eq!(made.get(), 0, "no sync on launch");
     assert!(!ctx.sync_running.get());
@@ -1569,7 +1632,7 @@ pub(super) fn switch_off_stops_auto_sync(dir: &Path) {
     // On again: the next launch syncs.
     page.auto_sync.set_active(true);
     assert!(settings::load(&ctx.settings_path).auto_sync);
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     pump_until("the sync on launch", || made.get() == 2);
     pump_until("it to finish", || !ctx.sync_running.get());
     drop(page);
@@ -1713,7 +1776,7 @@ pub(super) fn syncs_read_the_keyring_on_the_worker_only(dir: &Path) {
     };
     check("Sync Now", &|| app.activate_action("sync-now", None));
     check("the sync page", &|| page.sync_button.emit_clicked());
-    check("the sync on launch", &|| crate::launch(&app, &ctx));
+    check("the sync on launch", &|| super::launch_at_home(&app, &ctx));
     drop(page);
     close_all(&app);
 }
@@ -2197,7 +2260,7 @@ pub(super) fn the_launch_sync_of_a_machine_that_has_been_away_only_says_so(dir: 
     let seen: Choices = Arc::default();
     away_unless_allowed(&ctx, &seen);
     let delivered = ctx.notice.delivered();
-    crate::launch(&app, &ctx);
+    super::launch_at_home(&app, &ctx);
     pump_until("the notification", || ctx.notice.delivered() > delivered);
     pump_for(Duration::from_millis(300));
     assert_eq!(*seen.lock().unwrap(), [StaleSync::Refuse]);
