@@ -394,7 +394,8 @@ fn append_profile_rows(chooser: &Rc<Chooser>, list: &gtk::ListBox) {
 }
 
 /// The "›" button of a row: it opens `popover`, which holds the row's choices.
-fn more_button(tooltip: &str, popover: &gtk::Popover) -> gtk::MenuButton {
+/// (The Sessions menu's rows have one too.)
+pub(crate) fn more_button(tooltip: &str, popover: &gtk::Popover) -> gtk::MenuButton {
     gtk::MenuButton::builder()
         .icon_name("go-next-symbolic")
         .tooltip_text(tooltip)

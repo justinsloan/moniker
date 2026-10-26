@@ -48,8 +48,6 @@ use crate::session_file::{self, Kind, Node, PaneRecord, TabRecord};
 use crate::terminal_tab::{self, PaneHolder, PaneKind, TabTitle};
 
 /// Every tab of `view`, in order, as a session records it.
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 pub(crate) fn capture(view: &adw::TabView) -> Vec<TabRecord> {
     (0..view.n_pages())
         .filter_map(|index| panes::layout_of_page(&view.nth_page(index)))
@@ -117,8 +115,6 @@ fn kept(text: &str) -> String {
 
 /// Add `tabs` to `view`, after its own tabs, and select the first added
 /// (module docs).
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 pub(crate) fn restore(view: &adw::TabView, ctx: &Rc<AppContext>, tabs: &[TabRecord]) {
     // Read once: whether every session saves a transcript.
     let save_all = ctx.settings().save_all_transcripts;

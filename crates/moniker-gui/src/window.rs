@@ -2,10 +2,11 @@
 //!
 //! The header bar holds, left to right: ＋ (a new tab here showing the new-tab
 //! list, [`crate::new_tab`], where a saved profile becomes a session in that
-//! tab), the selected tab's title, and ☰ (the app's actions, which `main.rs`
-//! defines, under a zoom row for the selected tab's text size). There is no
-//! Connect button: sessions come from the new-tab list and the Connection
-//! Profiles window.
+//! tab), Sessions (the saved layouts of windows, to add back to this one, and
+//! saving this one: [`crate::sessions_menu`]), the selected tab's title, and ☰
+//! (the app's actions, which `main.rs` defines, under a zoom row for the
+//! selected tab's text size). There is no Connect button: connections come
+//! from the new-tab list and the Connection Profiles window.
 //! Below it the tab bar, which hides itself while there is one tab, so a fresh
 //! window looks like a plain terminal; then the tabs ([`crate::terminal_tab`])
 //! inside a notification area ([`crate::notify`]) attached to the context's
@@ -62,6 +63,7 @@ use moniker_core::profile::Profile;
 use crate::context::AppContext;
 use crate::launch_args::Start;
 use crate::notify::NotificationArea;
+use crate::sessions_menu;
 use crate::window_size::{self, Kind};
 use crate::{new_tab, panes, profiles, recordings, settings, terminal_tab, zoom};
 
@@ -257,11 +259,15 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
     terminal_tab::sync_window_actions(&view);
     save_scale_when_last_window_closes(&window, ctx, &scale);
     terminal_tab::end_sessions_on_close(&window, &view);
-    MainWindow {
+    let main = MainWindow {
         window,
         view,
         notifications,
-    }
+    };
+    // Sessions, right after ＋: it needs the window's own view and
+    // notification area.
+    header.pack_start(&sessions_menu::button(&main, ctx));
+    main
 }
 
 /// The window's tab actions: `win.new-tab` (the new-tab list in a new tab),

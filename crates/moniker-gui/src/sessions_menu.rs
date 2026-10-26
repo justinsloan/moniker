@@ -1,0 +1,623 @@
+//! The Sessions menu beside ＋ in a main window (issue #12): the layouts of
+//! windows that were saved ([`crate::session_file`]), added back to this window
+//! with a click, and the questions that save this window's layout, rename a
+//! saved one and delete it.
+//!
+//! The button opens a popover that is built again from the file every time it
+//! shows, so it lists what is saved now, whichever window saved it: each
+//! session by name (sorted ignoring case) with a › for Rename… and Delete…, or
+//! "No saved sessions", or why the file cannot be read; then Save Session…. A
+//! click on a session adds its tabs to this window ([`session_layout::restore`]).
+//!
+//! Nothing here keeps what the file said for later: the file is read again at
+//! every decision, because another window may have changed it since the menu
+//! was built. A pick reads the session as it is then (a replaced one adds the
+//! layout now saved, a deleted one says so); Save asks "Replace" when the name
+//! is in use or the file unreadable *as it is when Save is answered*, and
+//! captures the window when the answer is final, not when the dialog opened.
+//! A file that cannot be read is never written over without asking.
+//!
+//! A pick and every question wait for the closing menu to hand the keyboard
+//! focus back (`terminal_tab::after_the_menu_lets_go`): a dialog opened too soon
+//! loses the keyboard to one of its buttons, and a restored pane that takes the
+//! keyboard would have it taken back by the closing menu.
+//!
+//! Session names are chosen by the person but may come from a file that was
+//! edited or written by another Moniker: every label and dialog here shows
+//! them as plain text, never as Pango markup. A message goes to the
+//! notification area of the window the button is in (the button itself is in
+//! the header bar, outside the area, so the area is held by the menu).
+
+use std::io;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use adw::prelude::*;
+use gtk::{gio, glib};
+use gtk4 as gtk;
+use libadwaita as adw;
+
+use crate::connect_menu::entry_button;
+use crate::context::AppContext;
+use crate::new_tab::more_button;
+use crate::notify::NotificationArea;
+use crate::session_file::{self, Loaded, Session};
+use crate::session_layout;
+use crate::terminal_tab::after_the_menu_lets_go;
+use crate::window::MainWindow;
+
+/// Widget name of the box that holds one saved session's button and its › in
+/// the menu (tests look for it).
+pub(crate) const ROW_NAME: &str = "session-row";
+
+/// Tooltip of the button beside ＋.
+const TOOLTIP: &str = "Sessions";
+/// The entry that saves this window.
+const SAVE_ENTRY: &str = "Save Session\u{2026}";
+/// What the menu says with nothing saved.
+const NONE_SAVED: &str = "No saved sessions";
+/// What the Save question says it saves.
+const SAVE_BODY: &str = "Saves this window's tabs and panes to add them to a window later. \
+     No passwords, and nothing shown in the panes, are saved.";
+/// What the Replace question says is replaced.
+const REPLACE_BODY: &str = "The saved session with this name is replaced by this window's layout.";
+/// What the Delete question says is deleted.
+const DELETE_BODY: &str = "The saved layout is deleted. Windows that are open are not changed.";
+
+/// The sessions file of this machine: beside the GUI settings.
+pub(crate) fn sessions_path(ctx: &AppContext) -> PathBuf {
+    ctx.settings_path.with_file_name(session_file::FILE_NAME)
+}
+
+/// The Sessions button for `main`: its popover lists the saved sessions
+/// (module docs), and a pick adds one's tabs to `main.view`. It holds the
+/// window's view and notification area weakly: the window owns the button.
+pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton {
+    let popover = gtk::Popover::new();
+    let button = gtk::MenuButton::builder()
+        .icon_name("view-grid-symbolic")
+        .tooltip_text(TOOLTIP)
+        .popover(&popover)
+        .build();
+    let menu = Rc::new(Menu {
+        ctx: Rc::clone(ctx),
+        view: main.view.downgrade(),
+        area: main.notifications.downgrade(),
+        button: button.downgrade(),
+    });
+    popover.connect_show(move |popover| popover.set_child(Some(&menu.content(popover))));
+    button
+}
+
+/// What the menu's closures share. Nothing here is a snapshot of the file.
+struct Menu {
+    ctx: Rc<AppContext>,
+    /// The tabs a pick adds to.
+    view: glib::WeakRef<adw::TabView>,
+    /// Where messages appear: the window's own.
+    area: glib::WeakRef<NotificationArea>,
+    /// The button, which dialogs are shown over (its window).
+    button: glib::WeakRef<gtk::MenuButton>,
+}
+
+impl Menu {
+    fn path(&self) -> PathBuf {
+        sessions_path(&self.ctx)
+    }
+
+    /// The window the button is in, if it is still shown.
+    fn window(&self) -> Option<gtk::Window> {
+        self.button
+            .upgrade()
+            .and_then(|button| button.root())
+            .and_downcast::<gtk::Window>()
+    }
+
+    /// Show `text` (plain) in this window.
+    fn tell(&self, text: &str) {
+        match self.area.upgrade() {
+            Some(area) => self.ctx.notice.show_near(&area, text),
+            None => self.ctx.notice.show(text),
+        }
+    }
+
+    /// The popover's content, from the file as it is now.
+    fn content(self: &Rc<Self>, popover: &gtk::Popover) -> gtk::Box {
+        let column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .build();
+        match session_file::load(&self.path()) {
+            Loaded::Sessions(sessions) if sessions.is_empty() => {
+                column.append(&note(NONE_SAVED, true));
+            }
+            Loaded::Sessions(sessions) => {
+                column.append(&self.list(popover, &names_in_order(&sessions)));
+            }
+            Loaded::Unreadable(why) => {
+                column.append(&note(&unreadable_text(&why), false));
+            }
+        }
+        column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        let save = entry_button(SAVE_ENTRY);
+        let menu = Rc::clone(self);
+        save.connect_clicked(glib::clone!(
+            #[weak]
+            popover,
+            move |_| menu.leave(&[&popover], |menu| menu.ask_save())
+        ));
+        column.append(&save);
+        column
+    }
+
+    /// A row for each of `names`, scrolling when there are many.
+    fn list(self: &Rc<Self>, popover: &gtk::Popover, names: &[String]) -> gtk::ScrolledWindow {
+        let rows = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .build();
+        for name in names {
+            rows.append(&self.row(popover, name));
+        }
+        gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_width(true)
+            .propagate_natural_height(true)
+            .max_content_height(320)
+            .child(&rows)
+            .build()
+    }
+
+    /// The row of the session `name`: its button, which adds it, and a › with
+    /// Rename… and Delete….
+    fn row(self: &Rc<Self>, outer: &gtk::Popover, name: &str) -> gtk::Box {
+        let row = gtk::Box::builder().name(ROW_NAME).spacing(2).build();
+        let name = name.to_owned();
+
+        let pick = entry_button(&name);
+        pick.set_hexpand(true);
+        let menu = Rc::clone(self);
+        pick.connect_clicked(glib::clone!(
+            #[weak]
+            outer,
+            #[strong]
+            name,
+            move |_| menu.pick(&outer, &name)
+        ));
+        row.append(&pick);
+
+        let inner = gtk::Popover::new();
+        let actions = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(2)
+            .build();
+        let rename = entry_button("Rename\u{2026}");
+        let menu = Rc::clone(self);
+        rename.connect_clicked(glib::clone!(
+            #[weak]
+            inner,
+            #[weak]
+            outer,
+            #[strong]
+            name,
+            move |_| {
+                let name = name.clone();
+                menu.leave(&[&inner, &outer], move |menu| menu.ask_rename(&name));
+            }
+        ));
+        let delete = entry_button("Delete\u{2026}");
+        let menu = Rc::clone(self);
+        delete.connect_clicked(glib::clone!(
+            #[weak]
+            inner,
+            #[weak]
+            outer,
+            #[strong]
+            name,
+            move |_| {
+                let name = name.clone();
+                menu.leave(&[&inner, &outer], move |menu| menu.ask_delete(&name));
+            }
+        ));
+        actions.append(&rename);
+        actions.append(&delete);
+        inner.set_child(Some(&actions));
+        row.append(&more_button("Session Menu", &inner));
+        row
+    }
+
+    /// Close `popovers`, and once the keyboard focus has left the menu run
+    /// `then`.
+    fn leave(self: &Rc<Self>, popovers: &[&gtk::Popover], then: impl FnOnce(&Rc<Menu>) + 'static) {
+        for popover in popovers {
+            popover.popdown();
+        }
+        let menu = Rc::clone(self);
+        after_the_menu_lets_go(self.window().as_ref(), move || then(&menu));
+    }
+
+    /// Add the session `name` to this window's tabs.
+    fn pick(self: &Rc<Self>, popover: &gtk::Popover, name: &str) {
+        let name = name.to_owned();
+        self.leave(&[popover], move |menu| menu.add(&name));
+    }
+
+    /// Add the session `name`, as the file has it now.
+    fn add(&self, name: &str) {
+        match session_file::load(&self.path()) {
+            Loaded::Unreadable(why) => self.tell(&unreadable_text(&why)),
+            Loaded::Sessions(sessions) => match sessions.iter().find(|s| s.name == name) {
+                Some(session) => {
+                    if let Some(view) = self.view.upgrade() {
+                        session_layout::restore(&view, &self.ctx, &session.tabs);
+                    }
+                }
+                None => self.tell(session_file::GONE),
+            },
+        }
+    }
+
+    /// Ask for a name to save this window under.
+    fn ask_save(self: &Rc<Self>) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        // From the file as it is now: another window may have saved meanwhile.
+        let start = match session_file::load(&self.path()) {
+            Loaded::Sessions(sessions) => session_file::next_default_name(&sessions),
+            Loaded::Unreadable(_) => session_file::next_default_name(&[]),
+        };
+        let (dialog, entry) = name_dialog(
+            "Save Session",
+            Some(SAVE_BODY),
+            ("save", "Save"),
+            &start,
+            Vec::new(),
+        );
+        let menu = Rc::clone(self);
+        dialog.choose(
+            Some(&window),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak]
+                entry,
+                move |response| {
+                    if response == "save"
+                        && let Ok(name) = session_file::check_name(&entry.text())
+                    {
+                        menu.save(name);
+                    }
+                }
+            ),
+        );
+    }
+
+    /// Save this window as `name`, if the file as it is now allows it without
+    /// asking: asks first to replace a session of that name or a file that
+    /// cannot be read.
+    fn save(self: &Rc<Self>, name: String) {
+        match session_file::load(&self.path()) {
+            Loaded::Unreadable(why) => self.ask_to_replace_the_file(name, &why),
+            Loaded::Sessions(sessions) if sessions.iter().any(|s| s.name == name) => {
+                self.ask_to_replace(name);
+            }
+            Loaded::Sessions(_) => self.put(name, false),
+        }
+    }
+
+    /// Write this window, as it is now, as the session `name`.
+    /// `replace_unreadable` says the person chose to start a new file.
+    fn put(&self, name: String, replace_unreadable: bool) {
+        let Some(view) = self.view.upgrade() else {
+            return;
+        };
+        let session = Session {
+            name,
+            tabs: session_layout::capture(&view),
+        };
+        if let Err(err) = session_file::put(&self.path(), session, replace_unreadable) {
+            self.tell(&write_error(&err));
+        }
+    }
+
+    /// Ask before a session of the same name is replaced.
+    fn ask_to_replace(self: &Rc<Self>, name: String) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        let dialog = question(
+            &format!("Replace \u{201c}{name}\u{201d}?"),
+            REPLACE_BODY,
+            ("replace", "Replace"),
+        );
+        let menu = Rc::clone(self);
+        dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+            if response == "replace" {
+                menu.put(name, false);
+            }
+        });
+    }
+
+    /// Ask before a file that cannot be read (`why`) is replaced by a new one.
+    fn ask_to_replace_the_file(self: &Rc<Self>, name: String, why: &str) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        let dialog = question(
+            "Replace the Saved Sessions File?",
+            &format!(
+                "Moniker could not read it: {why}. Saving starts a new file without the \
+                 sessions that were in it."
+            ),
+            ("replace", "Replace"),
+        );
+        let menu = Rc::clone(self);
+        dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+            if response == "replace" {
+                menu.put(name, true);
+            }
+        });
+    }
+
+    /// Ask for a new name for the session `from`.
+    fn ask_rename(self: &Rc<Self>, from: &str) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        // The names of the other sessions, as the file has them now; the file
+        // is checked again when Rename is answered.
+        let taken = match session_file::load(&self.path()) {
+            Loaded::Sessions(sessions) => sessions
+                .into_iter()
+                .map(|session| session.name)
+                .filter(|name| name != from)
+                .collect(),
+            Loaded::Unreadable(_) => Vec::new(),
+        };
+        let (dialog, entry) =
+            name_dialog("Rename Session", None, ("rename", "Rename"), from, taken);
+        let menu = Rc::clone(self);
+        let from = from.to_owned();
+        dialog.choose(
+            Some(&window),
+            gio::Cancellable::NONE,
+            glib::clone!(
+                #[weak]
+                entry,
+                move |response| {
+                    if response == "rename"
+                        && let Err(text) = session_file::rename(&menu.path(), &from, &entry.text())
+                    {
+                        menu.tell(&text);
+                    }
+                }
+            ),
+        );
+    }
+
+    /// Ask before the session `name` is deleted.
+    fn ask_delete(self: &Rc<Self>, name: &str) {
+        let Some(window) = self.window() else {
+            return;
+        };
+        let dialog = question(
+            &format!("Delete \u{201c}{name}\u{201d}?"),
+            DELETE_BODY,
+            ("delete", "Delete"),
+        );
+        let menu = Rc::clone(self);
+        let name = name.to_owned();
+        dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+            if response == "delete"
+                && let Err(err) = session_file::delete(&menu.path(), &name)
+            {
+                menu.tell(&write_error(&err));
+            }
+        });
+    }
+}
+
+/// A line of plain text for the menu: dimmed when it only says there is nothing,
+/// wrapping when it says why the file cannot be read.
+fn note(text: &str, dim: bool) -> gtk::Label {
+    let label = gtk::Label::builder()
+        .label(text)
+        .use_markup(false)
+        .xalign(0.0)
+        .wrap(true)
+        .max_width_chars(40)
+        .margin_start(6)
+        .margin_end(6)
+        .margin_top(4)
+        .margin_bottom(4)
+        .build();
+    if dim {
+        label.add_css_class("dim-label");
+    }
+    label
+}
+
+/// What the menu and a pick say of a file that cannot be read.
+fn unreadable_text(why: &str) -> String {
+    format!("Could not read the saved sessions: {why}")
+}
+
+/// The sessions' names as the menu lists them: sorted ignoring case.
+fn names_in_order(sessions: &[Session]) -> Vec<String> {
+    let mut names: Vec<String> = sessions
+        .iter()
+        .map(|session| session.name.clone())
+        .collect();
+    names.sort_by_cached_key(|name| (name.to_lowercase(), name.clone()));
+    names
+}
+
+/// What to say of a write that failed, by what failed: a session the file would
+/// not read back ([`io::ErrorKind::InvalidInput`], a plain sentence), a file that
+/// cannot be read (`InvalidData`, which already says "Could not read the saved
+/// sessions"), or the write itself.
+fn write_error(err: &io::Error) -> String {
+    match err.kind() {
+        io::ErrorKind::InvalidInput => format!("Could not save the session: {err}"),
+        io::ErrorKind::InvalidData => err.to_string(),
+        _ => format!("Could not save the sessions: {err}"),
+    }
+}
+
+/// Why `raw` cannot be the name of a session, if it cannot: a name
+/// [`session_file::check_name`] refuses, or one of the `taken` names.
+fn name_error(raw: &str, taken: &[String]) -> Option<&'static str> {
+    match session_file::check_name(raw) {
+        Err(why) => Some(why),
+        Ok(name) => taken.contains(&name).then_some(session_file::NAME_TAKEN),
+    }
+}
+
+/// A question with Cancel and the `action` response (id, label) as the
+/// destructive one. Cancel (also Escape) is the default. Plain text.
+fn question(heading: &str, body: &str, action: (&str, &str)) -> adw::AlertDialog {
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .heading_use_markup(false)
+        .body(body)
+        .body_use_markup(false)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response(action.0, action.1);
+    dialog.set_response_appearance(action.0, adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog
+}
+
+/// A dialog that asks for a session's name, in a field that starts as `start`,
+/// with Cancel (also Escape) and the `action` response (id, label), which Enter
+/// in the field answers. A plain label under the field gives the reason the name
+/// cannot be used (as [`name_error`] says, with `taken` the names of other
+/// sessions) and the response is off meanwhile. Plain text.
+fn name_dialog(
+    heading: &str,
+    body: Option<&str>,
+    action: (&'static str, &str),
+    start: &str,
+    taken: Vec<String>,
+) -> (adw::AlertDialog, gtk::Entry) {
+    let entry = gtk::Entry::builder()
+        .text(start)
+        .activates_default(true)
+        .build();
+    let error = gtk::Label::builder()
+        .use_markup(false)
+        .xalign(0.0)
+        .wrap(true)
+        .css_classes(["error"])
+        .visible(false)
+        .build();
+    let extra = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .build();
+    extra.append(&entry);
+    extra.append(&error);
+    let dialog = adw::AlertDialog::builder()
+        .heading(heading)
+        .heading_use_markup(false)
+        .body_use_markup(false)
+        .extra_child(&extra)
+        .build();
+    if let Some(body) = body {
+        dialog.set_body(body);
+    }
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response(action.0, action.1);
+    dialog.set_response_appearance(action.0, adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some(action.0));
+    dialog.set_close_response("cancel");
+    dialog.set_focus(Some(&entry));
+    let check = glib::clone!(
+        #[weak]
+        dialog,
+        #[weak]
+        error,
+        move |entry: &gtk::Entry| {
+            let problem = name_error(&entry.text(), &taken);
+            error.set_label(problem.unwrap_or_default());
+            error.set_visible(problem.is_some());
+            dialog.set_response_enabled(action.0, problem.is_none());
+        }
+    );
+    check(&entry);
+    entry.connect_changed(check);
+    (dialog, entry)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session_file::TabRecord;
+
+    fn named(name: &str) -> Session {
+        Session {
+            name: name.to_owned(),
+            tabs: Vec::<TabRecord>::new(),
+        }
+    }
+
+    #[test]
+    fn names_are_listed_ignoring_case() {
+        let sessions = [named("beta"), named("Zed"), named("alpha"), named("Alpha")];
+        assert_eq!(
+            names_in_order(&sessions),
+            ["Alpha", "alpha", "beta", "Zed"],
+            "ignoring case, and the same name in another case by its own order"
+        );
+        assert!(names_in_order(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_name_is_refused_with_the_reason_or_taken_by_another() {
+        let taken = ["Work".to_owned()];
+        assert_eq!(name_error("Home", &taken), None);
+        assert_eq!(name_error("  Home ", &taken), None, "trimmed");
+        assert_eq!(name_error("", &taken), Some("Enter a name."));
+        assert_eq!(name_error("   ", &taken), Some("Enter a name."));
+        assert_eq!(
+            name_error("a\tb", &taken),
+            Some("A name cannot contain control characters.")
+        );
+        assert_eq!(
+            name_error(&"x".repeat(101), &taken),
+            Some("A name can be at most 100 characters.")
+        );
+        assert_eq!(name_error(" Work ", &taken), Some(session_file::NAME_TAKEN));
+        assert_eq!(name_error("work", &taken), None, "names are case-sensitive");
+        assert_eq!(
+            name_error("Work", &[]),
+            None,
+            "Save asks about a name in use"
+        );
+    }
+
+    #[test]
+    fn a_write_error_is_told_by_what_failed() {
+        let refused = io::Error::new(io::ErrorKind::InvalidInput, "the session has no tab");
+        assert_eq!(
+            write_error(&refused),
+            "Could not save the session: the session has no tab"
+        );
+        // Already says what it is.
+        let unreadable = io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Could not read the saved sessions: it is not JSON (x)",
+        );
+        assert_eq!(
+            write_error(&unreadable),
+            "Could not read the saved sessions: it is not JSON (x)"
+        );
+        let failed = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            write_error(&failed),
+            format!("Could not save the sessions: {failed}")
+        );
+    }
+}

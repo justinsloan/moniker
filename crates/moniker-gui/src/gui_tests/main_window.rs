@@ -487,8 +487,9 @@ pub(super) fn about_shows_copyright_and_mit() {
     assert_eq!(about.website(), REPOSITORY_URL, "the About box's website");
 }
 
-/// The header bar has ＋, the tab's title and ☰ and no Connect button: new
-/// sessions come from the new-tab list and the Connection Profiles window.
+/// The header bar has ＋, Sessions (saved layouts of windows, issue #12), the
+/// tab's title and ☰ and no Connect button: new connections come from the
+/// new-tab list and the Connection Profiles window.
 pub(super) fn header_has_no_connect_button(dir: &Path) {
     let ctx = ctx_with(dir, &[web()]);
     let app = test_app();
@@ -509,12 +510,13 @@ pub(super) fn header_has_no_connect_button(dir: &Path) {
             .all(|b| b.icon_name().as_deref() != Some("network-server-symbolic")),
         "no server-icon button either"
     );
+    // Sessions (issue #12) and ☰, in that order, and nothing else.
+    let tooltips: Vec<_> = tooltips.iter().map(|t| t.as_deref()).collect();
     assert_eq!(
-        tooltips.len(),
-        1,
-        "the ☰ button is the header's only menu button: {tooltips:?}"
+        tooltips,
+        [Some("Sessions"), Some("Main Menu")],
+        "the header's menu buttons"
     );
-    assert_eq!(tooltips[0].as_deref(), Some("Main Menu"));
     let new_tab = widgets_outside_popovers::<gtk::Button>(&header)
         .into_iter()
         .filter(|b| b.tooltip_text().as_deref() == Some("New Tab"))

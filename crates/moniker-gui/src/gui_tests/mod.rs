@@ -443,6 +443,15 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #12, the Sessions menu beside ＋.
+    sessions::the_menu_with_no_sessions(&tmp.path().join("sm-none"));
+    sessions::saving_and_adding_from_the_menu(&bin, &tmp.path().join("sm-save"));
+    sessions::saving_under_a_name_in_use_asks(&tmp.path().join("sm-replace"));
+    sessions::rename_and_delete_ask_first(&tmp.path().join("sm-rename"));
+    sessions::a_damaged_file_is_told_and_kept(&tmp.path().join("sm-damaged"));
+    sessions::two_windows_saving_keep_both(&tmp.path().join("sm-two"));
+    sessions::a_session_changed_since_the_menu_opened_is_read_again(&tmp.path().join("sm-gone"));
+    sessions::a_failed_write_is_told(&tmp.path().join("sm-fail"));
     // Issue #12, saved sessions: a window captured and added back.
     sessions::a_window_comes_back_as_saved(&bin, &tmp.path().join("sess-saved"));
     sessions::a_tab_not_shown_yet_gets_its_split_when_shown(&tmp.path().join("sess-hidden"));
@@ -788,8 +797,9 @@ fn close_popover(popover: &gtk::Popover) {
 ///
 /// Surfaces: the new-tab list (row and the choices behind "›"), the tab (title,
 /// tooltip, as the tab bar draws it), the window title, a notification (and the
-/// toast of the Preferences dialog), the note over the list of a restored pane
-/// whose profile is gone, the sync
+/// toast of the Preferences dialog), the Sessions menu (a saved session's row, its
+/// rename field and the questions of delete and replace) and, from it, the note
+/// over the list of a restored pane whose profile is gone, the sync
 /// page's profile choice, and in the Connection Profiles window the sidebar row, the page
 /// title, the key-file row, the sequence row, the Default sequence row (as chosen
 /// and in its open list) and the delete confirmation. The session runs a fake
@@ -888,8 +898,9 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     );
     literal_labels("notification", &main.notifications, MARKUP_NAME);
 
-    // A saved session's pane whose profile is gone says so above the list,
-    // naming the profile as the session recorded it.
+    // A saved session named like this, added from the Sessions menu: its pane
+    // whose profile is gone says so above the list, naming the profile as the
+    // session recorded it.
     let gone = TabRecord {
         root: Node::Pane(PaneRecord {
             kind: Kind::Profile {
@@ -902,7 +913,23 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         }),
         focused: 0,
     };
-    crate::session_layout::restore(&main.view, &ctx, &[gone]);
+    let session_file = dir.join(crate::session_file::FILE_NAME);
+    crate::session_file::put(
+        &session_file,
+        crate::session_file::Session {
+            name: MARKUP_NAME.to_owned(),
+            tabs: vec![gone.clone()],
+        },
+        false,
+    )
+    .expect("the session is saved");
+    // The menu row shows the name as it is.
+    let sessions_menu = sessions::open_menu(&main);
+    assert_eq!(sessions::listed(&sessions_menu), [MARKUP_NAME]);
+    literal_labels("sessions menu", &sessions_menu, MARKUP_NAME);
+    let tabs = main.view.n_pages();
+    sessions::pick_session(&sessions_menu, MARKUP_NAME);
+    pump_until("the session's tab", || main.view.n_pages() == tabs + 1);
     let restored = main.view.selected_page().expect("the restored tab");
     literal_labels(
         "gone profile note",
@@ -910,6 +937,40 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         &format!("{MARKUP_NAME} is no longer saved."),
     );
     main.view.close_page(&restored);
+    // Its Rename field, and the questions of Delete and Replace, name it as it
+    // is too.
+    let sessions_menu = sessions::open_menu(&main);
+    sessions::from_session_menu(&sessions_menu, MARKUP_NAME, "Rename\u{2026}");
+    let dialog = sessions::dialog_over(&main, "the Rename dialog");
+    assert_eq!(sessions::name_entry(&dialog).text(), MARKUP_NAME);
+    sessions::answer(&main, &dialog, "Cancel");
+    let sessions_menu = sessions::open_menu(&main);
+    sessions::from_session_menu(&sessions_menu, MARKUP_NAME, "Delete\u{2026}");
+    let dialog = sessions::dialog_over(&main, "the Delete question");
+    let heading = format!("Delete \u{201c}{MARKUP_NAME}\u{201d}?");
+    assert_eq!(dialog.heading().as_deref(), Some(heading.as_str()));
+    assert!(!dialog.is_heading_use_markup(), "delete session heading");
+    assert!(!dialog.is_body_use_markup(), "delete session body");
+    literal_labels("delete session dialog", &dialog, &heading);
+    sessions::answer(&main, &dialog, "Cancel");
+    let dialog = sessions::save_dialog(&main);
+    sessions::name_entry(&dialog).set_text(MARKUP_NAME);
+    sessions::answer(&main, &dialog, "Save");
+    let dialog = sessions::dialog_over(&main, "the Replace question");
+    let heading = format!("Replace \u{201c}{MARKUP_NAME}\u{201d}?");
+    assert_eq!(dialog.heading().as_deref(), Some(heading.as_str()));
+    assert!(!dialog.is_heading_use_markup(), "replace session heading");
+    assert!(!dialog.is_body_use_markup(), "replace session body");
+    literal_labels("replace session dialog", &dialog, &heading);
+    sessions::answer(&main, &dialog, "Cancel");
+    assert_eq!(
+        crate::session_file::load(&session_file),
+        crate::session_file::Loaded::Sessions(vec![crate::session_file::Session {
+            name: MARKUP_NAME.to_owned(),
+            tabs: vec![gone],
+        }]),
+        "the questions changed nothing"
+    );
 
     // The Preferences dialog shows its own messages in a toast of its own (they
     // can quote a folder name): the same text, as it is.

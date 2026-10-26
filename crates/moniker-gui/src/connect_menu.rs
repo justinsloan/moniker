@@ -48,8 +48,9 @@ fn entries(profile: &Profile) -> Vec<(String, Option<usize>)> {
         .collect()
 }
 
-/// A flat button called `label`, plain text.
-fn entry_button(label: &str) -> gtk::Button {
+/// A flat button called `label`, plain text. (The Sessions menu's buttons are
+/// made the same way.)
+pub(crate) fn entry_button(label: &str) -> gtk::Button {
     let label = gtk::Label::builder()
         .label(label)
         .use_markup(false)

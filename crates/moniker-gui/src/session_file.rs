@@ -41,10 +41,12 @@ use crate::settings::write_private;
 use crate::zoom;
 
 /// The file's name, beside `gui-settings.json`.
-// Used first by the sessions menu (task 5), which finds the file beside the
-// settings.
-#[allow(dead_code)]
 pub(crate) const FILE_NAME: &str = "sessions.json";
+
+/// What [`rename`] says of a session that is not in the file any more.
+pub(crate) const GONE: &str = "That session is no longer saved.";
+/// What [`rename`] says of a name another session has.
+pub(crate) const NAME_TAKEN: &str = "A session with this name exists.";
 
 /// The format version this build reads and writes.
 const VERSION: u64 = 1;
@@ -69,9 +71,6 @@ const FRACTION_RANGE: (f64, f64) = (0.05, 0.95);
 const FRACTION_DEFAULT: f64 = 0.5;
 
 /// A saved session: a named layout of a window.
-// Used first by `session_layout` (capture and restore, task 4) and the
-// sessions menu (task 5).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Session {
     /// Passes [`check_name`] and is unique in the file.
@@ -130,8 +129,6 @@ pub(crate) enum Kind {
 }
 
 /// What reading the file found.
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum Loaded {
     /// The sessions in the file, in file order; none for a missing file.
@@ -144,8 +141,6 @@ pub(crate) enum Loaded {
 
 /// The saved sessions at `path`: the entries of the file that make sense. (An
 /// entry that does not is skipped here, but the writes below keep it.)
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 pub(crate) fn load(path: &Path) -> Loaded {
     match read(path) {
         Ok(entries) => Loaded::Sessions(
@@ -163,8 +158,6 @@ pub(crate) fn load(path: &Path) -> Loaded {
 
 /// `raw` as a session name: trimmed, and refused with the text to show if it
 /// is empty, holds a control character or is over 100 characters.
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 pub(crate) fn check_name(raw: &str) -> Result<String, &'static str> {
     let name = raw.trim();
     if name.is_empty() {
@@ -191,8 +184,6 @@ pub(crate) fn check_name(raw: &str) -> Result<String, &'static str> {
 /// more than 32 panes"; it fits after "Could not save the session: "), so what
 /// is saved is always found again. So is one that would make the file larger
 /// than 4 MiB.
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 pub(crate) fn put(path: &Path, session: Session, replace_unreadable: bool) -> io::Result<()> {
     if let Some(why) = refusal(&session) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
@@ -215,8 +206,6 @@ pub(crate) fn put(path: &Path, session: Session, replace_unreadable: bool) -> io
 
 /// Rename the session `from` to `to` (trimmed, and checked as
 /// [`check_name`] does), keeping its place. The error is the text to show.
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 pub(crate) fn rename(path: &Path, from: &str, to: &str) -> Result<(), String> {
     let to = check_name(to).map_err(str::to_owned)?;
     let mut entries =
@@ -224,7 +213,7 @@ pub(crate) fn rename(path: &Path, from: &str, to: &str) -> Result<(), String> {
     let index = entries
         .iter()
         .position(|entry| matches!(entry, Entry::Session(saved) if saved.name == from))
-        .ok_or("That session is no longer saved.")?;
+        .ok_or(GONE)?;
     if to == from {
         return Ok(());
     }
@@ -232,7 +221,7 @@ pub(crate) fn rename(path: &Path, from: &str, to: &str) -> Result<(), String> {
         .iter()
         .any(|entry| matches!(entry, Entry::Session(saved) if saved.name == to))
     {
-        return Err("A session with this name exists.".to_owned());
+        return Err(NAME_TAKEN.to_owned());
     }
     if let Entry::Session(saved) = &mut entries[index] {
         saved.name = to;
@@ -243,8 +232,6 @@ pub(crate) fn rename(path: &Path, from: &str, to: &str) -> Result<(), String> {
 /// Remove the session `name`; nothing to do if there is none (another window
 /// may have removed it). A file that cannot be read is an error and is left as
 /// it is.
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 pub(crate) fn delete(path: &Path, name: &str) -> io::Result<()> {
     let mut entries = read(path).map_err(|why| unreadable_error(&why))?;
     let before = entries.len();
@@ -256,8 +243,6 @@ pub(crate) fn delete(path: &Path, name: &str) -> io::Result<()> {
 }
 
 /// "Session N" for the smallest N from 1 that no session in `sessions` uses.
-// Used first by the sessions menu (task 5).
-#[allow(dead_code)]
 pub(crate) fn next_default_name(sessions: &[Session]) -> String {
     let mut n = 1_u64;
     loop {

@@ -11,12 +11,21 @@
 //! not report its folder by itself: a scenario feeds it the `printf` of an OSC 7
 //! that bash and zsh send on Ubuntu (`vte-2.91.sh`), and reads `$PWD` back the
 //! same way.
+//!
+//! The Sessions menu beside ＋ (the last scenarios) is how a person does it:
+//! saving a window under a name, adding a saved session to another window,
+//! renaming and deleting, the questions each asks, a name in use, a file that
+//! cannot be read, two windows saving at once, a session gone since the menu
+//! was built, and a write that fails.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
@@ -30,13 +39,16 @@ use zeroize::Zeroizing;
 use super::main_window::{ctx_with, ctx_with_secrets, test_app};
 use super::windows::{list_in, main_window, row, ssh_args};
 use super::{
-    HeldKeyring, MARKUP_NAME, fake_shell, fake_ssh, files_in, find_widget, literal_labels, pane,
-    profile, pump_for, pump_until, shown, wait_for_session, wait_for_text,
+    HeldKeyring, MARKUP_NAME, all_widgets, button_labeled, close_popover, fake_shell, fake_ssh,
+    files_in, find_widget, labels_in, literal_labels, menu_button, open_popover, pane, profile,
+    pump_for, pump_until, shown, wait_for_session, wait_for_text,
 };
+use crate::context::AppContext;
 use crate::launch_args::{Run, Start};
 use crate::panes::{self, Pane, TabLayout};
 use crate::session_file::{self, Kind, Loaded, Node, PaneRecord, Session, TabRecord};
 use crate::session_layout::{capture, restore};
+use crate::sessions_menu;
 use crate::terminal_tab::{
     self, PaneHolder, open_local, open_profile, rename_pane, set_test_ssh_program, shown_title,
     terminal_in,
@@ -859,5 +871,782 @@ pub(super) fn restored_connections_ask_the_keyring_in_pane_order(bin: &Path, dir
     );
     set_test_ssh_program(None);
     main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+// The Sessions menu
+
+/// The menu's last entry.
+const SAVE_ENTRY: &str = "Save Session\u{2026}";
+
+/// The Sessions button of `main`.
+fn sessions_button(main: &window::MainWindow) -> gtk::MenuButton {
+    menu_button(&main.window, "Sessions")
+}
+
+/// The text of `button`, one the menu made: a label is its only child.
+fn text_of(button: &gtk::Button) -> Option<String> {
+    button
+        .child()
+        .and_downcast::<gtk::Label>()
+        .map(|label| label.label().to_string())
+}
+
+/// The button below `root` whose text is `text`.
+pub(super) fn menu_entry(root: &impl IsA<gtk::Widget>, text: &str) -> gtk::Button {
+    all_widgets::<gtk::Button>(root)
+        .into_iter()
+        .find(|button| text_of(button).as_deref() == Some(text))
+        .unwrap_or_else(|| panic!("no {text:?} entry"))
+}
+
+/// The texts the menu `popover` shows, sorted (GTK's own empty label for a
+/// tooltip is no text).
+fn texts_in(popover: &gtk::Popover) -> Vec<String> {
+    let mut texts: Vec<String> = labels_in(popover)
+        .iter()
+        .map(|label| label.label().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+    texts.sort();
+    texts
+}
+
+/// The boxes of the saved sessions in `popover`, in the order shown.
+fn rows_in(popover: &gtk::Popover) -> Vec<gtk::Box> {
+    all_widgets::<gtk::Box>(popover)
+        .into_iter()
+        .filter(|row| row.widget_name() == sessions_menu::ROW_NAME)
+        .collect()
+}
+
+/// The name on the button of `row`.
+fn row_name(row: &gtk::Box) -> String {
+    let button = row
+        .first_child()
+        .and_downcast::<gtk::Button>()
+        .expect("the session's button");
+    text_of(&button).expect("a name on it")
+}
+
+/// The names `popover` lists, in the order shown.
+pub(super) fn listed(popover: &gtk::Popover) -> Vec<String> {
+    rows_in(popover).iter().map(row_name).collect()
+}
+
+/// The row of the session `name` in `popover`.
+pub(super) fn row_of(popover: &gtk::Popover, name: &str) -> gtk::Box {
+    rows_in(popover)
+        .into_iter()
+        .find(|row| row_name(row) == name)
+        .unwrap_or_else(|| panic!("no session {name:?} in the menu"))
+}
+
+/// `main`'s Sessions menu, open. It is one popover that is rebuilt each time
+/// it shows, so first wait for it to be closed.
+pub(super) fn open_menu(main: &window::MainWindow) -> gtk::Popover {
+    let button = sessions_button(main);
+    let popover = button.popover().expect("the menu");
+    pump_until("the menu to be closed", || !popover.is_visible());
+    open_popover(&button)
+}
+
+/// Click the session `name` in the open `popover`.
+pub(super) fn pick_session(popover: &gtk::Popover, name: &str) {
+    row_of(popover, name)
+        .first_child()
+        .and_downcast::<gtk::Button>()
+        .expect("the session's button")
+        .emit_clicked();
+}
+
+/// Open the › of the session `name` in the open `popover` and click `entry`
+/// ("Rename\u{2026}" or "Delete\u{2026}") in what it shows.
+pub(super) fn from_session_menu(popover: &gtk::Popover, name: &str, entry: &str) {
+    let more = menu_button(&row_of(popover, name), "Session Menu");
+    let inner = open_popover(&more);
+    menu_entry(&inner, entry).emit_clicked();
+    let window = more.root().and_downcast::<adw::ApplicationWindow>();
+    assert!(
+        window.is_some_and(|window| window.visible_dialog().is_none()),
+        "the question waits for the menu to let go of the keyboard"
+    );
+}
+
+/// The dialog open over `main`'s window, once there is one.
+pub(super) fn dialog_over(main: &window::MainWindow, what: &str) -> adw::AlertDialog {
+    pump_until(what, || main.window.visible_dialog().is_some());
+    main.window
+        .visible_dialog()
+        .and_downcast::<adw::AlertDialog>()
+        .expect("an alert dialog")
+}
+
+/// The name field of a Save or Rename dialog.
+pub(super) fn name_entry(dialog: &adw::AlertDialog) -> gtk::Entry {
+    find_widget::<gtk::Entry>(dialog).expect("the name field")
+}
+
+/// The reason a Save or Rename dialog gives for refusing the name, if it shows
+/// one.
+fn error_in(dialog: &adw::AlertDialog) -> Option<String> {
+    labels_in(dialog)
+        .into_iter()
+        .find(|label| label.has_css_class("error") && label.is_visible())
+        .map(|label| label.label().to_string())
+}
+
+/// Whether the button `response` of `dialog` can be pressed.
+fn can_answer(dialog: &adw::AlertDialog, response: &str) -> bool {
+    button_labeled(dialog, response)
+        .unwrap_or_else(|| panic!("no {response} button"))
+        .is_sensitive()
+}
+
+/// Press the button `response` of `dialog` and wait until the dialog is gone
+/// (another may be shown by then).
+pub(super) fn answer(main: &window::MainWindow, dialog: &adw::AlertDialog, response: &str) {
+    button_labeled(dialog, response)
+        .unwrap_or_else(|| panic!("no {response} button"))
+        .emit_clicked();
+    pump_until("the dialog to go", || {
+        main.window.visible_dialog().as_ref() != Some(dialog.upcast_ref::<adw::Dialog>())
+    });
+}
+
+/// Press Enter in `entry`.
+fn press_enter(entry: &gtk::Entry) {
+    entry
+        .delegate()
+        .expect("the entry's text widget")
+        .emit_by_name::<()>("activate", &[]);
+}
+
+/// Open `main`'s Sessions menu, press Save Session\u{2026} and wait for the
+/// dialog.
+pub(super) fn save_dialog(main: &window::MainWindow) -> adw::AlertDialog {
+    let popover = open_menu(main);
+    menu_entry(&popover, SAVE_ENTRY).emit_clicked();
+    assert!(
+        main.window.visible_dialog().is_none(),
+        "the dialog waits for the menu to let go of the keyboard"
+    );
+    dialog_over(main, "the Save dialog")
+}
+
+/// The sessions in the file at `file`; panics if it cannot be read.
+fn saved(file: &Path) -> Vec<Session> {
+    match session_file::load(file) {
+        Loaded::Sessions(sessions) => sessions,
+        Loaded::Unreadable(why) => panic!("the sessions file cannot be read: {why}"),
+    }
+}
+
+/// The names in the file at `file`, in file order.
+fn names_saved(file: &Path) -> Vec<String> {
+    saved(file)
+        .into_iter()
+        .map(|session| session.name)
+        .collect()
+}
+
+/// Save `tabs` in the file at `file` as another window would.
+fn save_as(file: &Path, name: &str, tabs: Vec<TabRecord>) {
+    session_file::put(
+        file,
+        Session {
+            name: name.to_owned(),
+            tabs,
+        },
+        false,
+    )
+    .expect("the session is saved");
+}
+
+/// A session of one tab that shows the new-tab list.
+fn one_list_tab() -> Vec<TabRecord> {
+    vec![TabRecord {
+        root: Node::Pane(pane_record(Kind::List, None, 1.0, false)),
+        focused: 0,
+    }]
+}
+
+/// What the one pane of `tab` was.
+fn kind_of(tab: &TabRecord) -> &Kind {
+    match &tab.root {
+        Node::Pane(pane) => &pane.kind,
+        split => panic!("a tab of one pane: {split:?}"),
+    }
+}
+
+/// Wait for the message that comes after `since` messages (`ctx.notice.delivered()`)
+/// and give its text; it must be the only one, in `main`'s own window.
+pub(super) fn told(ctx: &Rc<AppContext>, main: &window::MainWindow, since: usize) -> String {
+    pump_until("a message", || ctx.notice.delivered() > since);
+    assert_eq!(ctx.notice.delivered(), since + 1, "one message");
+    assert_eq!(
+        ctx.notice.last_area().as_ref(),
+        Some(&main.notifications),
+        "in the window it is about"
+    );
+    ctx.notice.last_text().expect("its text")
+}
+
+/// The Sessions button is right after ＋ (the same icon, tooltip and place the
+/// brief says), and a menu with nothing saved says so and offers only to save.
+/// Looking at it writes nothing.
+pub(super) fn the_menu_with_no_sessions(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let plus = all_widgets::<gtk::Button>(&main.window)
+        .into_iter()
+        .find(|b| b.tooltip_text().as_deref() == Some("New Tab"))
+        .expect("the ＋ button");
+    let button = sessions_button(&main);
+    assert_eq!(
+        plus.next_sibling().as_ref(),
+        Some(button.upcast_ref::<gtk::Widget>()),
+        "right after ＋"
+    );
+    assert_eq!(button.icon_name().as_deref(), Some("view-grid-symbolic"));
+
+    let popover = open_menu(&main);
+    assert_eq!(texts_in(&popover), ["No saved sessions", SAVE_ENTRY]);
+    literal_labels("the menu", &popover, "No saved sessions");
+    assert!(rows_in(&popover).is_empty());
+    assert!(
+        !dir.join(session_file::FILE_NAME).exists(),
+        "looking writes nothing"
+    );
+    close_popover(&popover);
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A window saved from the menu and added to another from its menu: Save
+/// Session\u{2026} names it (the first free "Session N" to start with, a name of
+/// nothing refused with the reason, Enter answering Save) and saves the window
+/// as it is when Save is answered; the other window's menu, rebuilt each time it
+/// opens, then lists it, and picking it adds its tabs after the window's own,
+/// the first added selected, connecting the profile's pane.
+pub(super) fn saving_and_adding_from_the_menu(bin: &Path, dir: &Path) {
+    let fake = fake_ssh(bin, "menu-ssh", "echo FAKE-END\nexec sleep 600");
+    let mut web = profile(&[]);
+    web.name = "web".to_owned();
+    let ctx = ctx_with(dir, std::slice::from_ref(&web));
+    let app = test_app();
+    set_test_ssh_program(Some(fake));
+    let a = main_window(&app, &ctx);
+    let b = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+
+    // Window A: its own shell and a connection to web.
+    open_profile(&a.view, &ctx, &web, None, false);
+    let connected = pane(&a.view.selected_page().expect("web's tab"));
+    wait_for_text(&session_in(&connected), "FAKE-END");
+
+    // B's menu has nothing yet.
+    let popover = open_menu(&b);
+    assert!(rows_in(&popover).is_empty());
+    close_popover(&popover);
+
+    let dialog = save_dialog(&a);
+    assert_eq!(dialog.heading().as_deref(), Some("Save Session"));
+    assert_eq!(
+        dialog.body().as_str(),
+        "Saves this window's tabs and panes to add them to a window later. No \
+         passwords, and nothing shown in the panes, are saved."
+    );
+    assert!(!dialog.is_heading_use_markup() && !dialog.is_body_use_markup());
+    assert_eq!(dialog.close_response().as_str(), "cancel");
+    let entry = name_entry(&dialog);
+    assert_eq!(entry.text(), "Session 1");
+    let focus = dialog
+        .focus()
+        .expect("the keyboard is somewhere in the dialog");
+    assert!(
+        &focus == entry.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&entry),
+        "the keyboard is in the name field"
+    );
+
+    // A name of nothing cannot be saved, and the field says why; nor can one
+    // with a control character; Enter does not answer Save then.
+    entry.set_text("");
+    assert_eq!(error_in(&dialog).as_deref(), Some("Enter a name."));
+    assert!(!can_answer(&dialog, "Save"));
+    press_enter(&entry);
+    entry.set_text("a\tb");
+    assert_eq!(
+        error_in(&dialog).as_deref(),
+        Some("A name cannot contain control characters.")
+    );
+    assert!(!can_answer(&dialog, "Save"));
+    press_enter(&entry);
+    pump_for(Duration::from_millis(300));
+    assert!(a.window.visible_dialog().is_some(), "still asking");
+    assert!(!file.exists(), "nothing saved");
+    literal_labels(
+        "the reason",
+        &dialog,
+        "A name cannot contain control characters.",
+    );
+
+    // A good name: the reason goes. A tab opened after the dialog was is in the
+    // session: the window is captured when Save is answered.
+    entry.set_text("  Work ");
+    assert_eq!(error_in(&dialog), None);
+    assert!(can_answer(&dialog, "Save"));
+    new_tab::open(&a.view, &ctx);
+    press_enter(&entry);
+    pump_until("the dialog to go", || a.window.visible_dialog().is_none());
+    let sessions = saved(&file);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].name, "Work", "trimmed");
+    assert_eq!(sessions[0].tabs.len(), 3, "the shell, web and the new tab");
+    assert!(matches!(kind_of(&sessions[0].tabs[0]), Kind::Local { .. }));
+    assert!(matches!(
+        kind_of(&sessions[0].tabs[1]),
+        Kind::Profile { id, name } if *id == web.id && name == "web"
+    ));
+    assert_eq!(*kind_of(&sessions[0].tabs[2]), Kind::List);
+    assert_eq!(a.view.n_pages(), 3, "A is as it was");
+
+    // B's menu is rebuilt as it opens: it lists the session now, and picking
+    // it adds the tabs after B's own, the first added selected.
+    let popover = open_menu(&b);
+    assert_eq!(listed(&popover), ["Work"]);
+    literal_labels("the menu", &popover, "Work");
+    pick_session(&popover, "Work");
+    assert_eq!(
+        b.view.n_pages(),
+        1,
+        "added once the menu has let go of the keyboard"
+    );
+    pump_until("the tabs to be added", || b.view.n_pages() == 4);
+    pump_until("the menu to close", || !popover.is_visible());
+    assert_eq!(b.view.selected_page().as_ref(), Some(&b.view.nth_page(1)));
+    let terminal = session_in(&pane(&b.view.nth_page(2)));
+    wait_for_text(&terminal, "FAKE-END");
+    assert!(ssh_args(&terminal).contains(&format!("{}@{}", web.username, web.host)));
+    assert!(list_in(&b.view.nth_page(3)).is_some(), "the list tab");
+    assert_eq!(a.view.n_pages(), 3, "A is still as it was");
+
+    set_test_ssh_program(None);
+    a.window.destroy();
+    b.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A name already saved is asked about, naming it, before it is replaced:
+/// Cancel keeps the old layout byte for byte; Replace puts this window's layout
+/// as it is when Replace is answered in the old one's place. A file that goes
+/// bad while the question is open is not replaced silently.
+pub(super) fn saving_under_a_name_in_use_asks(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    let old = one_list_tab();
+    save_as(&file, "Work", old.clone());
+    save_as(&file, "Other", old.clone());
+    new_tab::open(&a.view, &ctx);
+    let before = fs::read(&file).expect("the file");
+
+    // The question, and Cancel.
+    let dialog = save_dialog(&a);
+    assert_eq!(name_entry(&dialog).text(), "Session 1", "a name not in use");
+    name_entry(&dialog).set_text("Work");
+    assert_eq!(error_in(&dialog), None, "asked about, not refused");
+    answer(&a, &dialog, "Save");
+    let ask = dialog_over(&a, "the Replace question");
+    assert_eq!(
+        ask.heading().as_deref(),
+        Some("Replace \u{201c}Work\u{201d}?")
+    );
+    assert_eq!(
+        ask.body().as_str(),
+        "The saved session with this name is replaced by this window's layout."
+    );
+    assert!(!ask.is_heading_use_markup() && !ask.is_body_use_markup());
+    assert_eq!(ask.default_response().as_deref(), Some("cancel"));
+    assert_eq!(ask.close_response().as_str(), "cancel");
+    assert_eq!(
+        ask.response_appearance("replace"),
+        adw::ResponseAppearance::Destructive
+    );
+    assert_eq!(fs::read(&file).expect("the file"), before, "nothing yet");
+    answer(&a, &ask, "Cancel");
+    assert_eq!(fs::read(&file).expect("the file"), before, "kept");
+
+    // Replace: the window as it is when Replace is answered, in the old
+    // one's place.
+    let dialog = save_dialog(&a);
+    name_entry(&dialog).set_text("Work");
+    answer(&a, &dialog, "Save");
+    let ask = dialog_over(&a, "the Replace question");
+    new_tab::open(&a.view, &ctx);
+    answer(&a, &ask, "Replace");
+    assert_eq!(names_saved(&file), ["Work", "Other"], "in its place");
+    let sessions = saved(&file);
+    assert_eq!(sessions[0].tabs.len(), 3, "the three tabs of the window");
+    assert_eq!(sessions[1].tabs, old, "the other is as it was");
+
+    // The file going bad while the question is open: not replaced silently.
+    let dialog = save_dialog(&a);
+    name_entry(&dialog).set_text("Work");
+    answer(&a, &dialog, "Save");
+    let ask = dialog_over(&a, "the Replace question");
+    fs::write(&file, "not json").expect("damage the file");
+    let since = ctx.notice.delivered();
+    answer(&a, &ask, "Replace");
+    let said = told(&ctx, &a, since);
+    assert!(
+        said.starts_with("Could not read the saved sessions: it is not JSON"),
+        "{said}"
+    );
+    assert_eq!(fs::read(&file).expect("the file"), b"not json", "kept");
+    a.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Each saved session has a › with Rename\u{2026} and Delete\u{2026}; the menu lists the
+/// sessions by name ignoring case. Rename asks for a name (a used one refused
+/// with the reason, a name of nothing too), Cancel changes nothing and Rename
+/// keeps the session's place in the file; a name taken meanwhile by another
+/// window is told. Delete names the session and asks first.
+pub(super) fn rename_and_delete_ask_first(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    for name in ["beta", "Zed", "Alpha"] {
+        save_as(&file, name, one_list_tab());
+    }
+
+    let popover = open_menu(&a);
+    assert_eq!(listed(&popover), ["Alpha", "beta", "Zed"], "ignoring case");
+
+    // Rename: the field starts as the name; the reasons; Cancel.
+    from_session_menu(&popover, "beta", "Rename\u{2026}");
+    let dialog = dialog_over(&a, "the Rename dialog");
+    assert_eq!(dialog.heading().as_deref(), Some("Rename Session"));
+    assert!(!dialog.is_heading_use_markup() && !dialog.is_body_use_markup());
+    assert_eq!(dialog.close_response().as_str(), "cancel");
+    let entry = name_entry(&dialog);
+    assert_eq!(entry.text(), "beta");
+    assert_eq!(error_in(&dialog), None, "its own name is no clash");
+    entry.set_text("Alpha");
+    assert_eq!(
+        error_in(&dialog).as_deref(),
+        Some("A session with this name exists.")
+    );
+    assert!(!can_answer(&dialog, "Rename"));
+    entry.set_text(" ");
+    assert_eq!(error_in(&dialog).as_deref(), Some("Enter a name."));
+    assert!(!can_answer(&dialog, "Rename"));
+    entry.set_text("gamma");
+    assert_eq!(error_in(&dialog), None);
+    assert!(can_answer(&dialog, "Rename"));
+    answer(&a, &dialog, "Cancel");
+    assert_eq!(names_saved(&file), ["beta", "Zed", "Alpha"], "Cancel");
+
+    // Rename: in its place.
+    let popover = open_menu(&a);
+    from_session_menu(&popover, "beta", "Rename\u{2026}");
+    let dialog = dialog_over(&a, "the Rename dialog");
+    name_entry(&dialog).set_text("gamma");
+    answer(&a, &dialog, "Rename");
+    assert_eq!(
+        names_saved(&file),
+        ["gamma", "Zed", "Alpha"],
+        "in its place"
+    );
+    let popover = open_menu(&a);
+    assert_eq!(listed(&popover), ["Alpha", "gamma", "Zed"]);
+
+    // Another window takes the name while the dialog is open: told, and
+    // nothing changes.
+    from_session_menu(&popover, "gamma", "Rename\u{2026}");
+    let dialog = dialog_over(&a, "the Rename dialog");
+    name_entry(&dialog).set_text("Fresh");
+    save_as(&file, "Fresh", one_list_tab());
+    let since = ctx.notice.delivered();
+    answer(&a, &dialog, "Rename");
+    assert_eq!(
+        told(&ctx, &a, since),
+        "A session with this name exists.",
+        "the clash is told"
+    );
+    assert_eq!(names_saved(&file), ["gamma", "Zed", "Alpha", "Fresh"]);
+
+    // Delete names the session and asks first.
+    let popover = open_menu(&a);
+    from_session_menu(&popover, "gamma", "Delete\u{2026}");
+    let ask = dialog_over(&a, "the Delete question");
+    assert_eq!(
+        ask.heading().as_deref(),
+        Some("Delete \u{201c}gamma\u{201d}?")
+    );
+    assert_eq!(
+        ask.body().as_str(),
+        "The saved layout is deleted. Windows that are open are not changed."
+    );
+    assert!(!ask.is_heading_use_markup() && !ask.is_body_use_markup());
+    assert_eq!(ask.default_response().as_deref(), Some("cancel"));
+    assert_eq!(ask.close_response().as_str(), "cancel");
+    assert_eq!(
+        ask.response_appearance("delete"),
+        adw::ResponseAppearance::Destructive
+    );
+    assert_eq!(names_saved(&file).len(), 4, "nothing before the answer");
+    answer(&a, &ask, "Cancel");
+    assert_eq!(
+        names_saved(&file),
+        ["gamma", "Zed", "Alpha", "Fresh"],
+        "kept"
+    );
+    // Escape is Cancel.
+    let popover = open_menu(&a);
+    from_session_menu(&popover, "gamma", "Delete\u{2026}");
+    let ask = dialog_over(&a, "the Delete question");
+    ask.close();
+    pump_until("the question to go", || a.window.visible_dialog().is_none());
+    assert_eq!(
+        names_saved(&file),
+        ["gamma", "Zed", "Alpha", "Fresh"],
+        "Escape"
+    );
+    let popover = open_menu(&a);
+    from_session_menu(&popover, "gamma", "Delete\u{2026}");
+    let ask = dialog_over(&a, "the Delete question");
+    answer(&a, &ask, "Delete");
+    assert_eq!(names_saved(&file), ["Zed", "Alpha", "Fresh"], "deleted");
+    assert_eq!(a.view.n_pages(), 1, "open windows are not changed");
+    a.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A file that cannot be read is said so in the menu, which still offers to
+/// save; saving asks before starting a new file (the reason in the question),
+/// Cancel leaves the bytes alone and Replace writes a new file.
+pub(super) fn a_damaged_file_is_told_and_kept(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    fs::write(&file, "not json").expect("damage the file");
+    let Loaded::Unreadable(why) = session_file::load(&file) else {
+        panic!("the file cannot be read");
+    };
+
+    let popover = open_menu(&a);
+    let said = format!("Could not read the saved sessions: {why}");
+    let labels = literal_labels("the menu", &popover, &said);
+    assert!(labels[0].wraps(), "a long reason wraps");
+    assert!(rows_in(&popover).is_empty());
+    assert_eq!(
+        texts_in(&popover),
+        [said.as_str(), SAVE_ENTRY],
+        "only that and Save"
+    );
+    close_popover(&popover);
+
+    // Save asks, with the reason; Cancel keeps the file as it is.
+    let dialog = save_dialog(&a);
+    assert_eq!(name_entry(&dialog).text(), "Session 1");
+    answer(&a, &dialog, "Save");
+    let ask = dialog_over(&a, "the Replace question");
+    assert_eq!(
+        ask.heading().as_deref(),
+        Some("Replace the Saved Sessions File?")
+    );
+    assert_eq!(
+        ask.body().as_str(),
+        format!(
+            "Moniker could not read it: {why}. Saving starts a new file without the \
+             sessions that were in it."
+        )
+    );
+    assert!(!ask.is_heading_use_markup() && !ask.is_body_use_markup());
+    assert_eq!(ask.default_response().as_deref(), Some("cancel"));
+    assert_eq!(
+        ask.response_appearance("replace"),
+        adw::ResponseAppearance::Destructive
+    );
+    answer(&a, &ask, "Cancel");
+    assert_eq!(fs::read(&file).expect("the file"), b"not json", "Cancel");
+
+    // Replace: a new file with this window.
+    let dialog = save_dialog(&a);
+    answer(&a, &dialog, "Save");
+    let ask = dialog_over(&a, "the Replace question");
+    answer(&a, &ask, "Replace");
+    let sessions = saved(&file);
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].name, "Session 1");
+    assert_eq!(sessions[0].tabs.len(), 1);
+    a.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Two windows saving: a menu that was built before another window saved still
+/// saves its own session beside it (the file is read again with every save), the
+/// name offered is chosen from the file as it is when the dialog opens, and a
+/// name the other window took meanwhile is asked about, not replaced from an
+/// old snapshot.
+pub(super) fn two_windows_saving_keep_both(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let b = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+
+    // A's menu is open, built while nothing was saved, when B saves.
+    let popover_a = open_menu(&a);
+    assert!(rows_in(&popover_a).is_empty());
+    let dialog = save_dialog(&b);
+    assert_eq!(name_entry(&dialog).text(), "Session 1");
+    answer(&b, &dialog, "Save");
+    assert_eq!(names_saved(&file), ["Session 1"]);
+
+    // A saves from that menu: the name offered is the next one free, and both
+    // sessions are in the file.
+    assert!(popover_a.is_visible(), "A's menu stayed open");
+    menu_entry(&popover_a, SAVE_ENTRY).emit_clicked();
+    let dialog = dialog_over(&a, "A's Save dialog");
+    assert_eq!(name_entry(&dialog).text(), "Session 2");
+    name_entry(&dialog).set_text("A");
+    answer(&a, &dialog, "Save");
+    assert_eq!(names_saved(&file), ["Session 1", "A"], "both kept");
+
+    // B takes "B" while A is asking for it: A is asked, not silent.
+    let dialog = save_dialog(&a);
+    name_entry(&dialog).set_text("B");
+    save_as(&file, "B", one_list_tab());
+    answer(&a, &dialog, "Save");
+    let ask = dialog_over(&a, "the Replace question");
+    assert_eq!(ask.heading().as_deref(), Some("Replace \u{201c}B\u{201d}?"));
+    answer(&a, &ask, "Cancel");
+    assert_eq!(names_saved(&file), ["Session 1", "A", "B"]);
+    assert_eq!(saved(&file)[2].tabs, one_list_tab(), "B's is as B left it");
+    a.window.destroy();
+    b.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A session gone or changed since the menu was built: picking reads the file
+/// again, so a replaced session adds the layout now saved, and one that is
+/// gone says so and adds nothing; renaming a gone one says so and writes
+/// nothing. What is told appears in the window the menu is in, also when
+/// another window that was opened earlier has the keyboard too.
+pub(super) fn a_session_changed_since_the_menu_opened_is_read_again(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let other = main_window(&app, &ctx);
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    save_as(&file, "Work", one_list_tab());
+    save_as(&file, "Keep", one_list_tab());
+    let two_tabs = {
+        let mut tabs = one_list_tab();
+        tabs.extend(one_list_tab());
+        tabs
+    };
+
+    // Replaced by another window while the menu is open: the layout now saved.
+    let popover = open_menu(&a);
+    assert_eq!(listed(&popover), ["Keep", "Work"]);
+    save_as(&file, "Keep", two_tabs);
+    pick_session(&popover, "Keep");
+    pump_until("the two tabs", || a.view.n_pages() == 3);
+
+    // Deleted meanwhile: told, and nothing added.
+    let popover = open_menu(&a);
+    session_file::delete(&file, "Work").expect("another window deletes it");
+    let since = ctx.notice.delivered();
+    pick_session(&popover, "Work");
+    assert_eq!(told(&ctx, &a, since), "That session is no longer saved.");
+    assert_eq!(a.view.n_pages(), 3, "nothing added");
+
+    // Renaming one that is gone: told, nothing written.
+    let popover = open_menu(&a);
+    assert_eq!(listed(&popover), ["Keep"]);
+    from_session_menu(&popover, "Keep", "Rename\u{2026}");
+    let dialog = dialog_over(&a, "the Rename dialog");
+    name_entry(&dialog).set_text("Kept");
+    session_file::delete(&file, "Keep").expect("another window deletes it");
+    let before = fs::read(&file).expect("the file");
+    let since = ctx.notice.delivered();
+    answer(&a, &dialog, "Rename");
+    assert_eq!(told(&ctx, &a, since), "That session is no longer saved.");
+    assert_eq!(fs::read(&file).expect("the file"), before);
+
+    // A message appears in the window the menu is in, not in the one that has
+    // the keyboard: the other window is the active one while the question
+    // over A is answered, and the file has gone bad before it is.
+    save_as(&file, "Work", one_list_tab());
+    let dialog = save_dialog(&a);
+    name_entry(&dialog).set_text("Work");
+    answer(&a, &dialog, "Save");
+    let ask = dialog_over(&a, "the Replace question");
+    fs::write(&file, "not json").expect("damage the file");
+    other.window.present();
+    pump_until("the other window to be active", || other.window.is_active());
+    let since = ctx.notice.delivered();
+    answer(&a, &ask, "Replace");
+    let said = told(&ctx, &a, since);
+    assert!(
+        said.starts_with("Could not read the saved sessions: "),
+        "{said}"
+    );
+    a.window.destroy();
+    other.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A write that fails (the folder is read-only) is told, as plain text, in the
+/// window it is about: saving, renaming and deleting each say "Could not save the
+/// sessions: \u{2026}", and the file stays as it was.
+pub(super) fn a_failed_write_is_told(dir: &Path) {
+    if rustix::process::geteuid().is_root() {
+        return; // root can write to a read-only folder
+    }
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    save_as(&file, "Work", one_list_tab());
+    let before = fs::read(&file).expect("the file");
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("make the folder read-only");
+
+    let dialog = save_dialog(&a);
+    name_entry(&dialog).set_text("Other");
+    let since = ctx.notice.delivered();
+    answer(&a, &dialog, "Save");
+    let said = told(&ctx, &a, since);
+    assert!(said.starts_with("Could not save the sessions: "), "{said}");
+    literal_labels("a failed write", &a.notifications, &said);
+
+    let popover = open_menu(&a);
+    from_session_menu(&popover, "Work", "Rename\u{2026}");
+    let dialog = dialog_over(&a, "the Rename dialog");
+    name_entry(&dialog).set_text("Moved");
+    let since = ctx.notice.delivered();
+    answer(&a, &dialog, "Rename");
+    let said = told(&ctx, &a, since);
+    assert!(said.starts_with("Could not save the sessions: "), "{said}");
+
+    let popover = open_menu(&a);
+    from_session_menu(&popover, "Work", "Delete\u{2026}");
+    let ask = dialog_over(&a, "the Delete question");
+    let since = ctx.notice.delivered();
+    answer(&a, &ask, "Delete");
+    let said = told(&ctx, &a, since);
+    assert!(said.starts_with("Could not save the sessions: "), "{said}");
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("make it writable again");
+    assert_eq!(fs::read(&file).expect("the file"), before, "as it was");
+    a.window.destroy();
     pump_for(Duration::from_millis(200));
 }
