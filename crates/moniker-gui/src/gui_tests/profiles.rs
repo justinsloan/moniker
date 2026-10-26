@@ -1454,7 +1454,10 @@ pub(super) fn the_default_is_chosen_on_the_profile_page(dir: &Path) {
 /// The row shows what the file says, and only a pick saves: building the page,
 /// a refresh, a sequence added or taken away elsewhere write nothing, even when
 /// they rebuild the list on offer. A pick that cannot be saved goes back to the
-/// file's choice and says why.
+/// file's choice and says why. A pick is refused when the list changed under it
+/// (reordered, shortened) and the page has not heard of it yet: the default is
+/// kept by position, and it must never name a sequence the person did not
+/// choose.
 pub(super) fn the_default_row_follows_the_file_and_saves_only_a_pick(dir: &Path) {
     let mut p = web_with(&[
         seq("a", &["echo A"]),
@@ -1529,30 +1532,59 @@ pub(super) fn the_default_row_follows_the_file_and_saves_only_a_pick(dir: &Path)
     assert_eq!(s.stored_default(&p.id), Some(0));
     assert!(!combo.has_css_class("error"));
 
-    // A list that was shortened elsewhere before the page heard of it: the
-    // pick names a place the file no longer has, and is refused.
+    // The list was reordered elsewhere before the page heard of it (the file
+    // watch has not reloaded: nothing ran the main loop since the write). The
+    // list has the same length, so only the sequence the pick carries tells:
+    // "a" at its old place is "b" now, and a pick of it would make every
+    // connection run another sequence than the one the person saw. It is
+    // refused, the file keeps its default, and the row goes back to what the
+    // file says.
     s.elsewhere(&p.id, |p| {
         p.sequences = vec![
             seq("a", &["echo A"]),
             seq("b", &["echo B"]),
             seq("c", &["echo C"]),
         ];
-        p.startup_sequence = None;
+        p.startup_sequence = Some(2);
     });
     s.ctx.profiles_changed();
     assert_eq!(items_of(&combo), ["None", "a", "b", "c"]);
-    s.elsewhere(&p.id, |p| p.sequences.truncate(1));
+    assert_eq!(shown_item(&combo), "c");
+    s.elsewhere(&p.id, |p| {
+        p.sequences = vec![
+            seq("b", &["echo B"]),
+            seq("a", &["echo A"]),
+            seq("c", &["echo C"]),
+        ];
+    });
     let written = s.file_bytes();
-    let last = items_of(&combo).iter().position(|i| i == "c").expect("c");
-    combo.set_selected(u32::try_from(last).expect("small"));
+    let first = items_of(&combo).iter().position(|i| i == "a").expect("a");
+    combo.set_selected(u32::try_from(first).expect("small"));
     saved();
     assert_eq!(
         s.ctx.notice.last_text().as_deref(),
-        Some(form::SEQUENCE_CHANGED)
+        Some(form::CHOICE_CHANGED)
     );
     assert_eq!(s.file_bytes(), written, "nothing was written");
-    assert_eq!(items_of(&combo), ["None", "a"], "the file's list now");
-    assert_eq!(shown_item(&combo), "None");
+    assert_eq!(s.stored_default(&p.id), Some(2), "the file's default");
+    assert!(combo.has_css_class("error"));
+    assert_eq!(items_of(&combo), ["None", "b", "a", "c"], "the file's list");
+    assert_eq!(shown_item(&combo), "c", "the file's choice");
+
+    // A list that was shortened elsewhere before the page heard of it: the
+    // pick names a place the file no longer has, and is refused the same way.
+    s.elsewhere(&p.id, |p| p.sequences.truncate(1));
+    let written = s.file_bytes();
+    let second = items_of(&combo).iter().position(|i| i == "a").expect("a");
+    combo.set_selected(u32::try_from(second).expect("small"));
+    saved();
+    assert_eq!(
+        s.ctx.notice.last_text().as_deref(),
+        Some(form::CHOICE_CHANGED)
+    );
+    assert_eq!(s.file_bytes(), written, "nothing was written");
+    assert_eq!(items_of(&combo), ["None", "b"], "the file's list now");
+    assert_eq!(shown_item(&combo), "None", "its default is past the end");
     s.close();
 }
 

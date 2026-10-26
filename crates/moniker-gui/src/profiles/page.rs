@@ -54,7 +54,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
-use moniker_core::profile::Profile;
+use moniker_core::profile::{Profile, StartupSequence};
 use moniker_core::secrets::password_key;
 use zeroize::Zeroizing;
 
@@ -140,6 +140,10 @@ struct Inner {
     /// The sequence names the row offers after "None", to make its list again
     /// only when they change.
     default_names: RefCell<Vec<String>>,
+    /// The sequences as the page last saw them in the file: what a pick means.
+    /// A pick carries its sequence along, and the file refuses it if the list
+    /// changed since ([`form::CHOICE_CHANGED`]).
+    default_sequences: RefCell<Vec<StartupSequence>>,
     /// What the file says, or will say once the saves asked for are back: the
     /// last pick, while one is being saved.
     default_stored: Cell<Option<usize>>,
@@ -345,6 +349,7 @@ impl ProfilePage {
             sequences_shown: RefCell::new(None),
             default_row,
             default_names: RefCell::new(Vec::new()),
+            default_sequences: RefCell::new(Vec::new()),
             default_stored: Cell::new(profile.startup_choice()),
             default_saving,
             default_loading: Cell::new(false),
@@ -988,6 +993,7 @@ impl Inner {
             .iter()
             .map(|sequence| sequence.name.clone())
             .collect();
+        self.default_sequences.replace(profile.sequences.clone());
         self.default_loading.set(true);
         if *self.default_names.borrow() != names {
             let items: Vec<&str> = std::iter::once(DEFAULT_NONE)
@@ -1011,23 +1017,33 @@ impl Inner {
     }
 
     /// The person picked an entry of the "Default sequence" row: save it, as
-    /// the sequence's place in the list (`None` for "None"). The file has the
-    /// last word: a place it does not have (a sync took the sequence away) is
-    /// refused ([`Field::StartupSequence`]) and the row goes back to what the
-    /// file says.
+    /// the sequence's place in the list together with the sequence the person
+    /// saw there (`None` for "None"). The file has the last word: unless it
+    /// has that very sequence at that place (a sync took it away, moved it or
+    /// changed it since the page showed it) the pick is refused
+    /// ([`Field::StartupSequence`]), nothing is written, and the row goes back
+    /// to what the file says.
     fn default_picked(self: &Rc<Self>) {
         if self.default_loading.get() {
             return;
         }
-        let choice = match self.default_row.selected() {
+        let index = match self.default_row.selected() {
             gtk::INVALID_LIST_POSITION => return,
             0 => None,
             entry => Some(entry as usize - 1),
         };
-        if choice == self.default_stored.get() {
+        if index == self.default_stored.get() {
             return;
         }
-        self.default_stored.set(choice);
+        let choice = match index {
+            None => None,
+            // The row's list is made from these, so there is always one.
+            Some(index) => match self.default_sequences.borrow().get(index) {
+                Some(sequence) => Some((index, sequence.clone())),
+                None => return,
+            },
+        };
+        self.default_stored.set(index);
         self.save(
             &self.default_row,
             &self.default_saving,

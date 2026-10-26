@@ -192,6 +192,11 @@ pub const GONE: &str =
 /// kept here, and a tie goes to the deletion.
 pub const CANNOT_SYNC_AGAIN: &str = "This profile cannot sync again: another machine gave it the largest possible version. Delete it and create it again to sync it.";
 
+/// What the profile page says when a pick of the default sequence names a
+/// sequence that the file no longer has at that place (a sync changed the list
+/// after the page showed it).
+pub const CHOICE_CHANGED: &str = "The sequences changed meanwhile. Choose the default again.";
+
 /// One field of a profile, as the Connection Profiles window saves it: each row of the
 /// profile page applies its own field on its own (see [`apply_field`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -206,10 +211,12 @@ pub enum Field {
     /// Keep the profile on this machine only (`true`), or sync it again
     /// (`false`). Syncing again can be refused: see [`CANNOT_SYNC_AGAIN`].
     LocalOnly(bool),
-    /// The sequence that runs every time the profile connects (its position in
-    /// the list), or `None` for no default. A position past the end of the
-    /// list as the file holds it is refused: see [`SEQUENCE_CHANGED`].
-    StartupSequence(Option<usize>),
+    /// The sequence that runs every time the profile connects, or `None` for no
+    /// default. A pick carries the sequence it means as well as its place in
+    /// the list (the page's view of both): it is refused, and nothing is
+    /// written, unless the file has that very sequence at that place now (name
+    /// and commands): see [`CHOICE_CHANGED`]. `None` needs no check.
+    StartupSequence(Option<(usize, StartupSequence)>),
 }
 
 impl Field {
@@ -229,7 +236,9 @@ impl Field {
             }
             Field::Transcript(on) => profile.transcript = on,
             Field::LocalOnly(kept) => profile.local_only = kept,
-            Field::StartupSequence(choice) => profile.startup_sequence = choice,
+            Field::StartupSequence(choice) => {
+                profile.startup_sequence = choice.map(|(index, _)| index);
+            }
         }
     }
 }
@@ -249,9 +258,13 @@ impl Field {
 /// delete the profile here. The check is made on the profile under the store's
 /// lock, so a version that arrives while the save waits is the one judged.
 ///
-/// A default sequence past the end of the list as the file holds it now (a sync
-/// removed the sequence the page offered) is refused the same way, with
-/// [`SEQUENCE_CHANGED`].
+/// A pick of the default sequence is the one field that is judged against the
+/// list as well: a connection must never run a sequence the person did not
+/// choose, and the default is kept by position, so a sync that reordered the
+/// list after the page showed it would otherwise make the position name another
+/// sequence. The pick carries the sequence it means, and unless the file has
+/// that sequence (name and commands) at that place now, it is refused with
+/// [`CHOICE_CHANGED`] and nothing is written. The message quotes no command.
 pub fn apply_field(
     store: &RefCell<ProfileStore>,
     id: &str,
@@ -261,10 +274,10 @@ pub fn apply_field(
         if matches!(field, Field::LocalOnly(false)) && profile.updated_at == i64::MAX {
             return Err(CANNOT_SYNC_AGAIN.to_owned());
         }
-        if let Field::StartupSequence(Some(index)) = field
-            && index >= profile.sequences.len()
+        if let Field::StartupSequence(Some((index, expected))) = &field
+            && profile.sequences.get(*index) != Some(expected)
         {
-            return Err(SEQUENCE_CHANGED.to_owned());
+            return Err(CHOICE_CHANGED.to_owned());
         }
         field.set_on(profile);
         Ok(true)
@@ -622,6 +635,12 @@ mod tests {
             name: name.to_owned(),
             commands: commands.iter().map(|c| (*c).to_owned()).collect(),
         }
+    }
+
+    /// The pick of the sequence at `index` of `p`, as the page makes it from the
+    /// list it shows.
+    fn choose(p: &Profile, index: usize) -> Field {
+        Field::StartupSequence(Some((index, p.sequences[index].clone())))
     }
 
     fn values() -> FormValues {
@@ -1214,7 +1233,7 @@ mod tests {
     #[test]
     fn the_default_is_set_and_cleared_as_a_field() {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
-        let saved = apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        let saved = apply_field(&store, &p.id, choose(&p, 1)).unwrap();
         assert_eq!(saved.startup_sequence, Some(1));
         assert!(saved.updated_at > p.updated_at);
         assert_eq!(on_disk(&dir, &p.id), Some(saved.clone()));
@@ -1222,9 +1241,9 @@ mod tests {
         assert_eq!(saved.startup_sequence, None);
         assert_eq!(on_disk(&dir, &p.id).unwrap().startup_sequence, None);
         // The first and the last sequence are fine defaults.
-        apply_field(&store, &p.id, Field::StartupSequence(Some(0))).unwrap();
+        apply_field(&store, &p.id, choose(&p, 0)).unwrap();
         assert_eq!(on_disk(&dir, &p.id).unwrap().startup_choice(), Some(0));
-        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        apply_field(&store, &p.id, choose(&p, 1)).unwrap();
         assert_eq!(on_disk(&dir, &p.id).unwrap().startup_choice(), Some(1));
     }
 
@@ -1233,15 +1252,17 @@ mod tests {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
         let before = file_bytes(&dir);
 
-        let err = apply_field(&store, &p.id, Field::StartupSequence(Some(2))).unwrap_err();
+        let pick = Field::StartupSequence(Some((2, seq("c", &["3"]))));
+        let err = apply_field(&store, &p.id, pick).unwrap_err();
 
-        assert_eq!(err, SEQUENCE_CHANGED);
+        assert_eq!(err, CHOICE_CHANGED);
         assert_eq!(file_bytes(&dir), before, "nothing was written");
         // A profile with no sequence has nothing to name.
         let (dir, store, p) = store_with_profile();
         let before = file_bytes(&dir);
-        let err = apply_field(&store, &p.id, Field::StartupSequence(Some(0))).unwrap_err();
-        assert_eq!(err, SEQUENCE_CHANGED);
+        let pick = Field::StartupSequence(Some((0, seq("a", &["1"]))));
+        let err = apply_field(&store, &p.id, pick).unwrap_err();
+        assert_eq!(err, CHOICE_CHANGED);
         assert_eq!(file_bytes(&dir), before);
     }
 
@@ -1256,13 +1277,65 @@ mod tests {
         assert_eq!(store.borrow().get(&p.id).unwrap().sequences.len(), 2);
         let before = file_bytes(&dir);
 
-        let err = apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap_err();
+        let err = apply_field(&store, &p.id, choose(&p, 1)).unwrap_err();
 
-        assert_eq!(err, SEQUENCE_CHANGED);
+        assert_eq!(err, CHOICE_CHANGED);
         assert_eq!(file_bytes(&dir), before);
         // The one that is still there is fine.
-        apply_field(&store, &p.id, Field::StartupSequence(Some(0))).unwrap();
+        apply_field(&store, &p.id, choose(&p, 0)).unwrap();
         assert_eq!(on_disk(&dir, &p.id).unwrap().startup_sequence, Some(0));
+    }
+
+    #[test]
+    fn a_pick_is_refused_when_the_list_was_reordered_under_it() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
+        apply_field(&store, &p.id, choose(&p, 0)).unwrap();
+        // A sync reorders the list without changing its length, and the window
+        // still shows [a, b]. The default is kept by position, so a pick of "b"
+        // at 1 would make the profile run "a" on every connection.
+        let mut other = other_handle(&dir);
+        let mut changed = other.get(&p.id).unwrap().clone();
+        changed.sequences = vec![seq("b", &["2"]), seq("a", &["1"])];
+        other.upsert(changed).unwrap();
+        let before = file_bytes(&dir);
+
+        for index in [0, 1] {
+            let err = apply_field(&store, &p.id, choose(&p, index)).unwrap_err();
+            assert_eq!(err, CHOICE_CHANGED, "{index}");
+            assert_eq!(file_bytes(&dir), before, "{index}: nothing was written");
+        }
+        // The text says what to do and quotes no command.
+        assert_eq!(
+            CHOICE_CHANGED,
+            "The sequences changed meanwhile. Choose the default again."
+        );
+        // The sequence that is at that place now is a fine pick, and so is none.
+        let now = on_disk(&dir, &p.id).unwrap();
+        apply_field(&store, &p.id, choose(&now, 1)).unwrap();
+        assert_eq!(on_disk(&dir, &p.id).unwrap().startup_sequence, Some(1));
+        apply_field(&store, &p.id, Field::StartupSequence(None)).unwrap();
+        assert_eq!(on_disk(&dir, &p.id).unwrap().startup_sequence, None);
+    }
+
+    #[test]
+    fn a_pick_is_refused_when_the_commands_changed_under_it() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["uptime"]), seq("b", &["df"])]);
+        // The same names in the same places, other commands: not what the
+        // person saw, so not what they chose.
+        let mut other = other_handle(&dir);
+        let mut changed = other.get(&p.id).unwrap().clone();
+        changed.sequences = vec![seq("a", &["reboot"]), seq("b", &["df"])];
+        other.upsert(changed).unwrap();
+        let before = file_bytes(&dir);
+
+        let err = apply_field(&store, &p.id, choose(&p, 0)).unwrap_err();
+
+        assert_eq!(err, CHOICE_CHANGED);
+        assert!(!err.contains("uptime") && !err.contains("reboot"));
+        assert_eq!(file_bytes(&dir), before);
+        // The one that did not change is fine.
+        apply_field(&store, &p.id, choose(&p, 1)).unwrap();
+        assert_eq!(on_disk(&dir, &p.id).unwrap().startup_sequence, Some(1));
     }
 
     /// The profile's default set to `default` in the file, whatever the
@@ -1277,7 +1350,7 @@ mod tests {
     #[test]
     fn one_write_moves_a_sequence_and_its_default() {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
-        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        apply_field(&store, &p.id, choose(&p, 1)).unwrap();
         // A stamp far ahead of the clock: one write moves it by exactly one.
         let ahead = now_ms() + 1_000_000;
         store
@@ -1311,7 +1384,7 @@ mod tests {
     fn deleting_the_default_sequence_clears_it_in_the_same_write() {
         let (dir, store, p) =
             store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"]), seq("c", &["3"])]);
-        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        apply_field(&store, &p.id, choose(&p, 1)).unwrap();
 
         // A sequence before the default goes: the default moves down by one.
         apply_sequences(
@@ -1343,7 +1416,7 @@ mod tests {
     #[test]
     fn saving_a_sequence_keeps_the_default() {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
-        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        apply_field(&store, &p.id, choose(&p, 1)).unwrap();
 
         // Edited in place, and a new one added: the default stays on "b".
         apply_sequences(
@@ -1372,7 +1445,7 @@ mod tests {
     #[test]
     fn a_move_that_changes_nothing_leaves_the_default_alone() {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
-        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        apply_field(&store, &p.id, choose(&p, 1)).unwrap();
         let before = file_bytes(&dir);
 
         // "b" is the last: Down has nowhere to go, though `moved_default` alone
@@ -1417,7 +1490,7 @@ mod tests {
     #[test]
     fn a_default_the_new_list_has_no_place_for_is_not_written() {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
-        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        apply_field(&store, &p.id, choose(&p, 1)).unwrap();
 
         // A `follow` that names a place past the end of the list it goes with
         // (the two halves of a change disagreeing) is dropped, not saved.
