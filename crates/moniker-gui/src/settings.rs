@@ -270,11 +270,20 @@ pub fn load(path: &Path) -> GuiSettings {
     }
 }
 
-/// Write `settings` to `path` so readers see the old file or the new one,
-/// never part of one: a temporary file in the same directory, created with
-/// mode 0600, fsynced, then renamed over `path`. The directory is created
-/// (mode 0700) if it is missing.
+/// Write `settings` to `path` ([`write_private`]) as pretty JSON with a
+/// trailing newline.
 pub fn save(path: &Path, settings: &GuiSettings) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    write_private(path, &bytes)
+}
+
+/// Write `bytes` to `path` so readers see the old file or the new one, never
+/// part of one: a temporary file in the same directory, created with mode
+/// 0600, fsynced, then renamed over `path`. The directory is created (mode
+/// 0700) if it is missing. Both of this machine's own files, the settings and
+/// the saved sessions ([`crate::session_file`]), are written through here.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -283,8 +292,6 @@ pub fn save(path: &Path, settings: &GuiSettings) -> io::Result<()> {
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let mut bytes = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
-    bytes.push(b'\n');
 
     // A name of its own (pid and a counter), so two Moniker processes saving
     // at once never write the same temporary file. `create_new` never follows
@@ -303,7 +310,7 @@ pub fn save(path: &Path, settings: &GuiSettings) -> io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
-    let written = file.write_all(&bytes).and_then(|()| file.sync_all());
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
     let result = written.and_then(|()| fs::rename(&tmp, path));
     if result.is_err() {
