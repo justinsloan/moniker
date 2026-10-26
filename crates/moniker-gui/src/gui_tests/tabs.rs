@@ -27,10 +27,11 @@ use super::{
     pump_until, shown, tab_window, wait_for_session, wait_for_text, widgets_of_type,
 };
 use crate::context::{AppContext, Notice};
+use crate::launch_args::{Run, Start};
 use crate::notify::NotificationArea;
 use crate::terminal_tab::{
     ASKPASS_MISSING_NOTICE, TranscriptSpec, after_the_menu_lets_go, ask_rename,
-    end_sessions_on_close, launch, new_holder_page, new_holder_page_at, open_command,
+    end_sessions_on_close, launch, new_holder_page, new_holder_page_at, open_command, open_local,
     open_local_shell, rename_page, scale_of, set_test_ssh_program, start_command, start_profile,
     start_shell_in, terminal_of, terminal_text, write_transcripts,
 };
@@ -719,6 +720,366 @@ pub(super) fn local_shell_starts_in_home(bin: &Path, dir: &Path) {
     wait_for_text(&terminal, "$");
     terminal.feed_child(b"echo REAL:$(pwd -P)\n");
     wait_for_text(&terminal, &format!("REAL:{real_home}"));
+    fx.click_close(&terminal);
+    fx.window.destroy();
+}
+
+/// What a command-line launch asks for: `run` in `dir`, named `title`.
+fn start_of(dir: &Path, title: Option<&str>, run: Run) -> Start {
+    Start {
+        dir: dir.to_path_buf(),
+        title: title.map(str::to_owned),
+        run,
+        dir_refused: None,
+    }
+}
+
+/// A command with these arguments (program first), not held.
+fn command(argv: &[&str]) -> Run {
+    Run::Command {
+        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+        hold: false,
+    }
+}
+
+/// The same, kept open when it ends.
+fn held(argv: &[&str]) -> Run {
+    Run::Command {
+        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
+        hold: true,
+    }
+}
+
+/// A local tab opened for a launch in a given folder starts there: the shell,
+/// and a command, in a folder with a space and a non-ASCII name in it (Files
+/// hands over exactly such paths).
+pub(super) fn a_local_tab_starts_in_its_folder(bin: &Path, dir: &Path) {
+    let folder = dir.join("My Files").join("Ünï");
+    fs::create_dir_all(&folder).expect("the folder");
+    let there = canonical(&folder);
+    let here = canonical(&std::env::current_dir().expect("a working directory"));
+    let home = canonical(&glib::home_dir());
+    assert_ne!(there, here);
+    assert_ne!(there, home);
+
+    let fx = fixture();
+    // The shell (no $SHELL here: /bin/sh): wait for its prompt, then ask.
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(&folder, None, Run::Shell),
+        None,
+    );
+    wait_for_text(&terminal, "$");
+    terminal.feed_child(b"echo SHELL-IN:$(pwd -P)\n");
+    wait_for_text(&terminal, &format!("SHELL-IN:{there}"));
+    fx.click_close(&terminal);
+
+    // A command starts in the folder too.
+    let prints = fake_shell(
+        bin,
+        "pwd-command",
+        "echo \"COMMAND-IN:$(pwd -P)\"\nexec sleep 600",
+    );
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(&folder, None, command(&[&prints])),
+        None,
+    );
+    wait_for_text(&terminal, &format!("COMMAND-IN:{there}"));
+    fx.click_close(&terminal);
+    fx.window.destroy();
+}
+
+/// A command tab: the arguments reach the program as they are, the environment
+/// is Moniker's own, success closes the tab, any other end keeps it with the
+/// note a connection shows, `hold` keeps it on success too, and a command that
+/// cannot be started says so in the tab. A transcript is saved as for any tab.
+pub(super) fn a_command_tab_closes_on_success_and_keeps_failures(bin: &Path, dir: &Path) {
+    fs::create_dir_all(dir).expect("dir");
+    let fx = fixture();
+    let home = std::env::var("HOME").expect("the test environment has a home");
+
+    // The arguments are an argument list: nothing is split, expanded or
+    // unquoted on the way.
+    let args = fake_shell(
+        bin,
+        "print-args",
+        "for a in \"$@\"; do printf 'ARG:%s\\n' \"$a\"; done\n\
+         printf 'HOME:%s\\n' \"$HOME\"\n\
+         printf 'SSH_ASKPASS:%s\\n' \"${SSH_ASKPASS-unset}\"\n\
+         exit 3",
+    );
+    let tricky = [
+        "a b",
+        "$HOME",
+        "it's \"quoted\"",
+        "x; echo INJECTED",
+        "*",
+        "`id`",
+        "ünï",
+    ];
+    let mut argv = vec![args.as_str()];
+    argv.extend(tricky);
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, command(&argv)),
+        None,
+    );
+    wait_for_text(&terminal, "[session ended: status 3]");
+    let lines = shown(&terminal);
+    let printed: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("ARG:"))
+        .collect();
+    assert_eq!(printed, tricky, "{lines:?}");
+    assert!(
+        !lines.iter().any(|l| l == "INJECTED"),
+        "nothing ran as a command: {lines:?}"
+    );
+    // Moniker's own environment, as for a local shell: the home is there, and
+    // nothing the launcher might have set.
+    assert!(lines.contains(&format!("HOME:{home}")), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "SSH_ASKPASS:unset"), "{lines:?}");
+    assert_eq!(fx.tabs(), 1, "a failed command's tab stays: {lines:?}");
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("[session ended: status 3]")
+    );
+    fx.click_close(&terminal);
+
+    // The tab is named after the program until the program says otherwise.
+    let named = fake_shell(
+        bin,
+        "named-program",
+        "echo ASKED\nread line\nprintf '\\033]0;from the program\\007'\necho SET\nexec sleep 600",
+    );
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, command(&[&named])),
+        None,
+    );
+    let page = fx.page_of(&terminal);
+    assert_eq!(page.title(), "named-program", "the program's file name");
+    wait_for_text(&terminal, "ASKED");
+    terminal.feed_child(b"go\n");
+    pump_until("the program's title", || page.title() == "from the program");
+    fx.click_close(&terminal);
+
+    // Success closes the tab.
+    let ok = fake_shell(bin, "exit-0", "echo DONE\nexit 0");
+    open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, command(&[&ok])),
+        None,
+    );
+    assert_eq!(fx.tabs(), 1);
+    pump_until("the tab to close after exit 0", || fx.tabs() == 0);
+
+    // A program name with no folder is looked up on the PATH, the arguments
+    // after it are its own, and a failure is kept.
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(
+            dir,
+            None,
+            command(&["sh", "-c", "echo VIA-PATH $0; exit 4", "zero"]),
+        ),
+        None,
+    );
+    wait_for_text(&terminal, "[session ended: status 4]");
+    assert!(shown(&terminal).contains(&"VIA-PATH zero".to_owned()));
+    fx.click_close(&terminal);
+
+    // Killed by a signal: kept, with the signal.
+    let killed = fake_shell(bin, "killed", "echo ABOUT-TO-DIE\nkill -9 $$");
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, command(&[&killed])),
+        None,
+    );
+    wait_for_text(&terminal, "[session ended: signal 9]");
+    pump_for(Duration::from_millis(300));
+    assert_eq!(fx.tabs(), 1, "a command that was killed stays");
+    fx.click_close(&terminal);
+
+    // hold: the tab stays on success with the note, and a failure's note is
+    // the same either way.
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, held(&[&ok])),
+        None,
+    );
+    wait_for_text(&terminal, "[session ended: status 0]");
+    pump_for(Duration::from_millis(300));
+    assert_eq!(fx.tabs(), 1, "a held command's tab stays on success");
+    assert_eq!(shown(&terminal), ["DONE", "[session ended: status 0]"]);
+    fx.click_close(&terminal);
+    let fails = fake_shell(bin, "exit-3", "echo DONE\nexit 3");
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, held(&[&fails])),
+        None,
+    );
+    wait_for_text(&terminal, "[session ended: status 3]");
+    assert_eq!(shown(&terminal), ["DONE", "[session ended: status 3]"]);
+    fx.click_close(&terminal);
+
+    // A command that cannot be started: the note a failing program gets, the
+    // tab stays, and closing it is no trouble. An empty program name (`-e ""`)
+    // and no argument at all (not something the command line produces) are
+    // the same.
+    let missing = "/nonexistent/moniker-test-command";
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, command(&[missing, "x"])),
+        None,
+    );
+    wait_for_text(&terminal, &format!("[could not start {missing}:"));
+    assert_eq!(fx.tabs(), 1);
+    fx.click_close(&terminal);
+    for argv in [&[""][..], &[][..]] {
+        let terminal = open_local(
+            &fx.view,
+            zoom::DEFAULT,
+            &start_of(dir, None, command(argv)),
+            None,
+        );
+        wait_for_text(&terminal, "[could not start");
+        pump_for(Duration::from_millis(300));
+        assert_eq!(fx.tabs(), 1, "the tab stays: {:?}", shown(&terminal));
+        let weak = terminal.downgrade();
+        fx.click_close(&terminal);
+        drop(terminal);
+        pump_until_freed("a tab that could not start to be freed", weak);
+    }
+
+    // Transcripts: written as for a local shell, once, whichever way the
+    // command ends, and without the note.
+    let saved = dir.join("saved");
+    let notice = Notice::default();
+    let long = fake_shell(bin, "long-output", "seq 1 300\necho FAKE-END\nexit 0");
+    open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, command(&[&long])),
+        Some(spec(&saved, &notice)),
+    );
+    pump_until("the tab to close after exit 0", || fx.tabs() == 0);
+    let files = files_in(&saved);
+    assert_eq!(files.len(), 1, "{files:?}");
+    let body = fs::read_to_string(&files[0]).unwrap();
+    assert!(body.starts_with("1\n2\n3\n"), "the scrolled-off start");
+    assert!(body.ends_with("\n299\n300\nFAKE-END\n"), "{body:?}");
+
+    let more = dir.join("saved-more");
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, held(&[&fails])),
+        Some(spec(&more, &notice)),
+    );
+    wait_for_text(&terminal, "[session ended: status 3]");
+    pump_for(Duration::from_millis(300));
+    let files = files_in(&more);
+    assert_eq!(files.len(), 1, "written when the command ended: {files:?}");
+    assert_eq!(fs::read_to_string(&files[0]).unwrap(), "DONE\n");
+    fx.click_close(&terminal);
+    assert_eq!(files_in(&more).len(), 1, "closing writes nothing more");
+    assert_eq!(notice.last_text(), None);
+    fx.window.destroy();
+}
+
+/// A title given on the command line is the tab's name, fixed as a rename is:
+/// what the program says its title is does not change it, for a command and for
+/// the shell. Plain text, as every title is.
+pub(super) fn a_title_given_stays(bin: &Path, dir: &Path) {
+    fs::create_dir_all(dir).expect("dir");
+    let fx = fixture();
+    let titled = fake_shell(
+        bin,
+        "titled-command",
+        "printf '\\033]0;x\\007'\necho READY\nexec sleep 600",
+    );
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, Some("Logs"), command(&[&titled])),
+        None,
+    );
+    let page = fx.page_of(&terminal);
+    assert_eq!(page.title(), "Logs");
+    wait_for_text(&terminal, "READY");
+    pump_until("the terminal to have the program's title", || {
+        terminal.window_title().as_deref() == Some("x")
+    });
+    pump_for(Duration::from_millis(200));
+    assert_eq!(page.title(), "Logs", "the program cannot change it");
+    assert_eq!(page.tooltip().as_deref(), Some("Logs"));
+    fx.click_close(&terminal);
+
+    // The shell, too.
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, Some("Logs"), Run::Shell),
+        None,
+    );
+    let page = fx.page_of(&terminal);
+    assert_eq!(page.title(), "Logs");
+    wait_for_text(&terminal, "$");
+    terminal.feed_child(b"printf '\\033]0;x\\007'; echo READY\n");
+    wait_for_text(&terminal, "READY");
+    pump_until("the terminal to have the shell's title", || {
+        terminal.window_title().as_deref() == Some("x")
+    });
+    pump_for(Duration::from_millis(200));
+    assert_eq!(page.title(), "Logs", "the shell cannot change it");
+    fx.click_close(&terminal);
+
+    // Without a title the same program does rename its tab (so the check
+    // above is about the title, not about a program that never sets one).
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, None, command(&[&titled])),
+        None,
+    );
+    let page = fx.page_of(&terminal);
+    assert_eq!(page.title(), "titled-command");
+    pump_until("the program's title", || page.title() == "x");
+    fx.click_close(&terminal);
+
+    // Markup and control characters are shown as text, on one line.
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, Some(MARKUP_NAME), command(&[&titled])),
+        None,
+    );
+    let page = fx.page_of(&terminal);
+    assert_eq!(page.title(), MARKUP_NAME);
+    assert_eq!(
+        page.tooltip().as_deref(),
+        Some(glib::markup_escape_text(MARKUP_NAME).as_str())
+    );
+    fx.click_close(&terminal);
+    let terminal = open_local(
+        &fx.view,
+        zoom::DEFAULT,
+        &start_of(dir, Some("two\nlines"), command(&[&titled])),
+        None,
+    );
+    assert_eq!(fx.page_of(&terminal).title(), "two lines");
     fx.click_close(&terminal);
     fx.window.destroy();
 }

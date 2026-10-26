@@ -19,9 +19,11 @@
 //! and the home folder come from the caller), so everything runs under
 //! `cargo test` without a display.
 
-// Task 2 (`terminal_tab::open_local`) uses `Start`, `Run` and `Start::home`;
-// Task 3 (`handle_command_line` in `main.rs`) uses `parse`, `start`, `Parsed`,
-// `Request` and `HELP`. Until then the binary does not call them.
+// `terminal_tab::open_local` uses `Start`, `Run` and `Start::home`; Task 3
+// (`handle_command_line` in `main.rs`) will use `parse`, `start`, `Parsed`,
+// `Request`, `HELP` and `Start::dir_refused`. Until then the binary does not
+// call them (so `Run::Command` is never built outside the tests), and this
+// allow stays.
 #![allow(dead_code)]
 
 use std::ffi::{OsStr, OsString};

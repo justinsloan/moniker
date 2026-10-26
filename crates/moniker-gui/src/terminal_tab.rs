@@ -23,6 +23,19 @@
 //! signal) the pane stays open with a short note, so the `ssh` error message
 //! can still be read. Closing the last tab of a window closes the window.
 //!
+//! # Local tabs and commands
+//!
+//! A local tab ([`open_local`]) runs the person's shell, or a command given on
+//! the command line, in a folder, as a [`Start`] says. The environment is
+//! Moniker's own either way, never the launching process's; nothing here
+//! reaches a profile, a password or a remote session. A command
+//! ([`start_command_in`]) is an argument list, never a shell string, and is named
+//! after its program until it sets a title; a title given with it is fixed as a
+//! rename is. When it ends, success closes the tab and any other end keeps it
+//! with the note a connection shows ([`exit_action`]); `hold` keeps it with
+//! [`hold_note`] on success too. One that cannot be started is a "[could not
+//! start …]" note in the tab, as a connection that cannot is.
+//!
 //! # Stored passwords
 //!
 //! A connection with a stored password gets a fresh one-time token
@@ -132,6 +145,7 @@ use vte4::prelude::*;
 use vte4::{Format, PtyFlags, Terminal};
 
 use crate::context::{AppContext, Notice};
+use crate::launch_args::{Run, Start};
 use crate::settings::{self, GuiSettings};
 use crate::{panes, theme, zoom};
 
@@ -174,15 +188,51 @@ pub fn spawn_args(cmd: &SshCommand) -> (Vec<String>, Vec<String>) {
 /// Decide from a raw wait status (as given by VTE's `child-exited`) whether
 /// the tab closes.
 pub fn exit_action(status: i32) -> ExitAction {
+    if ExitStatus::from_raw(status).code() == Some(0) {
+        return ExitAction::Close;
+    }
+    ExitAction::Keep {
+        note: hold_note(status),
+    }
+}
+
+/// The note a session that has ended leaves in its terminal, for the raw wait
+/// status `status`: the exit code, or the signal that ended it. [`exit_action`]
+/// writes exactly this for every end but a clean one, and a held command
+/// ([`start_command_in`] with `hold`) writes it for that one too, as
+/// "[session ended: status 0]".
+pub fn hold_note(status: i32) -> String {
     let wait = ExitStatus::from_raw(status);
-    let note = match (wait.code(), wait.signal()) {
-        (Some(0), _) => return ExitAction::Close,
+    match (wait.code(), wait.signal()) {
         (Some(code), _) => format!("[session ended: status {code}]"),
         (None, Some(signal)) => format!("[session ended: signal {signal}]"),
         // Stopped or unknown: not a clean exit either.
         (None, None) => format!("[session ended: status {status}]"),
-    };
-    ExitAction::Keep { note }
+    }
+}
+
+/// What a command tab does when its command ends: as a connection does, or
+/// with `hold` keeps the tab whatever the status was.
+fn command_exit_action(status: i32, hold: bool) -> ExitAction {
+    if hold {
+        ExitAction::Keep {
+            note: hold_note(status),
+        }
+    } else {
+        exit_action(status)
+    }
+}
+
+/// The automatic title of a tab that runs the command whose program is
+/// `argv0`: the program's file name (`/usr/bin/htop` is "htop"), until the
+/// program sets a title of its own. A name with nothing to show (empty, or only
+/// control characters) is the local tab's.
+fn program_title(argv0: &str) -> String {
+    let name = Path::new(argv0)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(argv0);
+    clean_title(name).unwrap_or_else(|| LOCAL_TITLE.to_owned())
 }
 
 /// `raw` as a one-line title: control characters (an escape sequence in a title
@@ -211,6 +261,8 @@ pub fn tab_title(profile: &Profile) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabTitle {
     automatic: String,
+    /// What a program that clears its title gets back as the automatic one.
+    fallback: String,
     /// Whether [`set_terminal_title`](TabTitle::set_terminal_title) changes the
     /// automatic title: only a local tab listens to its shell.
     follows_shell: bool,
@@ -221,8 +273,10 @@ impl TabTitle {
     /// The title of a tab connected to a profile titled `profile_title`. The
     /// remote shell cannot change it.
     pub fn remote(profile_title: String) -> TabTitle {
+        let automatic = clean_title(&profile_title).unwrap_or_else(|| FALLBACK_TITLE.to_owned());
         TabTitle {
-            automatic: clean_title(&profile_title).unwrap_or_else(|| FALLBACK_TITLE.to_owned()),
+            fallback: automatic.clone(),
+            automatic,
             follows_shell: false,
             renamed: None,
         }
@@ -230,19 +284,32 @@ impl TabTitle {
 
     /// The title of a local tab: "Local terminal" until its shell sets one.
     pub fn local() -> TabTitle {
+        TabTitle::following(LOCAL_TITLE.to_owned())
+    }
+
+    /// The title of a local tab that runs the command whose program is
+    /// `argv0`: the program's file name ([`program_title`]) until the program
+    /// sets one, and again if it clears it.
+    fn program(argv0: &str) -> TabTitle {
+        TabTitle::following(program_title(argv0))
+    }
+
+    /// A local tab's title: `name` until the program in the tab sets one.
+    fn following(name: String) -> TabTitle {
         TabTitle {
-            automatic: LOCAL_TITLE.to_owned(),
+            automatic: name.clone(),
+            fallback: name,
             follows_shell: true,
             renamed: None,
         }
     }
 
     /// The title the shell in the tab asked for (`raw` is as VTE reports it).
-    /// Only a local tab takes it, and a shell that clears its title gets the
-    /// default back.
+    /// Only a local tab takes it, and a program that clears its title gets the
+    /// tab's default back.
     pub fn set_terminal_title(&mut self, raw: &str) {
         if self.follows_shell {
-            self.automatic = clean_title(raw).unwrap_or_else(|| LOCAL_TITLE.to_owned());
+            self.automatic = clean_title(raw).unwrap_or_else(|| self.fallback.clone());
         }
     }
 
@@ -1556,19 +1623,51 @@ fn shell_choice(env_shell: Option<&str>) -> String {
     }
 }
 
-/// A new tab with a local shell, at the text size of the tab selected in
-/// `view`, or at `fallback_scale` if there is none (the first tab of a window).
-/// Closing it, or the shell exiting, closes the tab; the last tab closing
-/// closes the window. With a `transcript` the session is saved like a
+/// A new tab with a local shell in the home folder, at the text size of the tab
+/// selected in `view`, or at `fallback_scale` if there is none (the first tab of
+/// a window). Closing it, or the shell exiting, closes the tab; the last tab
+/// closing closes the window. With a `transcript` the session is saved like a
 /// connection's (module docs).
 pub fn open_local_shell(
     view: &adw::TabView,
     fallback_scale: f64,
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
+    open_local(
+        view,
+        fallback_scale,
+        &Start::home(&glib::home_dir()),
+        transcript,
+    )
+}
+
+/// A new tab for a local terminal as `start` says: the shell, or a command, in
+/// the folder `start.dir`, named `start.title` if it has one (a name given, which
+/// the program's own title never changes, as after a rename). The text size and
+/// the transcript are as for [`open_local_shell`]. Everything is local: nothing
+/// here reaches a profile or a password.
+pub(crate) fn open_local(
+    view: &adw::TabView,
+    fallback_scale: f64,
+    start: &Start,
+    transcript: Option<TranscriptSpec>,
+) -> Terminal {
     let page = new_holder_page_at(view, LOCAL_TITLE, || fallback_scale);
     let holder = holder_of(&page).expect("a new page has its pane");
-    start_local_shell(&holder, transcript)
+    // Before the session, so the tab never shows another name, not even for the
+    // moment before the program has said its own.
+    if let Some(title) = &start.title {
+        rename_pane(&holder, title);
+    }
+    match &start.run {
+        Run::Shell => {
+            let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
+            start_shell_in(&holder, &shell, &start.dir, transcript)
+        }
+        Run::Command { argv, hold } => {
+            start_command_in(&holder, argv, &start.dir, *hold, transcript)
+        }
+    }
 }
 
 /// Run the person's shell in `holder`'s pane, in their home directory. The pane
@@ -1602,11 +1701,69 @@ pub(crate) fn start_shell_in(
         holder,
         move |_, _status| close_pane(&holder)
     ));
-    // The shell's own title, e.g. "alice@desktop: ~". Remote tabs never get here:
-    // what a remote host says about itself is not to be believed. (VTE 0.78
-    // deprecated `window-title` for the `xterm.title` termprop, but the termprop
-    // API needs vte4's `v0_78` feature, which would raise the minimum VTE from
-    // 0.76; the property is still kept up to date, as the tests check.)
+    follow_program_title(holder, &terminal);
+    spawn(&terminal, folder_to_spawn_in(dir), &[shell.to_owned()], &[]);
+    terminal
+}
+
+/// Run the command `argv` (the program first, then its arguments, as a list:
+/// nothing here builds a shell string) in `holder`'s pane, in the folder `dir`
+/// (as [`start_shell_in`] takes it). The pane is named after the program's file
+/// name and follows the title the program sets ([`TabTitle::program`]). The
+/// environment is Moniker's own, as a local shell's is; the launching process's
+/// is never used.
+///
+/// When the command ends: a clean exit closes the pane (and the window with its
+/// last one), any other end keeps it with the note a connection shows
+/// ([`exit_action`]); with `hold` every end keeps it with [`hold_note`],
+/// success included. A transcript is saved when the command ends or the pane,
+/// tab or window closes, whichever is first, and holds no note.
+///
+/// A command that cannot be started (no program, an empty name or one that is
+/// not there) says so in the pane, "[could not start …]", which stays.
+pub(crate) fn start_command_in(
+    holder: &PaneHolder,
+    argv: &[String],
+    dir: &Path,
+    hold: bool,
+    transcript: Option<TranscriptSpec>,
+) -> Terminal {
+    let program = argv.first().map(String::as_str).unwrap_or_default();
+    let terminal = begin_session(holder, TabTitle::program(program));
+    let session = start_recording(&terminal, transcript);
+    terminal.connect_child_exited(glib::clone!(
+        #[weak]
+        holder,
+        move |terminal, status| {
+            if let Some(session) = &session {
+                session.write_transcript_once();
+            }
+            match command_exit_action(status, hold) {
+                ExitAction::Close => close_pane(&holder),
+                ExitAction::Keep { note } => show_note(terminal, &note),
+            }
+        }
+    ));
+    follow_program_title(holder, &terminal);
+    if program.is_empty() {
+        // Nothing to start: say so as a failed start does, without asking VTE
+        // or GLib to run a program with no name. There is no child to wait for
+        // when the pane closes.
+        show_note(&terminal, "[could not start: no program to run]");
+        holder.child_gone().set(true);
+    } else {
+        spawn(&terminal, folder_to_spawn_in(dir), argv, &[]);
+    }
+    terminal
+}
+
+/// Let the title the program in `terminal` sets name `holder`'s pane, until the
+/// pane is renamed. Only a local pane (a shell or a command of the person's own)
+/// gets here: what a remote host says about itself is not to be believed. (VTE
+/// 0.78 deprecated `window-title` for the `xterm.title` termprop, but the
+/// termprop API needs vte4's `v0_78` feature, which would raise the minimum VTE
+/// from 0.76; the property is still kept up to date, as the tests check.)
+fn follow_program_title(holder: &PaneHolder, terminal: &Terminal) {
     terminal.connect_window_title_notify(glib::clone!(
         #[weak]
         holder,
@@ -1616,9 +1773,12 @@ pub(crate) fn start_shell_in(
             refresh_title(&holder);
         }
     ));
-    let dir = dir.is_dir().then(|| dir.to_str()).flatten();
-    spawn(&terminal, dir, &[shell.to_owned()], &[]);
-    terminal
+}
+
+/// `dir` as the folder to start a program in: only one that is a folder (and
+/// text), else the program starts in the folder Moniker was started in.
+fn folder_to_spawn_in(dir: &Path) -> Option<&str> {
+    dir.is_dir().then(|| dir.to_str()).flatten()
 }
 
 /// Shown as a notification when a password is stored for a profile but the
@@ -2082,6 +2242,94 @@ mod tests {
     fn a_status_that_is_neither_keeps_the_tab() {
         // 0x7f in the low byte is "stopped", not an exit.
         assert_eq!(exit_action(0x137f), keep("[session ended: status 4991]"));
+    }
+
+    // hold_note and the end of a command tab
+
+    #[test]
+    fn hold_note_names_every_end() {
+        assert_eq!(hold_note(0), "[session ended: status 0]");
+        assert_eq!(hold_note(1 << 8), "[session ended: status 1]");
+        assert_eq!(hold_note(255 << 8), "[session ended: status 255]");
+        assert_eq!(hold_note(9), "[session ended: signal 9]");
+        assert_eq!(hold_note(0x80 | 11), "[session ended: signal 11]");
+        assert_eq!(hold_note(0x137f), "[session ended: status 4991]");
+    }
+
+    #[test]
+    fn hold_note_and_exit_action_write_the_same_text_for_every_nonzero_end() {
+        // Every exit code, every signal (with and without the core-dumped
+        // bit) and the stopped status: what a connection shows and what a held
+        // command shows must never drift apart.
+        let statuses = (1..=255)
+            .map(|code| code << 8)
+            .chain((1..=64).flat_map(|signal| [signal, signal | 0x80]))
+            .chain([0x137f, 0x7f]);
+        for status in statuses {
+            assert_eq!(
+                exit_action(status),
+                keep(&hold_note(status)),
+                "status {status:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_command_tab_closes_on_success_and_keeps_every_other_end() {
+        assert_eq!(command_exit_action(0, false), ExitAction::Close);
+        for status in [1 << 8, 3 << 8, 9, 0x80 | 11, 0x137f] {
+            assert_eq!(command_exit_action(status, false), keep(&hold_note(status)));
+        }
+    }
+
+    #[test]
+    fn a_held_command_tab_keeps_every_end_with_the_note() {
+        assert_eq!(
+            command_exit_action(0, true),
+            keep("[session ended: status 0]")
+        );
+        for status in [1 << 8, 3 << 8, 9, 0x80 | 11, 0x137f] {
+            assert_eq!(
+                command_exit_action(status, true),
+                command_exit_action(status, false),
+                "a failure is kept either way, with the same note"
+            );
+        }
+    }
+
+    // A command's name
+
+    #[test]
+    fn a_command_tab_is_named_after_its_program() {
+        assert_eq!(program_title("htop"), "htop");
+        assert_eq!(program_title("/usr/bin/htop"), "htop");
+        assert_eq!(program_title("/opt/My App/run me"), "run me");
+        assert_eq!(program_title("./tool/"), "tool");
+        // Nothing to take a file name from: the text as given, cleaned.
+        assert_eq!(program_title("/"), "/");
+        assert_eq!(program_title(".."), "..");
+        // Never a blank or control characters in a title.
+        assert_eq!(program_title("/bin/a\u{1b}b"), "a b");
+        assert_eq!(program_title(""), "Local terminal");
+        assert_eq!(program_title("\n"), "Local terminal");
+    }
+
+    #[test]
+    fn a_command_tab_follows_its_program_until_renamed() {
+        let mut t = TabTitle::program("htop");
+        assert_eq!(t.shown(), "htop");
+        t.set_terminal_title("htop - desktop");
+        assert_eq!(t.shown(), "htop - desktop");
+        // A program that clears its title gets its own name back, not the
+        // shell's.
+        t.set_terminal_title("");
+        assert_eq!(t.shown(), "htop");
+        // A given title stays whatever the program says.
+        t.rename("Logs");
+        t.set_terminal_title("x");
+        assert_eq!(t.shown(), "Logs");
+        t.rename("");
+        assert_eq!(t.shown(), "x");
     }
 
     // tab_title

@@ -431,6 +431,10 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #15, a local tab that starts in a folder or runs a command.
+    tabs::a_local_tab_starts_in_its_folder(&bin, &tmp.path().join("l-folder"));
+    tabs::a_command_tab_closes_on_success_and_keeps_failures(&bin, &tmp.path().join("l-command"));
+    tabs::a_title_given_stays(&bin, &tmp.path().join("l-title"));
     // Issue #10, a profile kept on this machine only.
     profiles::keeping_a_profile_here_asks_first(&tmp.path().join("k-keep"));
     profiles::syncing_it_again_asks_too(&tmp.path().join("k-again"));
