@@ -355,6 +355,74 @@ mod tests {
         assert_eq!(ids, [ID_A, ID_B, ID_C]);
     }
 
+    /// `entry` as a peer on Moniker 0.5.0 sends it back: that version does not
+    /// know `startup_sequence`, so it drops the field when it reads the entry
+    /// and writes the entry without it.
+    fn as_an_older_peer_sends_it(entry: &BundleEntry) -> BundleEntry {
+        let mut value = serde_json::to_value(entry).unwrap();
+        value["profile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("startup_sequence")
+            .expect("the entry has a default to drop");
+        let back: BundleEntry = serde_json::from_value(value).unwrap();
+        assert!(!wire(&back).contains("startup_sequence"));
+        back
+    }
+
+    /// A live entry that names its first sequence as the default.
+    fn with_default(id: &str, updated_at: i64) -> BundleEntry {
+        let mut entry = live(id, "update host", updated_at, Some("pw"));
+        entry
+            .profile
+            .sequences
+            .push(crate::profile::StartupSequence {
+                name: "update".to_string(),
+                commands: vec!["apt update".to_string()],
+            });
+        entry.profile.startup_sequence = Some(0);
+        entry
+    }
+
+    #[test]
+    fn a_peer_that_drops_the_default_does_not_erase_it() {
+        // The same version of the profile, on equal `updated_at`, once as this
+        // machine has it and once as a 0.5.0 peer sends it back: the merge
+        // compares the entries' JSON text, and the one that has the default
+        // must be the greater, whichever side it comes from.
+        let a = with_default(ID_A, 5);
+        let b = as_an_older_peer_sends_it(&a);
+        assert_ne!(a, b);
+        assert!(wire(&a) > wire(&b), "the field's place in the struct");
+
+        for merged in [
+            merge(vec![a.clone()], vec![b.clone()]),
+            merge(vec![b.clone()], vec![a.clone()]),
+        ] {
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged[0].profile.startup_sequence, Some(0));
+            assert_eq!(merged[0], a);
+        }
+    }
+
+    #[test]
+    fn an_edit_elsewhere_still_wins_over_the_default() {
+        // The peer edited the profile after this machine set the default: its
+        // newer version wins, and with it the absence of a default.
+        let a = with_default(ID_A, 5);
+        let mut b = as_an_older_peer_sends_it(&a);
+        b.profile.updated_at = 6;
+
+        for merged in [
+            merge(vec![a.clone()], vec![b.clone()]),
+            merge(vec![b.clone()], vec![a.clone()]),
+        ] {
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged[0].profile.updated_at, 6);
+            assert_eq!(merged[0].profile.startup_sequence, None);
+        }
+    }
+
     #[test]
     fn entry_serde_round_trip() {
         for entry in [

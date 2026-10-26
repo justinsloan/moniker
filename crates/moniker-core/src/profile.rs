@@ -53,6 +53,15 @@ pub struct Profile {
     pub local_only: bool,
     /// Last edit time, Unix milliseconds UTC. Newest edit wins when merging.
     pub updated_at: i64,
+    /// The position in `sequences` of the one that runs every time the profile
+    /// connects; left out of the JSON when `None`.
+    ///
+    /// Keep it between `updated_at` and `deleted`: on equal `updated_at` the
+    /// merge compares the entries' JSON text (`bundle::tie_key`), a peer on
+    /// 0.5.0 drops this field, and only here does `"startup_sequence"` sort
+    /// after that peer's `"deleted"`, so the entry that has it wins the tie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_sequence: Option<usize>,
     /// Tombstone marker so deletions propagate through sync.
     pub deleted: bool,
 }
@@ -109,8 +118,18 @@ impl Profile {
             transcript: false,
             local_only: false,
             updated_at: now_ms(),
+            startup_sequence: None,
             deleted: false,
         }
+    }
+
+    /// The sequence that runs every time this profile connects: the saved
+    /// default when it points at one of `sequences`, else `None`. An index past
+    /// the end (an edit on a peer, or by hand) is not an error, so it is not
+    /// checked by `validate`: it only runs nothing.
+    pub fn startup_choice(&self) -> Option<usize> {
+        self.startup_sequence
+            .filter(|&index| index < self.sequences.len())
     }
 
     /// Check that a profile is safe to store and to turn into an `ssh` invocation.
@@ -171,6 +190,7 @@ impl Profile {
             transcript: false,
             local_only: false,
             updated_at: now_ms,
+            startup_sequence: None,
             deleted: true,
         }
     }
@@ -366,6 +386,7 @@ mod tests {
             name: "update".to_string(),
             commands: vec!["apt update".to_string()],
         });
+        p.startup_sequence = Some(0);
         let t = p.tombstone(123_456);
         assert!(t.deleted);
         assert_eq!(t.id, p.id);
@@ -375,6 +396,7 @@ mod tests {
         assert_eq!(t.key_file, None);
         assert!(t.sequences.is_empty());
         assert!(!t.transcript);
+        assert_eq!(t.startup_sequence, None);
         assert_eq!(t.updated_at, 123_456);
     }
 
@@ -392,6 +414,50 @@ mod tests {
                 .contains("\"local_only\":true")
         );
         assert!(!kept.tombstone(5).local_only);
+    }
+
+    #[test]
+    fn no_default_is_written_as_before() {
+        let none = valid();
+        assert_eq!(none.startup_sequence, None);
+        assert!(
+            !serde_json::to_string(&none)
+                .unwrap()
+                .contains("startup_sequence")
+        );
+        let some = Profile {
+            startup_sequence: Some(1),
+            ..valid()
+        };
+        assert!(
+            serde_json::to_string(&some)
+                .unwrap()
+                .contains("\"startup_sequence\":1")
+        );
+        // An entry from a peer that does not know the field reads as no default.
+        let back: Profile = serde_json::from_str(&serde_json::to_string(&none).unwrap()).unwrap();
+        assert_eq!(back.startup_sequence, None);
+    }
+
+    #[test]
+    fn a_default_past_the_end_runs_nothing() {
+        let mut p = valid();
+        p.sequences.push(StartupSequence {
+            name: "update".to_string(),
+            commands: vec!["apt update".to_string()],
+        });
+        p.startup_sequence = Some(0);
+        assert_eq!(p.startup_choice(), Some(0));
+        p.startup_sequence = Some(1);
+        assert_eq!(p.startup_choice(), None);
+        p.startup_sequence = None;
+        assert_eq!(p.startup_choice(), None);
+        // A profile with no sequences has nothing to run, whatever the field says.
+        p.sequences.clear();
+        p.startup_sequence = Some(0);
+        assert_eq!(p.startup_choice(), None);
+        // An index past the end is not an error: it only runs nothing.
+        assert_eq!(p.validate(), Ok(()));
     }
 
     #[test]

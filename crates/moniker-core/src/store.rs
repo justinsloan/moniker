@@ -10,9 +10,11 @@
 //! kept on this machine (`local_only`); otherwise the file is version 1, as it
 //! always was. Older versions refuse a file of another version and leave it
 //! alone, so none of them can serve or start a sync from a file that says sync
-//! is off or holds a profile that must not leave. Version 1 has no switch and
-//! reads as on. The switch lives in this file so that one atomic write under
-//! the store's lock changes it together with the profiles.
+//! is off or holds a profile that must not leave. A profile's default startup
+//! sequence (`startup_sequence`) is neither: it leaves the version alone, and
+//! an older version reads the file and drops the field. Version 1 has no
+//! switch and reads as on. The switch lives in this file so that one atomic
+//! write under the store's lock changes it together with the profiles.
 //!
 //! Passwords are not stored here; they live in the system keyring.
 //!
@@ -806,8 +808,35 @@ mod tests {
         assert!(text.contains("\"version\": 1"), "{text}");
         assert!(!text.contains("sync_off"), "{text}");
         assert!(!text.contains("local_only"), "{text}");
+        assert!(!text.contains("startup_sequence"), "{text}");
         assert_eq!(s.sync_switch(), SyncSwitch::On);
         assert!(s.sync_switch().is_on());
+    }
+
+    #[test]
+    fn a_default_alone_keeps_the_file_at_version_1() {
+        // Sync on, nothing kept here: a profile's default sequence is only a
+        // field of the profile, and an older Moniker reading the file drops it
+        // like a bundle's. It must not make the file version 2, which older
+        // versions refuse.
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(Profile {
+            sequences: vec![crate::profile::StartupSequence {
+                name: "update".to_string(),
+                commands: vec!["apt update".to_string()],
+            }],
+            startup_sequence: Some(0),
+            ..profile(1, "A")
+        })
+        .unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("sync_off"), "{text}");
+        assert!(text.contains("\"startup_sequence\": 0"), "{text}");
+
+        let reopened = ProfileStore::open(&path).unwrap();
+        assert_eq!(reopened.get(&pid(1)).unwrap().startup_sequence, Some(0));
     }
 
     #[test]
@@ -1145,6 +1174,7 @@ mod tests {
             transcript: false,
             local_only: false,
             updated_at: 1_700_000_000_000,
+            startup_sequence: None,
             deleted: false,
         };
         s.replace_all(vec![p]).unwrap();
@@ -1651,6 +1681,7 @@ mod tests {
             transcript: true,
             local_only: true,
             updated_at: 42,
+            startup_sequence: Some(7),
             deleted: true,
         };
         s.replace_all(vec![junk]).unwrap();

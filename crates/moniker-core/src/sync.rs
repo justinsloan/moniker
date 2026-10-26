@@ -3505,12 +3505,14 @@ mod tests {
             name: "kept update".to_string(),
             commands: vec!["kept-command --now".to_string()],
         }];
+        p.startup_sequence = Some(0);
         p.transcript = true;
         p
     }
 
     /// Nothing of `p` but its id is in `sent`: not its name, host, user name,
-    /// port, key file, sequences or `password`, nor the flag that keeps it.
+    /// port, key file, sequences, default sequence or `password`, nor the flag
+    /// that keeps it.
     fn assert_nothing_of(sent: &[BundleEntry], p: &Profile, password: &str) {
         let text = serde_json::to_string(sent).unwrap();
         let port = format!("\"port\":{}", p.port);
@@ -3521,6 +3523,7 @@ mod tests {
             port.as_str(),
             password,
             "local_only",
+            "startup_sequence",
             "\"transcript\":true",
         ];
         let key_file = p.key_file.as_ref().map(|k| k.to_str().unwrap().to_owned());
