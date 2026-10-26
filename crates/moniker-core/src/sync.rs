@@ -109,12 +109,13 @@
 //! which removes their copy and its password (older versions understand it
 //! too). Nothing that arrives for the id changes the profile or its password
 //! here, in either role; when a peer had edited its copy after the profile was
-//! kept here, the local stamp is raised past that edit so that the next sync's
-//! tombstone wins (see `plan_apply`). Turning sync back on for the profile is
-//! an ordinary edit, stamped above every tombstone it sent, so the live
-//! profile and its password reach the others at the next sync. Whether a
-//! profile is kept is this machine's own choice: the flag is cleared on
-//! everything received. The HELLO and the bundle format are unchanged.
+//! kept here, the local stamp is raised to that edit's, so that the next
+//! sync's tombstone wins the tie (see `plan_apply`). Turning sync back on for
+//! the profile is an ordinary edit, stamped above every tombstone it sent or
+//! met, so the live profile and its password reach the others at the next
+//! sync. Whether a profile is kept is this machine's own choice: the flag is
+//! cleared on everything received. The HELLO and the bundle format are
+//! unchanged.
 //!
 //! # Passwords: set and changed travel, removal does not
 //!
@@ -538,17 +539,19 @@ impl UndoLog {
 ///
 /// One thing changes: when the merge carries a newer version of the id
 /// (a peer edited its copy after this machine kept the profile, before it
-/// heard), the local `updated_at` is raised one past it. The next sync's
-/// tombstone then beats that edit, without trusting any clock; the deletion
-/// therefore wins on the sync after the one that saw the edit. The raise
-/// saturates: against a peer that pinned the profile at `i64::MAX` the stamp
-/// stays there, and the tombstone still wins the tie. A newer tombstone (a
-/// peer deleted its copy, or keeps it too) raises it as well, so the stamp is
-/// always above every version this machine has heard of: turning sync back
-/// on, an ordinary edit stamped above it, then beats those deletions too, not
-/// only the tombstones this machine sent, whatever the clocks say. Two
-/// machines that both keep the profile each keep their own copy; each sync
-/// between them raises one of the two stamps by one, and counts nothing.
+/// heard), the local `updated_at` is raised to that version's. The next
+/// sync's tombstone, at that same stamp, then beats the edit, because a
+/// tombstone wins a tie on `updated_at` (rule 2 of [`merge`]); so the
+/// deletion wins on the sync after the one that saw the edit, without
+/// trusting any clock. Nothing is added to the stamp, so nothing can
+/// overflow: a peer that pinned the profile at `i64::MAX` gets a tombstone at
+/// `i64::MAX`, which still wins. A newer tombstone (a peer deleted its copy,
+/// or keeps it too) raises the stamp as well, so it is never below any
+/// version this machine has heard of: turning sync back on, an ordinary edit
+/// stamped one above it, then beats those deletions too, not only the
+/// tombstones this machine sent, whatever the clocks say. Two machines that
+/// both keep the profile each keep their own copy and settle on the same
+/// stamp, after which a sync between them writes nothing.
 ///
 /// The kept profile is live, so the pruning above never touches it.
 fn plan_apply(
@@ -569,13 +572,9 @@ fn plan_apply(
         let prev = before.get(&w.profile.id);
         if let Some(kept) = prev.filter(|p| p.profile.local_only && !p.profile.deleted) {
             // Kept on this machine: left alone, password included, only
-            // raised past a newer version (see the docs above).
+            // raised to the stamp of a newer version (see the docs above).
             let mut profile = kept.profile.clone();
-            if w.profile.updated_at > profile.updated_at {
-                profile.updated_at = profile
-                    .updated_at
-                    .max(w.profile.updated_at.saturating_add(1));
-            }
+            profile.updated_at = profile.updated_at.max(w.profile.updated_at);
             profiles.push(profile);
             continue;
         }
@@ -3620,13 +3619,17 @@ mod tests {
             vec![entry(&other, Some("b"))],
             None,
         );
-        assert_eq!(profiles, vec![at(21)], "only raised past the newer edit");
+        assert_eq!(
+            profiles,
+            vec![at(20)],
+            "only raised to the newer edit's stamp, where its tombstone wins"
+        );
         assert!(ops.is_empty());
         assert_eq!(outcome, SyncOutcome::default());
 
         // Nor a deletion, newer or as old; nor an older edit. A peer that
-        // pinned its stamp makes the raise saturate, and the tombstone this
-        // machine then sends still wins the tie.
+        // pinned its stamp at `i64::MAX` gets a tombstone there, which still
+        // wins the tie.
         let older = Profile {
             updated_at: 5,
             ..other.clone()
@@ -3636,7 +3639,7 @@ mod tests {
             ..other.clone()
         };
         let cases = [
-            (kept.tombstone(20), 21),
+            (kept.tombstone(20), 20),
             (kept.tombstone(10), 10),
             (older, 10),
             (pinned, i64::MAX),
@@ -3750,18 +3753,18 @@ mod tests {
         assert!(edit.updated_at > kept.updated_at);
 
         // The first sync sees the newer edit: `b` keeps it, and `a` only
-        // raises its stamp past it, counting nothing.
+        // raises its stamp to the edit's, counting nothing.
         let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
         assert_eq!(out.unwrap(), SyncOutcome::default());
         served.unwrap();
         assert_eq!(b.profile(&x.id), Some(edit.clone()));
         assert_eq!(b.secrets.password(&x.id).as_deref(), Some("pw-b"));
         let raised = Profile {
-            updated_at: edit.updated_at + 1,
+            updated_at: edit.updated_at,
             ..kept.clone()
         };
         assert_kept(&a, &raised, "pw");
-        // The second deletes it there.
+        // The second deletes it there: a tombstone wins the tie.
         let (out, served) = sync_machines(&mut a, &mut b, StaleSync::Refuse);
         assert_eq!(out.unwrap(), SyncOutcome::default());
         assert_eq!(served.unwrap().removed, 1);
@@ -3917,6 +3920,41 @@ mod tests {
                 assert!(!m.secrets.was_read(&x.id));
                 assert_eq!(m.secrets.writes(), 0);
             }
+        }
+    }
+
+    #[test]
+    fn two_keepers_settle_on_one_stamp_and_then_write_nothing() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let x = prof("x");
+        let mut a = Machine::new(&clock, &[(x.clone(), Some("pw-a"))]);
+        let mut b = Machine::new(&clock, &[(x.clone(), Some("pw-b"))]);
+        a.keep_here(&x.id, true);
+        clock.set(start + 60_000);
+        b.keep_here(&x.id, true);
+        let newest = b.profile(&x.id).unwrap().updated_at;
+
+        // The first sync brings `a`'s stamp up to `b`'s, and no further.
+        synced(&mut a, &mut b);
+        for m in [&a, &b] {
+            assert_eq!(m.profile(&x.id).unwrap().updated_at, newest);
+        }
+        // From then on, in either role, neither profile file is written.
+        let files = (file_of(&a.path), file_of(&b.path));
+        for round in 1..=4 {
+            if round % 2 == 0 {
+                synced(&mut a, &mut b);
+            } else {
+                synced(&mut b, &mut a);
+            }
+            let now = (file_of(&a.path), file_of(&b.path));
+            assert!(now == files, "a profile file was written in round {round}");
+        }
+        for (m, password) in [(&a, "pw-a"), (&b, "pw-b")] {
+            let p = m.profile(&x.id).unwrap();
+            assert!(p.local_only && !p.deleted);
+            assert_eq!(m.secrets.password(&x.id).as_deref(), Some(password));
         }
     }
 
