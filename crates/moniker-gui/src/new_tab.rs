@@ -16,13 +16,15 @@
 //!
 //! Picking a row turns that same tab (or pane) into the session: Local terminal starts
 //! the person's shell ([`terminal_tab::start_local_shell`]), a profile connects
-//! with "Just connect". Whether the session saves a transcript is decided here,
+//! and runs its default sequence, if it has one (issue #12). Whether the
+//! session saves a transcript is decided here,
 //! before the tab starts: with "Save transcripts of all sessions" on, every
 //! session does; without it, a profile follows its own setting and Local
 //! terminal saves nothing ([`terminal_tab::default_save`]). A row's "›" (or the
 //! Right arrow on it) opens its choices, where that decision can be made for
-//! this one session: a profile's ([`connect_menu::choices`]) are "Just connect",
-//! each startup sequence and the "Save transcript" box, Local terminal's
+//! this one session: a profile's ([`connect_menu::choices`]) are "Just connect"
+//! (which skips the default sequence), each startup sequence and the "Save
+//! transcript" box, Local terminal's
 //! ([`connect_menu::local_choices`]) "Open" and the box. The box shows the
 //! setting as it is when the choices open. The search matches a profile's name,
 //! host or user name; Local terminal stays the top entry whatever the query.
@@ -131,15 +133,18 @@ impl Chooser {
     }
 
     /// Turn the pane into what `row` stands for: a local shell, or the
-    /// profile's session with "Just connect". A transcript is saved as
-    /// [`terminal_tab::default_save`] says.
+    /// profile's session, which runs the profile's default sequence if it has
+    /// one (the choices behind "›" are where "Just connect" skips it). The
+    /// sequence is the one the list shows: the profile is the list's copy, so
+    /// its default and its sequences are from the same moment. A transcript is
+    /// saved as [`terminal_tab::default_save`] says.
     fn pick(&self, list: &gtk::ListBox, row: &gtk::ListBoxRow) {
         let name = row.widget_name();
         if name == LOCAL_ROW {
             self.open_local(list, terminal_tab::default_save(false, self.save_all()));
         } else if let Some(profile) = self.profile(&name) {
             let save = terminal_tab::default_save(profile.transcript, self.save_all());
-            self.connect(list, &profile, None, save);
+            self.connect(list, &profile, profile.startup_choice(), save);
         }
     }
 

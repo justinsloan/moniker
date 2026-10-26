@@ -206,6 +206,10 @@ pub enum Field {
     /// Keep the profile on this machine only (`true`), or sync it again
     /// (`false`). Syncing again can be refused: see [`CANNOT_SYNC_AGAIN`].
     LocalOnly(bool),
+    /// The sequence that runs every time the profile connects (its position in
+    /// the list), or `None` for no default. A position past the end of the
+    /// list as the file holds it is refused: see [`SEQUENCE_CHANGED`].
+    StartupSequence(Option<usize>),
 }
 
 impl Field {
@@ -225,6 +229,7 @@ impl Field {
             }
             Field::Transcript(on) => profile.transcript = on,
             Field::LocalOnly(kept) => profile.local_only = kept,
+            Field::StartupSequence(choice) => profile.startup_sequence = choice,
         }
     }
 }
@@ -243,6 +248,10 @@ impl Field {
 /// machines hold for it, a tie goes to the deletion, and the next sync would
 /// delete the profile here. The check is made on the profile under the store's
 /// lock, so a version that arrives while the save waits is the one judged.
+///
+/// A default sequence past the end of the list as the file holds it now (a sync
+/// removed the sequence the page offered) is refused the same way, with
+/// [`SEQUENCE_CHANGED`].
 pub fn apply_field(
     store: &RefCell<ProfileStore>,
     id: &str,
@@ -251,6 +260,11 @@ pub fn apply_field(
     let saved = rewrite_live_if(store, id, |profile| {
         if matches!(field, Field::LocalOnly(false)) && profile.updated_at == i64::MAX {
             return Err(CANNOT_SYNC_AGAIN.to_owned());
+        }
+        if let Field::StartupSequence(Some(index)) = field
+            && index >= profile.sequences.len()
+        {
+            return Err(SEQUENCE_CHANGED.to_owned());
         }
         field.set_on(profile);
         Ok(true)
@@ -406,6 +420,39 @@ pub fn without_sequence(seqs: &[StartupSequence], index: usize) -> Vec<StartupSe
     list
 }
 
+/// Where the default sequence is after the sequence at `index` moved in
+/// direction `dir` (see [`moved`]): the default is kept by position, so it
+/// follows its sequence, whether that is the one that moved or the neighbor it
+/// swapped with. Any other default stays where it is.
+///
+/// This does not know the list's length: a move at the end of the list changes
+/// nothing, and [`apply_sequences`] then leaves the default alone as well.
+pub fn moved_default(default: Option<usize>, index: usize, dir: Move) -> Option<usize> {
+    let other = match dir {
+        Move::Up => index.checked_sub(1),
+        Move::Down => index.checked_add(1),
+    };
+    let Some(other) = other else {
+        return default;
+    };
+    match default {
+        Some(d) if d == index => Some(other),
+        Some(d) if d == other => Some(index),
+        d => d,
+    }
+}
+
+/// Where the default sequence is after the sequence at `index` was deleted
+/// ([`without_sequence`]): deleting the default itself clears it, and a default
+/// further down the list moves up by one place, staying on its own sequence.
+pub fn default_without(default: Option<usize>, index: usize) -> Option<usize> {
+    match default {
+        Some(d) if d == index => None,
+        Some(d) if d > index => Some(d - 1),
+        d => d,
+    }
+}
+
 /// Change the startup sequences of the live profile `id` as the file holds
 /// them now: `change` gets the list and returns the one to save.
 ///
@@ -420,11 +467,20 @@ pub fn without_sequence(seqs: &[StartupSequence], index: usize) -> Vec<StartupSe
 /// sequence (`None`) has no such expectation. `Ok(None)`: the list came out the
 /// same, and nothing was written. A profile that is missing or deleted is
 /// [`GONE`].
+///
+/// The default sequence is kept by position, so a change to the list must carry
+/// it along, in the same write: `follow` gets the default as the file holds it
+/// ([`Profile::startup_choice`]: one that points past the end is `None`, so it
+/// is not brought to life by a longer list) and returns the one to save
+/// ([`moved_default`], [`default_without`], or `|d| d` for an edit or an added
+/// sequence). It is not asked when the list comes out the same, and what it
+/// returns is dropped if it names a place the new list does not have.
 pub fn apply_sequences(
     store: &RefCell<ProfileStore>,
     id: &str,
     target: Option<(usize, &StartupSequence)>,
     change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence>,
+    follow: impl FnOnce(Option<usize>) -> Option<usize>,
 ) -> Result<Option<Profile>, String> {
     rewrite_live_if(store, id, |profile| {
         if let Some((index, expected)) = target
@@ -436,6 +492,7 @@ pub fn apply_sequences(
         if next == profile.sequences {
             return Ok(false);
         }
+        profile.startup_sequence = follow(profile.startup_choice()).filter(|&d| d < next.len());
         profile.sequences = next;
         Ok(true)
     })
@@ -836,9 +893,13 @@ mod tests {
         apply_field(&store, &p.id, Field::Username(" bob ".to_owned())).unwrap();
         apply_field(&store, &p.id, Field::Port(2222)).unwrap();
         apply_field(&store, &p.id, Field::Transcript(true)).unwrap();
-        apply_sequences(&store, &p.id, None, |_| {
-            vec![seq("update", &["sudo apt update"])]
-        })
+        apply_sequences(
+            &store,
+            &p.id,
+            None,
+            |_| vec![seq("update", &["sudo apt update"])],
+            |d| d,
+        )
         .unwrap();
         apply_field(
             &store,
@@ -1024,7 +1085,7 @@ mod tests {
         sequences: &[StartupSequence],
     ) -> (tempfile::TempDir, RefCell<ProfileStore>, Profile) {
         let (dir, store, p) = store_with_profile();
-        apply_sequences(&store, &p.id, None, |_| sequences.to_vec()).unwrap();
+        apply_sequences(&store, &p.id, None, |_| sequences.to_vec(), |d| d).unwrap();
         let p = store.borrow().get(&p.id).unwrap().clone();
         (dir, store, p)
     }
@@ -1040,10 +1101,16 @@ mod tests {
         // The window's snapshot has not seen the second sequence; the change
         // gets the list the file holds.
         assert_eq!(store.borrow().get(&p.id).unwrap().sequences.len(), 1);
-        let saved = apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), |now| {
-            assert_eq!(now, [seq("a", &["1"]), seq("b", &["2"])]);
-            with_sequence(now, Some(0), seq("a", &["1", "one"]))
-        })
+        let saved = apply_sequences(
+            &store,
+            &p.id,
+            Some((0, &seq("a", &["1"]))),
+            |now| {
+                assert_eq!(now, [seq("a", &["1"]), seq("b", &["2"])]);
+                with_sequence(now, Some(0), seq("a", &["1", "one"]))
+            },
+            |d| d,
+        )
         .unwrap()
         .expect("written");
         assert_eq!(saved.sequences, [seq("a", &["1", "one"]), seq("b", &["2"])]);
@@ -1052,9 +1119,13 @@ mod tests {
             saved.sequences
         );
         // A new sequence expects nothing to be there.
-        let saved = apply_sequences(&store, &p.id, None, |now| {
-            with_sequence(now, None, seq("c", &["3"]))
-        })
+        let saved = apply_sequences(
+            &store,
+            &p.id,
+            None,
+            |now| with_sequence(now, None, seq("c", &["3"])),
+            |d| d,
+        )
         .unwrap()
         .expect("written");
         assert_eq!(saved.sequences.len(), 3);
@@ -1065,9 +1136,13 @@ mod tests {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["1"])]);
         let before = file_bytes(&dir);
         // Moving the only sequence up changes nothing.
-        let saved = apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), |now| {
-            moved(now, 0, Move::Up)
-        });
+        let saved = apply_sequences(
+            &store,
+            &p.id,
+            Some((0, &seq("a", &["1"]))),
+            |now| moved(now, 0, Move::Up),
+            |d| d,
+        );
         assert_eq!(saved, Ok(None));
         assert_eq!(file_bytes(&dir), before);
     }
@@ -1082,20 +1157,282 @@ mod tests {
         let before = file_bytes(&dir);
 
         // The page was opened on "a" at index 0; now index 0 holds "b".
-        let err = apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), |now| {
-            without_sequence(now, 0)
-        })
+        let err = apply_sequences(
+            &store,
+            &p.id,
+            Some((0, &seq("a", &["1"]))),
+            |now| without_sequence(now, 0),
+            |d| d,
+        )
         .unwrap_err();
         assert_eq!(err, SEQUENCE_CHANGED);
         // Past the end counts the same.
-        let err = apply_sequences(&store, &p.id, Some((5, &seq("a", &["1"]))), |now| {
-            now.to_vec()
-        })
+        let err = apply_sequences(
+            &store,
+            &p.id,
+            Some((5, &seq("a", &["1"]))),
+            |now| now.to_vec(),
+            |d| d,
+        )
         .unwrap_err();
         assert_eq!(err, SEQUENCE_CHANGED);
         // Neither message holds a command, and nothing was written.
         assert!(!err.contains('1'));
         assert_eq!(file_bytes(&dir), before);
+    }
+
+    // ---- the default sequence (issue #12) ----
+
+    #[test]
+    fn the_default_follows_moves() {
+        // Its own sequence moves: the default goes with it.
+        assert_eq!(moved_default(Some(1), 1, Move::Up), Some(0));
+        assert_eq!(moved_default(Some(1), 1, Move::Down), Some(2));
+        // Its neighbor moves past it: the swap puts it where the neighbor was.
+        assert_eq!(moved_default(Some(0), 1, Move::Up), Some(1));
+        assert_eq!(moved_default(Some(2), 1, Move::Down), Some(1));
+        // A move elsewhere leaves it be, and so does no default at all.
+        assert_eq!(moved_default(Some(2), 0, Move::Down), Some(2));
+        assert_eq!(moved_default(Some(0), 2, Move::Up), Some(0));
+        assert_eq!(moved_default(None, 1, Move::Up), None);
+        // The ends: Up from the top has no neighbor.
+        assert_eq!(moved_default(Some(0), 0, Move::Up), Some(0));
+        assert_eq!(moved_default(Some(1), 0, Move::Up), Some(1));
+        assert_eq!(moved_default(Some(0), usize::MAX, Move::Down), Some(0));
+    }
+
+    #[test]
+    fn deleting_shifts_or_clears_the_default() {
+        assert_eq!(default_without(Some(1), 1), None, "its own sequence");
+        assert_eq!(default_without(Some(2), 0), Some(1), "one before it");
+        assert_eq!(default_without(Some(0), 1), Some(0), "one after it");
+        assert_eq!(default_without(None, 0), None);
+        assert_eq!(default_without(Some(0), 0), None);
+        assert_eq!(default_without(Some(3), 1), Some(2));
+    }
+
+    #[test]
+    fn the_default_is_set_and_cleared_as_a_field() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
+        let saved = apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        assert_eq!(saved.startup_sequence, Some(1));
+        assert!(saved.updated_at > p.updated_at);
+        assert_eq!(on_disk(&dir, &p.id), Some(saved.clone()));
+        let saved = apply_field(&store, &p.id, Field::StartupSequence(None)).unwrap();
+        assert_eq!(saved.startup_sequence, None);
+        assert_eq!(on_disk(&dir, &p.id).unwrap().startup_sequence, None);
+        // The first and the last sequence are fine defaults.
+        apply_field(&store, &p.id, Field::StartupSequence(Some(0))).unwrap();
+        assert_eq!(on_disk(&dir, &p.id).unwrap().startup_choice(), Some(0));
+        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        assert_eq!(on_disk(&dir, &p.id).unwrap().startup_choice(), Some(1));
+    }
+
+    #[test]
+    fn a_default_past_the_end_is_refused() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
+        let before = file_bytes(&dir);
+
+        let err = apply_field(&store, &p.id, Field::StartupSequence(Some(2))).unwrap_err();
+
+        assert_eq!(err, SEQUENCE_CHANGED);
+        assert_eq!(file_bytes(&dir), before, "nothing was written");
+        // A profile with no sequence has nothing to name.
+        let (dir, store, p) = store_with_profile();
+        let before = file_bytes(&dir);
+        let err = apply_field(&store, &p.id, Field::StartupSequence(Some(0))).unwrap_err();
+        assert_eq!(err, SEQUENCE_CHANGED);
+        assert_eq!(file_bytes(&dir), before);
+    }
+
+    #[test]
+    fn the_refusal_judges_the_file_not_the_windows_snapshot() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
+        // A sync removes "b" while the window still lists it.
+        let mut other = other_handle(&dir);
+        let mut changed = other.get(&p.id).unwrap().clone();
+        changed.sequences.pop();
+        other.upsert(changed).unwrap();
+        assert_eq!(store.borrow().get(&p.id).unwrap().sequences.len(), 2);
+        let before = file_bytes(&dir);
+
+        let err = apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap_err();
+
+        assert_eq!(err, SEQUENCE_CHANGED);
+        assert_eq!(file_bytes(&dir), before);
+        // The one that is still there is fine.
+        apply_field(&store, &p.id, Field::StartupSequence(Some(0))).unwrap();
+        assert_eq!(on_disk(&dir, &p.id).unwrap().startup_sequence, Some(0));
+    }
+
+    /// The profile's default set to `default` in the file, whatever the
+    /// sequences are (as an edit on a peer can leave it).
+    fn set_default_raw(dir: &tempfile::TempDir, id: &str, default: Option<usize>) {
+        let mut other = other_handle(dir);
+        let mut changed = other.get(id).unwrap().clone();
+        changed.startup_sequence = default;
+        other.upsert(changed).unwrap();
+    }
+
+    #[test]
+    fn one_write_moves_a_sequence_and_its_default() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
+        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        // A stamp far ahead of the clock: one write moves it by exactly one.
+        let ahead = now_ms() + 1_000_000;
+        store
+            .borrow_mut()
+            .update(|current| {
+                let mut next = current.to_vec();
+                for entry in &mut next {
+                    entry.updated_at = ahead;
+                }
+                Ok((next, ()))
+            })
+            .unwrap();
+
+        let saved = apply_sequences(
+            &store,
+            &p.id,
+            Some((1, &seq("b", &["2"]))),
+            |now| moved(now, 1, Move::Up),
+            |d| moved_default(d, 1, Move::Up),
+        )
+        .unwrap()
+        .expect("written");
+
+        assert_eq!(saved.sequences, [seq("b", &["2"]), seq("a", &["1"])]);
+        assert_eq!(saved.startup_sequence, Some(0), "still on \"b\"");
+        assert_eq!(saved.updated_at, ahead + 1, "one write, one stamp");
+        assert_eq!(on_disk(&dir, &p.id), Some(saved));
+    }
+
+    #[test]
+    fn deleting_the_default_sequence_clears_it_in_the_same_write() {
+        let (dir, store, p) =
+            store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"]), seq("c", &["3"])]);
+        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+
+        // A sequence before the default goes: the default moves down by one.
+        apply_sequences(
+            &store,
+            &p.id,
+            Some((0, &seq("a", &["1"]))),
+            |now| without_sequence(now, 0),
+            |d| default_without(d, 0),
+        )
+        .unwrap();
+        let now = on_disk(&dir, &p.id).unwrap();
+        assert_eq!(now.sequences, [seq("b", &["2"]), seq("c", &["3"])]);
+        assert_eq!(now.startup_sequence, Some(0), "still on \"b\"");
+
+        // The default itself goes: no default.
+        apply_sequences(
+            &store,
+            &p.id,
+            Some((0, &seq("b", &["2"]))),
+            |now| without_sequence(now, 0),
+            |d| default_without(d, 0),
+        )
+        .unwrap();
+        let now = on_disk(&dir, &p.id).unwrap();
+        assert_eq!(now.sequences, [seq("c", &["3"])]);
+        assert_eq!(now.startup_sequence, None);
+    }
+
+    #[test]
+    fn saving_a_sequence_keeps_the_default() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
+        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+
+        // Edited in place, and a new one added: the default stays on "b".
+        apply_sequences(
+            &store,
+            &p.id,
+            Some((1, &seq("b", &["2"]))),
+            |now| with_sequence(now, Some(1), seq("b2", &["22"])),
+            |d| d,
+        )
+        .unwrap();
+        apply_sequences(
+            &store,
+            &p.id,
+            None,
+            |now| with_sequence(now, None, seq("c", &["3"])),
+            |d| d,
+        )
+        .unwrap();
+
+        let now = on_disk(&dir, &p.id).unwrap();
+        assert_eq!(now.sequences.len(), 3);
+        assert_eq!(now.startup_sequence, Some(1));
+        assert_eq!(now.sequences[1].name, "b2");
+    }
+
+    #[test]
+    fn a_move_that_changes_nothing_leaves_the_default_alone() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
+        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+        let before = file_bytes(&dir);
+
+        // "b" is the last: Down has nowhere to go, though `moved_default` alone
+        // cannot tell (it does not know the length).
+        let saved = apply_sequences(
+            &store,
+            &p.id,
+            Some((1, &seq("b", &["2"]))),
+            |now| moved(now, 1, Move::Down),
+            |d| moved_default(d, 1, Move::Down),
+        );
+
+        assert_eq!(saved, Ok(None));
+        assert_eq!(file_bytes(&dir), before);
+    }
+
+    #[test]
+    fn a_default_that_points_nowhere_is_not_brought_to_life_by_a_change() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"])]);
+        // A peer's edit left a default past the end: it runs nothing.
+        set_default_raw(&dir, &p.id, Some(1));
+        store.borrow_mut().reload().unwrap();
+        assert_eq!(store.borrow().get(&p.id).unwrap().startup_choice(), None);
+
+        // A second sequence would make place 1 a real one. The default must not
+        // become that sequence by accident.
+        apply_sequences(
+            &store,
+            &p.id,
+            None,
+            |now| with_sequence(now, None, seq("b", &["x"])),
+            |d| d,
+        )
+        .unwrap();
+
+        let now = on_disk(&dir, &p.id).unwrap();
+        assert_eq!(now.sequences.len(), 2);
+        assert_eq!(now.startup_sequence, None);
+        assert_eq!(now.startup_choice(), None);
+    }
+
+    #[test]
+    fn a_default_the_new_list_has_no_place_for_is_not_written() {
+        let (dir, store, p) = store_with_sequences(&[seq("a", &["1"]), seq("b", &["2"])]);
+        apply_field(&store, &p.id, Field::StartupSequence(Some(1))).unwrap();
+
+        // A `follow` that names a place past the end of the list it goes with
+        // (the two halves of a change disagreeing) is dropped, not saved.
+        apply_sequences(
+            &store,
+            &p.id,
+            Some((0, &seq("a", &["1"]))),
+            |now| without_sequence(now, 0),
+            |_| Some(5),
+        )
+        .unwrap();
+
+        let now = on_disk(&dir, &p.id).unwrap();
+        assert_eq!(now.sequences, [seq("b", &["2"])]);
+        assert_eq!(now.startup_sequence, None);
     }
 
     #[test]
@@ -1106,11 +1443,12 @@ mod tests {
 
         let change = |now: &[StartupSequence]| with_sequence(now, None, seq("b", &["2"]));
         assert_eq!(
-            apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), change).unwrap_err(),
+            apply_sequences(&store, &p.id, Some((0, &seq("a", &["1"]))), change, |d| d)
+                .unwrap_err(),
             GONE
         );
         assert_eq!(
-            apply_sequences(&store, &p.id, None, change).unwrap_err(),
+            apply_sequences(&store, &p.id, None, change, |d| d).unwrap_err(),
             GONE
         );
         assert_eq!(file_bytes(&dir), before);
@@ -1123,7 +1461,7 @@ mod tests {
         let (dir, store, p) = store_with_sequences(&[seq("a", &["echo s3cret"])]);
         std::fs::write(dir.path().join("profiles.json"), "{ echo s3cret").unwrap();
 
-        let err = apply_sequences(&store, &p.id, None, |now| now.to_vec()).unwrap_err();
+        let err = apply_sequences(&store, &p.id, None, |now| now.to_vec(), |d| d).unwrap_err();
         assert!(err.starts_with("Could not save the profile"), "got: {err}");
         assert!(!err.contains("s3cret"));
     }

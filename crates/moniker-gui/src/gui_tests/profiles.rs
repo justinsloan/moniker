@@ -222,7 +222,11 @@ impl Setup {
             .into_iter()
             .find(|group| group.title() == "Startup sequences")
             .expect("the Startup sequences group");
+        // The default row is an action row too, but not one of the sequences.
         all_widgets::<adw::ActionRow>(&group)
+            .into_iter()
+            .filter(|row| !row.is::<adw::ComboRow>())
+            .collect()
     }
 
     fn sequence_row_titles(&self) -> Vec<String> {
@@ -230,6 +234,52 @@ impl Setup {
             .iter()
             .map(|row| row.title().to_string())
             .collect()
+    }
+
+    /// The "Default sequence" row of the shown page (not on show while the
+    /// profile has no sequence).
+    fn default_row(&self) -> adw::ComboRow {
+        all_widgets::<adw::ComboRow>(&self.window)
+            .into_iter()
+            .find(|row| row.title() == "Default sequence")
+            .expect("the Default sequence row")
+    }
+
+    /// Choose `name` in the "Default sequence" row, as a click on its list
+    /// does, and wait for what that saves.
+    fn pick_default(&self, name: &str) {
+        let row = self.default_row();
+        let at = items_of(&row)
+            .iter()
+            .position(|item| item == name)
+            .unwrap_or_else(|| panic!("no {name:?} in {:?}", items_of(&row)));
+        row.set_selected(u32::try_from(at).expect("a small position"));
+        saved();
+    }
+
+    /// The default sequence of profile `id` as the file has it.
+    fn stored_default(&self, id: &str) -> Option<usize> {
+        self.on_disk(id).expect("the profile").startup_sequence
+    }
+
+    /// Every row of the "Startup sequences" group, in order, the default row
+    /// and the Add row included.
+    fn group_row_titles(&self) -> Vec<String> {
+        let group = all_widgets::<adw::PreferencesGroup>(&self.window)
+            .into_iter()
+            .find(|group| group.title() == "Startup sequences")
+            .expect("the Startup sequences group");
+        all_widgets::<adw::ActionRow>(&group)
+            .iter()
+            .map(|row| row.title().to_string())
+            .collect()
+    }
+
+    /// Write `change` to the file as another process (a sync) would.
+    fn elsewhere(&self, id: &str, change: impl FnOnce(&mut Profile)) {
+        let mut profile = self.on_disk(id).expect("the profile");
+        change(&mut profile);
+        self.other_store().upsert(profile).expect("save");
     }
 
     /// Activate the sequence row titled `title` (a click on it) and return the
@@ -1259,6 +1309,250 @@ pub(super) fn a_sequence_changed_elsewhere_is_not_overwritten(dir: &Path) {
     s.click(&page, "Cancel");
     s.wait_for_sub_page_to_close();
     assert_eq!(s.sequence_row_titles(), ["b", "a", "Add sequence"]);
+    s.close();
+}
+
+// ----- the default sequence (issue #12) -----
+
+/// The strings a combo row offers, in order.
+fn items_of(row: &adw::ComboRow) -> Vec<String> {
+    let model = row.model().expect("the row's list");
+    (0..model.n_items())
+        .map(|i| {
+            model
+                .item(i)
+                .and_downcast::<gtk::StringObject>()
+                .expect("a string")
+                .string()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The string the combo row has selected.
+fn shown_item(row: &adw::ComboRow) -> String {
+    row.selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|item| item.string().to_string())
+        .unwrap_or_default()
+}
+
+/// The default sequence is chosen in a combo row of the profile page, after the
+/// sequences and before the row that adds one. Picking saves it by position,
+/// and it follows its sequence when that moves, is renamed or goes (and
+/// disappears with the last one); Connect passes it on.
+pub(super) fn the_default_is_chosen_on_the_profile_page(dir: &Path) {
+    let p = web_with(&[
+        seq("a", &["echo A"]),
+        seq("b", &["echo B"]),
+        seq("c", &["echo C"]),
+    ]);
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    s.select(&p.id);
+
+    // What it offers and where it is.
+    let combo = s.default_row();
+    assert!(combo.is_mapped());
+    assert_eq!(combo.title(), "Default sequence");
+    assert_eq!(
+        combo.subtitle().as_deref(),
+        Some("Runs every time this profile connects")
+    );
+    assert!(!combo.uses_markup());
+    assert_eq!(items_of(&combo), ["None", "a", "b", "c"]);
+    assert_eq!(shown_item(&combo), "None");
+    assert_eq!(
+        s.group_row_titles(),
+        ["a", "b", "c", "Default sequence", "Add sequence"]
+    );
+    assert_eq!(s.sequence_row_titles(), ["a", "b", "c", "Add sequence"]);
+    assert_eq!(s.stored_default(&p.id), None);
+
+    // Picking saves its place in the list, and Connect passes it on.
+    s.pick_default("b");
+    assert_eq!(s.stored_default(&p.id), Some(1));
+    assert_eq!(shown_item(&combo), "b");
+    assert!(s.on_disk(&p.id).unwrap().updated_at > p.updated_at);
+    button_labeled(&s.window, "Connect")
+        .expect("the Connect button")
+        .emit_clicked();
+    assert_eq!(*s.connected.borrow(), [(p.id.clone(), Some(1), false)]);
+
+    // Its sequence moves up: the default goes with it, in the same write.
+    let page = s.open_sequence("b");
+    s.click(&page, "Move Up");
+    assert_eq!(
+        s.stored_sequences(&p.id)
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "a", "c"]
+    );
+    assert_eq!(s.stored_default(&p.id), Some(0));
+    assert_eq!(s.default_row(), combo, "the same row");
+    assert_eq!(items_of(&combo), ["None", "b", "a", "c"]);
+    assert_eq!(shown_item(&combo), "b", "still on b");
+
+    // Deleting the default's sequence clears it.
+    s.click(&page, "Delete Sequence");
+    s.wait_for_sub_page_to_close();
+    assert_eq!(s.stored_default(&p.id), None);
+    assert_eq!(items_of(&combo), ["None", "a", "c"]);
+    assert_eq!(shown_item(&combo), "None");
+
+    // Deleting one before it moves it up one place, and it stays on its own.
+    s.pick_default("c");
+    assert_eq!(s.stored_default(&p.id), Some(1));
+    let page = s.open_sequence("a");
+    s.click(&page, "Delete Sequence");
+    s.wait_for_sub_page_to_close();
+    assert_eq!(s.stored_default(&p.id), Some(0));
+    assert_eq!(items_of(&combo), ["None", "c"]);
+    assert_eq!(shown_item(&combo), "c");
+
+    // Renaming it changes the name on offer, not the choice.
+    let page = s.open_sequence("c");
+    sub_name(&page).set_text("c2");
+    s.click(&page, "Save");
+    s.wait_for_sub_page_to_close();
+    assert_eq!(s.stored_default(&p.id), Some(0));
+    assert_eq!(items_of(&combo), ["None", "c2"]);
+    assert_eq!(shown_item(&combo), "c2");
+
+    // None is a choice too.
+    s.pick_default("None");
+    assert_eq!(s.stored_default(&p.id), None);
+    assert_eq!(shown_item(&combo), "None");
+    assert_eq!(s.on_disk(&p.id).unwrap().startup_choice(), None);
+
+    // With no sequence left there is nothing to choose: the row goes.
+    s.pick_default("c2");
+    assert_eq!(s.stored_default(&p.id), Some(0));
+    let page = s.open_sequence("c2");
+    s.click(&page, "Delete Sequence");
+    s.wait_for_sub_page_to_close();
+    assert_eq!(s.stored_default(&p.id), None);
+    assert!(!combo.is_mapped(), "no default to choose");
+    assert_eq!(
+        s.group_row_titles(),
+        ["None: connecting gives a plain shell", "Add sequence"]
+    );
+
+    // A new sequence brings it back, with nothing chosen.
+    let page = s.open_sequence("Add sequence");
+    sub_name(&page).set_text("update");
+    set_commands(&page, "sudo apt update");
+    s.click(&page, "Save");
+    s.wait_for_sub_page_to_close();
+    assert!(combo.is_mapped());
+    assert_eq!(items_of(&combo), ["None", "update"]);
+    assert_eq!(shown_item(&combo), "None");
+    assert_eq!(s.stored_default(&p.id), None);
+    s.close();
+}
+
+/// The row shows what the file says, and only a pick saves: building the page,
+/// a refresh, a sequence added or taken away elsewhere write nothing, even when
+/// they rebuild the list on offer. A pick that cannot be saved goes back to the
+/// file's choice and says why.
+pub(super) fn the_default_row_follows_the_file_and_saves_only_a_pick(dir: &Path) {
+    let mut p = web_with(&[
+        seq("a", &["echo A"]),
+        seq("b", &["echo B"]),
+        seq("c", &["echo C"]),
+    ]);
+    p.startup_sequence = Some(2);
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    let first = s.file_bytes();
+    s.select(&p.id);
+    let combo = s.default_row();
+    assert_eq!(shown_item(&combo), "c", "what the file says");
+    let idle = |what: &str, written: &[u8]| {
+        pump_for(Duration::from_millis(300));
+        assert_eq!(keyring::pending(), 0, "{what}: a save was asked for");
+        assert_eq!(s.file_bytes(), written, "{what}: the file was written");
+    };
+    idle("building the page", &first);
+
+    // The default changed elsewhere.
+    s.elsewhere(&p.id, |p| p.startup_sequence = Some(0));
+    let written = s.file_bytes();
+    s.ctx.profiles_changed();
+    assert_eq!(shown_item(&combo), "a");
+    idle("a refresh", &written);
+
+    // A sequence added elsewhere: the list on offer is made again, the choice
+    // stays, nothing is saved.
+    s.elsewhere(&p.id, |p| p.sequences.push(seq("d", &["echo D"])));
+    let written = s.file_bytes();
+    s.ctx.profiles_changed();
+    assert_eq!(items_of(&combo), ["None", "a", "b", "c", "d"]);
+    assert_eq!(shown_item(&combo), "a");
+    idle("a longer list", &written);
+
+    // The sequence it named taken away, with none left to name: nothing is
+    // chosen, and the file keeps what it has.
+    s.elsewhere(&p.id, |p| {
+        p.sequences.truncate(1);
+        p.startup_sequence = Some(2);
+    });
+    let written = s.file_bytes();
+    s.ctx.profiles_changed();
+    assert_eq!(items_of(&combo), ["None", "a"]);
+    assert_eq!(shown_item(&combo), "None");
+    idle("a default past the end", &written);
+    assert_eq!(s.stored_default(&p.id), Some(2), "left as it was");
+
+    // A pick that cannot be saved (the file cannot be replaced) goes back to
+    // what the file says, with the reason.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("chmod");
+        let first_pick = items_of(&combo).iter().position(|i| i == "a").expect("a");
+        combo.set_selected(u32::try_from(first_pick).expect("small"));
+        saved();
+        assert_eq!(shown_item(&combo), "None", "back to what is stored");
+        assert!(combo.has_css_class("error"));
+        assert!(
+            s.ctx
+                .notice
+                .last_text()
+                .is_some_and(|text| text.starts_with("Could not save the profile")),
+            "{:?}",
+            s.ctx.notice.last_text()
+        );
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+        assert_eq!(s.file_bytes(), written, "nothing was written");
+    }
+    // The same pick works now, and clears the mark.
+    s.pick_default("a");
+    assert_eq!(s.stored_default(&p.id), Some(0));
+    assert!(!combo.has_css_class("error"));
+
+    // A list that was shortened elsewhere before the page heard of it: the
+    // pick names a place the file no longer has, and is refused.
+    s.elsewhere(&p.id, |p| {
+        p.sequences = vec![
+            seq("a", &["echo A"]),
+            seq("b", &["echo B"]),
+            seq("c", &["echo C"]),
+        ];
+        p.startup_sequence = None;
+    });
+    s.ctx.profiles_changed();
+    assert_eq!(items_of(&combo), ["None", "a", "b", "c"]);
+    s.elsewhere(&p.id, |p| p.sequences.truncate(1));
+    let written = s.file_bytes();
+    let last = items_of(&combo).iter().position(|i| i == "c").expect("c");
+    combo.set_selected(u32::try_from(last).expect("small"));
+    saved();
+    assert_eq!(
+        s.ctx.notice.last_text().as_deref(),
+        Some(form::SEQUENCE_CHANGED)
+    );
+    assert_eq!(s.file_bytes(), written, "nothing was written");
+    assert_eq!(items_of(&combo), ["None", "a"], "the file's list now");
+    assert_eq!(shown_item(&combo), "None");
     s.close();
 }
 

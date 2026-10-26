@@ -27,14 +27,14 @@ use vte4::prelude::*;
 
 use super::main_window::{choices_parts, ctx_with, ctx_with_secrets, press_key, test_app};
 use super::{
-    HeldKeyring, MARKUP_NAME, all_widgets, close_popover, fake_command, fake_ssh, files_in,
-    find_widget, labels_in, menu_button, open_popover, press_enter_in, profile, pump_for,
-    pump_until, wait_for_session, wait_for_text,
+    HeldKeyring, MARKUP_NAME, all_widgets, button_labeled, close_popover, fake_command, fake_ssh,
+    files_in, find_widget, labels_in, menu_button, open_popover, press_enter_in, profile, pump_for,
+    pump_until, row_for, wait_for_session, wait_for_text,
 };
 use crate::context::{AppContext, Notice};
 use crate::form::{self, Field};
 use crate::terminal_tab::{self, TranscriptSpec, open_command, tab_title, terminal_of};
-use crate::{connect_menu, keyring, new_tab, settings, window, zoom};
+use crate::{connect_menu, keyring, new_tab, profiles, settings, window, zoom};
 
 /// A presented main window with one local tab.
 pub(super) fn main_window(app: &adw::Application, ctx: &Rc<AppContext>) -> window::MainWindow {
@@ -409,6 +409,153 @@ pub(super) fn the_new_tab_choices_reach_profiles_without_sequences(bin: &Path, d
     assert!(text.contains("ARG:bob@plain.example.test"), "{text}");
 
     terminal_tab::set_test_ssh_program(None);
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The `ARG:` lines of the fake `ssh` that a terminal shows, without the prefix:
+/// each argument the session was started with (one holding newlines spreads
+/// over several lines, of which only the first has the prefix).
+fn ssh_args(terminal: &vte4::Terminal) -> Vec<String> {
+    terminal_tab::terminal_text(terminal)
+        .lines()
+        .filter_map(|line| line.trim_end().strip_prefix("ARG:"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A profile that names a default sequence runs it every time it connects the
+/// plain way (issue #12): a click or Enter in the new-tab list, a double-click or
+/// Enter or Connect in the Connection Profiles window. The choices behind "›"
+/// are what they were: "Just connect" skips the default, and each sequence by
+/// name runs that one. A profile with sequences and no default just connects.
+pub(super) fn a_plain_connection_runs_the_default_sequence(bin: &Path, dir: &Path) {
+    let fake = fake_ssh(bin, "default-sequence", "echo FAKE-END\nexec sleep 600");
+    let mut web = profile(&[("a", &["echo A"]), ("b", &["echo B"])]);
+    web.name = "web".to_owned();
+    web.startup_sequence = Some(1);
+    let mut other = profile(&[("a", &["echo A"]), ("b", &["echo B"])]);
+    other.name = "other".to_owned();
+    other.host = "other.example.test".to_owned();
+    let ctx = ctx_with(dir, &[web.clone(), other.clone()]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    terminal_tab::set_test_ssh_program(Some(fake));
+    let ran = |terminal: &vte4::Terminal| -> Vec<String> {
+        wait_for_text(terminal, "FAKE-END");
+        ssh_args(terminal)
+            .into_iter()
+            .filter(|arg| arg.contains("echo"))
+            .collect()
+    };
+
+    // A click on the row in the new-tab list runs the default, and only it.
+    let page = new_tab::open(&main.view, &ctx);
+    pump_for(Duration::from_millis(200));
+    let list = list_in(&page).expect("the list");
+    list.emit_by_name::<()>("row-activated", &[&row(&list, &web.id)]);
+    let terminal = wait_for_session(&page);
+    assert_eq!(ran(&terminal), ["echo B"], "the default, nothing else");
+
+    // The profile with no default just connects, whatever sequences it has.
+    let page = new_tab::open(&main.view, &ctx);
+    pump_for(Duration::from_millis(200));
+    let list = list_in(&page).expect("the list");
+    list.emit_by_name::<()>("row-activated", &[&row(&list, &other.id)]);
+    let terminal = wait_for_session(&page);
+    assert_eq!(ran(&terminal), Vec::<String>::new(), "no default");
+    assert!(ssh_args(&terminal).contains(&"alice@other.example.test".to_owned()));
+
+    // Enter in the search entry takes the first match, which is the same click.
+    let page = new_tab::open(&main.view, &ctx);
+    pump_for(Duration::from_millis(200));
+    let search: gtk::SearchEntry = find_widget(&page.child()).expect("the search entry");
+    search.set_text("web");
+    pump_until("the filter to apply", || {
+        visible_titles(&list_in(&page).expect("the list")) == [new_tab::LOCAL_LABEL, "web"]
+    });
+    search.emit_activate();
+    let terminal = wait_for_session(&page);
+    assert_eq!(ran(&terminal), ["echo B"], "Enter in the search");
+
+    // The choices behind "›": "Just connect" skips the default, a sequence by
+    // name runs that one, also when it is the default.
+    let choose = |profile: &Profile, label: &str| -> vte4::Terminal {
+        let page = new_tab::open(&main.view, &ctx);
+        pump_for(Duration::from_millis(200));
+        let list = list_in(&page).expect("the list");
+        let more: gtk::MenuButton = find_widget(&row(&list, &profile.id)).expect("the › button");
+        let popover = more.popover().expect("its popover");
+        more.popup();
+        pump_until("the choices to open", || popover.is_visible());
+        pump_for(Duration::from_millis(200));
+        let column = named(&popover, connect_menu::CHOICES_NAME).expect("the connect choices");
+        let parts = choices_parts(&column);
+        let at = parts
+            .labels
+            .iter()
+            .position(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("no {label:?} in {:?}", parts.labels));
+        parts.buttons[at].emit_clicked();
+        pump_until("the choices to close", || !popover.is_visible());
+        wait_for_session(&page)
+    };
+    let terminal = choose(&web, "Just connect");
+    assert_eq!(ran(&terminal), Vec::<String>::new(), "Just connect");
+    let terminal = choose(&web, "a");
+    assert_eq!(ran(&terminal), ["echo A"], "a, not the default");
+    let terminal = choose(&web, "b");
+    assert_eq!(ran(&terminal), ["echo B"], "b, the default by name");
+
+    // The Connection Profiles window: Connect, and Enter or a double-click on
+    // the row (the list's `row-activated`), open a tab that runs the default.
+    let window = profiles::present(&app, &ctx, window::connect_fn(&app, &ctx));
+    pump_for(Duration::from_millis(300));
+    profiles::select(&window, &web.id);
+    pump_for(Duration::from_millis(100));
+    let tabs = main.view.n_pages();
+    button_labeled(&window, "Connect")
+        .expect("the Connect button")
+        .emit_clicked();
+    assert_eq!(main.view.n_pages(), tabs + 1, "a new tab");
+    let page = main.view.selected_page().expect("the new tab");
+    let terminal = wait_for_session(&page);
+    assert_eq!(ran(&terminal), ["echo B"], "Connect");
+
+    let sidebar = all_widgets::<gtk::ListBox>(&window)
+        .into_iter()
+        .find(|list| list.widget_name() == profiles::SIDEBAR_NAME)
+        .expect("the sidebar");
+    sidebar.emit_by_name::<()>("row-activated", &[&row_for(&sidebar, &web.id)]);
+    let page = main.view.selected_page().expect("the new tab");
+    let terminal = wait_for_session(&page);
+    assert_eq!(ran(&terminal), ["echo B"], "a double-click");
+
+    // The other profile, from the same window: no default, no sequence.
+    sidebar.emit_by_name::<()>("row-activated", &[&row_for(&sidebar, &other.id)]);
+    let page = main.view.selected_page().expect("the new tab");
+    let terminal = wait_for_session(&page);
+    assert_eq!(ran(&terminal), Vec::<String>::new(), "no default");
+
+    // A default that points past the sequences (a sync took one away) runs
+    // nothing: the profile just connects.
+    let mut past = profile(&[("a", &["echo A"])]);
+    past.name = "past".to_owned();
+    past.startup_sequence = Some(3);
+    ProfileStore::open(&dir.join("profiles.json"))
+        .expect("the store")
+        .upsert(past.clone())
+        .expect("save");
+    ctx.profiles_changed();
+    let page = new_tab::open(&main.view, &ctx);
+    pump_for(Duration::from_millis(200));
+    let list = list_in(&page).expect("the list");
+    list.emit_by_name::<()>("row-activated", &[&row(&list, &past.id)]);
+    let terminal = wait_for_session(&page);
+    assert_eq!(ran(&terminal), Vec::<String>::new(), "past the end");
+
+    terminal_tab::set_test_ssh_program(None);
+    window.close();
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }
@@ -1292,12 +1439,18 @@ pub(super) fn connecting_uses_the_profile_as_saved_just_before(bin: &Path, dir: 
         move |store| {
             form::apply_field(store, &id, Field::Host("moved.example.test".to_owned()))?;
             form::apply_field(store, &id, Field::Username("bob".to_owned()))?;
-            form::apply_sequences(store, &id, None, |_| {
-                vec![StartupSequence {
-                    name: "update".to_owned(),
-                    commands: vec!["reboot".to_owned()],
-                }]
-            })?;
+            form::apply_sequences(
+                store,
+                &id,
+                None,
+                |_| {
+                    vec![StartupSequence {
+                        name: "update".to_owned(),
+                        commands: vec!["reboot".to_owned()],
+                    }]
+                },
+                |d| d,
+            )?;
             Ok(())
         },
         move |result| {

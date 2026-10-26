@@ -27,7 +27,13 @@
 //! question is answered and, on yes, its save is back ([`local_only`]).
 //!
 //! The startup sequences are listed here and edited on a sub-page of their own
-//! ([`sequence_page`]) that opens over this one.
+//! ([`sequence_page`]) that opens over this one. Below them a combo row, "Default
+//! sequence", names the one that runs every time the profile connects (issue
+//! #12; the page does not show it for a profile with no sequence). Its list is
+//! "None" and then the sequences by name, made again whenever they change (a
+//! sequence added, renamed, moved or deleted on the sub-page, or arriving by
+//! sync), and only a pick by the person saves; showing what the file says does
+//! not (`default_loading`). A pick saves like any other field.
 //!
 //! The page never reads the keyring: it cannot show whether a password is
 //! stored. A Secret Service call on every selection could prompt with a
@@ -54,6 +60,7 @@ use zeroize::Zeroizing;
 
 use super::saving::Saving;
 use super::sequence_page;
+use super::sync_page::plain_text_factory;
 use crate::context::AppContext;
 use crate::form::{self, Field};
 use crate::keyring;
@@ -76,6 +83,9 @@ pub(crate) const PASSWORD_HINT: &str = "Leave the password empty to keep the sto
 
 /// How long the port must stay unchanged before it is saved.
 const PORT_SETTLE: Duration = Duration::from_secs(1);
+
+/// The first entry of the "Default sequence" row: no default.
+const DEFAULT_NONE: &str = "None";
 
 /// The page for one profile. Dropping it drops its state; the widgets go
 /// with the page widget.
@@ -120,6 +130,24 @@ struct Inner {
     key_saving: Rc<Saving>,
     sequences: adw::PreferencesGroup,
     sequence_rows: RefCell<Vec<adw::ActionRow>>,
+    /// What the sequence rows show (each name and its number of commands), so
+    /// that they are made again only when that changes, and a refresh that
+    /// brings nothing new leaves the rows, and the keyboard on them, alone.
+    sequences_shown: RefCell<Option<Vec<(String, usize)>>>,
+    /// "Default sequence": "None", then each sequence by name. In the group
+    /// between the sequence rows and "Add sequence" while there is a sequence.
+    default_row: adw::ComboRow,
+    /// The sequence names the row offers after "None", to make its list again
+    /// only when they change.
+    default_names: RefCell<Vec<String>>,
+    /// What the file says, or will say once the saves asked for are back: the
+    /// last pick, while one is being saved.
+    default_stored: Cell<Option<usize>>,
+    default_saving: Rc<Saving>,
+    /// The row is being set to what the file says (or its list is being made
+    /// again, which moves the selection), not picked by the person: that saves
+    /// nothing.
+    default_loading: Cell<bool>,
     transcript: adw::SwitchRow,
     /// What the file says, or will say once the saves asked for are back.
     transcript_stored: Cell<bool>,
@@ -255,6 +283,16 @@ impl ProfilePage {
             .description(SECRETS_WARNING)
             .build();
         widget.add(&sequences);
+        // Its list is made by `show_default`; names are data: plain text.
+        let default_row = adw::ComboRow::builder()
+            .title("Default sequence")
+            .subtitle("Runs every time this profile connects")
+            .use_markup(false)
+            .factory(&plain_text_factory())
+            .model(&gtk::StringList::new(&[DEFAULT_NONE]))
+            .build();
+        let default_saving = Saving::new();
+        default_row.add_suffix(&default_saving.spinner);
 
         let transcript = adw::SwitchRow::builder()
             .title("Save transcript")
@@ -304,6 +342,12 @@ impl ProfilePage {
             key_saving,
             sequences,
             sequence_rows: RefCell::new(Vec::new()),
+            sequences_shown: RefCell::new(None),
+            default_row,
+            default_names: RefCell::new(Vec::new()),
+            default_stored: Cell::new(profile.startup_choice()),
+            default_saving,
+            default_loading: Cell::new(false),
             transcript,
             transcript_stored: Cell::new(profile.transcript),
             transcript_saving,
@@ -454,6 +498,8 @@ impl Inner {
         self.transcript.connect_active_notify(move |_| changed());
         let changed = with(|inner| inner.sync_here_changed());
         self.sync_here.connect_active_notify(move |_| changed());
+        let picked = with(|inner| inner.default_picked());
+        self.default_row.connect_selected_notify(move |_| picked());
 
         let ask = with(|inner| inner.ask_remove_password());
         remove.connect_clicked(move |_| ask());
@@ -844,11 +890,32 @@ impl Inner {
         });
     }
 
-    /// One row per sequence (name and number of commands), each opening the
-    /// sequence's sub-page, then a row that adds one.
+    /// The sequence rows and the default sequence row for `profile`. The rows
+    /// are made again only when what they show has changed.
     fn show_sequences(self: &Rc<Self>, profile: &Profile) {
+        let shown: Vec<(String, usize)> = profile
+            .sequences
+            .iter()
+            .map(|sequence| (sequence.name.clone(), sequence.commands.len()))
+            .collect();
+        if self.sequences_shown.borrow().as_ref() != Some(&shown) {
+            self.make_sequence_rows(profile);
+            self.sequences_shown.replace(Some(shown));
+        }
+        self.show_default(profile);
+    }
+
+    /// One row per sequence (name and number of commands), each opening the
+    /// sequence's sub-page, then, if there is a sequence, the "Default
+    /// sequence" row, then a row that adds one.
+    fn make_sequence_rows(self: &Rc<Self>, profile: &Profile) {
         for row in self.sequence_rows.take() {
             self.sequences.remove(&row);
+        }
+        // The group knows only its own children: the default row is one of
+        // them only if it was put there.
+        if self.default_row.parent().is_some() {
+            self.sequences.remove(&self.default_row);
         }
         let weak = Rc::downgrade(self);
         let opens = |row: &adw::ActionRow, index: Option<usize>| {
@@ -894,10 +961,79 @@ impl Inner {
         add.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
         opens(&add, None);
         rows.push(add);
-        for row in &rows {
+        // The sequences (or the note that there are none), the default row
+        // when there is a sequence to choose, and the row that adds one.
+        let last = rows.len() - 1;
+        for (place, row) in rows.iter().enumerate() {
+            if place == last && !profile.sequences.is_empty() {
+                self.sequences.add(&self.default_row);
+            }
             self.sequences.add(row);
         }
         self.sequence_rows.replace(rows);
+    }
+
+    /// Show the profile's default sequence in its row, and make the row's list
+    /// again if the sequence names changed. Nothing here counts as a pick: the
+    /// row saves only what the person chooses
+    /// ([`default_picked`](Self::default_picked)). While a pick is being saved
+    /// the row keeps showing it; once it is back the refresh shows the file's
+    /// choice, which puts a failed pick back.
+    fn show_default(&self, profile: &Profile) {
+        if !self.default_saving.busy() {
+            self.default_stored.set(profile.startup_choice());
+        }
+        let names: Vec<String> = profile
+            .sequences
+            .iter()
+            .map(|sequence| sequence.name.clone())
+            .collect();
+        self.default_loading.set(true);
+        if *self.default_names.borrow() != names {
+            let items: Vec<&str> = std::iter::once(DEFAULT_NONE)
+                .chain(names.iter().map(String::as_str))
+                .collect();
+            self.default_row
+                .set_model(Some(&gtk::StringList::new(&items)));
+            self.default_names.replace(names);
+        }
+        // A pick that names a place the list no longer has shows as "None".
+        let place = self
+            .default_stored
+            .get()
+            .filter(|&index| index < self.default_names.borrow().len())
+            .map_or(0, |index| index + 1);
+        let place = u32::try_from(place).unwrap_or(0);
+        if self.default_row.selected() != place {
+            self.default_row.set_selected(place);
+        }
+        self.default_loading.set(false);
+    }
+
+    /// The person picked an entry of the "Default sequence" row: save it, as
+    /// the sequence's place in the list (`None` for "None"). The file has the
+    /// last word: a place it does not have (a sync took the sequence away) is
+    /// refused ([`Field::StartupSequence`]) and the row goes back to what the
+    /// file says.
+    fn default_picked(self: &Rc<Self>) {
+        if self.default_loading.get() {
+            return;
+        }
+        let choice = match self.default_row.selected() {
+            gtk::INVALID_LIST_POSITION => return,
+            0 => None,
+            entry => Some(entry as usize - 1),
+        };
+        if choice == self.default_stored.get() {
+            return;
+        }
+        self.default_stored.set(choice);
+        self.save(
+            &self.default_row,
+            &self.default_saving,
+            Field::StartupSequence(choice),
+            |_, _| {},
+        );
     }
 
     /// Open the sub-page for the sequence at `index` (`None`: a new one) over

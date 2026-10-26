@@ -452,6 +452,10 @@ fn gui_integration() {
     tabs::a_local_tab_starts_in_its_folder(&bin, &tmp.path().join("l-folder"));
     tabs::a_command_tab_closes_on_success_and_keeps_failures(&bin, &tmp.path().join("l-command"));
     tabs::a_title_given_stays(&bin, &tmp.path().join("l-title"));
+    // Issue #12, a profile's default sequence.
+    profiles::the_default_is_chosen_on_the_profile_page(&tmp.path().join("d-page"));
+    profiles::the_default_row_follows_the_file_and_saves_only_a_pick(&tmp.path().join("d-file"));
+    windows::a_plain_connection_runs_the_default_sequence(&bin, &tmp.path().join("d-run"));
     // Issue #10, a profile kept on this machine only.
     profiles::keeping_a_profile_here_asks_first(&tmp.path().join("k-keep"));
     profiles::syncing_it_again_asks_too(&tmp.path().join("k-again"));
@@ -769,8 +773,9 @@ fn close_popover(popover: &gtk::Popover) {
 /// tooltip, as the tab bar draws it), the window title, a notification (and the
 /// toast of the Preferences dialog), the sync
 /// page's profile choice, and in the Connection Profiles window the sidebar row, the page
-/// title, the key-file row, the sequence row and the delete confirmation. The
-/// session runs a fake `ssh`.
+/// title, the key-file row, the sequence row, the Default sequence row (as chosen
+/// and in its open list) and the delete confirmation. The session runs a fake
+/// `ssh`.
 fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     const KEY_FILE: &str = "/tmp/<i>k</i>";
     let mut p = Profile::new(MARKUP_NAME, "h", "u");
@@ -779,6 +784,8 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         name: MARKUP_NAME.to_owned(),
         commands: vec!["uptime".to_owned()],
     }];
+    // Chosen as the default sequence: the Default sequence row shows it.
+    p.startup_sequence = Some(0);
     let subtitle = form::subtitle(&p);
     let ctx = main_window::ctx_with(dir, std::slice::from_ref(&p));
     let app = main_window::test_app();
@@ -940,6 +947,29 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         MARKUP_NAME,
         Some("1 command"),
     );
+
+    // The Default sequence row offers the sequence by name: as the choice shown
+    // in the row, and as an entry of the list that opens from it, plain text
+    // both times.
+    let default_row = all_widgets::<adw::ComboRow>(&profiles_window)
+        .into_iter()
+        .find(|row| row.title() == "Default sequence")
+        .expect("the Default sequence row");
+    assert!(!default_row.uses_markup(), "default row parses markup");
+    let chosen = default_row
+        .selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .expect("the chosen default");
+    assert_eq!(chosen.string(), MARKUP_NAME, "the default is chosen");
+    literal_labels("default row", &default_row, MARKUP_NAME);
+    ActionRowExt::activate(&default_row);
+    let list: gtk::Popover = find_widget(&default_row).expect("the row's list");
+    pump_until("the default sequence list to open", || list.is_visible());
+    pump_for(Duration::from_millis(200));
+    literal_labels("default list", &list, MARKUP_NAME);
+    literal_labels("default list", &list, "None");
+    list.popdown();
+    pump_until("the default sequence list to close", || !list.is_visible());
 
     // The delete confirmation names the profile as it is. Cancel leaves it be.
     button_labeled(&profiles_window, "Delete Profile")

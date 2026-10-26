@@ -4,8 +4,11 @@
 //!
 //! A click (or Enter) on a row opens it at once, with "Save transcript" checked
 //! if the profile says so or "Save transcripts of all sessions" is on
-//! ([`crate::terminal_tab::default_save`]); there is no per-profile default
-//! sequence. The choices are for every profile, with or without sequences, and
+//! ([`crate::terminal_tab::default_save`]), and running the profile's default
+//! sequence if it has one (issue #12). These choices are the way round that:
+//! "Just connect" skips the default and runs no sequence, and each sequence by
+//! name runs that one, whichever is the default (the default is not marked
+//! here). The choices are for every profile, with or without sequences, and
 //! for the Local terminal, so the choice of saving one session's transcript is
 //! reachable by keyboard.
 //!

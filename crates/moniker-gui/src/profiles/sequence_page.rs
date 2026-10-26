@@ -10,6 +10,11 @@
 //! reordered or changed the list meanwhile is therefore never overwritten, and
 //! Move or Delete never acts on a different sequence.
 //!
+//! The profile's default sequence is kept by position, so each of them says
+//! how the default follows, and the same write saves both: Save leaves it, Move
+//! takes it along with its sequence ([`form::moved_default`]), and Delete
+//! clears it or moves it up by one ([`form::default_without`]).
+//!
 //! Move and Delete act on what is saved, at once. Text typed in the editor is
 //! kept by Move (the page stays open at the sequence's new place) and is
 //! discarded by Cancel, Escape, Delete, or selecting another profile.
@@ -308,13 +313,15 @@ impl Inner {
 
     /// Change the profile's sequences on the keyring worker (module docs):
     /// `change` gets the list as it is in the file then and returns the one to
-    /// save. When it is back, `then` gets the profile as stored, or `None` if
-    /// the list came out the same and nothing was written; a failure is shown
-    /// ([`fail`](Self::fail)). If the page has gone by then, a failure is told
-    /// in the window.
+    /// save, and `follow` gets the default sequence as the file has it then and
+    /// returns the one to save with it. When it is back, `then` gets the
+    /// profile as stored, or `None` if the list came out the same and nothing
+    /// was written; a failure is shown ([`fail`](Self::fail)). If the page has
+    /// gone by then, a failure is told in the window.
     fn apply(
         self: &Rc<Self>,
         change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence> + Send + 'static,
+        follow: impl FnOnce(Option<usize>) -> Option<usize> + Send + 'static,
         then: impl FnOnce(&Rc<Inner>, Option<Profile>) + 'static,
     ) {
         self.saving.begin();
@@ -328,7 +335,7 @@ impl Inner {
             &self.ctx,
             move |store| {
                 let target = target.as_ref().map(|(index, sequence)| (*index, sequence));
-                form::apply_sequences(store, &id, target, change)
+                form::apply_sequences(store, &id, target, change, follow)
             },
             move |result| {
                 saving.end();
@@ -397,6 +404,7 @@ impl Inner {
         let index = self.index.get();
         self.apply(
             move |current| form::with_sequence(current, index, sequence),
+            |default| default,
             |inner, _| {
                 inner.ctx.profiles_changed();
                 inner.close();
@@ -413,6 +421,7 @@ impl Inner {
         }
         self.apply(
             move |current| form::moved(current, index, dir),
+            move |default| form::moved_default(default, index, dir),
             move |inner, saved| {
                 if let Some(profile) = saved {
                     // It moved: the sequence now sits one place over.
@@ -437,6 +446,7 @@ impl Inner {
         }
         self.apply(
             move |current| form::without_sequence(current, index),
+            move |default| form::default_without(default, index),
             |inner, _| {
                 inner.ctx.profiles_changed();
                 inner.close();

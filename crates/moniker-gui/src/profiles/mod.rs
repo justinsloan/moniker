@@ -13,7 +13,8 @@
 //! One Connection Profiles window per application ([`present`]). It is not modal and
 //! stays open while sessions start from it: double click or Enter on a
 //! profile, or the Connect button in its header, hand the profile to the
-//! [`ConnectFn`] the window was opened with.
+//! [`ConnectFn`] the window was opened with, with the profile's default
+//! sequence if it has one (issue #12).
 //!
 //! The window follows the profile file through
 //! [`AppContext::on_profiles_changed`]: the sidebar is rebuilt (keeping the
@@ -51,8 +52,8 @@ use page::ProfilePage;
 use sync_page::SyncPage;
 
 /// What connecting from the Connection Profiles window does: start a session for the
-/// profile with this startup sequence (`None`: just connect), recording a
-/// transcript or not.
+/// profile with this startup sequence (`None`: just connect; the window passes
+/// the profile's default sequence), recording a transcript or not.
 pub type ConnectFn = Rc<dyn Fn(&Profile, Option<usize>, bool)>;
 
 /// Widget name of the Connection Profiles window, how [`present`] finds an open one.
@@ -477,14 +478,16 @@ impl State {
         self.page.borrow().clone()
     }
 
-    /// Connect to the live profile `id` the way the window was told to.
+    /// Connect to the live profile `id` the way the window was told to, running
+    /// its default sequence if it has one (the double-click, Enter and the
+    /// Connect button all come here).
     fn connect_to(&self, id: &str) {
         // Bind first so the store borrow ends before connecting.
         let profile = self.ctx.store.borrow().get(id).cloned();
         if let Some(profile) = profile {
             // "Save transcripts of all sessions" covers this way in too.
             let save = default_save(profile.transcript, self.ctx.settings().save_all_transcripts);
-            (self.connect)(&profile, None, save);
+            (self.connect)(&profile, profile.startup_choice(), save);
         }
     }
 
