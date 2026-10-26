@@ -7,7 +7,9 @@
 #                   package of the same version, which puts `moniker-askpass`
 #                   next to it in /usr/bin, and on libadwaita 1.9 and VTE 0.76
 #                   or newer; it also carries the desktop file and the
-#                   AppStream metainfo (data/), where the publisher shows
+#                   AppStream metainfo (data/), where the publisher shows;
+#                   its postinst and prerm register /usr/bin/moniker as an
+#                   x-terminal-emulator alternative at priority 20
 # Library dependencies are read from the binaries by dpkg-shlibdeps. Needs
 # cargo, dpkg-deb, dpkg-shlibdeps (dpkg-dev) and strip. Installs nothing.
 set -euo pipefail
@@ -149,6 +151,33 @@ stage_copyright moniker
 install -D -m 644 "$METAINFO" "$STAGE/moniker/usr/share/metainfo/org.moniker.Moniker.metainfo.xml"
 # The desktop file, shared with scripts/build-rpm.sh.
 install -D -m 644 data/org.moniker.Moniker.desktop "$STAGE/moniker/usr/share/applications/org.moniker.Moniker.desktop"
+# The x-terminal-emulator alternative (issue #15): programs that start "the
+# terminal" through Debian's mechanism find Moniker among the choices, and
+# `update-alternatives --config x-terminal-emulator` picks it. Priority 20 is
+# below Ptyxis's 40 (Ubuntu's own terminal), so installing Moniker never changes
+# which terminal the system chooses by itself. Plain scripts, no #DEBHELPER#
+# (nothing here is built by debhelper).
+install -D -m 755 /dev/stdin "$STAGE/moniker/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+case "$1" in
+configure)
+    update-alternatives --install /usr/bin/x-terminal-emulator \
+        x-terminal-emulator /usr/bin/moniker 20
+    ;;
+esac
+exit 0
+EOF
+install -D -m 755 /dev/stdin "$STAGE/moniker/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+case "$1" in
+remove | deconfigure)
+    update-alternatives --remove x-terminal-emulator /usr/bin/moniker
+    ;;
+esac
+exit 0
+EOF
 # The floors are the versions the GUI is built and tested against: libadwaita
 # 1.9 (the `v1_9` feature of libadwaita) and VTE 0.76 (vte4's `v0_76`
 # feature: the terminal's context menu model). dpkg-shlibdeps reads 0.75.0 for

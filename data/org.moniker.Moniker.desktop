@@ -8,3 +8,7 @@ Icon=utilities-terminal
 Terminal=false
 Categories=System;TerminalEmulator;GTK;
 StartupNotify=true
+X-TerminalArgExec=--
+X-TerminalArgDir=--working-directory=
+X-TerminalArgTitle=--title=
+X-TerminalArgHold=--hold

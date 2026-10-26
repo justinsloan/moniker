@@ -7,7 +7,9 @@
 #   * `moniker-server` runs, and finds no profiles in a new config,
 #   * the desktop file and the AppStream metainfo are where desktops look,
 #   * the GUI starts and is still running after 10 seconds on a virtual display
-#     (with no session bus, a throwaway HOME and no keyring, as the window tests).
+#     (with no session bus, a throwaway HOME and no keyring, as the window tests),
+#   * the .deb registers /usr/bin/moniker as an x-terminal-emulator alternative
+#     at priority 20, and removing the package takes it away again.
 # It installs packages as root: run it ONLY in a throwaway container, never on
 # your own machine.
 set -euo pipefail
@@ -20,7 +22,9 @@ dir=$(cd "$dir" && pwd)
 [ -f /.dockerenv ] || [ -n "${GITHUB_ACTIONS:-}" ] ||
     { echo "install-test: refusing to run outside a container" >&2; exit 2; }
 
+deb=false
 if command -v apt-get >/dev/null; then
+    deb=true
     shopt -s nullglob
     packages=("$dir"/*.deb)
     [ ${#packages[@]} = 2 ] || { echo "install-test: expected two .deb in $dir" >&2; exit 2; }
@@ -69,6 +73,19 @@ for file in /usr/share/applications/org.moniker.Moniker.desktop \
     [ -f "$file" ] || fail "$file is missing"
 done
 
+# The .deb registers Moniker as an x-terminal-emulator alternative at priority
+# 20 (below Ptyxis's 40, so it never changes the system's own choice); the RPM
+# has no such mechanism.
+if $deb; then
+    query=$(update-alternatives --query x-terminal-emulator) ||
+        fail "update-alternatives does not know x-terminal-emulator"
+    priority=$(awk '$1 == "Alternative:" { inside = ($2 == "/usr/bin/moniker") }
+        inside && $1 == "Priority:" { print $2 }' <<<"$query")
+    [ "$priority" = 20 ] ||
+        fail "x-terminal-emulator lists /usr/bin/moniker with priority '${priority:-none}', not 20"
+    echo "install-test: x-terminal-emulator alternative registered at priority 20"
+fi
+
 # The virtual display is installed only now, after the library check, so its
 # own dependencies cannot stand in for one the packages forgot.
 install_display
@@ -81,4 +98,14 @@ env -i PATH=/usr/bin:/bin HOME="$T" SHELL=/bin/sh \
     timeout 10 xvfb-run -a moniker || status=$?
 # timeout's 124: still running when the time was up, which is the pass.
 [ "$status" = 124 ] || fail "moniker exited with status $status within 10 seconds"
+
+# Removing the package takes its alternative away again (its prerm).
+if $deb; then
+    DEBIAN_FRONTEND=noninteractive apt-get remove -y -q moniker
+    left=$(update-alternatives --query x-terminal-emulator 2>/dev/null || true)
+    if grep -qF '/usr/bin/moniker' <<<"$left"; then
+        fail "x-terminal-emulator still lists /usr/bin/moniker after the package was removed"
+    fi
+    echo "install-test: the alternative went with the package"
+fi
 echo "install-test: ok"

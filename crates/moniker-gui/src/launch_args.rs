@@ -323,9 +323,12 @@ pub(crate) fn local(args: &[OsString], cwd: Option<&Path>, home: &Path) -> Local
 // each field of a [`Start`], every one starting with `--moniker-` and, except
 // the flag, carrying its value after an `=`: a word GLib's parser does not know
 // is kept as it is, and a value attached to its option cannot be read as
-// another argument, whatever it looks like (`--`, `-e`, `--help`, empty). A
-// person cannot type them: [`parse`] refuses every `--moniker-` word, so only
-// [`local`] makes a handover.
+// another argument, whatever it looks like (`--`, `-e`, `--help`, empty).
+// [`parse`] refuses every `--moniker-` word, so what a person types is never
+// taken for a handover. That is not what limits one: any client of the same
+// user on the session bus can send these words, so it is [`decode`] that keeps
+// a handover to opening one local terminal (a folder, a title, a command, hold)
+// and nothing else.
 const DIR: &str = "--moniker-dir=";
 const REFUSED: &str = "--moniker-refused=";
 const TITLE: &str = "--moniker-title=";

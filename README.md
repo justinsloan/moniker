@@ -198,6 +198,43 @@ Only files named the way Moniker names transcripts are listed; anything else in 
 
 What needs your attention (a transcript that could not be saved, `moniker-askpass` missing, the result of a sync, an export or a failed delete) appears as a notification at the top center of the window, just below the header bar. Notifications wrap onto several lines, fade after about 8 seconds (a little longer for a long one) and come one after another. They cannot be dismissed, so for that time one covers whatever is under it. While a dialog is open the window's notifications wait until it closes; Preferences shows its own at the bottom of the dialog. A message with no window left to show it goes to the standard error of the `moniker` process.
 
+### The command line, and Moniker as the default terminal
+
+```text
+moniker [-w DIR | --working-directory=DIR] [-T TITLE | --title=TITLE] [--hold]
+        [-- COMMAND [ARG]... | -e COMMAND [ARG]...]
+moniker --help | --version
+```
+
+| Option | Effect |
+|---|---|
+| `-w DIR`, `--working-directory=DIR` | The terminal starts in DIR (a relative one is taken from where you ran `moniker`). With no folder, it starts where you ran `moniker`, or in your home folder if that is `/`, which is where many launchers start everything. |
+| `-- COMMAND [ARG]...`, `-e COMMAND [ARG]...` | Run COMMAND with its arguments instead of your shell. Everything after `--` or `-e` belongs to the command, and nothing goes through a shell. When the command ends with status 0 the tab closes (and the window with it, if it was the last tab); any other end keeps the tab with a note such as `[session ended: status 1]`. A program that cannot be started shows `[could not start …]`. |
+| `-T TITLE`, `--title=TITLE` | The tab's name, fixed as if you had renamed it: the program cannot change it. Without it a command's tab is named after the program until the program sets a title. |
+| `--hold` | A command's tab stays open when the command ends, whatever its status, with a note such as `[session ended: status 0]`. |
+| `--help`, `--version` | Print the usage or the version and exit. |
+
+Every launch opens **a new window** with one local tab, and does it in the Moniker that is already running if there is one. A mistake (an unknown option, a missing value, `-e` with no command) prints one line, `moniker: …`, to the terminal you typed it in, exits with status 2 and opens nothing. A folder that is not a folder starts the terminal in your home folder and the window says so in a notification. The window is for a local terminal only: the command line never opens a connection profile, and a command runs with Moniker's own environment, not the environment of the program that launched it. Save transcripts of all sessions applies to these tabs like any other new tab.
+
+**Making Moniker the default terminal.** Desktops start the default terminal with `xdg-terminal-exec`, which uses the first terminal in `~/.config/xdg-terminals.list`, then the system's list (Ptyxis on Ubuntu). Moniker's desktop file tells it how to pass a folder, a program, a title and `--hold`, so once Moniker is first in your list, Files' **Open in Terminal** opens a Moniker window in that folder and apps marked to run in a terminal (a `Terminal=true` launcher such as htop's) run in Moniker:
+
+```sh
+echo org.moniker.Moniker.desktop > ~/.config/xdg-terminals.list   # a new list; if you have one, add the line at the top
+xdg-terminal-exec --print-cmd --dir=/tmp -- true                   # prints moniker, --working-directory=/tmp, --, true
+```
+
+To go back, delete that line (or the file, if you made it for this): the system's choice returns. If a list named for your desktop exists in `~/.config` (`ubuntu-xdg-terminals.list`, `gnome-xdg-terminals.list`), it comes before the generic one, so put the line at the top of that one instead, or too. Quit every running Moniker (close all its windows) before you try any of this, and again after you install or build a newer one. A Moniker that is still running from before has no command line handler, so launches (Files' **Open in Terminal**, `moniker -w …`) fail with nothing opened until it quits. A package and a build from source share the application id `org.moniker.Moniker`, so a launch always goes to whichever of them is already running.
+
+**On Debian and Ubuntu**, the `moniker` package also registers `/usr/bin/moniker` as an `x-terminal-emulator` alternative, for programs that start "the terminal" the older way (`-e COMMAND ARG...` and `-T TITLE`, both understood). Its priority is 20, below Ptyxis's 40, so installing Moniker does not change which terminal the system picks; `update-alternatives --display x-terminal-emulator` lists the choices and `sudo update-alternatives --config x-terminal-emulator` picks Moniker. Removing the package takes the alternative away. The `.rpm` has none: Fedora's tools use `xdg-terminal-exec` alone.
+
+Limits:
+
+- Every launch is a new window; there is no way to open a tab in a window that already exists.
+- A caller of `x-terminal-emulator -e COMMAND` that waits for the command to finish does not get that. While Moniker is running, a launch returns once the window is open, as with GNOME Terminal; the launch that starts Moniker stays until Moniker quits, whatever the command does.
+- `moniker` started with `/` as its directory opens in the home folder, because launchers do that to everything; a folder whose name is not valid UTF-8 cannot be handed to a running Moniker, so the terminal starts in the home folder, with the notification.
+- A list for your desktop in `~/.config` comes before the generic `xdg-terminals.list`, as above.
+- A Moniker built from source needs `data/org.moniker.Moniker.desktop` in `~/.local/share/applications/` and `moniker` on the PATH before `xdg-terminal-exec` can use it.
+
 ### Where Moniker keeps things
 
 | What | Where | Synced |
@@ -316,7 +353,7 @@ bash scripts/build-rpm.sh   # → target/rpm/ (on Fedora 44 or newer, needs rpm-
 | `target/rpm/moniker-<version>-1.fc<NN>.x86_64.rpm` | The terminal app |
 | `target/rpm/moniker-server-<version>-1.fc<NN>.x86_64.rpm` | `moniker-server` and `moniker-askpass`, no GTK |
 
-Build each package on the distribution it is for, so that it links that distribution's libraries. Both scripts take the maintainer's address from `git config user.email` and refuse to build without it. The packages name Justin Sloan as maintainer, carry the MIT license and give the repository as their homepage, and the `moniker` package includes AppStream metadata (`data/org.moniker.Moniker.metainfo.xml`), from which App Center and GNOME Software take the publisher's name.
+Build each package on the distribution it is for, so that it links that distribution's libraries. Both scripts take the maintainer's address from `git config user.email` and refuse to build without it. The packages name Justin Sloan as maintainer, carry the MIT license and give the repository as their homepage, and the `moniker` package includes AppStream metadata (`data/org.moniker.Moniker.metainfo.xml`), from which App Center and GNOME Software take the publisher's name. The `.deb` of `moniker` also registers the `x-terminal-emulator` alternative (see [the default terminal](#the-command-line-and-moniker-as-the-default-terminal)).
 
 ## Development
 
@@ -380,6 +417,7 @@ The workflow runs every check, builds and install-tests both packages, and only 
 - Two machines can each keep the same profile to themselves, and each keeps its own copy. If one of them then syncs it again, the other's deletion reaches it within a sync or two and removes the profile there, password included, while the profile stays on the machine that kept it. Neither machine can tell that deletion from any other, so there is no warning.
 - While sync is off or a profile is kept on this machine only, an older Moniker on this machine (0.5.0 or earlier) refuses `profiles.json` and shows no profiles; see [Where Moniker keeps things](#where-moniker-keeps-things).
 - A deletion is forgotten a year after it was made. A profile deleted more than a year ago can come back, password included: from a machine that had not synced since, after **Sync Anyway** (or `--allow-stale`); from a machine still running Moniker 0.5.0 or older, or upgraded from it after more than a year away, which does not ask; when machines sync in a chain (A with B, B with C) and a deletion takes more than six months to reach the far end; or when a machine's clock is far off. Delete it again if it does.
+- As the default terminal, every launch is a new window, a caller that waits for `x-terminal-emulator -e COMMAND` to finish does not get that, and a Moniker that was already running before an upgrade cannot take a command line until it is quit; see [The command line, and Moniker as the default terminal](#the-command-line-and-moniker-as-the-default-terminal).
 - Not there yet: search in the terminal and color settings (the terminal colors follow the system light or dark style). The packages are for x86-64 only.
 
 ## License
