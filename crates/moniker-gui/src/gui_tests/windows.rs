@@ -416,7 +416,7 @@ pub(super) fn the_new_tab_choices_reach_profiles_without_sequences(bin: &Path, d
 /// The `ARG:` lines of the fake `ssh` that a terminal shows, without the prefix:
 /// each argument the session was started with (one holding newlines spreads
 /// over several lines, of which only the first has the prefix).
-fn ssh_args(terminal: &vte4::Terminal) -> Vec<String> {
+pub(super) fn ssh_args(terminal: &vte4::Terminal) -> Vec<String> {
     terminal_tab::terminal_text(terminal)
         .lines()
         .filter_map(|line| line.trim_end().strip_prefix("ARG:"))

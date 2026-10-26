@@ -14,7 +14,7 @@
 //!
 //! The scenarios live in one file per area ([`tabs`], [`main_window`],
 //! [`windows`], [`save_transcripts`], [`preferences`], [`notifications`],
-//! [`sync`], [`profiles`], [`recordings`]);
+//! [`sync`], [`profiles`], [`recordings`], [`sessions`]);
 //! this file holds the test function that calls them, the helpers they
 //! share, and [`markup_is_shown_literally_everywhere`], the one scenario that
 //! spans the areas. The transcripts go to a temporary directory the tests pass
@@ -39,6 +39,7 @@ use vte4::prelude::*;
 
 use crate::context::AppContext;
 use crate::notify::NotificationArea;
+use crate::session_file::{Kind, Node, PaneRecord, TabRecord};
 use crate::terminal_tab::{
     connection_command, has_stored_password, set_test_ssh_program, tab_title, terminal_of,
     terminal_text,
@@ -53,6 +54,7 @@ mod preferences;
 mod profiles;
 mod recordings;
 mod save_transcripts;
+mod sessions;
 mod sync;
 mod tabs;
 mod windows;
@@ -441,6 +443,21 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #12, saved sessions: a window captured and added back.
+    sessions::a_window_comes_back_as_saved(&bin, &tmp.path().join("sess-saved"));
+    sessions::a_tab_not_shown_yet_gets_its_split_when_shown(&tmp.path().join("sess-hidden"));
+    sessions::a_profile_gone_shows_the_list_with_a_note(&tmp.path().join("sess-gone"));
+    sessions::a_renamed_profile_still_connects(&bin, &tmp.path().join("sess-renamed"));
+    sessions::a_folder_gone_starts_at_home(&tmp.path().join("sess-folder"));
+    sessions::a_command_tab_is_saved_as_a_shell_in_its_folder(
+        &bin,
+        &tmp.path().join("sess-command"),
+    );
+    sessions::a_pane_waiting_or_ended_is_still_its_profile(&bin, &tmp.path().join("sess-ended"));
+    sessions::restored_connections_ask_the_keyring_in_pane_order(
+        &bin,
+        &tmp.path().join("sess-order"),
+    );
     // Issue #15, the command line, also when Moniker is already running.
     main_window::glib_leaves_the_handed_over_arguments_alone(&tmp.path().join("c-glib"));
     main_window::the_command_line_opens_a_window_where_asked(&bin, &tmp.path().join("c-where"));
@@ -771,7 +788,8 @@ fn close_popover(popover: &gtk::Popover) {
 ///
 /// Surfaces: the new-tab list (row and the choices behind "›"), the tab (title,
 /// tooltip, as the tab bar draws it), the window title, a notification (and the
-/// toast of the Preferences dialog), the sync
+/// toast of the Preferences dialog), the note over the list of a restored pane
+/// whose profile is gone, the sync
 /// page's profile choice, and in the Connection Profiles window the sidebar row, the page
 /// title, the key-file row, the sequence row, the Default sequence row (as chosen
 /// and in its open list) and the delete confirmation. The session runs a fake
@@ -869,6 +887,29 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         Some(MARKUP_NAME)
     );
     literal_labels("notification", &main.notifications, MARKUP_NAME);
+
+    // A saved session's pane whose profile is gone says so above the list,
+    // naming the profile as the session recorded it.
+    let gone = TabRecord {
+        root: Node::Pane(PaneRecord {
+            kind: Kind::Profile {
+                id: "gone".to_owned(),
+                name: MARKUP_NAME.to_owned(),
+            },
+            name: None,
+            scale: 1.0,
+            transcript: false,
+        }),
+        focused: 0,
+    };
+    crate::session_layout::restore(&main.view, &ctx, &[gone]);
+    let restored = main.view.selected_page().expect("the restored tab");
+    literal_labels(
+        "gone profile note",
+        &restored.child(),
+        &format!("{MARKUP_NAME} is no longer saved."),
+    );
+    main.view.close_page(&restored);
 
     // The Preferences dialog shows its own messages in a toast of its own (they
     // can quote a folder name): the same text, as it is.

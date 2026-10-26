@@ -1,6 +1,8 @@
 //! The new-tab list: what a tab opened with ＋ (or Ctrl+Shift+T) shows until
 //! the person picks what it becomes ([`open`]), and what a new pane shows, made
-//! by splitting one (Ctrl+Shift+R or D, [`fill`]).
+//! by splitting one (Ctrl+Shift+R or D, [`fill`]). A pane of a saved session
+//! whose profile has gone shows it too, with a note above the search entry
+//! ([`fill_with_note`], plain text).
 //!
 //! The tab, called "New Tab" (a new pane: "New Pane"), holds a search entry
 //! over a list. The first row
@@ -82,7 +84,15 @@ pub fn open(view: &adw::TabView, ctx: &Rc<AppContext>) -> adw::TabPage {
 /// Show the new-tab list in `holder`, a fresh pane (a new tab's, or one made by
 /// splitting), which it fills with whatever is picked.
 pub fn fill(holder: &PaneHolder, ctx: &Rc<AppContext>) {
-    let chooser = build(holder, ctx);
+    let chooser = build(holder, ctx, None);
+    terminal_tab::show_chooser(holder, &chooser);
+}
+
+/// [`fill`], with `note` above the search entry: a short line of plain text
+/// (it may quote a name), wrapped if the pane is narrow. A restored pane whose
+/// profile is gone says so this way (`crate::session_layout`).
+pub fn fill_with_note(holder: &PaneHolder, ctx: &Rc<AppContext>, note: &str) {
+    let chooser = build(holder, ctx, Some(note));
     terminal_tab::show_chooser(holder, &chooser);
 }
 
@@ -176,8 +186,9 @@ fn live_profiles(ctx: &AppContext) -> Vec<Profile> {
     ctx.store.borrow().live().into_iter().cloned().collect()
 }
 
-/// The search entry over the list, in a scrolled column, for `holder`'s pane.
-fn build(holder: &PaneHolder, ctx: &Rc<AppContext>) -> gtk::Widget {
+/// The search entry over the list, in a scrolled column, for `holder`'s pane,
+/// with `note` above them if there is one.
+fn build(holder: &PaneHolder, ctx: &Rc<AppContext>, note: Option<&str>) -> gtk::Widget {
     let chooser = Rc::new(Chooser {
         ctx: Rc::clone(ctx),
         holder: holder.downgrade(),
@@ -276,6 +287,17 @@ fn build(holder: &PaneHolder, ctx: &Rc<AppContext>) -> gtk::Widget {
         .margin_start(12)
         .margin_end(12)
         .build();
+    if let Some(note) = note {
+        column.append(
+            &gtk::Label::builder()
+                .label(note)
+                .use_markup(false)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .xalign(0.0)
+                .build(),
+        );
+    }
     column.append(&search);
     column.append(&list);
     let clamp = adw::Clamp::builder()

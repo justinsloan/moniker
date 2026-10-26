@@ -31,6 +31,16 @@
 //! whose pane leaves is replaced by its other child, so the tree never holds an
 //! empty split.
 //!
+//! # Saved sessions
+//!
+//! For `crate::session_layout` (issue #12), a tab's arrangement reads as a
+//! [`Tree`] of its panes' holders ([`tree_of`]: each split's orientation, and
+//! its divider as a fraction of how far it can go) and is made again from one
+//! ([`layout_from`], added to a window with [`append_layout`]). A tab added but
+//! not selected has no size yet, so each split made that way takes its fraction
+//! when it is first given one, once, and [`tree_of`] tells that fraction until
+//! then.
+//!
 //! # Drag and drop
 //!
 //! A pane is dragged by its header (only shown with two panes or more). Every
@@ -65,6 +75,7 @@
 //! text everywhere; a page's tooltip, which GTK reads as markup, is escaped.
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -338,7 +349,7 @@ impl TabLayout {
 
     /// Make `holder`'s pane the focused one (the keyboard focus is not moved:
     /// [`focus_pane`] does both).
-    fn set_focused(&self, holder: &PaneHolder) {
+    pub(crate) fn set_focused(&self, holder: &PaneHolder) {
         if self.focused().upgrade().as_ref() == Some(holder) {
             return;
         }
@@ -842,18 +853,23 @@ fn room_beside(target: &Pane, side: Side, leaving: Option<&gtk::Widget>) -> i32 
     }
 }
 
-/// Put `node` (a pane or a split) beside `target`, on its `side`: the two share
-/// `room`, the target's room measured before anything moved ([`room_beside`]),
-/// half each.
-fn put_beside(node: &gtk::Widget, target: &Pane, side: Side, room: i32) {
-    let orientation = orientation_for(side);
-    let split = gtk::Paned::builder()
+/// A new, empty split dividing its room `orientation`-wise. Neither side can
+/// be squeezed below what it needs (a terminal's smallest size).
+fn new_split(orientation: gtk::Orientation) -> gtk::Paned {
+    gtk::Paned::builder()
         .orientation(orientation)
         .hexpand(true)
         .vexpand(true)
         .shrink_start_child(false)
         .shrink_end_child(false)
-        .build();
+        .build()
+}
+
+/// Put `node` (a pane or a split) beside `target`, on its `side`: the two share
+/// `room`, the target's room measured before anything moved ([`room_beside`]),
+/// half each.
+fn put_beside(node: &gtk::Widget, target: &Pane, side: Side, room: i32) {
+    let split = new_split(orientation_for(side));
     replace(target.upcast_ref(), split.upcast_ref());
     let (first, second): (&gtk::Widget, &gtk::Widget) = match side {
         Side::Left | Side::Top => (node, target.upcast_ref()),
@@ -1051,6 +1067,185 @@ pub(crate) fn move_to_new_page(pane: &Pane, view: &adw::TabView, position: i32) 
     view.set_selected_page(&page);
     aside.give_back();
     show_moved(pane.holder());
+}
+
+/// The arrangement of a tab's panes, without the widgets: what a saved session
+/// keeps of a tab (`crate::session_layout`). A leaf is a pane (`T`: its holder,
+/// or what a session recorded of it); a split divides its room
+/// `orientation`-wise (horizontal: side by side), its divider `fraction` of
+/// the way along it, `start` before `end`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Tree<T> {
+    Leaf(T),
+    Split {
+        orientation: gtk::Orientation,
+        fraction: f64,
+        start: Box<Tree<T>>,
+        end: Box<Tree<T>>,
+    },
+}
+
+impl<T> Tree<T> {
+    /// The same tree with `f` of every leaf, `f` called in reading order
+    /// (start before end, depth first), as [`TabLayout::panes`] lists them.
+    pub(crate) fn map<U>(self, f: &mut impl FnMut(T) -> U) -> Tree<U> {
+        match self {
+            Tree::Leaf(leaf) => Tree::Leaf(f(leaf)),
+            Tree::Split {
+                orientation,
+                fraction,
+                start,
+                end,
+            } => {
+                let start = start.map(f);
+                let end = end.map(f);
+                Tree::Split {
+                    orientation,
+                    fraction,
+                    start: Box::new(start),
+                    end: Box::new(end),
+                }
+            }
+        }
+    }
+}
+
+/// Where a split's divider is when nothing says better: the middle.
+const MIDDLE: f64 = 0.5;
+
+thread_local! {
+    /// The splits [`layout_from`] made that have not been given a size yet (a
+    /// tab added but not shown), with the fraction each will take then, so
+    /// [`tree_of`] tells what they will be and not the middle. GTK runs on one
+    /// thread.
+    static UNSIZED: RefCell<Vec<(glib::WeakRef<gtk::Paned>, f64)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// The fraction `split` is waiting to take once sized, if [`layout_from`] made
+/// it and it has had no size yet.
+fn waiting_fraction(split: &gtk::Paned) -> Option<f64> {
+    UNSIZED.with_borrow(|unsized_| {
+        unsized_
+            .iter()
+            .find(|(waiting, _)| waiting.upgrade().as_ref() == Some(split))
+            .map(|(_, fraction)| *fraction)
+    })
+}
+
+/// Where the divider of `split` is, as a fraction of how far it can go (its
+/// `position` over its `max-position`): the fraction it waits for if it has
+/// not been sized yet, the middle if it has never been sized at all.
+fn fraction_of(split: &gtk::Paned) -> f64 {
+    if let Some(fraction) = waiting_fraction(split) {
+        return fraction;
+    }
+    match split.max_position() {
+        // GTK's value before the first size allocation.
+        max if max <= 0 || max == i32::MAX => MIDDLE,
+        max => f64::from(split.position()) / f64::from(max),
+    }
+}
+
+/// The arrangement of `layout`'s panes, leaves in reading order. `None` for a
+/// layout whose panes have all gone (its tab is closing).
+pub(crate) fn tree_of(layout: &TabLayout) -> Option<Tree<PaneHolder>> {
+    layout.node().and_then(|node| tree_at(&node))
+}
+
+/// [`tree_of`] for one node: a pane, or a split of two (a split missing a
+/// child, which the panes never leave, is the child it has).
+fn tree_at(node: &gtk::Widget) -> Option<Tree<PaneHolder>> {
+    if let Some(pane) = node.downcast_ref::<Pane>() {
+        return Some(Tree::Leaf(pane.holder().clone()));
+    }
+    let split = node.downcast_ref::<gtk::Paned>()?;
+    let start = split.start_child().and_then(|child| tree_at(&child));
+    let end = split.end_child().and_then(|child| tree_at(&child));
+    match (start, end) {
+        (Some(start), Some(end)) => Some(Tree::Split {
+            orientation: split.orientation(),
+            fraction: fraction_of(split),
+            start: Box::new(start),
+            end: Box::new(end),
+        }),
+        (start, end) => start.or(end),
+    }
+}
+
+/// A new layout holding `tree`'s panes, arranged as it says, the first one
+/// focused; for [`append_layout`]. Each split takes its fraction when it is
+/// first given a size (`max-position` above 0: a tab added but not selected
+/// has none until it is shown), once, and then follows the window's resizes
+/// and the person's dragging as any split does.
+pub(crate) fn layout_from(tree: Tree<PaneHolder>) -> TabLayout {
+    let layout = TabLayout::new();
+    let mut first = None;
+    let node = build_node(tree, &mut first);
+    layout.append(&node);
+    layout.focused().set(first.as_ref());
+    layout
+}
+
+/// The widget for `tree`: a pane, or a split of the widgets for its two sides.
+/// `first` is set to the first pane's holder.
+fn build_node(tree: Tree<PaneHolder>, first: &mut Option<PaneHolder>) -> gtk::Widget {
+    match tree {
+        Tree::Leaf(holder) => {
+            first.get_or_insert_with(|| holder.clone());
+            build_pane(&holder).upcast()
+        }
+        Tree::Split {
+            orientation,
+            fraction,
+            start,
+            end,
+        } => {
+            let split = new_split(orientation);
+            split.set_start_child(Some(&build_node(*start, first)));
+            split.set_end_child(Some(&build_node(*end, first)));
+            take_fraction_when_sized(&split, fraction);
+            split.upcast()
+        }
+    }
+}
+
+/// Put the divider of `split` `fraction` of the way along once it has a size:
+/// at its first `max-position` above 0, after which it stops listening.
+fn take_fraction_when_sized(split: &gtk::Paned, fraction: f64) {
+    UNSIZED.with_borrow_mut(|unsized_| {
+        unsized_.retain(|(waiting, _)| waiting.upgrade().is_some());
+        unsized_.push((split.downgrade(), fraction));
+    });
+    let handler = Rc::new(Cell::new(None::<glib::SignalHandlerId>));
+    let id = split.connect_max_position_notify(glib::clone!(
+        #[strong]
+        handler,
+        move |split| {
+            let max = split.max_position();
+            if max <= 0 || max == i32::MAX {
+                return;
+            }
+            UNSIZED.with_borrow_mut(|unsized_| {
+                unsized_.retain(|(waiting, _)| {
+                    waiting.upgrade().is_some_and(|waiting| &waiting != split)
+                });
+            });
+            split.set_position((fraction * f64::from(max)).round() as i32);
+            if let Some(id) = handler.take() {
+                split.disconnect(id);
+            }
+        }
+    ));
+    handler.set(Some(id));
+}
+
+/// Add `layout` as a tab of `view`, after the others, without selecting it,
+/// and show its titles.
+pub(crate) fn append_layout(view: &adw::TabView, layout: &TabLayout) -> adw::TabPage {
+    let page = view.append(layout);
+    refresh(layout);
+    page
 }
 
 /// How long the tab whose panes a drop took is waited for, to be closed once

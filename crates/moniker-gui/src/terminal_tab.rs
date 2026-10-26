@@ -9,7 +9,10 @@
 //! are a new holder page followed by one of those. Everything below that is
 //! said of a tab holds for each pane of a tab with several: its own session,
 //! title, text size, transcript and askpass marker. The tab, the window's
-//! actions and the ☰ menu go by the tab's focused pane.
+//! actions and the ☰ menu go by the tab's focused pane. The holder also keeps
+//! what its pane shows ([`PaneKind`]) and whether its session saves a
+//! transcript, which a saved session records (`crate::session_layout`, issue
+//! #12), with the folder a local shell last reported ([`current_folder`]).
 //!
 //! [`open_profile`] turns a profile into an `ssh` command with
 //! `moniker_core::ssh::terminal_command` and runs it in a VTE tab. The command
@@ -348,6 +351,11 @@ impl TabTitle {
         self.renamed.as_deref().unwrap_or(&self.automatic)
     }
 
+    /// The name the person gave the tab, if any (never empty).
+    pub fn renamed(&self) -> Option<&str> {
+        self.renamed.as_deref()
+    }
+
     /// Make `next` the automatic title, as when a tab that held a chooser turns
     /// into a session. A name the person already gave the tab is kept.
     fn adopt(&mut self, next: TabTitle) {
@@ -356,10 +364,34 @@ impl TabTitle {
     }
 }
 
+/// What a pane shows, as a saved session records it (issue #12): set where the
+/// pane is filled ([`show_chooser`], [`start_shell_in`], [`start_command_in`],
+/// [`start_profile`]) and kept with the pane's holder, so it moves with it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) enum PaneKind {
+    /// Nothing yet: a pane just made, before its list or session.
+    #[default]
+    Empty,
+    /// The new-tab list.
+    List,
+    /// A local terminal: the person's shell, or a command started with
+    /// `moniker -- COMMAND` (issue #15). A session saves both as a shell in the
+    /// folder the terminal last reported; `started_in` is the folder a command
+    /// was started in, for one that never reports one (none for a shell, which
+    /// reports its own).
+    Local { started_in: Option<PathBuf> },
+    /// A connection to the saved profile `id`, from the moment it is picked:
+    /// while it waits for the keyring, and after its session has ended too.
+    /// `name` is the profile's name then, which a session keeps only to say
+    /// which profile is gone.
+    Profile { id: String, name: String },
+}
+
 /// The holder of one pane's session: an empty box that fills the pane, which
 /// later receives a chooser or a terminal. It also keeps the pane's
-/// [`TabTitle`], text size and askpass marker, so they move with the pane when
-/// it or its tab is dragged elsewhere.
+/// [`TabTitle`], text size, askpass marker, what it shows ([`PaneKind`]) and
+/// whether it saves a transcript, so they move with the pane when it or its
+/// tab is dragged elsewhere.
 mod holder {
     use std::cell::{Cell, RefCell};
 
@@ -368,7 +400,7 @@ mod holder {
     use gtk::subclass::prelude::*;
     use gtk4 as gtk;
 
-    use super::{FALLBACK_TITLE, OneTimeMarker, TabTitle, zoom};
+    use super::{FALLBACK_TITLE, OneTimeMarker, PaneKind, TabTitle, zoom};
 
     mod imp {
         use super::*;
@@ -382,6 +414,10 @@ mod holder {
             /// The tab's text size: the font scale its terminal has, or will
             /// have once a session replaces the chooser.
             pub(super) scale: Cell<f64>,
+            /// What the pane shows.
+            pub(super) kind: RefCell<PaneKind>,
+            /// Whether its session saves a transcript (decided when it starts).
+            pub(super) records: Cell<bool>,
         }
 
         impl Default for PaneHolder {
@@ -391,6 +427,8 @@ mod holder {
                     marker: RefCell::new(None),
                     child_gone: Cell::new(false),
                     scale: Cell::new(zoom::DEFAULT),
+                    kind: RefCell::new(PaneKind::Empty),
+                    records: Cell::new(false),
                 }
             }
         }
@@ -443,6 +481,16 @@ mod holder {
         /// The pane's text size.
         pub(crate) fn scale(&self) -> &Cell<f64> {
             &self.imp().scale
+        }
+
+        /// What the pane shows.
+        pub(crate) fn kind(&self) -> &RefCell<PaneKind> {
+            &self.imp().kind
+        }
+
+        /// Whether the pane's session saves a transcript.
+        pub(crate) fn records(&self) -> &Cell<bool> {
+            &self.imp().records
         }
     }
 }
@@ -928,10 +976,16 @@ impl Session {
     }
 }
 
-/// Make `terminal`'s session a recording one if it has a `transcript` spec: the
-/// terminal keeps unlimited scrollback and the returned [`Session`] writes its
-/// text once (module docs). `None` leaves the terminal as it is.
-fn start_recording(terminal: &Terminal, transcript: Option<TranscriptSpec>) -> Option<Rc<Session>> {
+/// Make `terminal`'s session (in `holder`'s pane) a recording one if it has a
+/// `transcript` spec: the terminal keeps unlimited scrollback and the returned
+/// [`Session`] writes its text once (module docs). `None` leaves the terminal
+/// as it is. The pane remembers which it is, for a saved session.
+fn start_recording(
+    holder: &PaneHolder,
+    terminal: &Terminal,
+    transcript: Option<TranscriptSpec>,
+) -> Option<Rc<Session>> {
+    holder.records().set(transcript.is_some());
     transcript.map(|spec| {
         terminal.set_scrollback_lines(-1);
         let session = Rc::new(Session {
@@ -1384,6 +1438,7 @@ pub(crate) fn new_holder_page_at(
 /// pane shows until a session replaces it (the new-tab list).
 pub(crate) fn show_chooser(holder: &PaneHolder, chooser: &impl IsA<gtk::Widget>) {
     debug_assert!(holder.first_child().is_none(), "a fresh pane");
+    holder.kind().replace(PaneKind::List);
     holder.append(chooser);
 }
 
@@ -1702,8 +1757,35 @@ pub(crate) fn start_local_shell(
     holder: &PaneHolder,
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
+    start_local_shell_in(holder, &glib::home_dir(), transcript)
+}
+
+/// [`start_local_shell`] in the folder `dir`, or in the home folder when `dir`
+/// is not a folder (any more: a restored session's folder may have gone), with
+/// nothing said about it.
+pub(crate) fn start_local_shell_in(
+    holder: &PaneHolder,
+    dir: &Path,
+    transcript: Option<TranscriptSpec>,
+) -> Terminal {
     let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
-    start_shell_in(holder, &shell, &glib::home_dir(), transcript)
+    let home = glib::home_dir();
+    let dir = if folder_to_spawn_in(dir).is_some() {
+        dir
+    } else {
+        &home
+    };
+    start_shell_in(holder, &shell, dir, transcript)
+}
+
+/// The folder the program in `terminal` last reported as its own (the shell's
+/// OSC 7, VTE's current directory: `file://HOST/PATH`, percent-encoded), if it
+/// did, whatever host the address names. Read when a session is saved, never
+/// followed.
+pub(crate) fn current_folder(terminal: &Terminal) -> Option<PathBuf> {
+    let uri = terminal.current_directory_uri()?;
+    let (path, _host) = glib::filename_from_uri(&uri).ok()?;
+    path.is_absolute().then_some(path)
 }
 
 /// [`start_local_shell`] with the shell and the directory given (the tests run a
@@ -1716,10 +1798,12 @@ pub(crate) fn start_shell_in(
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
     let terminal = begin_session(holder, TabTitle::local());
+    // The shell reports its own folder.
+    holder.kind().replace(PaneKind::Local { started_in: None });
     // A shell that exits closes its pane, and closing a pane or a tab writes
     // the transcript ([`close_pane`], `setup_tab_view`), so there is nothing
     // more to do when it exits.
-    start_recording(&terminal, transcript);
+    start_recording(holder, &terminal, transcript);
     terminal.connect_child_exited(glib::clone!(
         #[weak]
         holder,
@@ -1755,7 +1839,15 @@ pub(crate) fn start_command_in(
 ) -> Terminal {
     let program = argv.first().map(String::as_str).unwrap_or_default();
     let terminal = begin_session(holder, TabTitle::program(program));
-    let session = start_recording(&terminal, transcript);
+    // A local terminal for a saved session, in the folder the command really
+    // started in (none when that is the folder Moniker was started in, as for
+    // a folder that is not one); never its command.
+    holder.kind().replace(PaneKind::Local {
+        started_in: folder_to_spawn_in(dir)
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute()),
+    });
+    let session = start_recording(holder, &terminal, transcript);
     terminal.connect_child_exited(glib::clone!(
         #[weak]
         holder,
@@ -1964,6 +2056,13 @@ pub(crate) fn start_profile(
     record: bool,
 ) {
     let waiting = show_waiting(holder);
+    // The profile's pane from now on, also while it waits and after its
+    // session has ended; it saves a transcript as `record` says.
+    holder.kind().replace(PaneKind::Profile {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+    });
+    holder.records().set(record);
     // Named after the profile at once, while it waits (a name the person gave
     // the pane is kept).
     holder
@@ -2141,7 +2240,7 @@ pub(crate) fn start_command(
 ) -> Terminal {
     let terminal = begin_session(holder, TabTitle::remote(title.to_owned()));
     holder.marker().replace(marker);
-    let session = start_recording(&terminal, transcript);
+    let session = start_recording(holder, &terminal, transcript);
 
     terminal.connect_child_exited(glib::clone!(
         #[weak]
@@ -2466,6 +2565,27 @@ mod tests {
         t.set_terminal_title("justin@desktop: /tmp");
         t.rename("");
         assert_eq!(t.shown(), "justin@desktop: /tmp");
+    }
+
+    /// What a saved session keeps as a pane's name: only one the person gave,
+    /// cleaned, and never a name of nothing.
+    #[test]
+    fn only_a_name_given_is_the_renamed_one() {
+        let mut t = TabTitle::local();
+        assert_eq!(t.renamed(), None);
+        t.set_terminal_title("vim");
+        assert_eq!(t.renamed(), None, "a program's title is not a name given");
+        t.rename("  Logs\n");
+        assert_eq!(t.renamed(), Some("Logs"));
+        t.rename(" \t ");
+        assert_eq!(t.renamed(), None, "a name of nothing is no name");
+        t.rename("x");
+        t.rename("");
+        assert_eq!(t.renamed(), None);
+        let mut t = TabTitle::remote("web".into());
+        t.rename("Kept");
+        t.adopt(TabTitle::remote("web, renamed".into()));
+        assert_eq!(t.renamed(), Some("Kept"), "kept when the session starts");
     }
 
     #[test]

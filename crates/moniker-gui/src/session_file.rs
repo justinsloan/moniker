@@ -62,7 +62,7 @@ const MAX_ID_CHARS: usize = 64;
 /// The longest session name, in characters ([`check_name`]).
 const MAX_NAME_CHARS: usize = 100;
 /// The longest pane name or profile name kept, in characters.
-const MAX_LABEL_CHARS: usize = 200;
+pub(crate) const MAX_LABEL_CHARS: usize = 200;
 /// A split's divider, as a fraction of the split, stays within these ends and
 /// is in the middle when the file gives none.
 const FRACTION_RANGE: (f64, f64) = (0.05, 0.95);
@@ -81,8 +81,6 @@ pub(crate) struct Session {
 }
 
 /// One tab of a session.
-// Used first by `session_layout` (task 4).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TabRecord {
     pub(crate) root: Node,
@@ -92,8 +90,6 @@ pub(crate) struct TabRecord {
 }
 
 /// A tab's split tree.
-// Used first by `session_layout` (task 4).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Node {
     Pane(PaneRecord),
@@ -109,8 +105,6 @@ pub(crate) enum Node {
 }
 
 /// One pane.
-// Used first by `session_layout` (task 4).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct PaneRecord {
     pub(crate) kind: Kind,
@@ -123,8 +117,6 @@ pub(crate) struct PaneRecord {
 }
 
 /// What a pane was.
-// Used first by `session_layout` (task 4).
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Kind {
     /// A connection to a saved profile, by id. `name` is the profile's name at

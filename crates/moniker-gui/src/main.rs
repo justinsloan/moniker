@@ -36,6 +36,7 @@ mod preferences;
 mod profiles;
 mod recordings;
 mod session_file;
+mod session_layout;
 mod settings;
 mod sync;
 mod terminal_tab;
