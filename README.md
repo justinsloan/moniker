@@ -99,6 +99,8 @@ cargo build --workspace
 target/debug/moniker
 ```
 
+If a Moniker you installed is running, quit it before you start the one you built: both use the application id `org.moniker.Moniker`, so starting a second only asks the one already running to show a window.
+
 Build with `--workspace`, not just `cargo run -p moniker-gui`: the password helper `moniker-askpass` must sit next to `moniker`. Without it Moniker cannot use stored passwords, and it says so. On a headless machine, `cargo build --release -p moniker-cli` builds only `moniker-server` and `moniker-askpass`, with no GTK.
 
 ## Using Moniker
@@ -208,7 +210,7 @@ What needs your attention (a transcript that could not be saved, `moniker-askpas
 
 If `gui-settings.json` is damaged, Moniker uses the defaults and leaves the file as it is instead of overwriting it; a Preferences change then says it cannot be saved.
 
-`profiles.json` is format version 1 until you use one of the two settings that stay on this machine. While sync is turned off, or any profile is kept on this machine only, Moniker writes it as version 2, and it goes back to version 1 when neither is true. Moniker 0.5.0 and older refuse a file of another version and leave it alone, so an older `moniker` or `moniker-server` on this machine can neither send a profile you keep here nor take part in a sync while sync is off. The cost: until you turn sync on and stop keeping profiles here, an older version on this machine says "unsupported profile store version 2" and shows no profiles. Moniker reads both versions.
+`profiles.json` is format version 1 until you use one of the two settings that stay on this machine. While sync is turned off, or any profile is kept on this machine only, Moniker writes it as version 2, and it goes back to version 1 when neither is true. Moniker 0.5.0 and older refuse a file of another version and leave it alone, so an older `moniker` or `moniker-server` on this machine can neither send a profile you keep here nor take part in a sync while sync is off. One that is already running cannot reload or save the file either. The cost: until you turn sync on and stop keeping profiles here, an older version on this machine says "unsupported profile store version 2" and shows no profiles. Moniker reads both versions.
 
 ## Syncing two machines
 
@@ -241,7 +243,7 @@ The check is made by the code that does the syncing, in both roles, so a grayed-
 
 Turn off **Sync to other machines** on a profile's page and Moniker asks "Keep “name” on This Machine Only?": the profile will be deleted from your other machines, with its stored password, the next time they sync, and it stays here. Cancel (or Escape) leaves everything as it was.
 
-- **Nothing about a kept profile leaves this machine** except its id and a version time, in the shape of a deletion. Its name, host, user name, port, key file, sequences and password are not sent, and the password is not even read from the keyring for a sync.
+- **Nothing about a kept profile leaves this machine** except its id and a version time, in the shape of a deletion. Its name, host, user name, port, key file, sequences and password are not sent: its password is never put in a bundle. If the kept profile is the one a sync connects through, its stored password still logs in to that machine, as it does for any connection.
 - **Nothing that arrives changes it.** A newer copy or a deletion from another machine leaves the kept profile and its stored password as they are.
 - **Turning the switch back on asks too** ("Sync “name” to Your Other Machines?"): the profile is copied to your other machines, with its stored password, at the next sync, and the deletions sent while it was kept here cannot delete it again.
 - **New Profile** has the same switch. Turned off there, the profile is created kept on this machine, and nothing asks, since no other machine has it yet.
@@ -295,7 +297,7 @@ A sync exchanges sealed bundles over ssh. The sync key never goes on the wire:
 
 - **A machine holding your sync key is trusted.** It sees every password in the bundle and can add, change or delete your profiles. What it sends is still checked at the edge: ids must be canonical UUIDs, host and user names are restricted, control characters are refused, and one bad entry rejects the whole sync.
 - **Use a long sync key.** The client sends its bundle once the other end has answered, but before it has shown that it knows the key.
-- **Off means off, and kept means kept.** With sync turned off this machine neither starts a sync nor accepts one, and the refusal comes before the keyring is asked for anything, the sync key included. A profile kept on this machine leaves it only as a deletion with no password, and its own password is never read from the keyring for a sync (a sync that includes it still reads the sync key and the passwords of the profiles that do sync). Both are decided in the code that does the syncing.
+- **Off means off, and kept means kept.** With sync turned off this machine neither starts a sync nor accepts one, and the refusal comes before the keyring is asked for anything, the sync key included. A profile kept on this machine leaves it only as a deletion with no password: its password is never put in a bundle or sent (a sync reads the sync key and the passwords of the profiles that do sync; and if the kept profile is the one the sync connects through, its stored password logs in to that machine, as for any connection). Both are decided in the code that does the syncing.
 - **Names stay plain text.** Profile names, hosts and tab titles are never shown as markup, and a remote shell cannot retitle its tab to look like another host.
 - **Files are private.** Config, transcript and exported transcript files are mode 0600, and a transcripts folder Moniker creates is 0700.
 - **No other traffic, but the pings.** Moniker makes no network connections other than your ssh sessions, except the pings behind the host marks (ICMP echo requests with a payload of zeros to each saved host, and the DNS lookups of their names), which Preferences turns off. Finding where a profile really connects runs `ssh -G`, which runs your `Match exec` commands too, at most every five minutes per host.
