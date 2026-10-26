@@ -8,8 +8,10 @@
 #   * the desktop file and the AppStream metainfo are where desktops look,
 #   * the GUI starts and is still running after 10 seconds on a virtual display
 #     (with no session bus, a throwaway HOME and no keyring, as the window tests),
-#   * the .deb registers /usr/bin/moniker as an x-terminal-emulator alternative
-#     at priority 20, and removing the package takes it away again.
+#   * the .deb provides x-terminal-emulator and registers /usr/bin/moniker as an
+#     alternative of it at priority 20; the prerm calls of a package that stays
+#     installed (upgrade, deconfigure, failed-upgrade) leave the alternative
+#     alone, and removing the package takes it away again.
 # It installs packages as root: run it ONLY in a throwaway container, never on
 # your own machine.
 set -euo pipefail
@@ -73,10 +75,14 @@ for file in /usr/share/applications/org.moniker.Moniker.desktop \
     [ -f "$file" ] || fail "$file is missing"
 done
 
-# The .deb registers Moniker as an x-terminal-emulator alternative at priority
-# 20 (it never outranks a terminal at 40 or above, as Ubuntu's Ptyxis is); the
-# RPM has no such mechanism.
+# The .deb provides x-terminal-emulator (Debian Policy 11.8.3) and registers
+# Moniker as an alternative of it at priority 20 (it never outranks a terminal
+# at 40 or above, as Ubuntu's Ptyxis is); the RPM has no such mechanism.
 if $deb; then
+    provides=$(dpkg-query -W -f='${Provides}' moniker)
+    [ "$provides" = x-terminal-emulator ] ||
+        fail "moniker provides '${provides:-nothing}', not x-terminal-emulator"
+    echo "install-test: moniker provides x-terminal-emulator"
     query=$(update-alternatives --query x-terminal-emulator) ||
         fail "update-alternatives does not know x-terminal-emulator"
     priority=$(awk '$1 == "Alternative:" { inside = ($2 == "/usr/bin/moniker") }
@@ -98,6 +104,26 @@ env -i PATH=/usr/bin:/bin HOME="$T" SHELL=/bin/sh \
     timeout 10 xvfb-run -a moniker || status=$?
 # timeout's 124: still running when the time was up, which is the pass.
 [ "$status" = 124 ] || fail "moniker exited with status $status within 10 seconds"
+
+# The alternative goes only when the package is removed. A package that stays
+# installed keeps it: the prerm calls of an upgrade, of a deconfigure (another
+# package takes its place for a while) and of a failed upgrade leave it alone,
+# so such a path can never leave the package installed without it.
+listed() {
+    update-alternatives --query x-terminal-emulator 2>/dev/null |
+        grep -qF 'Alternative: /usr/bin/moniker'
+}
+if $deb; then
+    prerm=/var/lib/dpkg/info/moniker.prerm
+    [ -x "$prerm" ] || fail "$prerm is missing"
+    for call in "upgrade 9.9.9" "deconfigure in-favour other-package 1.0" "failed-upgrade 0.0.1"; do
+        # The words of one call, as dpkg gives them to the script.
+        read -r -a words <<<"$call"
+        "$prerm" "${words[@]}"
+        listed || fail "x-terminal-emulator lost /usr/bin/moniker on 'prerm $call'"
+    done
+    echo "install-test: prerm leaves the alternative alone unless the package is removed"
+fi
 
 # Removing the package takes its alternative away again (its prerm).
 if $deb; then

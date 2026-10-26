@@ -8,6 +8,7 @@
 #                   next to it in /usr/bin, and on libadwaita 1.9 and VTE 0.76
 #                   or newer; it also carries the desktop file and the
 #                   AppStream metainfo (data/), where the publisher shows;
+#                   it provides x-terminal-emulator (Debian Policy 11.8.3), and
 #                   its postinst and prerm register /usr/bin/moniker as an
 #                   x-terminal-emulator alternative at priority 20
 # Library dependencies are read from the binaries by dpkg-shlibdeps. Needs
@@ -109,6 +110,7 @@ stage_copyright() {
 }
 
 # build_deb PACKAGE: write DEBIAN/control from the CONTROL_* variables and pack.
+# CONTROL_RECOMMENDS and CONTROL_PROVIDES may be empty (no such field).
 build_deb() {
     local dir=$STAGE/$1
     mkdir -p "$dir/DEBIAN"
@@ -120,6 +122,7 @@ build_deb() {
         printf 'Installed-Size: %s\n' "$(du -sk --exclude=DEBIAN "$dir" | cut -f1)"
         printf 'Depends: %s\n' "$CONTROL_DEPENDS"
         [ -z "${CONTROL_RECOMMENDS:-}" ] || printf 'Recommends: %s\n' "$CONTROL_RECOMMENDS"
+        [ -z "${CONTROL_PROVIDES:-}" ] || printf 'Provides: %s\n' "$CONTROL_PROVIDES"
         printf 'Section: %s\n' "$CONTROL_SECTION"
         printf 'Priority: optional\n'
         printf 'Homepage: %s\n' "$REPOSITORY"
@@ -135,6 +138,7 @@ stage_bin moniker-server moniker-askpass
 stage_copyright moniker-server
 CONTROL_DEPENDS="$(shlib_depends moniker-server), openssh-client"
 CONTROL_RECOMMENDS="gnome-keyring"
+CONTROL_PROVIDES=""
 CONTROL_SECTION=net
 CONTROL_DESCRIPTION="Moniker command line and sync server (no GUI)
  moniker-server syncs saved SSH connection profiles and their passwords
@@ -156,7 +160,13 @@ install -D -m 644 data/org.moniker.Moniker.desktop "$STAGE/moniker/usr/share/app
 # `update-alternatives --config x-terminal-emulator` picks it. Priority 20 never
 # outranks a terminal at 40 or above (Ubuntu's Ptyxis is 40), so on Ubuntu
 # installing Moniker does not change which terminal the system chooses by itself.
-# Plain scripts, no #DEBHELPER# (nothing here is built by debhelper).
+# The package also declares `Provides: x-terminal-emulator` below, which Debian
+# Policy 11.8.3 asks of a terminal emulator that registers the alternative.
+# Plain scripts, no #DEBHELPER# (nothing here is built by debhelper): they do
+# what dh_installalternatives does, which removes the alternative on `remove`
+# only, as Ptyxis's prerm does. Not on `upgrade` or `deconfigure` (the package
+# comes back configured), nor on a `failed-upgrade` or an `abort-*`: a path that
+# leaves the package installed must leave its alternative registered.
 install -D -m 755 /dev/stdin "$STAGE/moniker/DEBIAN/postinst" <<'EOF'
 #!/bin/sh
 set -e
@@ -172,7 +182,7 @@ install -D -m 755 /dev/stdin "$STAGE/moniker/DEBIAN/prerm" <<'EOF'
 #!/bin/sh
 set -e
 case "$1" in
-remove | deconfigure)
+remove)
     update-alternatives --remove x-terminal-emulator /usr/bin/moniker
     ;;
 esac
@@ -188,6 +198,7 @@ GUI_DEPENDS=$(with_floor "$(shlib_depends moniker)" libadwaita-1-0 1.9)
 GUI_DEPENDS=$(with_floor "$GUI_DEPENDS" libvte-2.91-gtk4-0 0.76)
 CONTROL_DEPENDS="$GUI_DEPENDS, moniker-server (= $VERSION)"
 CONTROL_RECOMMENDS=""
+CONTROL_PROVIDES="x-terminal-emulator"
 CONTROL_SECTION=x11
 CONTROL_DESCRIPTION="SSH terminal with saved connection profiles
  Moniker is a GTK4/libadwaita/VTE terminal built around saved SSH
