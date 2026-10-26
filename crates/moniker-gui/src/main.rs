@@ -11,7 +11,8 @@
 //! sync on launch both sync with the partner recorded in the GUI settings
 //! ([`settings`]) by the first successful sync from the sync page; until then
 //! neither exists for the person (Sync Now is hidden, nothing syncs on
-//! launch).
+//! launch). Once sync is set up but turned off (issue #10), Sync Now stays in
+//! the menu grayed out, and nothing syncs on launch, with no notification.
 
 mod connect_menu;
 mod context;
@@ -218,15 +219,6 @@ fn add_actions(app: &adw::Application, ctx: &Rc<AppContext>) {
             }
         ))
         .build();
-    let sync_now = gio::ActionEntry::builder("sync-now")
-        .activate(glib::clone!(
-            #[strong]
-            ctx,
-            move |app: &adw::Application, _, _| {
-                sync_now(app, &ctx);
-            }
-        ))
-        .build();
     let preferences = gio::ActionEntry::builder("preferences")
         .activate(glib::clone!(
             #[strong]
@@ -252,18 +244,21 @@ fn add_actions(app: &adw::Application, ctx: &Rc<AppContext>) {
         new_window,
         profiles,
         recordings,
-        sync_now,
         preferences,
         shortcuts,
         about,
     ]);
+    // `app.sync-now` is not among them: it exists only while there is a sync
+    // partner ([`refresh_sync_now`]).
     follow_sync_partner(app, ctx);
 }
 
-/// Offer Sync Now (enable `app.sync-now`, which shows its menu entry) only
-/// while a sync partner is recorded and its profile exists; check again
-/// whenever the profiles change and after every sync, so the first successful
-/// sync from the sync page offers it at once.
+/// Show Sync Now in the ☰ menu (have `app.sync-now`, whose menu entry is
+/// `hidden-when: action-missing`) only while a sync partner is recorded and
+/// its profile exists, and let it be chosen only while sync is turned on; check
+/// again whenever the profiles change (the switch is in the profile file) and
+/// after every sync, so the first successful sync from the sync page offers it
+/// at once.
 fn follow_sync_partner(app: &adw::Application, ctx: &Rc<AppContext>) {
     // Weak both: the context keeps these closures, and the app the context.
     let refresh: Rc<dyn Fn()> = {
@@ -287,15 +282,54 @@ fn follow_sync_partner(app: &adw::Application, ctx: &Rc<AppContext>) {
     });
 }
 
-fn refresh_sync_now(app: &adw::Application, ctx: &AppContext) {
+/// Bring `app.sync-now` in line with the partner and the sync switch:
+/// * no live partner: no action, so the menu item is hidden (before sync is
+///   set up, and when a sync deleted the partner);
+/// * a partner and sync turned on: the action, enabled;
+/// * a partner and sync turned off (or a switch that cannot be read): the
+///   action, disabled, so the item shows grayed out (issue #10, the user's
+///   choice: the person sees that Sync Now exists and is off, not that it is
+///   gone).
+fn refresh_sync_now(app: &adw::Application, ctx: &Rc<AppContext>) {
     let settings = settings::load(&ctx.settings_path);
-    let enabled = sync::live_partner(&settings, &ctx.store.borrow()).is_some();
-    if let Some(action) = app
+    // Bind first so the store borrow ends here.
+    let (has_partner, sync_on) = {
+        let store = ctx.store.borrow();
+        (
+            sync::live_partner(&settings, &store).is_some(),
+            store.sync_switch().is_on(),
+        )
+    };
+    if !has_partner {
+        app.remove_action("sync-now");
+        return;
+    }
+    let action = match app
         .lookup_action("sync-now")
         .and_downcast::<gio::SimpleAction>()
     {
-        action.set_enabled(enabled);
-    }
+        Some(action) => action,
+        None => {
+            let action = sync_now_action(app, ctx);
+            app.add_action(&action);
+            action
+        }
+    };
+    action.set_enabled(sync_on);
+}
+
+/// The `app.sync-now` action.
+fn sync_now_action(app: &adw::Application, ctx: &Rc<AppContext>) -> gio::SimpleAction {
+    let action = gio::SimpleAction::new("sync-now", None);
+    // The app owns the action: a strong reference back would be a cycle.
+    action.connect_activate(glib::clone!(
+        #[weak]
+        app,
+        #[strong]
+        ctx,
+        move |_, _| sync_now(&app, &ctx)
+    ));
+    action
 }
 
 /// Sync Now: sync with the partner and say how it went in a notification, in
@@ -369,12 +403,13 @@ pub(crate) fn launch(app: &adw::Application, ctx: &Rc<AppContext>) {
     glib::idle_add_local_once(move || sync_on_launch(&ctx));
 }
 
-/// The automatic sync: with the partner, if there is one and the switch is
-/// on. Only the profile is read here; the worker reads the keyring (which may
-/// ask to be unlocked) and runs the exchange, so the new window and its
-/// terminal never wait for either. A success is silent; a failure is one
-/// notification. If a sync is already running (started by hand meanwhile),
-/// this one is skipped.
+/// The automatic sync: with the partner, if there is one, the automatic sync
+/// switch is on and sync is not turned off (then nothing runs and nothing is
+/// said: the person turned it off on purpose). Only the profile is read here;
+/// the worker reads the keyring (which may ask to be unlocked) and runs the
+/// exchange, so the new window and its terminal never wait for either. A
+/// success is silent; a failure is one notification. If a sync is already
+/// running (started by hand meanwhile), this one is skipped.
 fn sync_on_launch(ctx: &Rc<AppContext>) {
     let settings = settings::load(&ctx.settings_path);
     // Bind first so the store borrow ends here.

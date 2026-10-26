@@ -578,8 +578,9 @@ const DEFAULT_SIZE: (i32, i32) = (1100, 700);
 
 /// The ☰ menu: the zoom row, then entries that are app actions (`main.rs`),
 /// Preferences among them.
-/// Sync Now is hidden while its action is disabled, that is while no sync
-/// partner is recorded.
+/// Sync Now is hidden while its action is missing, that is while no sync
+/// partner is recorded, and shown grayed out while sync is turned off (its
+/// action is then disabled; `main.rs` keeps both).
 fn main_menu() -> gio::Menu {
     // A custom item: the zoom row takes its place ([`zoom_row`]).
     let zoom_item = gio::MenuItem::new(None, None);
@@ -592,7 +593,7 @@ fn main_menu() -> gio::Menu {
     app_section.append(Some("Connection Profiles"), Some("app.profiles"));
     app_section.append(Some("Transcripts"), Some("app.recordings"));
     let sync_now = gio::MenuItem::new(Some("Sync Now"), Some("app.sync-now"));
-    sync_now.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+    sync_now.set_attribute_value("hidden-when", Some(&"action-missing".to_variant()));
     app_section.append_item(&sync_now);
     let about_section = gio::Menu::new();
     about_section.append(Some("Preferences"), Some("app.preferences"));

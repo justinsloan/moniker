@@ -96,6 +96,8 @@ pub(crate) fn explain(err: &SyncError) -> String {
         SyncError::PeerStale => {
             format!("The other machine has not synced for more than 180 days. {FORGETS}")
         }
+        SyncError::SyncOff => SYNC_IS_OFF.to_owned(),
+        SyncError::PeerSyncOff => "Sync is turned off on the other machine.".to_owned(),
         // ssh's login failed. It cannot ask anyone (it has no terminal), so a
         // password that is not stored, or a key that needs its passphrase,
         // ends here too.
@@ -134,9 +136,13 @@ pub(crate) fn outcome_text(outcome: &SyncOutcome) -> String {
     }
 }
 
-/// Why Sync is unavailable right now, or `None` if it is available.
-pub(crate) fn sync_hint(key_set: bool, profiles: usize) -> Option<&'static str> {
-    if !key_set {
+/// Why Sync is unavailable right now, or `None` if it is available. The
+/// switch comes first: it is the one reason that stops a sync even when
+/// everything else is set up (issue #10).
+pub(crate) fn sync_hint(sync_on: bool, key_set: bool, profiles: usize) -> Option<&'static str> {
+    if !sync_on {
+        Some(SYNC_IS_OFF)
+    } else if !key_set {
         Some(NO_SYNC_KEY)
     } else if profiles == 0 {
         Some("Add a profile for the other machine first (+ above the list of profiles).")
@@ -199,17 +205,19 @@ fn sentence(message: &str) -> String {
 }
 
 /// The partner automatic sync should sync with on launch: the recorded
-/// partner, if automatic sync is on and that profile still exists (a sync may
-/// have deleted it). `None`: no automatic sync.
+/// partner, if sync is turned on, automatic sync is on and that profile still
+/// exists (a sync may have deleted it). `None`: no automatic sync. With sync
+/// turned off (or a switch that cannot be read) there is none, and the launch
+/// says nothing: the person turned it off on purpose (issue #10).
 pub(crate) fn auto_sync_target(settings: &GuiSettings, store: &ProfileStore) -> Option<String> {
-    if !settings.auto_sync {
+    if !settings.auto_sync || !store.sync_switch().is_on() {
         return None;
     }
     live_partner(settings, store)
 }
 
-/// The recorded partner, if that profile still exists. Sync Now is offered
-/// only while there is one.
+/// The recorded partner, if that profile still exists. Sync Now is shown
+/// only while there is one (grayed out while sync is turned off).
 pub(crate) fn live_partner(settings: &GuiSettings, store: &ProfileStore) -> Option<String> {
     let partner = settings.sync_partner.as_deref()?;
     store.get(partner).map(|p| p.id.clone())
@@ -239,11 +247,19 @@ pub(crate) struct SyncRequest {
 
 /// On the main thread: the profile to sync with, and where the worker finds
 /// the profile file and the askpass helper. Reads no secret.
+///
+/// Refused while sync is turned off, here and now, so that no worker starts and
+/// the keyring is not read for a sync that cannot run (issue #10). The core
+/// refuses again, from the file as the worker finds it, which is what protects
+/// the data; this is the courtesy in front of it.
 pub(crate) fn sync_request(
     store: &ProfileStore,
     askpass: &Path,
     profile_id: &str,
 ) -> Result<SyncRequest, String> {
+    if !store.sync_switch().is_on() {
+        return Err(SYNC_IS_OFF.to_owned());
+    }
     // The worker opens the file again by this path.
     let store_path = store.path().to_path_buf();
     if !store_path.is_absolute() {
@@ -328,6 +344,10 @@ profile's password, or add the key to ssh-agent.";
 
 /// Why a sync cannot run without a key.
 pub(crate) const NO_SYNC_KEY: &str = "Set a sync key first.";
+
+/// Why no sync runs while the switch is off (issue #10): the sync page's hint,
+/// the refusal of a request, and the core's own error ([`explain`]).
+pub(crate) const SYNC_IS_OFF: &str = "Sync is turned off on this machine.";
 
 /// The worker's whole job: open this thread's own store and secret store, build
 /// the ssh command, and run the exchange. `tweak` may change the command before
@@ -692,20 +712,43 @@ mod tests {
 
     #[test]
     fn sync_is_available_with_a_key_and_a_profile() {
-        assert_eq!(sync_hint(true, 1), None);
-        assert_eq!(sync_hint(true, 5), None);
+        assert_eq!(sync_hint(true, true, 1), None);
+        assert_eq!(sync_hint(true, true, 5), None);
     }
 
     #[test]
     fn a_missing_key_comes_first() {
-        assert_eq!(sync_hint(false, 3), Some("Set a sync key first."));
-        assert_eq!(sync_hint(false, 0), Some("Set a sync key first."));
+        assert_eq!(sync_hint(true, false, 3), Some("Set a sync key first."));
+        assert_eq!(sync_hint(true, false, 0), Some("Set a sync key first."));
     }
 
     #[test]
     fn no_profiles_asks_for_one() {
-        let hint = sync_hint(true, 0).expect("a hint");
+        let hint = sync_hint(true, true, 0).expect("a hint");
         assert!(hint.contains("profile"), "{hint}");
+    }
+
+    #[test]
+    fn sync_off_is_the_first_reason_sync_is_unavailable() {
+        // Whatever else is missing, the switch is what the person can act on
+        // first, and the one thing that stops a sync even when all is set up.
+        assert_eq!(sync_hint(false, true, 3), Some(SYNC_IS_OFF));
+        assert_eq!(sync_hint(false, false, 0), Some(SYNC_IS_OFF));
+        assert_eq!(sync_hint(true, false, 3), Some(NO_SYNC_KEY));
+        assert_eq!(SYNC_IS_OFF, "Sync is turned off on this machine.");
+    }
+
+    #[test]
+    fn the_two_off_errors_are_explained() {
+        assert_eq!(explain(&SyncError::SyncOff), SYNC_IS_OFF);
+        assert_eq!(
+            explain(&SyncError::PeerSyncOff),
+            "Sync is turned off on the other machine."
+        );
+        assert_eq!(
+            failure_text(&SyncFailure::Sync(SyncError::SyncOff)),
+            SYNC_IS_OFF
+        );
     }
 
     // ----- key status -----
@@ -1071,6 +1114,41 @@ mod tests {
             auto_sync_target(&settings(Some(&w.profile.id), true), &w.store),
             Some(w.profile.id.clone())
         );
+    }
+
+    #[test]
+    fn an_off_switch_has_no_automatic_sync_target() {
+        let mut w = world();
+        let partner = settings(Some(&w.profile.id), true);
+        w.store.set_sync(false).unwrap();
+        assert_eq!(auto_sync_target(&partner, &w.store), None, "off");
+        // The partner is still there: Sync Now is shown, grayed out.
+        assert_eq!(live_partner(&partner, &w.store), Some(w.profile.id.clone()));
+        // No request, so no worker and no keyring read.
+        let err = sync_request(&w.store, &w.askpass, &w.profile.id)
+            .err()
+            .expect("refused");
+        assert_eq!(err, SYNC_IS_OFF);
+        // Back on: both work again.
+        w.store.set_sync(true).unwrap();
+        assert_eq!(
+            auto_sync_target(&partner, &w.store),
+            Some(w.profile.id.clone())
+        );
+        assert!(sync_request(&w.store, &w.askpass, &w.profile.id).is_ok());
+    }
+
+    #[test]
+    fn a_switch_nobody_can_read_counts_as_off() {
+        // Fail closed, as the core does: a version-2 file whose switch is
+        // missing or not a boolean.
+        let w = world();
+        let partner = settings(Some(&w.profile.id), true);
+        fs::write(w.store.path(), r#"{"version":2,"profiles":[]}"#).unwrap();
+        let unreadable = ProfileStore::open(w.store.path()).unwrap();
+        assert_eq!(auto_sync_target(&partner, &unreadable), None);
+        let err = sync_request(&unreadable, &w.askpass, &w.profile.id);
+        assert_eq!(err.err().as_deref(), Some(SYNC_IS_OFF));
     }
 
     #[test]

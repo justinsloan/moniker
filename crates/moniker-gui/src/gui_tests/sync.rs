@@ -311,10 +311,17 @@ fn has_css(label: &gtk::Label, class: &str) -> bool {
     label.css_classes().iter().any(|c| c == class)
 }
 
+/// Whether Sync Now can be chosen: its action exists and is enabled.
 fn sync_now_enabled(app: &adw::Application) -> bool {
     app.lookup_action("sync-now")
-        .expect("the sync-now action")
-        .is_enabled()
+        .is_some_and(|action| action.is_enabled())
+}
+
+/// Whether the `app.sync-now` action exists. Without it the ☰ menu's item is
+/// hidden (`hidden-when: action-missing`); with it disabled the item shows
+/// grayed out.
+fn sync_now_exists(app: &adw::Application) -> bool {
+    app.lookup_action("sync-now").is_some()
 }
 
 // ----- the sync page (what the old sync dialog did) -----
@@ -850,10 +857,10 @@ pub(super) fn first_manual_success_enables_sync_now(dir: &Path) {
     pump_for(Duration::from_millis(200));
     assert_eq!(
         sync_now_item(&main),
-        Some(("Sync Now".to_owned(), "action-disabled".to_owned())),
-        "the menu item hides while its action is disabled"
+        Some(("Sync Now".to_owned(), "action-missing".to_owned())),
+        "the menu item hides while its action is missing"
     );
-    assert!(!sync_now_enabled(&rig.app), "no partner: no Sync Now");
+    assert!(!sync_now_exists(&rig.app), "no partner: no Sync Now");
     assert_eq!(
         rig.page.auto_sync.subtitle().as_deref(),
         Some(sync_page::AUTO_SYNC_NO_PARTNER)
@@ -864,7 +871,7 @@ pub(super) fn first_manual_success_enables_sync_now(dir: &Path) {
     rig.page
         .sync_with(&rig.ctx, |_| Err(SyncError::WrongSyncKey));
     pump_until("the failed sync", || rig.page.sync_button.is_sensitive());
-    assert!(!sync_now_enabled(&rig.app));
+    assert!(!sync_now_exists(&rig.app));
     assert!(!rig.ctx.settings_path.exists(), "nothing written");
 
     // The first success records the partner and offers Sync Now at once.
@@ -897,7 +904,10 @@ pub(super) fn first_manual_success_enables_sync_now(dir: &Path) {
         .delete(&profile.id)
         .unwrap();
     rig.ctx.profiles_changed();
-    assert!(!sync_now_enabled(&rig.app));
+    assert!(
+        !sync_now_exists(&rig.app),
+        "the partner is gone: Sync Now goes away"
+    );
     main.window.destroy();
     rig.finish();
 }
@@ -1092,6 +1102,126 @@ pub(super) fn auto_sync_failure_is_one_notification(dir: &Path) {
     pump_until("it to finish", || !ctx.sync_running.get());
     pump_for(Duration::from_millis(300));
     assert_eq!(ctx.notice.delivered(), delivered, "a success is silent");
+    close_all(&app);
+}
+
+/// Issue #10: while sync is turned off (as the command line or another Moniker
+/// wrote it in the profile file) nothing starts a sync: not the launch, not Sync
+/// Now, not the sync page's button, and the keyring is not even read for one.
+/// Sync Now stays in the menu, grayed out, as long as there is a partner.
+pub(super) fn sync_off_grays_out_sync_now_and_skips_launch(dir: &Path) {
+    let reads = Reads::default();
+    let (ctx, _secrets, profile) = sync_ctx_counting(dir, true, Some(SYNC_KEY), &reads);
+    let profile = profile.expect("a profile");
+    set_partner(&ctx, &profile, true);
+    let path = ctx.store.borrow().path().to_path_buf();
+    // Another handle, as `moniker-server sync-switch off` would write it.
+    ProfileStore::open(&path).unwrap().set_sync(false).unwrap();
+    ctx.profiles_changed();
+    assert!(!ctx.store.borrow().sync_switch().is_on());
+
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
+    let runs = Arc::new(AtomicUsize::new(0));
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    let delivered = ctx.notice.delivered();
+
+    // Launch: nothing runs, and the person, who turned it off on purpose, is
+    // told nothing.
+    crate::launch(&app, &ctx);
+    let main = window::last_active(&app).expect("the first window");
+    pump_for(Duration::from_secs(1));
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "no sync on launch");
+    assert!(!ctx.sync_running.get());
+    assert_eq!(ctx.notice.delivered(), delivered, "and no notification");
+    assert_eq!(
+        (
+            reads.main.load(Ordering::SeqCst),
+            reads.worker.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "no keyring read for a sync that cannot run"
+    );
+
+    // Sync Now is in the menu, grayed out: its action exists and is disabled.
+    assert_eq!(
+        sync_now_item(&main),
+        Some(("Sync Now".to_owned(), "action-missing".to_owned()))
+    );
+    assert!(sync_now_exists(&app), "shown");
+    assert!(!sync_now_enabled(&app), "but grayed out");
+    app.activate_action("sync-now", None);
+    pump_for(Duration::from_millis(200));
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(ctx.notice.delivered(), delivered);
+
+    // The sync page says why Sync is unavailable. Even a press that gets past
+    // the insensitive button (a test can) starts nothing: the request is
+    // refused on the main thread, before any worker or keyring.
+    let profiles_window = open_sync_page(&app, &ctx);
+    let page = page_in(&profiles_window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
+    assert_eq!(page.key_status.label(), "Sync key: set");
+    assert!(page.hint.is_visible());
+    assert_eq!(page.hint.label(), sync::SYNC_IS_OFF);
+    assert!(!page.sync_button.is_sensitive());
+    let worker_reads = reads.worker.load(Ordering::SeqCst);
+    page.sync_button.emit_clicked();
+    assert_eq!(page.result.label(), sync::SYNC_IS_OFF);
+    assert!(!ctx.sync_running.get());
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(reads.worker.load(Ordering::SeqCst), worker_reads);
+
+    // The partner deleted (by a sync, say): Sync Now is hidden again, off or not.
+    ProfileStore::open(&path)
+        .unwrap()
+        .delete(&profile.id)
+        .unwrap();
+    ctx.profiles_changed();
+    assert!(!sync_now_exists(&app), "no partner: hidden");
+
+    // Another partner, sync still off: shown, grayed out. The file watch is
+    // what tells the menu in the app; here the reload is asked for.
+    let other = Profile::new("other", "other.example.test", "bob");
+    let other_id = other.id.clone();
+    ProfileStore::open(&path).unwrap().upsert(other).unwrap();
+    ctx.profiles_changed();
+    let other = ctx.store.borrow().get(&other_id).expect("saved").clone();
+    set_partner(&ctx, &other, true);
+    ctx.profiles_changed();
+    assert!(sync_now_exists(&app));
+    assert!(!sync_now_enabled(&app), "still off: grayed out");
+
+    // Turned on: Sync Now can be chosen, the page's hint goes, and the launch
+    // syncs (the control for everything above).
+    ProfileStore::open(&path).unwrap().set_sync(true).unwrap();
+    ctx.profiles_changed();
+    assert!(sync_now_enabled(&app), "on: enabled");
+    assert!(!page.hint.is_visible(), "the page no longer says it is off");
+    assert!(page.sync_button.is_sensitive());
+    // (The press above asked for its runner before it was refused.)
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    crate::launch(&app, &ctx);
+    pump_until("the sync on launch", || runs.load(Ordering::SeqCst) == 1);
+    pump_until("it to finish", || !ctx.sync_running.get());
+    assert_eq!(ctx.notice.delivered(), delivered, "a success is silent");
+    set_runner(&ctx, counting(&runs, || Ok(added(0))));
+    app.activate_action("sync-now", None);
+    pump_until("Sync Now to run", || runs.load(Ordering::SeqCst) == 2);
+    pump_until("it to finish", || !ctx.sync_running.get());
+
+    // Off again: grayed out again, nothing runs.
+    ProfileStore::open(&path).unwrap().set_sync(false).unwrap();
+    ctx.profiles_changed();
+    assert!(sync_now_exists(&app));
+    assert!(!sync_now_enabled(&app));
+    set_runner(&ctx, counting(&runs, || Ok(added(0))));
+    app.activate_action("sync-now", None);
+    pump_for(Duration::from_millis(200));
+    assert_eq!(runs.load(Ordering::SeqCst), 2, "no third sync");
+    drop(page);
     close_all(&app);
 }
 

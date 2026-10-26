@@ -368,8 +368,10 @@ impl SyncPage {
     fn refresh_controls(&self) {
         let profiles = self.ids.borrow().len();
         let known = self.key_known.get();
+        // The switch is in the profile file, which the context keeps current.
+        let sync_on = self.ctx.store.borrow().sync_switch().is_on();
         let hint = known
-            .then(|| sync::sync_hint(self.key_set.get(), profiles))
+            .then(|| sync::sync_hint(sync_on, self.key_set.get(), profiles))
             .flatten();
         self.hint.set_label(hint.unwrap_or(""));
         self.hint.set_visible(hint.is_some());

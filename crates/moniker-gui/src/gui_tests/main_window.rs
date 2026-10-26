@@ -278,16 +278,12 @@ pub(super) fn launch_has_one_local_tab_and_no_sidebar(dir: &Path) {
 
     // The menu's actions exist and do what they say.
     crate::add_actions(&app, &ctx);
-    for action in [
-        "new-window",
-        "profiles",
-        "recordings",
-        "sync-now",
-        "shortcuts",
-        "about",
-    ] {
+    for action in ["new-window", "profiles", "recordings", "shortcuts", "about"] {
         assert!(app.has_action(action), "app.{action}");
     }
+    // Sync Now exists only while there is a sync partner (none here), so that
+    // its menu item is hidden; the sync scenarios cover it.
+    assert!(!app.has_action("sync-now"));
     app.activate_action("profiles", None);
     pump_for(Duration::from_millis(300));
     let profiles_window = app

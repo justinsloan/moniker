@@ -372,6 +372,8 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #10, sync turned off.
+    sync::sync_off_grays_out_sync_now_and_skips_launch(&tmp.path().join("s-off"));
     // Issue #6, the panes of a tab.
     panes::splitting_puts_a_new_pane_beside_the_focused_one(&bin, &tmp.path().join("s-split"));
     panes::the_tab_follows_its_focused_pane(&bin, &tmp.path().join("s-focus"));
