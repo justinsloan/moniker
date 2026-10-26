@@ -37,7 +37,7 @@ Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, 
 
 - 🔑 **One click to a logged-in shell.** A profile holds the host, user name, port, an optional key file and a password. Pick it in the new-tab list and the tab logs in with no typing. The password lives in the system keyring and reaches `ssh` through a helper that answers only that host's password prompt, never through a file, the command line or the environment.
 - ▶️ **Startup sequences.** Give a profile as many named command lists as you like ("update", "tail the logs"). Connect with one and its commands run after login, then you are left in your normal interactive shell.
-- 🔄 **Sync with no server.** Profiles and passwords sync between your own machines over plain SSH. The bundle is encrypted with a shared sync key (Argon2id, XChaCha20-Poly1305) before it leaves the machine, and the key itself is never sent. Changes merge both ways: profiles added on either side are kept, the newest edit of a profile wins and deletions propagate. Once set up, Moniker syncs in the background at every launch.
+- 🔄 **Sync with no server.** Profiles and passwords sync between your own machines over plain SSH. The bundle is encrypted with a shared sync key (Argon2id, XChaCha20-Poly1305) before it leaves the machine, and the key itself is never sent. Changes merge both ways: profiles added on either side are kept, the newest edit of a profile wins and deletions propagate. Once set up, Moniker syncs in the background at every launch. You can turn sync off on a machine, and keep any one profile on a single machine.
 - 📝 **Transcripts.** Save a plain-text transcript of any session, remote or local: per profile, per connection, or of every session. The Transcripts window lists them by day, filters by host, searches across all of them, and exports or deletes them. Transcripts never leave the machine.
 - 🖥️ **A real terminal.** Tabs, panes side by side or one above the other in any arrangement (to compare two servers, say), several windows, tabs and panes dragged from one window to another, a text size per pane, and copy and paste with bracketed paste. Moniker keeps only a handful of [shortcuts](#keyboard-shortcuts); every other key, Ctrl+Tab and F10 included, goes to the program in the terminal.
 - 🎨 **The modern GNOME look.** libadwaita, following the system light or dark style, terminal colors close to GNOME Console's, and a Connection Profiles window laid out like GNOME Settings.
@@ -112,7 +112,7 @@ Moniker opens with one local terminal: your login shell, in your home directory.
 | **Connect with options** | **›** on a row (or <kbd>→</kbd>): **Just connect**, each startup sequence by name, and a **Save transcript** box for this one connection. Local terminal has a **›** too. |
 | **Add or edit profiles** | **☰ → Connection Profiles**. Double-click a profile there, or press its **Connect** button, to open a session in the main window you used last. |
 | **Read transcripts** | **☰ → Transcripts**. |
-| **Sync** | **☰ → Sync Now**, once sync is set up (see [Syncing two machines](#syncing-two-machines)). |
+| **Sync** | **☰ → Sync Now**, once sync is set up (see [Syncing two machines](#syncing-two-machines)). It is grayed out while sync is turned off. |
 | **Split a tab** | <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> puts a new pane on the right, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> one below (also **Split Right** and **Split Down** when you right-click a terminal). The new pane shows the same list as a new tab. See [Panes](#panes). |
 | **Rename a tab** | Double-click it, or right-click it, then **Rename…**. |
 | **New window** | **☰ → New Window**, or drag a tab out of the tab bar. A tab can also be dragged into another Moniker window. |
@@ -156,6 +156,7 @@ A tab can hold several panes, each its own session: a connection or a local shel
 
 - **Editing saves field by field.** A changed text field shows a ✓, and the value is saved only when you press ✓ or <kbd>Enter</kbd>; leave the field without that and the edit is dropped. Switches, the port and the key file save when changed. A mistake, such as an empty host, marks the field and a notification says why, and nothing is saved. Saving never holds up the window: if the profile file is busy (a sync is writing it), the field keeps what you set, shows a small spinner after a moment, and is saved once the file is free.
 - **Passwords:** the password field is empty unless you type a new one, and leaving it empty keeps the stored password. **Remove stored password** deletes it from this machine only.
+- **Sync to other machines** is a switch on the profile page, on for every profile to start with. Turn it off to keep the profile on this machine only; see [Keeping a profile on this machine only](#keeping-a-profile-on-this-machine-only). A profile kept here has a small computer icon at the end of its row, in the Connection Profiles window and in the new-tab list.
 - **Startup sequences** are listed on the profile page, one row each. Open one to name it and type its commands, one per line, then Save or Cancel; Move Up and Move Down set the order of the Connect choices. A profile with no sequences gives a plain shell.
 - Narrow the Connection Profiles window and it shows one pane at a time, with a back button.
 
@@ -200,12 +201,14 @@ What needs your attention (a transcript that could not be saved, `moniker-askpas
 | What | Where | Synced |
 |---|---|---|
 | Passwords and the sync key | The system keyring (Secret Service) | Passwords yes, the sync key never |
-| Profiles, no secrets | `~/.config/moniker/profiles.json` (mode 0600) | Yes |
+| Profiles, no secrets, and the sync switch | `~/.config/moniker/profiles.json` (mode 0600; format version 2 while sync is off or a profile is kept on this machine, version 1 otherwise) | Profiles yes, except those kept on this machine; the switch never |
 | Sync partner, automatic sync, text size and window sizes for the next launch, Preferences | `~/.config/moniker/gui-settings.json` (mode 0600) | No |
 | When this machine last completed a sync | `~/.config/moniker/sync-state.json` (mode 0600) | No |
 | Transcripts | `~/.local/share/moniker/transcripts/`, or the folder chosen in Preferences | No |
 
 If `gui-settings.json` is damaged, Moniker uses the defaults and leaves the file as it is instead of overwriting it; a Preferences change then says it cannot be saved.
+
+`profiles.json` is format version 1 until you use one of the two settings that stay on this machine. While sync is turned off, or any profile is kept on this machine only, Moniker writes it as version 2, and it goes back to version 1 when neither is true. Moniker 0.5.0 and older refuse a file of another version and leave it alone, so an older `moniker` or `moniker-server` on this machine can neither send a profile you keep here nor take part in a sync while sync is off. The cost: until you turn sync on and stop keeping profiles here, an older version on this machine says "unsupported profile store version 2" and shows no profiles. Moniker reads both versions.
 
 ## Syncing two machines
 
@@ -220,6 +223,31 @@ If `gui-settings.json` is damaged, Moniker uses the defaults and leaves the file
 
 > [!IMPORTANT]
 > `moniker-server` must be on the other machine's *non-interactive* `PATH`, and `~/.cargo/bin` usually is not. Install it in `/usr/local/bin` or `~/.local/bin` (the packages put it in `/usr/bin`), then check that `ssh other-machine which moniker-server` prints a path.
+
+### Turning sync off
+
+The **Sync** switch at the top of the Sync page turns sync off on this machine. `moniker-server sync-switch off` does the same from a terminal, and `moniker-server sync-switch status` says whether sync is on or off (and why, if the setting could not be read). While sync is off, nothing leaves this machine and nothing is accepted from another:
+
+- Moniker does not sync at launch, and shows no notification about it.
+- **☰ → Sync Now** stays in the menu, grayed out. **Sync Automatically** and the Sync button on the Sync page are grayed out, with the line "Sync is turned off on this machine."
+- `moniker-server sync <profile>` stops with "sync is turned off on this machine".
+- **This machine also refuses a sync that another machine starts.** The other machine is told "Sync is turned off on the other machine." Without that, any machine with your sync key and an ssh login here could still pull your profiles. The refusal comes before this machine reads the sync key from the keyring, so it causes no keyring prompt here.
+
+The check is made by the code that does the syncing, in both roles, so a grayed-out button is a convenience and not the protection. The sync key and the sync partner are kept, so turning sync on again just works. A sync that is already running finishes; the next one is refused. If the setting is in the file but cannot be read, sync counts as off.
+
+**Turning sync on asks first.** "Turn Sync On?" says that at the next sync every profile on this machine that syncs, including any added while sync was off, will be copied to your other machines with its stored password, and that to keep a profile on this machine only you cancel and turn off "Sync to other machines" on its page first. `moniker-server sync-switch on` says the same and asks `Turn sync on? [y/N]` when its input is a terminal; otherwise it changes nothing unless you add `--yes`. Turning sync off asks nothing, since it only stops data leaving. Profiles you add while sync is off sync like any other once it is turned back on.
+
+### Keeping a profile on this machine only
+
+Turn off **Sync to other machines** on a profile's page and Moniker asks "Keep “name” on This Machine Only?": the profile will be deleted from your other machines, with its stored password, the next time they sync, and it stays here. Cancel (or Escape) leaves everything as it was.
+
+- **Nothing about a kept profile leaves this machine** except its id and a version time, in the shape of a deletion. Its name, host, user name, port, key file, sequences and password are not sent, and the password is not even read from the keyring for a sync.
+- **Nothing that arrives changes it.** A newer copy or a deletion from another machine leaves the kept profile and its stored password as they are.
+- **Turning the switch back on asks too** ("Sync “name” to Your Other Machines?"): the profile is copied to your other machines, with its stored password, at the next sync, and the deletions sent while it was kept here cannot delete it again.
+- **New Profile** has the same switch. Turned off there, the profile is created kept on this machine, and nothing asks, since no other machine has it yet.
+- **The mark:** a profile kept here shows a small dimmed computer icon at the end of its row, in the Connection Profiles window and in the new-tab list, with the tooltip "On this machine only". Profiles that sync have no mark. The marks show each profile's own setting, whether sync is on or off. `moniker-server profile list` adds "(this machine only)".
+
+To other machines running Moniker 0.5.0 or older, a kept profile looks like any deleted profile, which they already understand.
 
 ## How it keeps your passwords safe
 
@@ -267,6 +295,7 @@ A sync exchanges sealed bundles over ssh. The sync key never goes on the wire:
 
 - **A machine holding your sync key is trusted.** It sees every password in the bundle and can add, change or delete your profiles. What it sends is still checked at the edge: ids must be canonical UUIDs, host and user names are restricted, control characters are refused, and one bad entry rejects the whole sync.
 - **Use a long sync key.** The client sends its bundle once the other end has answered, but before it has shown that it knows the key.
+- **Off means off, and kept means kept.** With sync turned off this machine neither starts a sync nor accepts one, and a profile kept on this machine leaves it only as a deletion with no password; both are decided in the code that does the syncing, before the keyring is asked for anything.
 - **Names stay plain text.** Profile names, hosts and tab titles are never shown as markup, and a remote shell cannot retitle its tab to look like another host.
 - **Files are private.** Config, transcript and exported transcript files are mode 0600, and a transcripts folder Moniker creates is 0700.
 - **No other traffic, but the pings.** Moniker makes no network connections other than your ssh sessions, except the pings behind the host marks (ICMP echo requests with a payload of zeros to each saved host, and the DNS lookups of their names), which Preferences turns off. Finding where a profile really connects runs `ssh -G`, which runs your `Match exec` commands too, at most every five minutes per host.
@@ -343,6 +372,11 @@ The workflow runs every check, builds and install-tests both packages, and only 
 - A sync cannot ask you anything: its `ssh` runs without a terminal (even when you start `moniker` from a shell), so a key that needs its passphrase, a ProxyJump hop's password or a password that is not stored makes the sync fail at once, and the message says so. Add the key to `ssh-agent` or store the password. `moniker-server sync` in a terminal can still ask there.
 - The host marks: a host reached through ProxyJump or ProxyCommand, or one `ssh -G` cannot tell about, is never pinged (its mark stays a gray dash); a host that drops pings shows a red ring though `ssh` may still reach it. Only addresses your `AddressFamily` allows are pinged: the first the system gives for the name and, if that one gets no reply, the first of the other kind (IPv4 or IPv6), so a host that is down can take six seconds to show its red ring. A name that cannot be looked up shows a red ring with "Name not found"; while this machine is offline, hosts given by name can show it too. Finding where a profile really connects runs `ssh -G` (your `Match exec` commands then run too), at most every five minutes per host, so a change to `~/.ssh/config` can take that long to show; turning the marks off and on again in Preferences asks again at once. Your network and its DNS see the names of the hosts pinged.
 - Sync needs a Secret Service on the other machine; there is no fallback store.
+- Turning sync off recalls nothing: a profile that already reached another machine stays there.
+- Keeping a profile on this machine deletes it from another machine only when that machine syncs. A machine that never syncs again keeps its copy, password included. While sync is off here, nothing is sent, so the deletion waits until you turn sync on.
+- If another machine edits its copy of a profile after you kept it here, that machine keeps the copy at the next sync, and loses it at the one after.
+- Two machines can each keep the same profile to themselves, and each keeps its own copy. If one of them then syncs it again, the other's deletion reaches it within a sync or two and removes the profile there, password included, while the profile stays on the machine that kept it. Neither machine can tell that deletion from any other, so there is no warning.
+- While sync is off or a profile is kept on this machine only, an older Moniker on this machine (0.5.0 or earlier) refuses `profiles.json` and shows no profiles; see [Where Moniker keeps things](#where-moniker-keeps-things).
 - A deletion is forgotten a year after it was made. A profile deleted more than a year ago can come back, password included: from a machine that had not synced since, after **Sync Anyway** (or `--allow-stale`); from a machine still running Moniker 0.5.0 or older, or upgraded from it after more than a year away, which does not ask; when machines sync in a chain (A with B, B with C) and a deletion takes more than six months to reach the far end; or when a machine's clock is far off. Delete it again if it does.
 - Not there yet: search in the terminal and color settings (the terminal colors follow the system light or dark style). The packages are for x86-64 only.
 
