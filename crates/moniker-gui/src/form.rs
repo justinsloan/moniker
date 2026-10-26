@@ -22,6 +22,10 @@ pub struct FormValues {
     /// Empty means no key file.
     pub key_file: String,
     pub transcript: bool,
+    /// Whether a new profile is kept on this machine only (issue #10). Only a
+    /// new profile takes it: an existing profile keeps its own, which changes
+    /// through [`Field::LocalOnly`] alone, after the profile page's question.
+    pub local_only: bool,
 }
 
 /// Label of the editor's check box that removes the stored password. It says
@@ -48,13 +52,19 @@ pub enum PasswordAction {
 /// Turn the editor's values into a [`Profile`], or a message for the user.
 ///
 /// An edit keeps the `id`, the startup sequences (edited on their own page)
-/// and anything else the form does not show of `existing`; otherwise the
-/// profile is new, with a fresh id and no sequences. Name, host, username and
+/// and anything else the form does not show of `existing`, `local_only`
+/// included (it changes only through [`Field::LocalOnly`], after the profile
+/// page's question); otherwise the profile is new, with a fresh id, no
+/// sequences and `local_only` as the form says. Name, host, username and
 /// key file are trimmed. The result has passed [`Profile::validate`].
 pub fn build_profile(form: &FormValues, existing: Option<&Profile>) -> Result<Profile, String> {
     let mut profile = match existing {
         Some(p) => p.clone(),
-        None => Profile::new("", "", ""),
+        None => {
+            let mut new = Profile::new("", "", "");
+            new.local_only = form.local_only;
+            new
+        }
     };
     profile.name = form.name.trim().to_owned();
     profile.host = form.host.trim().to_owned();
@@ -448,6 +458,9 @@ pub struct NewProfile {
     pub host: String,
     pub username: String,
     pub port: u16,
+    /// Keep the profile on this machine only from the start (issue #10): no
+    /// question, since nothing of it exists on another machine yet.
+    pub local_only: bool,
 }
 
 /// Save a new profile (and its password, if one was typed: keyring first) and
@@ -465,6 +478,7 @@ pub fn create_profile(
         username: new.username.clone(),
         key_file: String::new(),
         transcript: false,
+        local_only: new.local_only,
     };
     save_profile(store, secrets, &form, typed_password, false, None).map(|p| p.id)
 }
@@ -561,6 +575,7 @@ mod tests {
             username: "alice".to_owned(),
             key_file: String::new(),
             transcript: false,
+            local_only: false,
         }
     }
 
@@ -576,6 +591,31 @@ mod tests {
         // Two new profiles never share an id.
         let q = build_profile(&values(), None).unwrap();
         assert_ne!(p.id, q.id);
+    }
+
+    #[test]
+    fn a_new_profile_takes_local_only_from_the_form() {
+        let mut v = values();
+        assert!(!build_profile(&v, None).unwrap().local_only);
+        v.local_only = true;
+        assert!(build_profile(&v, None).unwrap().local_only);
+    }
+
+    #[test]
+    fn an_edit_keeps_the_profiles_own_local_only() {
+        // Only Field::LocalOnly (the profile page's two questions) changes it:
+        // a form that left the field false would otherwise sync a kept profile,
+        // and its password, with no question.
+        let mut kept = Profile::new("Old", "old.example.com", "bob");
+        kept.local_only = true;
+        let mut v = values();
+        v.local_only = false;
+        assert!(build_profile(&v, Some(&kept)).unwrap().local_only);
+
+        // And the other way: a form that says kept does not keep a syncing one.
+        let synced = Profile::new("Old", "old.example.com", "bob");
+        v.local_only = true;
+        assert!(!build_profile(&v, Some(&synced)).unwrap().local_only);
     }
 
     #[test]
@@ -1368,6 +1408,7 @@ mod tests {
             host: "nas.lan".to_owned(),
             username: "admin".to_owned(),
             port: 2200,
+            local_only: false,
         }
     }
 
@@ -1385,6 +1426,29 @@ mod tests {
         assert!(p.sequences.is_empty());
         assert!(!p.transcript);
         assert_eq!(stored_password(&secrets, &id), Some(PASSWORD.to_owned()));
+    }
+
+    #[test]
+    fn a_new_profile_can_start_kept_here() {
+        let (dir, store) = temp_store();
+        let secrets = MemorySecretStore::default();
+        let mut kept = new_values();
+        kept.local_only = true;
+
+        let id = create_profile(&store, &secrets, &kept, PASSWORD).unwrap();
+
+        assert!(store.borrow().get(&id).expect("live").local_only);
+        let on_disk = ProfileStore::open(&dir.path().join("profiles.json")).unwrap();
+        assert!(on_disk.get(&id).expect("in the file").local_only);
+        assert_eq!(
+            stored_password(&secrets, &id),
+            Some(PASSWORD.to_owned()),
+            "its password is kept here, in this machine's keyring"
+        );
+
+        // Left on, as it is by default, the profile syncs.
+        let synced = create_profile(&store, &secrets, &new_values(), "").unwrap();
+        assert!(!store.borrow().get(&synced).expect("live").local_only);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! The Connection Profiles window, laid out like GNOME Settings: a sidebar listing the
-//! saved profiles (with ＋ and search) and, beside it, the page of the selected
+//! saved profiles (with ＋ and search; a profile kept on this machine only has a
+//! mark, [`local_only::mark`]) and, beside it, the page of the selected
 //! profile ([`page`]), where each field saves on its own. ＋ opens the New
 //! Profile dialog ([`new_profile`]). A startup sequence opens as a sub-page
 //! ([`sequence_page`]) pushed over the profile page in the content pane;
@@ -42,10 +43,10 @@ use libadwaita as adw;
 use moniker_core::profile::Profile;
 
 use crate::context::AppContext;
-use crate::form;
 use crate::notify::NotificationArea;
 use crate::terminal_tab::default_save;
 use crate::window_size::{self, Kind};
+use crate::{form, local_only};
 use page::ProfilePage;
 use sync_page::SyncPage;
 
@@ -638,6 +639,10 @@ impl State {
                 .build();
             // Whether the host answers a ping (`crate::hosts`), before the name.
             row.add_prefix(&self.ctx.hosts.mark(&profile));
+            // That it stays on this machine, after the name.
+            if let Some(kept) = local_only::mark(&profile) {
+                row.add_suffix(&kept);
+            }
             self.list.append(&row);
             if selected.as_deref() == Some(profile.id.as_str()) {
                 self.list.select_row(Some(&row));

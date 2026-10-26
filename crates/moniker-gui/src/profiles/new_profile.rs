@@ -6,9 +6,11 @@
 //! creates the profile with [`form::create_profile`] (password to the keyring
 //! first) on the keyring worker ([`keyring::change`], so a locked keyring never
 //! freezes the window), and hands the new id back so the window selects it;
-//! everything else is edited on its page. While the profile is being created,
-//! Create is off. Errors are shown inside the dialog, which stays open so they
-//! can be fixed, and never contain the password.
+//! everything else is edited on its page. A switch, "Sync to other machines",
+//! on unless turned off, creates the profile already kept on this machine only
+//! (issue #10): no question, since nothing of it exists elsewhere yet. While the
+//! profile is being created, Create is off. Errors are shown inside the dialog,
+//! which stays open so they can be fixed, and never contain the password.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -21,7 +23,7 @@ use zeroize::Zeroizing;
 
 use crate::context::AppContext;
 use crate::form::{self, NewProfile};
-use crate::keyring;
+use crate::{keyring, local_only};
 
 /// The dialog's widgets.
 struct Fields {
@@ -30,6 +32,8 @@ struct Fields {
     username: adw::EntryRow,
     port: adw::SpinRow,
     password: adw::PasswordEntryRow,
+    /// "Sync to other machines": off creates the profile kept on this machine.
+    sync: adw::SwitchRow,
     create: gtk::Button,
     error: gtk::Label,
     /// The profile is being created: Create stays off until that is back.
@@ -55,6 +59,7 @@ impl Fields {
             username: self.username.text().to_string(),
             // The spin row is limited to 1..=65535.
             port: u16::try_from(self.port.value().round() as i64).unwrap_or(0),
+            local_only: !self.sync.is_active(),
         }
     }
 }
@@ -85,6 +90,12 @@ pub(super) fn show(
             .title("Password (optional)")
             .use_markup(false)
             .build(),
+        sync: adw::SwitchRow::builder()
+            .title(local_only::ROW_TITLE)
+            .subtitle(local_only::SYNCS_SUBTITLE)
+            .use_markup(false)
+            .active(true)
+            .build(),
         create: gtk::Button::builder()
             .label("Create")
             .css_classes(["suggested-action"])
@@ -106,6 +117,16 @@ pub(super) fn show(
     group.add(&fields.username);
     group.add(&fields.port);
     group.add(&fields.password);
+    // The subtitle says what the switch is doing, as on the profile page.
+    fields.sync.connect_active_notify(|row| {
+        row.set_subtitle(if row.is_active() {
+            local_only::SYNCS_SUBTITLE
+        } else {
+            local_only::KEPT_SUBTITLE
+        });
+    });
+    let sync_group = adw::PreferencesGroup::new();
+    sync_group.add(&fields.sync);
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -115,6 +136,7 @@ pub(super) fn show(
         .margin_end(12)
         .build();
     column.append(&group);
+    column.append(&sync_group);
     column.append(&fields.error);
 
     let cancel = gtk::Button::with_label("Cancel");

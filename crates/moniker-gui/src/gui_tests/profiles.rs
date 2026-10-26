@@ -21,13 +21,14 @@ use moniker_core::secrets::{MemorySecretStore, SecretError, SecretStore, passwor
 use moniker_core::store::ProfileStore;
 use zeroize::Zeroizing;
 
+use super::windows::list_in;
 use super::{
     HeldKeyring, MARKUP_NAME, alert_in, all_widgets, button_labeled, find_widget, make_helper,
-    pump_for, pump_until,
+    pump_for, pump_until, row_for,
 };
 use crate::context::AppContext;
 use crate::profiles::{self, ConnectFn};
-use crate::{form, keyring};
+use crate::{form, keyring, new_tab, window};
 
 /// An in-memory keyring that counts `get` calls: the profile page must never
 /// read the keyring.
@@ -2188,4 +2189,194 @@ pub(super) fn a_question_closes_with_its_profile(dir: &Path) {
     assert_eq!(s.file_bytes(), after_delete, "nothing written");
     assert!(s.on_disk(&p.id).is_none(), "the profile stays deleted");
     s.close();
+}
+
+/// What the mark of a profile kept on this machine says, in its tooltip and to
+/// a screen reader.
+const KEPT_MARK_TEXT: &str = "On this machine only";
+
+/// The marks of kept profiles that `row` holds: the images that say so by their
+/// icon or by their text, whatever else they are.
+fn kept_marks(row: &impl IsA<gtk::Widget>) -> Vec<gtk::Image> {
+    all_widgets::<gtk::Image>(row)
+        .into_iter()
+        .filter(|image| {
+            image.icon_name().as_deref() == Some("computer-symbolic")
+                || image.tooltip_text().as_deref() == Some(KEPT_MARK_TEXT)
+        })
+        .collect()
+}
+
+/// `row` (of the list called `what`) holds one mark, a plain image that says
+/// "On this machine only", is not in the keyboard's way, and is shown.
+fn assert_marked(what: &str, row: &adw::ActionRow) -> gtk::Image {
+    let marks = kept_marks(row);
+    assert_eq!(marks.len(), 1, "{what}: one mark in the row");
+    let mark = marks.into_iter().next().expect("the mark");
+    assert_eq!(mark.icon_name().as_deref(), Some("computer-symbolic"));
+    assert_eq!(mark.tooltip_text().as_deref(), Some(KEPT_MARK_TEXT));
+    assert!(mark.has_css_class("dim-label"), "{what}: dimmed");
+    assert_eq!(mark.accessible_role(), gtk::AccessibleRole::Img);
+    assert!(!mark.is_focusable(), "{what}: the mark takes no keyboard");
+    pump_until("the mark to show", || mark.is_mapped());
+    mark
+}
+
+/// A kept profile is marked in both lists, and no other is (issue #10): the
+/// sidebar of the Connection Profiles window and the new-tab list each hold one
+/// image, "computer-symbolic" with the tooltip "On this machine only", in the
+/// row of a profile kept on this machine, and none in the row of one that
+/// syncs. In the new-tab list it sits before the "›" button. A profile file
+/// changed elsewhere (a sync, another window) changes the marks in both lists
+/// at once, in both directions.
+pub(super) fn the_lists_mark_profiles_kept_here(dir: &Path) {
+    let mut kept = Profile::new("Kept", "kept.example.test", "alice");
+    kept.local_only = true;
+    let other = Profile::new("Other", "other.example.test", "bob");
+    let s = Setup::open(dir, &[kept.clone(), other.clone()]);
+    s.ctx.watch_profile_file();
+    let main = window::build(&s._app, &s.ctx);
+    main.window.present();
+    pump_for(Duration::from_millis(300));
+    let page = new_tab::open(&main.view, &s.ctx);
+    pump_for(Duration::from_millis(300));
+    let list = list_in(&page).expect("the new-tab list");
+    let sidebar_row = |p: &Profile| row_for(&s.sidebar(), &p.id);
+    let list_row = |p: &Profile| row_for(&list, &p.id);
+
+    assert_marked("sidebar", &sidebar_row(&kept));
+    let mark = assert_marked("new-tab list", &list_row(&kept));
+    let more = all_widgets::<gtk::MenuButton>(&list_row(&kept))
+        .into_iter()
+        .find(|b| b.tooltip_text().as_deref() == Some("Connect Options"))
+        .expect("the › button");
+    assert_eq!(
+        mark.next_sibling().as_ref(),
+        Some(more.upcast_ref::<gtk::Widget>()),
+        "the mark comes before the › button"
+    );
+    assert!(kept_marks(&sidebar_row(&other)).is_empty(), "syncs: none");
+    assert!(kept_marks(&list_row(&other)).is_empty(), "syncs: none");
+
+    // Another process keeps the other one here: its rows gain the mark.
+    let mut changed = other.clone();
+    changed.local_only = true;
+    s.other_store().upsert(changed).expect("save");
+    pump_until("both lists to mark it", || {
+        !kept_marks(&sidebar_row(&other)).is_empty() && !kept_marks(&list_row(&other)).is_empty()
+    });
+    assert_marked("sidebar", &sidebar_row(&other));
+    assert_marked("new-tab list", &list_row(&other));
+    assert_marked("sidebar", &sidebar_row(&kept));
+    assert_marked("new-tab list", &list_row(&kept));
+
+    // And one that syncs again loses it.
+    let mut changed = kept.clone();
+    changed.local_only = false;
+    s.other_store().upsert(changed).expect("save");
+    pump_until("both lists to unmark it", || {
+        kept_marks(&sidebar_row(&kept)).is_empty() && kept_marks(&list_row(&kept)).is_empty()
+    });
+    assert_marked("sidebar", &sidebar_row(&other));
+    assert_marked("new-tab list", &list_row(&other));
+
+    main.window.destroy();
+    s.close();
+}
+
+/// The New Profile dialog's "Sync to other machines" switch (issue #10): on
+/// unless turned off, with the same subtitles as the profile page's. A profile
+/// created with it off is kept on this machine only from the start, with no
+/// question (nothing of it exists on another machine yet), and shows the mark
+/// and the profile page's switch off; one created with it on syncs.
+pub(super) fn a_new_profile_can_be_kept_here(dir: &Path) {
+    let s = Setup::open(dir, &[web()]);
+
+    // Left on, as it is: the profile syncs.
+    let synced = create_in_the_dialog(&s, "Synced", "synced.lan", None, true);
+    assert!(!s.on_disk(&synced).expect("saved").local_only);
+    assert!(kept_marks(&row_for(&s.sidebar(), &synced)).is_empty());
+    assert!(s.switch(SYNC_ROW).is_active());
+
+    // Turned off: kept here, with its password, with no dialog.
+    let kept = create_in_the_dialog(&s, "Kept", "kept.lan", Some("kept-password"), false);
+    assert!(s.on_disk(&kept).expect("saved").local_only);
+    assert_eq!(s.secrets.password(&kept).as_deref(), Some("kept-password"));
+    assert_marked("sidebar", &row_for(&s.sidebar(), &kept));
+    assert!(kept_marks(&row_for(&s.sidebar(), &synced)).is_empty());
+    let selected = s.sidebar().selected_row().expect("a selection");
+    assert_eq!(selected.widget_name(), kept.as_str());
+    let page_switch = s.switch(SYNC_ROW);
+    assert!(!page_switch.is_active(), "the page shows it kept here");
+    assert_eq!(page_switch.subtitle().as_deref(), Some(KEPT_SUBTITLE));
+    pump_for(Duration::from_millis(300));
+    assert!(
+        s.window.visible_dialog().is_none(),
+        "no question came later"
+    );
+    s.close();
+}
+
+/// Open the New Profile dialog of `s`, fill it in, leave "Sync to other
+/// machines" on or turn it off as `sync` says (checking what it shows), press
+/// Create and return the new profile's id once the dialog has closed with no
+/// question in its place.
+fn create_in_the_dialog(
+    s: &Setup,
+    name: &str,
+    host: &str,
+    password: Option<&str>,
+    sync: bool,
+) -> String {
+    let add = all_widgets::<gtk::Button>(&s.window)
+        .into_iter()
+        .find(|b| b.tooltip_text().as_deref() == Some("Add Profile"))
+        .expect("the + button");
+    add.emit_clicked();
+    pump_until("the New Profile dialog", || {
+        s.window.visible_dialog().is_some()
+    });
+    let dialog = s.window.visible_dialog().expect("the New Profile dialog");
+    let entry = |title: &str| {
+        all_widgets::<adw::EntryRow>(&dialog)
+            .into_iter()
+            .find(|r| r.title() == title)
+            .unwrap_or_else(|| panic!("no {title:?} row"))
+    };
+    let switches = all_widgets::<adw::SwitchRow>(&dialog);
+    assert_eq!(switches.len(), 1, "one switch in the dialog");
+    let switch = &switches[0];
+    assert_eq!(switch.title(), SYNC_ROW);
+    assert!(!switch.uses_markup());
+    assert!(switch.is_active(), "on unless the person turns it off");
+    assert_eq!(switch.subtitle().as_deref(), Some(SYNCS_SUBTITLE));
+    if !sync {
+        switch.set_active(false);
+        assert_eq!(switch.subtitle().as_deref(), Some(KEPT_SUBTITLE));
+    }
+    entry("Name").set_text(name);
+    entry("Host").set_text(host);
+    entry("Username").set_text("admin");
+    if let Some(password) = password {
+        entry("Password (optional)").set_text(password);
+    }
+    button_labeled(&dialog, "Create")
+        .expect("the Create button")
+        .emit_clicked();
+    saved();
+    pump_until("the dialog to close", || {
+        s.window.visible_dialog().is_none()
+    });
+    assert!(
+        all_widgets::<adw::AlertDialog>(&s.window).is_empty(),
+        "no question when nothing exists elsewhere yet"
+    );
+    s.ctx
+        .store
+        .borrow()
+        .live()
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.id.clone())
+        .expect("the new profile")
 }

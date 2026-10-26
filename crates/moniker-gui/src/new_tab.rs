@@ -5,8 +5,10 @@
 //! The tab, called "New Tab" (a new pane: "New Pane"), holds a search entry
 //! over a list. The first row
 //! is always "Local terminal"; below it come the live profiles in the store's
-//! order, each with its name and `user@host:port`. "Local terminal" starts out
-//! selected and with the focus, so Enter gives a local shell at once.
+//! order, each with its name and `user@host:port` and, for a profile kept on
+//! this machine only, a mark before its "›" ([`local_only::mark`]). "Local
+//! terminal" starts out selected and with the focus, so Enter gives a local shell
+//! at once.
 //!
 //! The tab starts at the text size of the tab that was selected when ＋ was
 //! pressed ([`terminal_tab::new_holder_page`]), a new pane at the size of the
@@ -50,7 +52,7 @@ use moniker_core::profile::Profile;
 
 use crate::context::AppContext;
 use crate::terminal_tab::PaneHolder;
-use crate::{connect_menu, form, terminal_tab};
+use crate::{connect_menu, form, local_only, terminal_tab};
 
 /// Title of a tab that shows the new-tab list.
 pub(crate) const TITLE: &str = "New Tab";
@@ -471,6 +473,10 @@ fn profile_row(chooser: &Rc<Chooser>, list: &gtk::ListBox, profile: &Profile) ->
         .build();
     // Whether the host answers a ping (`crate::hosts`), before the name.
     row.add_prefix(&chooser.ctx.hosts.mark(profile));
+    // That it stays on this machine, before the › button.
+    if let Some(kept) = local_only::mark(profile) {
+        row.add_suffix(&kept);
+    }
     row.add_suffix(&more);
     row
 }

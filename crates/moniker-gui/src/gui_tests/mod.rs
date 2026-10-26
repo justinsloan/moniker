@@ -378,6 +378,8 @@ fn gui_integration() {
     profiles::a_profile_that_cannot_sync_again_says_so(&tmp.path().join("k-max"));
     profiles::a_second_flip_waits_for_the_first(&tmp.path().join("k-second"));
     profiles::a_question_closes_with_its_profile(&tmp.path().join("k-gone"));
+    profiles::the_lists_mark_profiles_kept_here(&tmp.path().join("k-mark"));
+    profiles::a_new_profile_can_be_kept_here(&tmp.path().join("k-new"));
     // Issue #10, sync turned off.
     sync::sync_off_grays_out_sync_now_and_skips_launch(&tmp.path().join("s-off"));
     sync::the_sync_page_turns_sync_off_and_asks_to_turn_it_on(&tmp.path().join("s-sw-ask"));
