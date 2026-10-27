@@ -12,7 +12,9 @@
 //! local pane is recorded with the folder its terminal last reported for this
 //! machine ([`terminal_tab::current_folder`], the shell's OSC 7); a
 //! command started with `moniker -- COMMAND` is recorded as a local pane in that
-//! folder, or the one it was started in, never as its command. A pane that
+//! folder, or the one it was started in, never as its command, and so is a pane
+//! that runs one of Local terminal's startup sequences (issue #13), never its
+//! commands. A pane that
 //! waits for the keyring, or whose session has ended, is its profile; an empty
 //! one is the list. Nothing else is read: no host, user name, password, command
 //! line, sequence, environment or text of a terminal, and the folder is read
@@ -52,10 +54,10 @@ use libadwaita as adw;
 
 use crate::context::AppContext;
 use crate::launch_args::one_line;
-use crate::local_terminal::LocalTerminal;
 use crate::new_tab;
 use crate::panes::{self, TabLayout, Tree};
 use crate::session_file::{self, Kind, Node, PaneRecord, TabRecord};
+use crate::settings::GuiSettings;
 use crate::terminal_tab::{self, PaneHolder, PaneKind, TabTitle};
 
 /// Every tab of `view`, in order, as a session records it.
@@ -129,8 +131,6 @@ pub(crate) fn restore(view: &adw::TabView, ctx: &Rc<AppContext>, tabs: &[TabReco
     // Read once: whether every session saves a transcript, and Local
     // terminal's default sequence and own switch.
     let settings = ctx.settings();
-    let save_all = settings.save_all_transcripts;
-    let local = &settings.local_terminal;
     let mut added = Vec::new();
     let mut to_fill = Vec::new();
     for tab in tabs {
@@ -164,7 +164,7 @@ pub(crate) fn restore(view: &adw::TabView, ctx: &Rc<AppContext>, tabs: &[TabReco
         if let Some(name) = &record.name {
             terminal_tab::rename_pane(&holder, name);
         }
-        fill(&holder, record, ctx, local, save_all);
+        fill(&holder, record, ctx, &settings);
     }
     if let Some((page, layout, focused)) = added.first() {
         view.set_selected_page(page);
@@ -182,23 +182,21 @@ pub(crate) fn restore(view: &adw::TabView, ctx: &Rc<AppContext>, tabs: &[TabReco
     }
 }
 
-/// Fill the fresh pane of `holder` with what `record` says it was: a local
-/// pane runs `local`'s default sequence, as a profile pane runs its profile's.
-/// A transcript is saved as a plain click would save one (module docs).
-fn fill(
-    holder: &PaneHolder,
-    record: &PaneRecord,
-    ctx: &Rc<AppContext>,
-    local: &LocalTerminal,
-    save_all: bool,
-) {
+/// Fill the fresh pane of `holder` with what `record` says it was, with the
+/// `settings` read for the whole restore: a local pane runs Local terminal's
+/// default sequence, as a profile pane runs its profile's. A transcript is
+/// saved as a plain click would save one (module docs).
+fn fill(holder: &PaneHolder, record: &PaneRecord, ctx: &Rc<AppContext>, settings: &GuiSettings) {
     match &record.kind {
         Kind::Profile { id, name } => {
             // Bind first so the store borrow ends before connecting.
             let profile = ctx.store.borrow().get(id).cloned();
             match profile {
                 Some(profile) => {
-                    let save = terminal_tab::default_save(profile.transcript, save_all);
+                    let save = terminal_tab::default_save(
+                        profile.transcript,
+                        settings.save_all_transcripts,
+                    );
                     terminal_tab::start_profile(
                         holder,
                         ctx,
@@ -212,9 +210,10 @@ fn fill(
         }
         Kind::Local { dir } => {
             let dir = dir.clone().unwrap_or_else(glib::home_dir);
-            let save = terminal_tab::default_save(local.transcript, save_all);
+            let save = terminal_tab::default_local_save(settings);
             let transcript = terminal_tab::local_transcript_spec(ctx, save);
-            terminal_tab::start_local_in(holder, &dir, local.default_sequence(), transcript);
+            let sequence = settings.local_terminal.default_sequence();
+            terminal_tab::start_local_in(holder, &dir, sequence, transcript);
         }
         Kind::List => new_tab::fill(holder, ctx),
     }

@@ -96,6 +96,24 @@ fn holds(terminal: &Terminal, needle: &str) -> bool {
     terminal_text(terminal).contains(needle)
 }
 
+/// `terminal` does not show `needle`; a failure says what it does show.
+#[track_caller]
+fn assert_lacks(terminal: &Terminal, needle: &str) {
+    let text = terminal_text(terminal);
+    assert!(!text.contains(needle), "{needle:?} in {text:?}");
+}
+
+/// Open Local terminal's choices on `list` with the Right arrow, as the
+/// keyboard does, and wait for their first button to have the keyboard, so
+/// that Enter opens it: every opening builds the column again.
+fn open_local_choices(list: &gtk::ListBox) -> (gtk::Popover, gtk::Widget) {
+    let (popover, column) =
+        open_choices(list, new_tab::LOCAL_ROW, connect_menu::LOCAL_CHOICES_NAME);
+    let first = choices_parts(&column).buttons[0].clone();
+    pump_until("the first choice to have the keyboard", || first.is_focus());
+    (popover, column)
+}
+
 /// Once the shell in `terminal` shows its prompt, type a command that prints
 /// `M-word` and wait for it: the shell is interactive, and whatever a sequence
 /// printed before it started is on the screen by then.
@@ -108,7 +126,8 @@ fn alive(terminal: &Terminal, word: &str) {
 /// A plain pick of Local terminal (Enter in the list's search entry) runs its
 /// default sequence and leaves an interactive shell, the person's own (here
 /// `/bin/sh`, with `$SHELL` set to it although Moniker has none). The pane is
-/// named as a plain local tab is, and a saved session keeps it as a local pane.
+/// named as a plain local tab is, and a saved session keeps it as a local pane
+/// in the folder it started in (the home folder), never its commands.
 /// The default is read from the file at the pick, not when the list was made;
 /// one that points past the end of the list (a hand edit) runs nothing.
 pub(super) fn a_plain_pick_runs_the_default_and_leaves_a_shell(dir: &Path) {
@@ -123,26 +142,31 @@ pub(super) fn a_plain_pick_runs_the_default_and_leaves_a_shell(dir: &Path) {
     wait_for_text(&terminal, "ALIVE-yes");
     terminal.feed_child(b"echo \"SH=$SHELL\"\n");
     wait_for_text(&terminal, "SH=/bin/sh");
-    assert!(!holds(&terminal, "OTHER-ran"), "only the default ran");
+    assert_lacks(&terminal, "OTHER-ran");
     assert_eq!(page.title(), "Local terminal", "named as a plain local tab");
     let records = capture(&fx.view);
     let last = records.last().expect("the tab");
     assert_eq!(
         last.root,
-        Node::Pane(pane_record(Kind::Local { dir: None }, None, 1.0)),
-        "a local pane, never its commands"
+        Node::Pane(pane_record(
+            Kind::Local {
+                dir: Some(glib::home_dir())
+            },
+            None,
+            1.0
+        )),
+        "a local pane in the folder it started in, never its commands"
     );
     fx.click_close(&terminal);
     pump_until("the tab to close", || fx.tabs() == 0);
 
     // The default changes while a second list is up: the pick reads the file.
     let (page, search) = open_list(&fx.view, &ctx);
-    pump_for(Duration::from_millis(200));
     set_local(&ctx, &[hello(), other()], Some(1), false);
     let terminal = pick_plainly(&page, &search);
     wait_for_text(&terminal, "OTHER-ran");
     alive(&terminal, "second");
-    assert!(!holds(&terminal, "SEQ-ran"), "the default as it is now");
+    assert_lacks(&terminal, "SEQ-ran");
     fx.click_close(&terminal);
     pump_until("the tab to close", || fx.tabs() == 0);
 
@@ -151,16 +175,8 @@ pub(super) fn a_plain_pick_runs_the_default_and_leaves_a_shell(dir: &Path) {
     let (page, search) = open_list(&fx.view, &ctx);
     let terminal = pick_plainly(&page, &search);
     alive(&terminal, "plain");
-    assert!(
-        !holds(&terminal, "SEQ-ran"),
-        "{:?}",
-        terminal_text(&terminal)
-    );
-    assert!(
-        !holds(&terminal, "OTHER-ran"),
-        "{:?}",
-        terminal_text(&terminal)
-    );
+    assert_lacks(&terminal, "SEQ-ran");
+    assert_lacks(&terminal, "OTHER-ran");
     fx.click_close(&terminal);
     pump_until("the tab to close", || fx.tabs() == 0);
 
@@ -196,11 +212,10 @@ pub(super) fn the_choices_offer_just_open_and_each_sequence(dir: &Path) {
     set_local(&ctx, &[hello(), other()], Some(0), false);
     let app = test_app();
     let main = main_window(&app, &ctx);
-    let local = (new_tab::LOCAL_ROW, connect_menu::LOCAL_CHOICES_NAME);
 
     // "Just open": a shell, and the default does not run.
     let (page, list) = new_list(&main, &ctx);
-    let (popover, column) = open_choices(&list, local.0, local.1);
+    let (popover, column) = open_local_choices(&list);
     assert_eq!(labels(&column), ["Just open", "Hello", "Other"]);
     let parts = choices_parts(&column);
     assert!(!parts.record.is_active(), "both switches off");
@@ -208,53 +223,41 @@ pub(super) fn the_choices_offer_just_open_and_each_sequence(dir: &Path) {
     pump_until("the choices to close", || !popover.is_visible());
     let terminal = terminal_of(&page).expect("Just open opens a local shell in that tab");
     alive(&terminal, "just");
-    assert!(
-        !holds(&terminal, "SEQ-ran"),
-        "{:?}",
-        terminal_text(&terminal)
-    );
-    assert!(
-        !holds(&terminal, "OTHER-ran"),
-        "{:?}",
-        terminal_text(&terminal)
-    );
+    assert_lacks(&terminal, "SEQ-ran");
+    assert_lacks(&terminal, "OTHER-ran");
     main.view.close_page(&page);
     pump_until("the tab to close", || main.view.n_pages() == 1);
 
     // A sequence by name runs that one, not the default.
     let (page, list) = new_list(&main, &ctx);
-    let (popover, column) = open_choices(&list, local.0, local.1);
+    let (popover, column) = open_local_choices(&list);
     choices_parts(&column).buttons[2].emit_clicked();
     pump_until("the choices to close", || !popover.is_visible());
     let terminal = terminal_of(&page).expect("a local terminal in that tab");
     wait_for_text(&terminal, "OTHER-ran");
     alive(&terminal, "other");
-    assert!(
-        !holds(&terminal, "SEQ-ran"),
-        "{:?}",
-        terminal_text(&terminal)
-    );
+    assert_lacks(&terminal, "SEQ-ran");
     main.view.close_page(&page);
     pump_until("the tab to close", || main.view.n_pages() == 1);
 
     // The sequences go while the list is up: the next opening offers "Open".
     let (page, list) = new_list(&main, &ctx);
     set_local(&ctx, &[], None, false);
-    let (popover, column) = open_choices(&list, local.0, local.1);
+    let (popover, column) = open_local_choices(&list);
     assert_eq!(labels(&column), [connect_menu::OPEN_LABEL]);
     popover.popdown();
     pump_until("the choices to close", || !popover.is_visible());
 
     // The box: Local terminal's own switch, then "save all" alone.
     set_local(&ctx, &[hello(), other()], Some(0), true);
-    let (popover, column) = open_choices(&list, local.0, local.1);
+    let (popover, column) = open_local_choices(&list);
     assert_eq!(labels(&column), ["Just open", "Hello", "Other"]);
     assert!(choices_parts(&column).record.is_active(), "its own switch");
     popover.popdown();
     pump_until("the choices to close", || !popover.is_visible());
     set_local(&ctx, &[hello(), other()], Some(0), false);
     set_save_all(&ctx, true);
-    let (popover, column) = open_choices(&list, local.0, local.1);
+    let (popover, column) = open_local_choices(&list);
     assert!(choices_parts(&column).record.is_active(), "save all");
     popover.popdown();
     pump_until("the choices to close", || !popover.is_visible());
@@ -428,7 +431,9 @@ pub(super) fn a_window_s_first_tab_runs_no_sequence(dir: &Path) {
 /// A local pane a saved session adds back runs Local terminal's default
 /// sequence in its folder, as a profile pane runs its profile's (in the home
 /// folder when its folder has gone, as a plain shell would start), and saves a
-/// transcript when Local terminal's own switch is on.
+/// transcript when Local terminal's own switch is on. Saved again while a long
+/// command of its sequence runs (the shell running it reports no folder), it
+/// keeps the folder it started in.
 pub(super) fn a_restored_local_pane_runs_the_default_in_its_folder(dir: &Path) {
     let folder = dir.join("Fold er");
     fs::create_dir_all(&folder).expect("the folder");
@@ -478,6 +483,31 @@ pub(super) fn a_restored_local_pane_runs_the_default_in_its_folder(dir: &Path) {
         texts.iter().any(|t| t.contains(&format!("SEQ-IN:{there}"))),
         "{texts:?}"
     );
+
+    set_local(
+        &ctx,
+        &[seq("Long", &["printf 'M-%s\\n' x", "sleep 600"])],
+        Some(0),
+        false,
+    );
+    let before = main.view.n_pages();
+    restore(&main.view, &ctx, &saved(&file)[0].tabs[..1]);
+    let terminal = session_in(&pane(&main.view.nth_page(before)));
+    wait_for_text(&terminal, "M-x");
+    assert_eq!(
+        capture(&main.view).last().expect("the restored tab").root,
+        Node::Pane(pane_record(
+            Kind::Local {
+                dir: Some(folder.clone())
+            },
+            None,
+            1.0
+        )),
+        "saved while its sequence runs: {:?}",
+        terminal_text(&terminal)
+    );
+    main.view.close_page(&main.view.nth_page(before));
+    pump_until("the tab to close", || main.view.n_pages() == before);
 
     main.window.destroy();
     pump_for(Duration::from_millis(200));

@@ -162,9 +162,8 @@ impl Chooser {
         let name = row.widget_name();
         if name == LOCAL_ROW {
             let settings = self.ctx.settings();
-            let local = &settings.local_terminal;
-            let save = terminal_tab::default_save(local.transcript, settings.save_all_transcripts);
-            self.open_local(list, local.default_sequence(), save);
+            let save = terminal_tab::default_local_save(&settings);
+            self.open_local(list, settings.local_terminal.default_sequence(), save);
         } else if let Some(profile) = self.profile(&name) {
             let save = terminal_tab::default_save(profile.transcript, self.save_all());
             self.connect(list, &profile, profile.startup_choice(), save);
@@ -469,10 +468,9 @@ fn local_choices_now(
     popover: &gtk::Popover,
 ) -> gtk::Widget {
     let settings = chooser.ctx.settings();
-    let local = &settings.local_terminal;
     connect_menu::local_choices(
-        &local.sequences,
-        terminal_tab::default_save(local.transcript, settings.save_all_transcripts),
+        &settings.local_terminal.sequences,
+        terminal_tab::default_local_save(&settings),
         glib::clone!(
             #[weak]
             popover,

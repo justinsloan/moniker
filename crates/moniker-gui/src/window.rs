@@ -138,10 +138,7 @@ pub fn build(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
 pub fn build_with(app: &adw::Application, ctx: &Rc<AppContext>, start: &Start) -> MainWindow {
     let main = build_empty(app, ctx);
     let settings = ctx.settings();
-    let save = terminal_tab::default_save(
-        settings.local_terminal.transcript,
-        settings.save_all_transcripts,
-    );
+    let save = terminal_tab::default_local_save(&settings);
     terminal_tab::open_local(
         &main.view,
         settings.font_scale,

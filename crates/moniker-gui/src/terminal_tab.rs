@@ -396,8 +396,9 @@ pub(crate) enum PaneKind {
     /// startup sequences or not, issue #13), or a command started with
     /// `moniker -- COMMAND` (issue #15). A session saves each as a shell in the
     /// folder the terminal last reported, never a sequence or a command;
-    /// `started_in` is the folder a command was started in, for one that never
-    /// reports one (none for a shell, which reports its own).
+    /// `started_in` is the folder a command or a sequence was started in, for
+    /// one that never reports one (none for a plain shell, which reports its
+    /// own).
     Local { started_in: Option<PathBuf> },
     /// A connection to the saved profile `id`, from the moment it is picked:
     /// while it waits for the keyring, and after its session has ended too.
@@ -860,11 +861,21 @@ pub fn transcript_spec(
 /// Whether a session's "Save transcript" choice starts out checked (and what a
 /// plain click or Enter does): "Save transcripts of all sessions" (`save_all`)
 /// wins over everything, else the profile's own setting. A local terminal
-/// passes Local terminal's own switch (issue #13), for every local tab: a pick
-/// in the new-tab list, a window's first tab and a restored local pane. The
+/// passes Local terminal's own switch (issue #13, [`default_local_save`]). The
 /// person can still uncheck one session in the choices behind "›".
 pub fn default_save(profile_setting: bool, save_all: bool) -> bool {
     save_all || profile_setting
+}
+
+/// [`default_save`] for a local terminal, as `settings` say: Local terminal's
+/// own "Save transcript" switch or "Save transcripts of all sessions" (issue
+/// #13). The one rule for every local tab: a pick in the new-tab list (and the
+/// box under its "›"), a window's first tab and a restored local pane.
+pub fn default_local_save(settings: &GuiSettings) -> bool {
+    default_save(
+        settings.local_terminal.transcript,
+        settings.save_all_transcripts,
+    )
 }
 
 /// This machine's name for itself (the node name `uname` reports), which names
@@ -1720,6 +1731,11 @@ fn spawn(terminal: &Terminal, dir: Option<&str>, argv: &[String], envv: &[String
     );
 }
 
+/// The shell a local terminal runs: [`shell_choice`] for Moniker's own `$SHELL`.
+fn local_shell() -> String {
+    shell_choice(std::env::var("SHELL").ok().as_deref())
+}
+
 /// The shell to run in the local tab: `$SHELL` if it is set to something, else
 /// `/bin/sh`. An empty `$SHELL` is as good as none (an empty program name would
 /// not start anything).
@@ -1773,7 +1789,7 @@ pub(crate) fn open_local(
     }
     match &start.run {
         Run::Shell => {
-            let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
+            let shell = local_shell();
             start_shell_in(&holder, &shell, &start.dir, transcript)
         }
         Run::Command { argv, hold } => {
@@ -1802,7 +1818,7 @@ pub(crate) fn start_local_in(
     let Some(script) = local_command(sequence) else {
         return start_local_shell_in(holder, dir, transcript);
     };
-    let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
+    let shell = local_shell();
     let home = glib::home_dir();
     start_sequence_in(
         holder,
@@ -1826,7 +1842,7 @@ pub(crate) fn start_local_shell_in(
     dir: &Path,
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
-    let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
+    let shell = local_shell();
     let home = glib::home_dir();
     start_shell_in(holder, &shell, enterable_or(dir, &home), transcript)
 }
@@ -1947,12 +1963,9 @@ pub(crate) fn start_command_in(
     let program = argv.first().map(String::as_str).unwrap_or_default();
     let terminal = begin_session(holder, TabTitle::program(program));
     // A local terminal for a saved session, in the folder the command really
-    // started in (none when that is the folder Moniker was started in, as for
-    // a folder that is not one); never its command.
+    // started in; never its command.
     holder.kind().replace(PaneKind::Local {
-        started_in: folder_to_spawn_in(dir)
-            .map(PathBuf::from)
-            .filter(|dir| dir.is_absolute()),
+        started_in: started_in(dir),
     });
     let session = start_recording(&terminal, transcript);
     end_as_a_command(holder, &terminal, session, hold);
@@ -1980,9 +1993,13 @@ pub(crate) fn start_command_in(
 /// their own shell's language, as a profile's are in the remote login shell's.
 ///
 /// The pane is named as a plain local tab is ([`TabTitle::local`], following
-/// the shell's title until renamed), saves a transcript as one does, and is
-/// saved by a saved session as a local pane in the folder its shell last
-/// reports (never its commands). It ends as a command tab does
+/// the shell's title until renamed) and saves a transcript as one does. A saved
+/// session keeps it as a local pane (never its commands) in the folder its
+/// shell last reports, else in the folder it started in, as a command tab is
+/// kept: the shell running the sequence reports none, so a pane saved while a
+/// long command of the sequence runs (`journalctl -f`, `htop`) keeps its
+/// folder, and once the interactive shell reports its own, that one counts.
+/// It ends as a command tab does
 /// ([`start_command_in`] without `hold`), not as a plain shell: a clean exit
 /// closes the pane, any other end keeps it with the note ([`exit_action`]).
 /// Ctrl+C during a long command of the sequence ends the non-interactive shell
@@ -1998,8 +2015,11 @@ pub(crate) fn start_sequence_in(
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
     let terminal = begin_session(holder, TabTitle::local());
-    // The shell it leaves reports its own folder, as a plain one does.
-    holder.kind().replace(PaneKind::Local { started_in: None });
+    // The folder it really starts in, as for a command tab, until the shell it
+    // leaves reports its own.
+    holder.kind().replace(PaneKind::Local {
+        started_in: started_in(dir),
+    });
     let session = start_recording(&terminal, transcript);
     end_as_a_command(holder, &terminal, session, false);
     follow_program_title(holder, &terminal);
@@ -2053,6 +2073,16 @@ fn follow_program_title(holder: &PaneHolder, terminal: &Terminal) {
             refresh_title(&holder);
         }
     ));
+}
+
+/// The folder a program started in `dir` really starts in, as a saved session
+/// records it ([`PaneKind::Local`]): `dir` if a program starts there
+/// ([`folder_to_spawn_in`]), else none (it starts in the folder Moniker was
+/// started in, which is not recorded).
+fn started_in(dir: &Path) -> Option<PathBuf> {
+    folder_to_spawn_in(dir)
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
 }
 
 /// `dir` as the folder to start a program in: only one that is a folder (and
