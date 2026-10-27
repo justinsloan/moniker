@@ -20,7 +20,7 @@
 //! the person's shell in the home folder after running its default sequence, if
 //! it has one (issue #13, [`terminal_tab::start_local_in`]), a profile connects
 //! and runs its default sequence, if it has one (issue #12). Local terminal's
-//! sequences and default are read from the settings file at the pick
+//! sequences and default are read from their file at the pick
 //! (`crate::local_terminal`), so a change made in the Connection Profiles
 //! window shows without rebuilding the list; a profile's are the list's copy.
 //! Whether the session saves a transcript is decided here, before the tab
@@ -33,8 +33,8 @@
 //! terminal's ([`connect_menu::local_choices`]) "Just open" (which skips its
 //! default) and each of its sequences, or "Open" while it has none, and the
 //! box. The box shows the setting as it is when the choices open, and Local
-//! terminal's choices are built again from the settings file every time they
-//! open, each carrying the sequence it shows.
+//! terminal's choices are built again from its file every time they open, each
+//! carrying the sequence it shows.
 //! The search matches a profile's name,
 //! host or user name; Local terminal stays the top entry whatever the query.
 //! While searching, the first profile the search leaves is selected and Enter in
@@ -155,15 +155,14 @@ impl Chooser {
     /// choices behind "›" are where "Just open" and "Just connect" skip them).
     /// A profile's sequence is the one the list shows: the profile is the
     /// list's copy, so its default and its sequences are from the same moment.
-    /// Local terminal's are read from the settings file now, with whether to
-    /// save a transcript, in one read. A transcript is saved as
-    /// [`terminal_tab::default_save`] says.
+    /// Local terminal's are read from its file now, with its own switch, in
+    /// one read. A transcript is saved as [`terminal_tab::default_save`] says.
     fn pick(&self, list: &gtk::ListBox, row: &gtk::ListBoxRow) {
         let name = row.widget_name();
         if name == LOCAL_ROW {
-            let settings = self.ctx.settings();
-            let save = terminal_tab::default_local_save(&settings);
-            self.open_local(list, settings.local_terminal.default_sequence(), save);
+            let local = self.ctx.local_terminal();
+            let save = terminal_tab::default_local_save(&local, self.save_all());
+            self.open_local(list, local.default_sequence(), save);
         } else if let Some(profile) = self.profile(&name) {
             let save = terminal_tab::default_save(profile.transcript, self.save_all());
             self.connect(list, &profile, profile.startup_choice(), save);
@@ -457,8 +456,8 @@ fn local_row(chooser: &Rc<Chooser>, list: &gtk::ListBox) -> adw::ActionRow {
     row
 }
 
-/// Local terminal's choices as the settings file has them now, for `popover`:
-/// its sequences, and the "Save transcript" box checked when its own switch or
+/// Local terminal's choices as its file has them now, for `popover`: its
+/// sequences, and the "Save transcript" box checked when its own switch or
 /// "Save transcripts of all sessions" is on. A choice closes the popover and
 /// turns the list's pane into a local shell running the sequence that choice
 /// showed (none for "Open" and "Just open").
@@ -467,10 +466,10 @@ fn local_choices_now(
     list: &gtk::ListBox,
     popover: &gtk::Popover,
 ) -> gtk::Widget {
-    let settings = chooser.ctx.settings();
+    let local = chooser.ctx.local_terminal();
     connect_menu::local_choices(
-        &settings.local_terminal.sequences,
-        terminal_tab::default_local_save(&settings),
+        &local.sequences,
+        terminal_tab::default_local_save(&local, chooser.save_all()),
         glib::clone!(
             #[weak]
             popover,

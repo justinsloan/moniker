@@ -9,22 +9,22 @@
 //! nothing else. "Session" holds Local terminal's own "Save transcript"
 //! switch, with a profile's subtitle.
 //!
-//! All of it is kept in the GUI settings file, this machine's own and never
-//! synced ([`local_terminal`]), never in the profile file. The settings file
-//! takes no lock and its writes are quick, so the saves here run on the main
-//! thread, at once, as the Preferences' do; a profile's go to the keyring
-//! worker (issue #7) because a sync can hold the profile file. A save that
-//! worked tells every list and window ([`AppContext::profiles_changed`]), as a
-//! profile's save does. One that did not (a settings file that cannot be read
-//! is never written over; a pick of the default is refused if the list
-//! changed since the page showed it) is told near its row, which is marked
-//! `error` and shows the file again. After a pick of the default, both wait
-//! for the main loop, since the pick is told from inside the row's own signal
-//! ([`Inner::pick`]).
+//! All of it is kept in Local terminal's own file, `local-terminal.json`, this
+//! machine's own and never synced ([`local_terminal`]), never in the profile
+//! file. That file takes no lock and its writes are quick, so the saves here
+//! run on the main thread, at once, as the Preferences' do; a profile's go to
+//! the keyring worker (issue #7) because a sync can hold the profile file. A
+//! save that worked tells every list and window
+//! ([`AppContext::profiles_changed`]), as a profile's save does. One that did
+//! not (a file that cannot be used is never written over; a pick of the
+//! default is refused if the list changed since the page showed it) is told
+//! near its row, which is marked `error` and shows the file again. After a
+//! pick of the default, both wait for the main loop, since the pick is told
+//! from inside the row's own signal ([`Inner::pick`]).
 //!
-//! The page shows the settings file as it is when it is made and at every
+//! The page shows the file as it is when it is made and at every
 //! [`LocalPage::refresh`] (the window calls it after every change). A file
-//! that cannot be read reads as the defaults: no sequence, the switch off.
+//! that cannot be used reads as the defaults: no sequence, the switch off.
 //!
 //! Sequence names are shown as plain text (markup off) although they are this
 //! machine's own: the file can be edited by hand.
@@ -64,7 +64,7 @@ struct Inner {
 }
 
 impl LocalPage {
-    /// The page, showing `local` (Local terminal as the settings file has it).
+    /// The page, showing `local` (Local terminal as its file has it).
     pub(super) fn new(ctx: &Rc<AppContext>, local: &LocalTerminal) -> Rc<LocalPage> {
         let widget = adw::PreferencesPage::new();
         let sequences = adw::PreferencesGroup::builder()
@@ -119,7 +119,7 @@ impl LocalPage {
         Rc::new(LocalPage { widget, inner })
     }
 
-    /// Show `local` (as the settings file has it now) in every row. The rows
+    /// Show `local` (as its file has it now) in every row. The rows
     /// of the sequences are made again only if what they show has changed.
     pub(super) fn refresh(&self, local: &LocalTerminal) {
         self.inner.show(local);
@@ -137,9 +137,9 @@ impl Inner {
         self.rows.show(&local.sequences, local.startup_choice());
     }
 
-    /// Show the settings file again, after a save it refused.
+    /// Show the file again, after a save it refused.
     fn show_file(&self) {
-        self.show(&self.ctx.settings().local_terminal);
+        self.show(&self.ctx.local_terminal());
     }
 
     /// Open the sub-page for the sequence at `index` (`None`: a new one) over
@@ -159,7 +159,7 @@ impl Inner {
     /// pick, as a profile's does while its save is out.
     fn pick(&self, choice: Choice) {
         let row = self.rows.default_row();
-        let saved = local_terminal::set_default(&self.ctx.settings_path, choice);
+        let saved = local_terminal::set_default(&self.ctx.local_terminal_path, choice);
         match &saved {
             Ok(()) => row.remove_css_class("error"),
             Err(message) => {
@@ -186,7 +186,7 @@ impl Inner {
         if on == self.transcript_stored.get() {
             return;
         }
-        match local_terminal::set_transcript(&self.ctx.settings_path, on) {
+        match local_terminal::set_transcript(&self.ctx.local_terminal_path, on) {
             Ok(()) => {
                 self.transcript_stored.set(on);
                 self.transcript.remove_css_class("error");

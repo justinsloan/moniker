@@ -1,41 +1,67 @@
 //! Local terminal's own startup sequences, default sequence and "Save
-//! transcript" switch (issue #13): the data, its place in the settings file
-//! and its edits. Nothing here touches GTK.
+//! transcript" switch (issue #13): the data, its file and its edits. Nothing
+//! here touches GTK.
 //!
 //! A profile keeps its sequences in `profiles.json`, which syncs. Local
 //! terminal's must never leave this machine, or any machine holding the sync
 //! key could put commands into this one's shells, so they are not a profile
-//! and not in that file: they are one field of the GUI settings file
-//! ([`settings`], `gui-settings.json`: this machine's own, private, never
-//! synced), `"local_terminal": {"sequences": [...], "startup_sequence": N,
-//! "transcript": bool}`, left out of the file while it holds nothing. The
-//! settings file's writer keeps every other setting as it was, and refuses to
-//! write over a file it cannot read ([`settings::update`]); the changes here
-//! go through it, so they refuse in the same way.
+//! and not in that file. They are in a file of their own beside it,
+//! `local-terminal.json` ([`FILE_NAME`]): this machine's own, mode 0600 in a
+//! folder of mode 0700, written whole and atomically
+//! ([`settings::write_private`]), never synced and unknown to `moniker-server`,
+//! as pretty JSON:
+//! `{"version": 1, "sequences": [...], "startup_sequence": N, "transcript": bool}`,
+//! with no `startup_sequence` while there is no default.
 //!
-//! It is read field by field, as the settings file is. A missing, null or odd
-//! field is that field's default. A sequence that breaks a profile's rules
-//! ([`StartupSequence::check`]) or is not of the right shape is skipped, which
-//! only a hand edit can cause; the default is a place in the list, so it
-//! stays on the sequence the file named while the entries before it are
-//! skipped, and is none if its own was. The default is an index, and one past
-//! the end of the list names nothing ([`LocalTerminal::startup_choice`]), as a
-//! profile's does.
+//! Why a file of its own and not a field of the GUI settings file: Moniker
+//! 0.6.0 and older read `gui-settings.json` field by field and write the whole
+//! of what they read back at every change (a window resized, the text size at
+//! quit, a Preferences switch), so any older Moniker started on this machine
+//! (the installed one, a downgrade, the one Files' "Open in Terminal" starts)
+//! would drop the sequences without a word. A file they never knew they never
+//! touch.
+//!
+//! Reading ([`load`]): a missing file is the default (no sequence, no default,
+//! the switch off), what a machine that never used any of this has. A file that
+//! is a JSON object with `"version": 1` is read field by field: a missing, null
+//! or odd field is that field's default and costs the others nothing. A
+//! sequence that breaks a profile's rules ([`StartupSequence::check`]) or is
+//! not of the right shape is skipped, which only a hand edit can cause; the
+//! default is a place in the list, so it stays on the sequence the file named
+//! while the entries before it are skipped, and is none if its own was. The
+//! default is an index, and one past the end of the list names nothing
+//! ([`LocalTerminal::startup_choice`]), as a profile's does. Anything else (a
+//! file that cannot be read, is not JSON, is not an object, or has another
+//! version or none, a newer Moniker's say) is unusable: running treats it as
+//! the default, with a line on stderr naming the file, and every change is
+//! refused and leaves it as it is ([`update`]), so a file the person may want
+//! to repair, or that a newer Moniker wrote, is never replaced. What is
+//! skipped goes at the next write.
 //!
 //! The edits mirror a profile's ([`crate::form::apply_sequences`] and the
 //! default's pick): the change is built from the list the file holds when it
 //! is saved, only if the sequence at its place is still the one the page was
 //! opened on, and a pick of the default carries the sequence it means. Both
-//! are refused otherwise, with the profile's texts, and nothing is written.
+//! are refused otherwise ([`LOCAL_SEQUENCE_CHANGED`],
+//! [`form::CHOICE_CHANGED`]), and nothing is written. No message quotes a
+//! command.
 
+use std::fs;
+use std::io;
 use std::path::Path;
 
 use moniker_core::profile::StartupSequence;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::form;
 use crate::settings;
+
+/// The file's name, beside `profiles.json` and `gui-settings.json`.
+pub const FILE_NAME: &str = "local-terminal.json";
+
+/// The format version this build reads and writes.
+const VERSION: u64 = 1;
 
 /// What the page for Local terminal says about what its sequences and
 /// transcripts may hold. A profile's page says the same about its own.
@@ -45,33 +71,44 @@ pub const LOCAL_SECRETS_WARNING: &str = "Startup commands are saved as plain tex
 /// where they run, that they are never synced, and [`LOCAL_SECRETS_WARNING`].
 pub const LOCAL_SEQUENCES_NOTE: &str = "These run in a shell on this computer when you open Local terminal, and are never synced. Startup commands are saved as plain text in Moniker's settings file, and a transcript records whatever appears in the terminal, including anything you type or paste. Keep passwords out of both.";
 
-/// Local terminal's sequences, default and transcript switch, as the settings
-/// file holds them. The default value (no sequences, no default, transcript
-/// off) is what a machine that never used any of this has, and is not written.
+/// What Local terminal's sequence sub-page says when the sequence it was opened
+/// on is not what the file holds any more: [`form::SEQUENCE_CHANGED`] without
+/// its "perhaps by a sync", as Local terminal's never sync.
+pub const LOCAL_SEQUENCE_CHANGED: &str = "This startup sequence was changed or removed elsewhere. \
+     Go back to the list to see what is saved now.";
+
+/// Local terminal's sequences, default and transcript switch, as its file
+/// holds them. The default value (no sequences, no default, transcript off) is
+/// what a machine that never used any of this has: no file.
 ///
 /// `Debug` prints every command, and commands can hold secrets: do not log it.
-#[derive(Serialize, Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default)]
 pub struct LocalTerminal {
     /// Every sequence is one [`StartupSequence::check`] accepts.
     pub sequences: Vec<StartupSequence>,
     /// The sequence a plain pick of Local terminal runs, as an index into
     /// `sequences`. May point past the end: see [`LocalTerminal::startup_choice`].
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_sequence: Option<usize>,
     /// Save a transcript of every local tab (the switch on Local terminal's
     /// page; "Save transcripts of all sessions" also does).
     pub transcript: bool,
 }
 
+/// What the file holds, as it is written: the version first.
+#[derive(Serialize)]
+struct Written<'a> {
+    version: u64,
+    sequences: &'a [StartupSequence],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    startup_sequence: Option<usize>,
+    transcript: bool,
+}
+
 impl LocalTerminal {
-    /// The local terminal in the settings field `value`, which is anything the
-    /// file might hold under `"local_terminal"` (or nothing). Each of its three
+    /// The local terminal in a version 1 file's `fields`. Each of its three
     /// fields is read on its own and falls back to its default: a missing one,
     /// a null, or one of the wrong type costs the others nothing.
-    pub fn from_value(value: Option<&Value>) -> LocalTerminal {
-        let Some(fields) = value.and_then(Value::as_object) else {
-            return LocalTerminal::default();
-        };
+    fn from_fields(fields: &Map<String, Value>) -> LocalTerminal {
         let entries: &[Value] = fields
             .get("sequences")
             .and_then(Value::as_array)
@@ -121,23 +158,114 @@ impl LocalTerminal {
         self.startup_choice()
             .and_then(|index| self.sequences.get(index))
     }
+}
 
-    /// Whether this is what a machine that never used Local terminal's
-    /// sequences has, which the settings file does not write.
-    pub fn is_default(&self) -> bool {
-        *self == LocalTerminal::default()
+/// An unusable file's reason, as an error of the kind [`read`] gives.
+fn unusable(why: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, why.into())
+}
+
+/// Local terminal's file at `path`: `None` if there is none, what it holds
+/// otherwise, and an error if it exists but cannot be used (module docs): it
+/// cannot be read, is not JSON (text that is not UTF-8 included), is not a JSON
+/// object, or is not version 1. The error says why and never what the file
+/// holds: a syntax error says where, a version says its number.
+fn read(path: &Path) -> io::Result<Option<LocalTerminal>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let value: Value =
+        serde_json::from_str(&text).map_err(|err| unusable(format!("it is not JSON ({err})")))?;
+    let fields = value
+        .as_object()
+        .ok_or_else(|| unusable("it is not a JSON object"))?;
+    match fields.get("version") {
+        Some(Value::Number(n)) if n.as_u64() == Some(VERSION) => {}
+        Some(Value::Number(n)) => {
+            return Err(unusable(format!(
+                "it is version {n}; this Moniker reads version {VERSION}"
+            )));
+        }
+        _ => {
+            return Err(unusable(format!(
+                "it has no version number; this Moniker reads version {VERSION}"
+            )));
+        }
+    }
+    Ok(Some(LocalTerminal::from_fields(fields)))
+}
+
+/// Local terminal as the file at `path` has it. A missing file is the default;
+/// a file that cannot be used is the default too, and stderr says which file
+/// it was and why (module docs).
+pub fn load(path: &Path) -> LocalTerminal {
+    match read(path) {
+        Ok(local) => local.unwrap_or_default(),
+        Err(err) => {
+            eprintln!(
+                "moniker: cannot use {}, so Local terminal has no startup sequences: {err}",
+                path.display()
+            );
+            LocalTerminal::default()
+        }
     }
 }
 
-/// What a failed save says, whatever failed: the settings file could not be
-/// read or written ([`settings::update`]).
-fn save_error(err: &std::io::Error) -> String {
+/// Write `local` to `path` ([`settings::write_private`]: mode 0600, atomic) as
+/// pretty JSON with a trailing newline, the version first.
+pub(crate) fn save(path: &Path, local: &LocalTerminal) -> io::Result<()> {
+    let written = Written {
+        version: VERSION,
+        sequences: &local.sequences,
+        startup_sequence: local.startup_sequence,
+        transcript: local.transcript,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&written).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    settings::write_private(path, &bytes)
+}
+
+/// Change Local terminal's file at `path` with `change`: read it now, change
+/// what it holds, write it ([`save`]). Every change to it goes through here.
+///
+/// A missing file starts from the default, and nothing is written if `change`
+/// leaves it as it was (so a change that changes nothing makes no file).
+/// Nothing is written, with an error, if the file exists but cannot be used
+/// (module docs), and `change` is not called: such a file is left as it is,
+/// not replaced by the default plus one change, and a permission problem that
+/// hides it is never mistaken for "no sequences yet".
+///
+/// This is a read and a rename, not a lock, as the settings file's
+/// [`settings::update`] is: the app makes its changes from its one main thread,
+/// one at a time, and two Monikers changing it at the same moment can lose one
+/// change.
+pub(crate) fn update(path: &Path, change: impl FnOnce(&mut LocalTerminal)) -> io::Result<()> {
+    let before = read(path)
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("the file is unusable, so it is left as it is: {err}"),
+            )
+        })?
+        .unwrap_or_default();
+    let mut after = before.clone();
+    change(&mut after);
+    if after == before {
+        return Ok(());
+    }
+    save(path, &after)
+}
+
+/// What a failed save says, whatever failed: the file could not be read, used
+/// or written ([`update`]).
+fn save_error(err: &io::Error) -> String {
     format!("Could not save the local terminal: {err}")
 }
 
-/// Change Local terminal's sequences in the settings file at `settings_path`
-/// as the file holds them now: `change` gets the list and returns the one to
-/// save.
+/// Change Local terminal's sequences in its file at `path` as the file holds
+/// them now: `change` gets the list and returns the one to save.
 ///
 /// The sub-page works on one sequence, opened at `target` (its index and what
 /// it held then). The file can change while the page is open (another window,
@@ -145,7 +273,7 @@ fn save_error(err: &std::io::Error) -> String {
 /// deleting that one would be a silent loss, and saving a list built from an
 /// older one would undo the edit. So the check and the change are made on what
 /// the file holds: the sequence at that index must still be the one the page
-/// was opened on, else [`form::SEQUENCE_CHANGED`] and nothing is written. A new
+/// was opened on, else [`LOCAL_SEQUENCE_CHANGED`] and nothing is written. A new
 /// sequence (`None`) has no such expectation.
 ///
 /// The default is kept by position, so a change to the list must carry it
@@ -162,22 +290,21 @@ fn save_error(err: &std::io::Error) -> String {
 /// `Ok(Some(n))`: written, with `n` sequences. `Ok(None)`: the list came out
 /// the same, and nothing was written. An `Err` is a message for the person,
 /// either of the refusals above or "Could not save the local terminal: …" when
-/// the settings file cannot be read or written (a file that exists but cannot
-/// be read is left as it is).
+/// the file cannot be used or written (one that exists but cannot be used is
+/// left as it is).
 pub fn apply_sequences(
-    settings_path: &Path,
+    path: &Path,
     target: Option<(usize, &StartupSequence)>,
     change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence>,
     follow: impl FnOnce(Option<usize>) -> Option<usize>,
 ) -> Result<Option<usize>, String> {
     let mut refusal = None;
     let mut written = None;
-    settings::update(settings_path, |settings| {
-        let local = &mut settings.local_terminal;
+    update(path, |local| {
         if let Some((index, expected)) = target
             && local.sequences.get(index) != Some(expected)
         {
-            refusal = Some(form::SEQUENCE_CHANGED.to_owned());
+            refusal = Some(LOCAL_SEQUENCE_CHANGED.to_owned());
             return;
         }
         let next = change(&local.sequences);
@@ -200,7 +327,8 @@ pub fn apply_sequences(
 }
 
 /// Make `choice` the sequence a plain pick of Local terminal runs, or none
-/// (`None`: always allowed, and it also clears a default that named nothing).
+/// (`None`: always allowed on a usable file, and it also clears a default that
+/// named nothing), in its file at `path`.
 ///
 /// A pick carries the sequence it means as well as its place in the list (the
 /// page's view of both), and is refused with [`form::CHOICE_CHANGED`], writing
@@ -209,20 +337,14 @@ pub fn apply_sequences(
 /// page showed it would otherwise make the position name another sequence,
 /// and a pick must never run a sequence the person did not choose. The message
 /// quotes no command.
-pub fn set_default(
-    settings_path: &Path,
-    choice: Option<(usize, StartupSequence)>,
-) -> Result<(), String> {
+pub fn set_default(path: &Path, choice: Option<(usize, StartupSequence)>) -> Result<(), String> {
     let mut refusal = None;
-    settings::update(settings_path, |settings| {
-        let local = &mut settings.local_terminal;
-        match &choice {
-            None => local.startup_sequence = None,
-            Some((index, expected)) if local.sequences.get(*index) == Some(expected) => {
-                local.startup_sequence = Some(*index);
-            }
-            Some(_) => refusal = Some(form::CHOICE_CHANGED.to_owned()),
+    update(path, |local| match &choice {
+        None => local.startup_sequence = None,
+        Some((index, expected)) if local.sequences.get(*index) == Some(expected) => {
+            local.startup_sequence = Some(*index);
         }
+        Some(_) => refusal = Some(form::CHOICE_CHANGED.to_owned()),
     })
     .map_err(|err| save_error(&err))?;
     match refusal {
@@ -231,22 +353,20 @@ pub fn set_default(
     }
 }
 
-/// Turn Local terminal's own "Save transcript" switch on or off, keeping every
-/// other setting as the file has it.
-pub fn set_transcript(settings_path: &Path, on: bool) -> Result<(), String> {
-    settings::update(settings_path, |settings| {
-        settings.local_terminal.transcript = on;
-    })
-    .map_err(|err| save_error(&err))
+/// Turn Local terminal's own "Save transcript" switch on or off in its file at
+/// `path`, keeping its sequences and default as the file has them.
+pub fn set_transcript(path: &Path, on: bool) -> Result<(), String> {
+    update(path, |local| local.transcript = on).map_err(|err| save_error(&err))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::form::{self, Move};
-    use crate::settings::{self, GuiSettings};
+    use crate::settings;
     use serde_json::json;
     use std::fs;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
     fn seq(name: &str, commands: &[&str]) -> StartupSequence {
@@ -264,23 +384,16 @@ mod tests {
         seq("Second", &["uptime"])
     }
 
-    /// A settings path in a fresh directory (nothing written yet).
+    /// Local terminal's file in a fresh directory (nothing written yet).
     fn world() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(settings::FILE_NAME);
+        let path = dir.path().join(FILE_NAME);
         (dir, path)
     }
 
-    /// Save `local` as the local terminal of the settings file at `path`.
+    /// Save `local` as Local terminal's file at `path`.
     fn seed(path: &Path, local: LocalTerminal) {
-        settings::save(
-            path,
-            &GuiSettings {
-                local_terminal: local,
-                ..GuiSettings::default()
-            },
-        )
-        .unwrap();
+        save(path, &local).unwrap();
     }
 
     fn two_with_default(default: Option<usize>) -> LocalTerminal {
@@ -291,39 +404,52 @@ mod tests {
         }
     }
 
+    /// What Moniker reads from a version 1 file that holds `fields` (an
+    /// object) besides its version.
+    fn read_back(fields: Value) -> LocalTerminal {
+        let (_dir, path) = world();
+        let mut fields = fields.as_object().expect("an object").clone();
+        fields.insert("version".to_owned(), json!(1));
+        fs::write(&path, Value::Object(fields).to_string()).unwrap();
+        read(&path).unwrap().expect("a file")
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn is_root() -> bool {
+        rustix::process::geteuid().is_root()
+    }
+
     #[test]
-    fn missing_or_odd_is_the_default() {
-        assert_eq!(LocalTerminal::from_value(None), LocalTerminal::default());
-        for odd in [json!(null), json!(7), json!("x"), json!([])] {
-            assert_eq!(
-                LocalTerminal::from_value(Some(&odd)),
-                LocalTerminal::default(),
-                "{odd}"
-            );
-        }
-        assert!(LocalTerminal::default().is_default());
+    fn a_missing_file_is_the_default() {
+        let (_dir, path) = world();
+        assert!(matches!(read(&path), Ok(None)));
+        assert_eq!(load(&path), LocalTerminal::default());
+        assert_eq!(read_back(json!({})), LocalTerminal::default());
     }
 
     #[test]
     fn each_field_falls_back_on_its_own() {
-        let value = json!({"sequences": "x", "startup_sequence": 0, "transcript": true});
-        let local = LocalTerminal::from_value(Some(&value));
+        let local = read_back(json!({"sequences": "x", "startup_sequence": 0, "transcript": true}));
         assert!(local.sequences.is_empty());
         assert_eq!(local.startup_sequence, Some(0));
         assert_eq!(local.startup_choice(), None, "nothing for it to name");
         assert!(local.transcript);
 
         for bad in [json!(-1), json!(1.5), json!("0"), json!(null), json!(true)] {
-            let value =
-                json!({"sequences": [hello()], "startup_sequence": bad, "transcript": true});
-            let local = LocalTerminal::from_value(Some(&value));
+            let local = read_back(
+                json!({"sequences": [hello()], "startup_sequence": bad, "transcript": true}),
+            );
             assert_eq!(local.startup_sequence, None, "{bad}");
             assert_eq!(local.sequences, [hello()], "{bad}: the others stay");
             assert!(local.transcript, "{bad}: the others stay");
         }
         for bad in [json!("yes"), json!(1), json!(null), json!([])] {
-            let value = json!({"sequences": [hello()], "startup_sequence": 0, "transcript": bad});
-            let local = LocalTerminal::from_value(Some(&value));
+            let local = read_back(
+                json!({"sequences": [hello()], "startup_sequence": 0, "transcript": bad}),
+            );
             assert!(!local.transcript, "{bad}");
             assert_eq!(local.sequences, [hello()], "{bad}: the others stay");
             assert_eq!(local.startup_sequence, Some(0), "{bad}: the others stay");
@@ -332,7 +458,7 @@ mod tests {
 
     #[test]
     fn entries_it_cannot_use_are_skipped() {
-        let value = json!({"sequences": [
+        let local = read_back(json!({"sequences": [
             hello(),
             {"name": "", "commands": ["a"]},
             {"name": "a\u{1b}b", "commands": ["a"]},
@@ -341,8 +467,7 @@ mod tests {
             {"name": "y", "commands": [1]},
             {"name": "z"},
             5,
-        ]});
-        let local = LocalTerminal::from_value(Some(&value));
+        ]}));
         assert_eq!(local.sequences, [hello()]);
     }
 
@@ -352,8 +477,9 @@ mod tests {
         // out has its places changed: the default stays on the sequence the
         // file named, or on none if that one was taken out.
         let bad = json!({"name": "", "commands": ["a"]});
-        let list = |default: u64| json!({"sequences": [hello(), bad, second()], "startup_sequence": default});
-        let read = |default: u64| LocalTerminal::from_value(Some(&list(default)));
+        let read = |default: u64| {
+            read_back(json!({"sequences": [hello(), bad, second()], "startup_sequence": default}))
+        };
         assert_eq!(read(0).default_sequence(), Some(&hello()));
         assert_eq!(read(1).default_sequence(), None, "its own entry is gone");
         assert_eq!(read(1).startup_choice(), None);
@@ -369,12 +495,10 @@ mod tests {
 
     #[test]
     fn the_default_is_bounded() {
-        let value = json!({"sequences": [hello(), second()], "startup_sequence": 3});
-        let local = LocalTerminal::from_value(Some(&value));
+        let local = read_back(json!({"sequences": [hello(), second()], "startup_sequence": 3}));
         assert_eq!(local.startup_choice(), None);
         assert_eq!(local.default_sequence(), None);
-        let value = json!({"sequences": [hello(), second()], "startup_sequence": 1});
-        let local = LocalTerminal::from_value(Some(&value));
+        let local = read_back(json!({"sequences": [hello(), second()], "startup_sequence": 1}));
         assert_eq!(local.startup_choice(), Some(1));
         assert_eq!(local.default_sequence(), Some(&second()));
     }
@@ -397,7 +521,207 @@ mod tests {
     }
 
     #[test]
-    fn it_round_trips_and_is_left_out_while_default() {
+    fn a_changed_sequence_is_told_without_a_sync() {
+        assert_eq!(
+            LOCAL_SEQUENCE_CHANGED,
+            "This startup sequence was changed or removed elsewhere. \
+             Go back to the list to see what is saved now."
+        );
+        assert!(!LOCAL_SEQUENCE_CHANGED.contains("sync"));
+        assert!(form::SEQUENCE_CHANGED.contains("perhaps by a sync"));
+    }
+
+    #[test]
+    fn only_version_1_is_read() {
+        let (_dir, path) = world();
+        let with = |version: Option<Value>| {
+            let mut file =
+                json!({"sequences": [hello()], "startup_sequence": 0, "transcript": true});
+            if let Some(version) = version {
+                file["version"] = version;
+            }
+            fs::write(&path, file.to_string()).unwrap();
+        };
+        with(Some(json!(1)));
+        assert_eq!(
+            load(&path),
+            LocalTerminal {
+                sequences: vec![hello()],
+                startup_sequence: Some(0),
+                transcript: true,
+            }
+        );
+
+        const NONE: &str = "it has no version number; this Moniker reads version 1";
+        let refused = [
+            (None, NONE),
+            (Some(json!(null)), NONE),
+            (Some(json!("1")), NONE),
+            (Some(json!(true)), NONE),
+            (Some(json!([1])), NONE),
+            (
+                Some(json!(2)),
+                "it is version 2; this Moniker reads version 1",
+            ),
+            (
+                Some(json!(0)),
+                "it is version 0; this Moniker reads version 1",
+            ),
+            (
+                Some(json!(-1)),
+                "it is version -1; this Moniker reads version 1",
+            ),
+            (
+                Some(json!(1.5)),
+                "it is version 1.5; this Moniker reads version 1",
+            ),
+        ];
+        for (version, why) in refused {
+            with(version.clone());
+            let err = read(&path).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{version:?}");
+            assert_eq!(err.to_string(), why, "{version:?}");
+            assert_eq!(
+                load(&path),
+                LocalTerminal::default(),
+                "{version:?}: runs as none"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_it_cannot_read_runs_as_the_default() {
+        let (dir, path) = world();
+        let bad: [&[u8]; 7] = [
+            b"",
+            b"not json",
+            b"[1, 2]",
+            b"\"x\"",
+            b"null",
+            b"{\"version\": 1",
+            b"\xff\xfe",
+        ];
+        for bad in bad {
+            fs::write(&path, bad).unwrap();
+            assert!(read(&path).is_err(), "{bad:?}");
+            assert_eq!(load(&path), LocalTerminal::default(), "{bad:?}");
+        }
+        // A directory where the file should be cannot be read.
+        let as_dir = dir.path().join("dir");
+        fs::create_dir(&as_dir).unwrap();
+        assert!(read(&as_dir).is_err());
+        assert_eq!(load(&as_dir), LocalTerminal::default());
+    }
+
+    #[test]
+    fn an_unreadable_file_refuses_every_change_and_keeps_its_bytes() {
+        let (dir, path) = world();
+        // What a version this build does not read may hold: a command, which
+        // no message may quote.
+        let newer = json!({
+            "version": 2,
+            "sequences": [{"name": "S", "commands": ["secret-command"]}],
+        })
+        .to_string();
+        // Each file's bytes, and whether this process is kept from reading it
+        // (root reads it anyway, so that one is left out as root).
+        let mut damaged: Vec<(Vec<u8>, bool)> = vec![
+            (b"not json".to_vec(), false),
+            (b"[1]".to_vec(), false),
+            (b"{\"sequences\": []}".to_vec(), false),
+            (b"{\"version\": \"1\"}".to_vec(), false),
+            (b"\xff\xfe".to_vec(), false),
+            (newer.into_bytes(), false),
+        ];
+        if !is_root() {
+            damaged.push((b"{\"version\": 1}".to_vec(), true));
+        }
+        for (n, (bytes, locked)) in damaged.iter().enumerate() {
+            fs::write(&path, bytes).unwrap();
+            if *locked {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            let results = [
+                apply_sequences(
+                    &path,
+                    None,
+                    |current| form::with_sequence(current, None, hello()),
+                    |default| default,
+                )
+                .map(|_| ()),
+                apply_sequences(
+                    &path,
+                    Some((0, &hello())),
+                    |current| form::without_sequence(current, 0),
+                    |default| form::default_without(default, 0),
+                )
+                .map(|_| ()),
+                set_default(&path, None),
+                set_default(&path, Some((0, hello()))),
+                set_transcript(&path, true),
+                set_transcript(&path, false),
+            ];
+            for result in results {
+                let err = result.unwrap_err();
+                assert!(
+                    err.starts_with(
+                        "Could not save the local terminal: the file is unusable, \
+                         so it is left as it is: "
+                    ),
+                    "{n}: {err}"
+                );
+                assert!(!err.contains("secret-command"), "{n}: {err}");
+            }
+            if *locked {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            assert_eq!(&fs::read(&path).unwrap(), bytes, "{n}: left as it was");
+            let names: Vec<_> = fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [FILE_NAME], "{n}: no temporary file left");
+        }
+
+        // A directory in the file's place is refused too, and left.
+        let as_dir = dir.path().join("dir");
+        fs::create_dir(&as_dir).unwrap();
+        assert!(set_transcript(&as_dir, true).is_err());
+        assert!(as_dir.is_dir());
+    }
+
+    #[test]
+    fn it_is_written_with_mode_0600_in_a_private_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        // The config directory may not exist yet: nothing was ever saved.
+        let path = dir.path().join("cfg").join("moniker").join(FILE_NAME);
+        assert_eq!(set_transcript(&path, true), Ok(()));
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\n  \"version\": 1,\n  \"sequences\": [],\n  \"transcript\": true\n}\n"
+        );
+
+        // Every write replaces it the same way (still 0600, nothing left).
+        apply_sequences(
+            &path,
+            None,
+            |current| form::with_sequence(current, None, hello()),
+            |default| default,
+        )
+        .unwrap();
+        set_default(&path, Some((0, hello()))).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [FILE_NAME], "only the file is left");
+    }
+
+    #[test]
+    fn it_round_trips_as_pretty_json_with_its_version() {
         let (_dir, path) = world();
         let local = LocalTerminal {
             sequences: vec![hello()],
@@ -405,46 +729,125 @@ mod tests {
             transcript: true,
         };
         seed(&path, local.clone());
-        assert_eq!(settings::load(&path).local_terminal, local);
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains(r#""local_terminal""#), "{text}");
-
-        // The default is not written at all, so a file that never used the
-        // local terminal reads as it did before.
-        settings::save(&path, &GuiSettings::default()).unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("local_terminal"), "{text}");
-        assert_eq!(settings::load(&path), GuiSettings::default());
-
-        // No default sequence is no key, not a null.
-        seed(
-            &path,
-            LocalTerminal {
-                sequences: vec![hello()],
-                ..LocalTerminal::default()
-            },
+        assert_eq!(load(&path), local);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{
+  "version": 1,
+  "sequences": [
+    {
+      "name": "Hello",
+      "commands": [
+        "printf hi"
+      ]
+    }
+  ],
+  "startup_sequence": 0,
+  "transcript": true
+}
+"#
         );
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("startup_sequence"), "{text}");
+
+        // No default sequence is no key, not a null; the defaults may be
+        // written.
+        seed(&path, LocalTerminal::default());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\n  \"version\": 1,\n  \"sequences\": [],\n  \"transcript\": false\n}\n"
+        );
+        assert_eq!(load(&path), LocalTerminal::default());
     }
 
     #[test]
-    fn other_settings_writes_keep_it() {
+    fn a_sequence_it_cannot_read_goes_at_the_next_write() {
         let (_dir, path) = world();
+        let file = json!({
+            "version": 1,
+            "sequences": [hello(), {"name": "", "commands": ["hand-edited"]}],
+            "startup_sequence": 0,
+        });
+        fs::write(&path, file.to_string()).unwrap();
+        // Reading it writes nothing.
+        assert_eq!(load(&path).sequences, [hello()]);
+        assert!(fs::read_to_string(&path).unwrap().contains("hand-edited"));
+        set_transcript(&path, true).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("hand-edited"), "{text}");
+        let local = load(&path);
+        assert_eq!(local.sequences, [hello()]);
+        assert_eq!(local.startup_sequence, Some(0));
+        assert!(local.transcript);
+    }
+
+    #[test]
+    fn settings_writes_never_touch_it() {
+        let (dir, path) = world();
+        let settings_path = dir.path().join(settings::FILE_NAME);
         let local = LocalTerminal {
             sequences: vec![hello(), second()],
             startup_sequence: Some(1),
             transcript: true,
         };
         seed(&path, local.clone());
+        let bytes = fs::read(&path).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        let untouched = |what: &str| {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{what}");
+            assert_eq!(
+                fs::metadata(&path).unwrap().ino(),
+                inode,
+                "{what}: not replaced"
+            );
+            assert_eq!(load(&path), local, "{what}");
+        };
 
-        settings::save_font_scale(&path, 1.5).unwrap();
-        assert_eq!(settings::load(&path).local_terminal, local, "text size");
-        assert_eq!(settings::load(&path).font_scale, 1.5);
+        settings::save_font_scale(&settings_path, 1.5).unwrap();
+        assert_eq!(settings::load(&settings_path).font_scale, 1.5);
+        untouched("text size");
 
-        settings::update(&path, |s| s.ping_hosts = false).unwrap();
-        assert_eq!(settings::load(&path).local_terminal, local, "a switch");
-        assert!(!settings::load(&path).ping_hosts);
+        settings::update(&settings_path, |s| s.ping_hosts = false).unwrap();
+        assert!(!settings::load(&settings_path).ping_hosts);
+        untouched("a switch");
+
+        settings::save(&settings_path, &settings::GuiSettings::default()).unwrap();
+        untouched("the whole settings file");
+
+        let text = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            !text.contains("Hello") && !text.contains("local_terminal"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_old_field_in_the_settings_file_is_ignored() {
+        // Earlier builds of this change kept Local terminal in the settings
+        // file. None was released, so it is not moved over: it is left unread,
+        // and goes at the settings file's next write.
+        let (dir, path) = world();
+        let settings_path = dir.path().join(settings::FILE_NAME);
+        let old = json!({
+            "font_scale": 1.5,
+            "local_terminal": {
+                "sequences": [hello()],
+                "startup_sequence": 0,
+                "transcript": true,
+            },
+        });
+        fs::write(&settings_path, old.to_string()).unwrap();
+        assert_eq!(load(&path), LocalTerminal::default());
+        assert!(!path.exists(), "nothing moved over");
+        assert_eq!(
+            settings::load(&settings_path).font_scale,
+            1.5,
+            "the rest is read"
+        );
+
+        settings::update(&settings_path, |s| s.ping_hosts = false).unwrap();
+        assert!(!path.exists());
+        let text = fs::read_to_string(&settings_path).unwrap();
+        assert!(!text.contains("local_terminal"), "{text}");
+        assert_eq!(settings::load(&settings_path).font_scale, 1.5);
     }
 
     #[test]
@@ -460,7 +863,7 @@ mod tests {
             |default| default,
         );
         assert_eq!(added, Ok(Some(1)));
-        assert_eq!(settings::load(&path).local_terminal.sequences, [hello()]);
+        assert_eq!(load(&path).sequences, [hello()]);
 
         // The page was opened on another sequence than the file holds.
         let before = bytes();
@@ -471,7 +874,7 @@ mod tests {
             |current| form::without_sequence(current, 0),
             |default| form::default_without(default, 0),
         );
-        assert_eq!(refused, Err(form::SEQUENCE_CHANGED.to_owned()));
+        assert_eq!(refused, Err(LOCAL_SEQUENCE_CHANGED.to_owned()));
         assert_eq!(bytes(), before);
 
         // The same list is no change, and writes nothing.
@@ -488,7 +891,7 @@ mod tests {
             |default| form::moved_default(default, 0, Move::Down),
         );
         assert_eq!(moved, Ok(Some(2)));
-        let local = settings::load(&path).local_terminal;
+        let local = load(&path);
         assert_eq!(local.sequences, [second(), hello()]);
         assert_eq!(local.startup_sequence, Some(1), "still on Hello");
 
@@ -501,7 +904,7 @@ mod tests {
             |default| form::default_without(default, 0),
         );
         assert_eq!(deleted, Ok(Some(1)));
-        let local = settings::load(&path).local_terminal;
+        let local = load(&path);
         assert_eq!(local.sequences, [second()]);
         assert_eq!(local.startup_sequence, None);
 
@@ -514,7 +917,7 @@ mod tests {
             |default| form::default_without(default, 0),
         )
         .unwrap();
-        let local = settings::load(&path).local_terminal;
+        let local = load(&path);
         assert_eq!(local.startup_sequence, Some(0));
         assert_eq!(local.default_sequence(), Some(&second()));
 
@@ -527,7 +930,19 @@ mod tests {
             |_| Some(9),
         )
         .unwrap();
-        assert_eq!(settings::load(&path).local_terminal.startup_sequence, None);
+        assert_eq!(load(&path).startup_sequence, None);
+
+        // On a missing file there is no sequence the page could have been
+        // opened on.
+        let (_dir, missing) = world();
+        let refused = apply_sequences(
+            &missing,
+            Some((0, &hello())),
+            |current| form::without_sequence(current, 0),
+            |default| default,
+        );
+        assert_eq!(refused, Err(LOCAL_SEQUENCE_CHANGED.to_owned()));
+        assert!(!missing.exists(), "nothing written");
     }
 
     #[test]
@@ -548,7 +963,7 @@ mod tests {
             |default| default,
         )
         .unwrap();
-        let local = settings::load(&path).local_terminal;
+        let local = load(&path);
         assert_eq!(local.sequences, [hello(), second()]);
         assert_eq!(local.startup_sequence, None, "it named nothing before");
     }
@@ -580,10 +995,7 @@ mod tests {
         let (_dir, path) = world();
         seed(&path, two_with_default(None));
         assert_eq!(set_default(&path, Some((1, second()))), Ok(()));
-        assert_eq!(
-            settings::load(&path).local_terminal.startup_sequence,
-            Some(1)
-        );
+        assert_eq!(load(&path).startup_sequence, Some(1));
 
         // The pick means a sequence the file no longer has at that place.
         let before = fs::read(&path).unwrap();
@@ -598,30 +1010,26 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before);
 
         assert_eq!(set_default(&path, None), Ok(()));
-        assert_eq!(settings::load(&path).local_terminal.startup_sequence, None);
+        assert_eq!(load(&path).startup_sequence, None);
+
+        // None also clears a default that names nothing (a hand edit).
+        seed(&path, two_with_default(Some(7)));
+        assert_eq!(set_default(&path, None), Ok(()));
+        assert_eq!(load(&path).startup_sequence, None);
     }
 
     #[test]
     fn set_transcript_keeps_the_rest() {
         let (_dir, path) = world();
-        settings::save(
-            &path,
-            &GuiSettings {
-                font_scale: 1.5,
-                local_terminal: two_with_default(Some(1)),
-                ..GuiSettings::default()
-            },
-        )
-        .unwrap();
+        seed(&path, two_with_default(Some(1)));
         assert_eq!(set_transcript(&path, true), Ok(()));
-        let loaded = settings::load(&path);
-        assert!(loaded.local_terminal.transcript);
-        assert_eq!(loaded.local_terminal.sequences, [hello(), second()]);
-        assert_eq!(loaded.local_terminal.startup_sequence, Some(1));
-        assert_eq!(loaded.font_scale, 1.5);
+        let loaded = load(&path);
+        assert!(loaded.transcript);
+        assert_eq!(loaded.sequences, [hello(), second()]);
+        assert_eq!(loaded.startup_sequence, Some(1));
 
         assert_eq!(set_transcript(&path, false), Ok(()));
-        assert!(!settings::load(&path).local_terminal.transcript);
+        assert!(!load(&path).transcript);
     }
 
     #[test]
@@ -632,31 +1040,6 @@ mod tests {
         assert_eq!(set_default(&path, None), Ok(()));
         assert!(!path.exists());
         assert_eq!(set_transcript(&path, true), Ok(()));
-        assert!(settings::load(&path).local_terminal.transcript);
-    }
-
-    #[test]
-    fn a_damaged_file_is_never_written() {
-        let (_dir, path) = world();
-        fs::write(&path, "not json").unwrap();
-        let results = [
-            apply_sequences(
-                &path,
-                None,
-                |current| form::with_sequence(current, None, hello()),
-                |default| default,
-            )
-            .map(|_| ()),
-            set_default(&path, None),
-            set_transcript(&path, true),
-        ];
-        for result in results {
-            let err = result.unwrap_err();
-            assert!(
-                err.starts_with("Could not save the local terminal: "),
-                "{err}"
-            );
-        }
-        assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
+        assert!(load(&path).transcript);
     }
 }

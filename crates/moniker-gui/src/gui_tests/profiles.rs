@@ -380,23 +380,24 @@ impl Setup {
         all_widgets::<adw::PreferencesGroup>(&page)
     }
 
-    /// Local terminal as the settings file has it now.
+    /// Local terminal as its file has it now.
     fn local(&self) -> LocalTerminal {
-        settings::load(&self.ctx.settings_path).local_terminal
+        local_terminal::load(&self.ctx.local_terminal_path)
     }
 
-    /// Write Local terminal's `sequences` and `default` into the settings file,
-    /// as another window (or a hand edit) would: nobody is told.
+    /// Write Local terminal's `sequences` and `default` into its file, as
+    /// another window (or a hand edit) would: nobody is told.
     fn local_elsewhere(&self, sequences: &[StartupSequence], default: Option<usize>) {
-        settings::update(&self.ctx.settings_path, |x| {
-            x.local_terminal.sequences = sequences.to_vec();
-            x.local_terminal.startup_sequence = default;
+        local_terminal::update(&self.ctx.local_terminal_path, |local| {
+            local.sequences = sequences.to_vec();
+            local.startup_sequence = default;
         })
-        .expect("write the settings");
+        .expect("write Local terminal's file");
     }
 
-    fn settings_bytes(&self) -> Vec<u8> {
-        fs::read(&self.ctx.settings_path).expect("the settings file")
+    /// The bytes of Local terminal's file, `None` while there is none.
+    fn local_bytes(&self) -> Option<Vec<u8>> {
+        fs::read(&self.ctx.local_terminal_path).ok()
     }
 
     /// How many times the lists and windows are told of a change from now on
@@ -2757,12 +2758,13 @@ const TRANSCRIPT_SUBTITLE: &str = "Saves the session as plain text when its tab 
 
 /// The sidebar's Local terminal entry sits above the profiles, whatever the
 /// search, and shows Local terminal's page: its startup sequences and its own
-/// "Save transcript" switch, which saves into the settings file and never the
-/// profile file. Selecting it, a profile or Sync unselects the others, and the
-/// header's button reads Open for Local terminal and Connect for a profile.
+/// "Save transcript" switch, which saves into Local terminal's own file and
+/// never the profile file or the settings file. Selecting it, a profile or
+/// Sync unselects the others, and the header's button reads Open for Local
+/// terminal and Connect for a profile.
 /// Opening it (a double click or Enter on the entry, or Open) asks for a local
 /// terminal running its default sequence, with a transcript as its switch and
-/// "Save transcripts of all sessions" say, as the settings file has them then.
+/// "Save transcripts of all sessions" say, as their files have them then.
 pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
     let p = web();
     let s = Setup::open(dir, std::slice::from_ref(&p));
@@ -2845,13 +2847,19 @@ pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
     assert_eq!(switch.subtitle().as_deref(), Some(TRANSCRIPT_SUBTITLE));
     assert!(switch.is_ancestor(&groups[1]), "in the Session group");
 
-    // The switch saves into the settings file at once, not the profile file,
-    // and every list and window hears of it.
+    // The switch saves into Local terminal's own file at once, not the
+    // profile file or the settings file, and every list and window hears of
+    // it.
     let heard = s.heard();
     switch.set_active(true);
     assert!(s.local().transcript);
     assert!(switch.is_active());
     assert_eq!(s.file_bytes(), profile_file);
+    assert!(
+        fs::read_to_string(&s.ctx.settings_path)
+            .map_or(true, |t| !t.contains("transcript\": true")),
+        "not in the settings file"
+    );
     assert_eq!(heard.get(), 1, "told");
 
     // A profile, then the entry again: each unselects the other, and the
@@ -2895,7 +2903,7 @@ pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
     // other way round.
     s.select(&p.id);
     let profile_before = s.file_bytes();
-    let settings_before = s.settings_bytes();
+    let local_before = s.local_bytes();
     let page = s.open_sequence("Add sequence");
     sub_name(&page).set_text("unsaved");
     set_commands(&page, "echo unsaved");
@@ -2915,7 +2923,7 @@ pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
         "Local terminal's page"
     );
     assert_eq!(s.file_bytes(), profile_before, "nothing saved");
-    assert_eq!(s.settings_bytes(), settings_before, "nothing saved");
+    assert_eq!(s.local_bytes(), local_before, "nothing saved");
     let page = s.open_sequence("Add sequence");
     sub_name(&page).set_text("unsaved");
     set_commands(&page, "echo unsaved");
@@ -2930,7 +2938,7 @@ pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
     );
     assert_eq!(s.title(), "web");
     assert_eq!(s.file_bytes(), profile_before, "nothing saved");
-    assert_eq!(s.settings_bytes(), settings_before, "nothing saved");
+    assert_eq!(s.local_bytes(), local_before, "nothing saved");
     s.select_local();
 
     // Opening: a double click or Enter on the entry, and Open.
@@ -2940,14 +2948,14 @@ pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
 
     // A default saved since, in another window: read when it opens.
     local_terminal::apply_sequences(
-        &s.ctx.settings_path,
+        &s.ctx.local_terminal_path,
         None,
         |current| form::with_sequence(current, None, seq("Hello", &["printf hi"])),
         |default| default,
     )
     .expect("add a sequence");
     local_terminal::set_default(
-        &s.ctx.settings_path,
+        &s.ctx.local_terminal_path,
         Some((0, seq("Hello", &["printf hi"]))),
     )
     .expect("choose it");
@@ -2963,7 +2971,7 @@ pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
     );
 
     // Its own switch off: "Save transcripts of all sessions" still saves one.
-    local_terminal::set_transcript(&s.ctx.settings_path, false).expect("switch off");
+    local_terminal::set_transcript(&s.ctx.local_terminal_path, false).expect("switch off");
     open.emit_clicked();
     assert_eq!(
         s.connected.borrow().last(),
@@ -2989,17 +2997,18 @@ pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
 }
 
 /// Local terminal's sequences are edited on the profile's sub-page, which saves
-/// them into the settings file (never the profile file), with the same rules:
-/// the default follows Move and Delete, a pick saves it, and the file as it is
-/// has the last word (a sequence changed meanwhile refuses Save, a list changed
-/// meanwhile refuses a pick, and a default past the end shows as "None"). A
-/// refresh that brings nothing new to the rows leaves them as they are.
+/// them into Local terminal's own file (never the profile file), with the same
+/// rules: the default follows Move and Delete, a pick saves it, and the file as
+/// it is has the last word (a sequence changed meanwhile refuses Save, in words
+/// that name no sync; a list changed meanwhile refuses a pick; and a default
+/// past the end shows as "None"). A refresh that brings nothing new to the rows
+/// leaves them as they are.
 pub(super) fn local_sequences_are_edited_like_a_profile_s(dir: &Path) {
     let s = Setup::open(dir, &[web()]);
     let profile_file = s.file_bytes();
     s.select_local();
 
-    // Add: the sub-page warns about the settings file.
+    // Add: the sub-page warns about where the commands are saved.
     let page = s.open_sequence("Add sequence");
     assert_eq!(page.title(), "New Startup Sequence");
     let commands = all_widgets::<adw::PreferencesGroup>(&page)
@@ -3098,7 +3107,7 @@ pub(super) fn local_sequences_are_edited_like_a_profile_s(dir: &Path) {
     // refused, and the file keeps that change.
     let page = s.open_sequence("Renamed");
     local_terminal::apply_sequences(
-        &s.ctx.settings_path,
+        &s.ctx.local_terminal_path,
         None,
         |current| form::with_sequence(current, Some(0), seq("Theirs", &["ls"])),
         |default| default,
@@ -3106,10 +3115,13 @@ pub(super) fn local_sequences_are_edited_like_a_profile_s(dir: &Path) {
     .expect("change it elsewhere");
     set_commands(&page, "whoami");
     s.click(&page, "Save");
-    assert_eq!(inline_error(&page).as_deref(), Some(form::SEQUENCE_CHANGED));
+    assert_eq!(
+        inline_error(&page).as_deref(),
+        Some(local_terminal::LOCAL_SEQUENCE_CHANGED)
+    );
     assert_eq!(
         s.ctx.notice.last_text().as_deref(),
-        Some(form::SEQUENCE_CHANGED)
+        Some(local_terminal::LOCAL_SEQUENCE_CHANGED)
     );
     assert!(s.sequence_page().is_some(), "the page stays");
     assert_eq!(s.local().sequences, [seq("Theirs", &["ls"])]);
@@ -3123,13 +3135,13 @@ pub(super) fn local_sequences_are_edited_like_a_profile_s(dir: &Path) {
     s.ctx.profiles_changed();
     assert_eq!(items_of(&combo), ["None", "a", "b"]);
     s.local_elsewhere(&[seq("b", &["echo B"]), seq("a", &["echo A"])], None);
-    let written = s.settings_bytes();
+    let written = s.local_bytes();
     s.pick_default("a");
     assert_eq!(
         s.ctx.notice.last_text().as_deref(),
         Some(form::CHOICE_CHANGED)
     );
-    assert_eq!(s.settings_bytes(), written, "nothing was written");
+    assert_eq!(s.local_bytes(), written, "nothing was written");
     assert!(combo.has_css_class("error"));
     // The row shows the file again from the main loop, not from inside its own
     // signal.
@@ -3145,21 +3157,25 @@ pub(super) fn local_sequences_are_edited_like_a_profile_s(dir: &Path) {
     // A default past the end of the list (a hand edit) shows as "None", and
     // showing it writes nothing.
     s.local_elsewhere(&[seq("a", &["echo A"])], Some(7));
-    let written = s.settings_bytes();
+    let written = s.local_bytes();
     s.ctx.profiles_changed();
     assert_eq!(items_of(&combo), ["None", "a"]);
     assert_eq!(shown_item(&combo), "None");
-    assert_eq!(s.settings_bytes(), written);
+    assert_eq!(s.local_bytes(), written);
     assert_eq!(s.local().startup_sequence, Some(7), "left as it was");
     assert_eq!(s.file_bytes(), profile_file, "the profile file untouched");
     s.close();
 }
 
-/// A settings file that cannot be read: Local terminal's page shows what the
-/// defaults say, and every change is refused, the file left as it is.
-pub(super) fn a_damaged_settings_file_refuses_local_changes(dir: &Path) {
+/// Local terminal's file cannot be used (not JSON, or of a version this build
+/// does not read: a newer Moniker's): its page shows what the defaults say,
+/// and every change is refused with the reason, the file left as it is.
+pub(super) fn a_damaged_local_terminal_file_refuses_changes(dir: &Path) {
+    const REFUSED: &str =
+        "Could not save the local terminal: the file is unusable, so it is left as it is: ";
     let s = Setup::open(dir, &[web()]);
-    fs::write(&s.ctx.settings_path, "not json").expect("damage the settings");
+    let path = s.ctx.local_terminal_path.clone();
+    fs::write(&path, "not json").expect("damage Local terminal's file");
     s.select_local();
     assert_eq!(
         s.group_row_titles(),
@@ -3174,7 +3190,7 @@ pub(super) fn a_damaged_settings_file_refuses_local_changes(dir: &Path) {
         s.ctx
             .notice
             .last_text()
-            .is_some_and(|text| text.starts_with("Could not save the local terminal: ")),
+            .is_some_and(|text| text.starts_with(REFUSED)),
         "{:?}",
         s.ctx.notice.last_text()
     );
@@ -3185,22 +3201,34 @@ pub(super) fn a_damaged_settings_file_refuses_local_changes(dir: &Path) {
     set_commands(&page, "printf hi");
     s.click(&page, "Save");
     let error = inline_error(&page).expect("the reason on the sub-page");
-    assert!(
-        error.starts_with("Could not save the local terminal: "),
-        "{error}"
-    );
+    assert!(error.starts_with(REFUSED), "{error}");
     assert!(s.sequence_page().is_some(), "the page stays");
-    assert_eq!(
-        fs::read_to_string(&s.ctx.settings_path).expect("the settings"),
-        "not json"
-    );
+    assert_eq!(fs::read_to_string(&path).expect("the file"), "not json");
     s.click(&page, "Cancel");
     s.wait_for_sub_page_to_close();
-    let settings_path = s.ctx.settings_path.clone();
+
+    // A file of another version is not read, and not written over either:
+    // its sequences are not shown, and quoted in no message.
+    let newer =
+        r#"{"version": 2, "sequences": [{"name": "Newer", "commands": ["newer-command"]}]}"#;
+    fs::write(&path, newer).expect("a newer Moniker's file");
+    s.ctx.profiles_changed();
+    assert_eq!(
+        s.group_row_titles(),
+        ["None: opening gives a plain shell", "Add sequence"]
+    );
+    let switch = s.switch("Save transcript");
+    switch.set_active(true);
+    assert!(!switch.is_active(), "back off");
+    let told = s.ctx.notice.last_text().unwrap_or_default();
+    assert!(told.starts_with(REFUSED), "{told}");
+    assert!(told.contains("version 2"), "{told}");
+    assert!(!told.contains("newer-command"), "{told}");
+    assert_eq!(fs::read_to_string(&path).expect("the file"), newer);
     s.close();
     assert_eq!(
-        fs::read_to_string(settings_path).expect("the settings"),
-        "not json",
+        fs::read_to_string(&path).expect("the file"),
+        newer,
         "closing the window wrote nothing either"
     );
 }

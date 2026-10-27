@@ -457,7 +457,7 @@ fn gui_integration() {
     );
     profiles::the_local_terminal_entry_and_its_page(&tmp.path().join("ls-entry"));
     profiles::local_sequences_are_edited_like_a_profile_s(&tmp.path().join("ls-edit"));
-    profiles::a_damaged_settings_file_refuses_local_changes(&tmp.path().join("ls-damaged"));
+    profiles::a_damaged_local_terminal_file_refuses_changes(&tmp.path().join("ls-damaged"));
     // The REC indicator of a tab that saves a transcript.
     transcript_indicator::a_tab_saving_a_transcript_shows_rec(&bin, &tmp.path().join("rec-shows"));
     transcript_indicator::rec_goes_when_the_transcript_is_written(&tmp.path().join("rec-goes"));
@@ -853,8 +853,8 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     let ctx = main_window::ctx_with(dir, std::slice::from_ref(&p));
     // Local terminal (issue #13) has a sequence named the same way, chosen as
     // its default.
-    crate::settings::update(&ctx.settings_path, |s| {
-        s.local_terminal = crate::local_terminal::LocalTerminal {
+    crate::local_terminal::update(&ctx.local_terminal_path, |local| {
+        *local = crate::local_terminal::LocalTerminal {
             sequences: vec![StartupSequence {
                 name: MARKUP_NAME.to_owned(),
                 commands: vec!["uptime".to_owned()],
@@ -863,7 +863,7 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
             transcript: false,
         };
     })
-    .expect("write the settings");
+    .expect("write Local terminal's file");
     let app = main_window::test_app();
     let main = window::build(&app, &ctx);
     main.window.present();

@@ -53,7 +53,7 @@ pub struct SshCommand {
 /// remain, or `seq` is `None`, the result is `None`. The remaining commands are
 /// passed through verbatim: they are the user's own shell commands.
 pub fn remote_command(seq: Option<&StartupSequence>) -> Option<String> {
-    script(seq?, "exec \"$SHELL\" -l")
+    Some(format!("{}\nexec \"$SHELL\" -l", commands(seq?)?))
 }
 
 /// The script a local terminal runs for a startup sequence, or `None` when
@@ -61,19 +61,24 @@ pub fn remote_command(seq: Option<&StartupSequence>) -> Option<String> {
 /// caller runs it with the person's own shell as `shell -c <script>`, with
 /// `SHELL` set to that shell, and it ends in `exec "$SHELL"`.
 ///
+/// The commands are joined and skipped exactly as [`remote_command`] does, and
+/// an empty line comes before the `exec`: a command ending in a backslash (a
+/// line continuation) would otherwise take the `exec` line as part of itself,
+/// and the sequence would leave no shell. The empty line ends that command
+/// first. (A backslash at the end of an earlier command still joins the next
+/// command to it: those lines are the person's own.)
+///
 /// There is no `-l`: a plain local terminal's shell is not a login shell, so
 /// the shell this leaves is the same kind. The shell's path travels in the
 /// environment (`$SHELL`), never in the script, so a path with a space or a
-/// quote cannot change what runs. The commands are joined and skipped exactly
-/// as [`remote_command`] does.
+/// quote cannot change what runs.
 pub fn local_command(seq: Option<&StartupSequence>) -> Option<String> {
-    script(seq?, "exec \"$SHELL\"")
+    Some(format!("{}\n\nexec \"$SHELL\"", commands(seq?)?))
 }
 
-/// The non-blank commands of `seq`, one to a line, followed by `last` on a line
-/// of its own; `None` when no command is left. The joining is the one
-/// [`remote_command`] documents.
-fn script(seq: &StartupSequence, last: &str) -> Option<String> {
+/// The non-blank commands of `seq`, one to a line; `None` when no command is
+/// left. The joining is the one [`remote_command`] documents.
+fn commands(seq: &StartupSequence) -> Option<String> {
     let commands: Vec<&str> = seq
         .commands
         .iter()
@@ -83,7 +88,7 @@ fn script(seq: &StartupSequence, last: &str) -> Option<String> {
     if commands.is_empty() {
         return None;
     }
-    Some(format!("{}\n{last}", commands.join("\n")))
+    Some(commands.join("\n"))
 }
 
 /// `ssh` invocation for an interactive terminal tab.
@@ -326,7 +331,7 @@ mod tests {
         };
         assert_eq!(
             local_command(Some(&seq)).as_deref(),
-            Some("sudo apt update\nuptime # check\nsleep 1 &\nexec \"$SHELL\"")
+            Some("sudo apt update\nuptime # check\nsleep 1 &\n\nexec \"$SHELL\"")
         );
         let blank = StartupSequence {
             name: "b".into(),
@@ -334,6 +339,28 @@ mod tests {
         };
         assert_eq!(local_command(Some(&blank)), None);
         assert_eq!(local_command(None), None);
+    }
+
+    #[test]
+    fn a_trailing_backslash_cannot_swallow_the_local_exec() {
+        // A backslash at the end of a line joins the next line to it: with the
+        // exec on the very next line, `printf 'A%s' \` would print "Aexec…" and
+        // no shell would be started. The empty line ends the command first.
+        let s = seq(&["printf 'A%s' \\"]);
+        let script = local_command(Some(&s)).unwrap();
+        assert_eq!(script, "printf 'A%s' \\\n\nexec \"$SHELL\"");
+        assert!(script.ends_with("\n\nexec \"$SHELL\""), "{script:?}");
+
+        // And so a real shell runs it: the printf, then the exec of `$SHELL`
+        // (here `echo`, which prints an empty line).
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env("SHELL", "/bin/echo")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "A\n");
     }
 
     #[test]

@@ -170,6 +170,7 @@ use vte4::{Format, PtyFlags, Terminal};
 
 use crate::context::{AppContext, Notice};
 use crate::launch_args::{Run, Start, one_line};
+use crate::local_terminal::LocalTerminal;
 use crate::settings::{self, GuiSettings};
 use crate::{panes, theme, zoom};
 
@@ -867,15 +868,13 @@ pub fn default_save(profile_setting: bool, save_all: bool) -> bool {
     save_all || profile_setting
 }
 
-/// [`default_save`] for a local terminal, as `settings` say: Local terminal's
-/// own "Save transcript" switch or "Save transcripts of all sessions" (issue
-/// #13). The one rule for every local tab: a pick in the new-tab list (and the
-/// box under its "›"), a window's first tab and a restored local pane.
-pub fn default_local_save(settings: &GuiSettings) -> bool {
-    default_save(
-        settings.local_terminal.transcript,
-        settings.save_all_transcripts,
-    )
+/// [`default_save`] for a local terminal: Local terminal's own "Save
+/// transcript" switch (`local`, as its file has it) or "Save transcripts of all
+/// sessions" (`save_all`, as the settings file has it) (issue #13). The one
+/// rule for every local tab: a pick in the new-tab list (and the box under its
+/// "›"), a window's first tab and a restored local pane.
+pub fn default_local_save(local: &LocalTerminal, save_all: bool) -> bool {
+    default_save(local.transcript, save_all)
 }
 
 /// This machine's name for itself (the node name `uname` reports), which names

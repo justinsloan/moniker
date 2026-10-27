@@ -8,10 +8,12 @@
 //! the file holds *then*, not from what the page was opened on, and only if
 //! the sequence at its place is still the one the page was opened on: a
 //! profile's under the profile file's lock ([`form::apply_sequences`]), Local
-//! terminal's in the settings file ([`local_terminal::apply_sequences`]). A
-//! sync (or another window, or a hand edit) that reordered or changed the list
+//! terminal's in its own file ([`local_terminal::apply_sequences`]). A sync
+//! (or another window, or a hand edit) that reordered or changed the list
 //! meanwhile is therefore never overwritten, and Move or Delete never acts on
-//! a different sequence.
+//! a different sequence: the page says so ([`form::SEQUENCE_CHANGED`], or
+//! [`local_terminal::LOCAL_SEQUENCE_CHANGED`] for Local terminal's, which no
+//! sync changes) and writes nothing.
 //!
 //! The default sequence is kept by position, so each of them says how the
 //! default follows, and the same write saves both: Save leaves it, Move takes
@@ -29,9 +31,9 @@
 //! other Save, Move or Delete, Cancel and Escape wait too, and after a moment a
 //! spinner in the header says it waits. Selecting another entry still closes
 //! the page; the change asked for goes on, and a failure is then told in the
-//! window. Local terminal's settings file takes no lock and is written quickly,
-//! so its changes run on the main thread and are back at once, as the
-//! Preferences' are.
+//! window. Local terminal's file takes no lock and is written quickly, so its
+//! changes run on the main thread and are back at once, as the Preferences'
+//! are.
 //!
 //! The page does not follow the file: a refresh of the page under it leaves
 //! what was typed alone. If the profile is deleted by a sync while the page is
@@ -69,8 +71,20 @@ const NEW_TITLE: &str = "New Startup Sequence";
 pub(super) enum Owner {
     /// The profile with this id: the profile file.
     Profile(String),
-    /// Local terminal (issue #13): the settings file.
+    /// Local terminal (issue #13): its own file ([`local_terminal`]).
     Local,
+}
+
+impl Owner {
+    /// What the page says when the sequence it was opened on is not what its
+    /// owner's file holds any more: a profile's may have been changed by a
+    /// sync, Local terminal's never are.
+    fn changed(&self) -> &'static str {
+        match self {
+            Owner::Profile(_) => form::SEQUENCE_CHANGED,
+            Owner::Local => local_terminal::LOCAL_SEQUENCE_CHANGED,
+        }
+    }
 }
 
 /// Widgets and state of an open sub-page.
@@ -150,7 +164,7 @@ fn push(
             reloaded.map_err(|err| format!("Could not read the profile file: {err}"))?;
             form::sequences_of(&ctx.store.borrow(), id)?
         }
-        Owner::Local => ctx.settings().local_terminal.sequences,
+        Owner::Local => ctx.local_terminal().sequences,
     };
     let original = match index {
         None => None,
@@ -158,7 +172,7 @@ fn push(
             current
                 .get(i)
                 .cloned()
-                .ok_or_else(|| form::SEQUENCE_CHANGED.to_owned())?,
+                .ok_or_else(|| owner.changed().to_owned())?,
         ),
     };
 
@@ -424,8 +438,8 @@ impl Inner {
         );
     }
 
-    /// [`apply`](Self::apply) for Local terminal, in the settings file on the
-    /// main thread: back at once (module docs).
+    /// [`apply`](Self::apply) for Local terminal, in its own file on the main
+    /// thread: back at once (module docs).
     fn apply_local(
         self: &Rc<Self>,
         change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence>,
@@ -437,7 +451,7 @@ impl Inner {
         let target = self.index.get().zip(self.original.clone());
         let target = target.as_ref().map(|(index, sequence)| (*index, sequence));
         let result =
-            local_terminal::apply_sequences(&self.ctx.settings_path, target, change, follow);
+            local_terminal::apply_sequences(&self.ctx.local_terminal_path, target, change, follow);
         self.saving.end();
         self.set_waiting(false);
         match result {
@@ -465,7 +479,7 @@ impl Inner {
         self.error.set_label(message);
         self.error.set_visible(true);
         self.ctx.notice.show_near(&self.error, message);
-        if message == form::GONE || message == form::SEQUENCE_CHANGED {
+        if message == form::GONE || message == self.owner.changed() {
             self.ctx.profiles_changed();
         }
     }

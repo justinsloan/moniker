@@ -12,11 +12,11 @@
 //! always shown whatever the search: it is not a profile, and nothing about
 //! it is in the profile file. It shows the Local terminal page
 //! ([`local_page`]): Local terminal's startup sequences, its default and its
-//! own "Save transcript" switch, kept in the GUI settings file and never
-//! synced. Below the profiles, the sidebar has a Sync entry: it shows the sync
-//! page ([`sync_page`]) in the content pane ([`present_sync`] opens the window
-//! on it). Selecting one of the three (a profile, Local terminal, Sync)
-//! unselects the other two.
+//! own "Save transcript" switch, kept in a file of their own on this machine
+//! ([`crate::local_terminal`]) and never synced. Below the profiles, the
+//! sidebar has a Sync entry: it shows the sync page ([`sync_page`]) in the
+//! content pane ([`present_sync`] opens the window on it). Selecting one of
+//! the three (a profile, Local terminal, Sync) unselects the other two.
 //!
 //! One Connection Profiles window per application ([`present`]). It is not
 //! modal and stays open while sessions start from it: double click or Enter on
@@ -24,15 +24,15 @@
 //! [`ConnectFn`] the window was opened with, with the profile's default
 //! sequence if it has one (issue #12). On the Local terminal entry the same
 //! button reads Open, and it, a double click or Enter hand Local terminal to
-//! it ([`Pick::Local`]) with its default sequence, as the settings file has
-//! them at that moment.
+//! it ([`Pick::Local`]) with its default sequence, as its file has them at
+//! that moment.
 //!
 //! The window follows the profile file through
 //! [`AppContext::on_profiles_changed`]: the sidebar is rebuilt (keeping the
 //! selection while that profile exists), rows without an unapplied edit show
 //! the new values, and a selected profile that a sync deleted leaves an empty
 //! state. A change to Local terminal tells the same listeners, and the Local
-//! terminal page then shows the settings file again. An open sub-page keeps
+//! terminal page then shows its file again. An open sub-page keeps
 //! its text through a refresh, and stays open if its profile is deleted
 //! (saving then says so); selecting another entry closes it.
 //!
@@ -583,12 +583,12 @@ impl State {
 
     /// Open Local terminal the way the window was told to, running its default
     /// sequence if it has one, with a transcript as its own switch and "Save
-    /// transcripts of all sessions" say: as the settings file has them now
-    /// (the double click, Enter and the Open button all come here).
+    /// transcripts of all sessions" say: as their files have them now (the
+    /// double click, Enter and the Open button all come here).
     fn open_local(&self) {
-        let settings = self.ctx.settings();
-        let save = default_local_save(&settings);
-        let sequence = settings.local_terminal.default_sequence().cloned();
+        let local = self.ctx.local_terminal();
+        let save = default_local_save(&local, self.ctx.settings().save_all_transcripts);
+        let sequence = local.default_sequence().cloned();
         (self.connect)(Pick::Local { sequence }, save);
     }
 
@@ -602,7 +602,7 @@ impl State {
         }
         self.leave_sync();
         self.nav.pop_to_tag(PROFILE_TAG);
-        let page = LocalPage::new(&self.ctx, &self.ctx.settings().local_terminal);
+        let page = LocalPage::new(&self.ctx, &self.ctx.local_terminal());
         self.body.set_content(Some(&page.widget));
         // Replacing the profile page drops it, which saves a port change
         // still settling there and empties its password row.
@@ -718,14 +718,14 @@ impl State {
 
     /// The profile file changed (the store is already reloaded), or Local
     /// terminal did: rebuild the sidebar and update the page (the Local
-    /// terminal page from the settings file), or leave an empty state if the
+    /// terminal page from its own file), or leave an empty state if the
     /// selected profile is gone.
     fn refresh(&self) {
         self.rebuild_sidebar();
         // Bind first so the borrow ends before the page is refreshed.
         let local_page = self.local_page.borrow().clone();
         if let Some(local_page) = local_page {
-            local_page.refresh(&self.ctx.settings().local_terminal);
+            local_page.refresh(&self.ctx.local_terminal());
         }
         let selected = self.selected.borrow().clone();
         let Some(id) = selected else {

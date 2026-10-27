@@ -17,7 +17,7 @@
 //! one session's transcript is reachable by keyboard.
 //!
 //! Profile names and sequence names come from other machines through sync, and
-//! Local terminal's from a settings file that can be edited by hand: every
+//! Local terminal's from a file that can be edited by hand: every
 //! label here has Pango markup off.
 
 use std::rc::Rc;
@@ -61,7 +61,7 @@ fn entries(profile: &Profile) -> Vec<(String, Option<usize>)> {
 /// What the Local terminal's choices offer for its startup `sequences`: with
 /// none, "Open" alone (`None`); with some, "Just open" (`None`), then each
 /// sequence by name, carrying the sequence itself, so what runs is what was
-/// shown even if the settings file changes before the click.
+/// shown even if its file changes before the click.
 fn local_entries(sequences: &[StartupSequence]) -> Vec<(String, Option<StartupSequence>)> {
     if sequences.is_empty() {
         return vec![(OPEN_LABEL.to_owned(), None)];

@@ -11,6 +11,11 @@
 //! progress registers with [`AppContext::on_sync_event`] and hears when any
 //! sync starts and ends, whichever part of the app started it.
 //!
+//! It knows where this machine's own files are, beside the profile file: the
+//! GUI settings ([`AppContext::settings`]) and Local terminal's startup
+//! sequences and switch ([`AppContext::local_terminal`], issue #13), and reads
+//! each afresh every time it is asked, so a change made anywhere shows at once.
+//!
 //! Messages are plain text: they can contain a profile name or an error that
 //! quotes one, and those come from sync data. The area shows them on a label, and
 //! the Preferences dialog in a toast, both with Pango markup off.
@@ -30,6 +35,7 @@ use moniker_core::secrets::{KeyringSecretStore, SecretStore};
 use moniker_core::store::{ProfileStore, StoreError};
 use moniker_core::transcript;
 
+use crate::local_terminal::{self, LocalTerminal};
 use crate::notify::{self, NotificationArea};
 use crate::settings::{self, GuiSettings};
 use crate::sync::SyncEvent;
@@ -133,6 +139,9 @@ pub struct AppContext {
     /// The GUI's settings file ([`settings`]): the sync partner and the
     /// automatic-sync switch. Beside the profile file.
     pub settings_path: PathBuf,
+    /// Local terminal's file ([`local_terminal`]): its startup sequences,
+    /// default and "Save transcript" switch. Beside the settings file.
+    pub local_terminal_path: PathBuf,
     /// Saves of the sync switch (the sync page's row) that have not come back,
     /// and the value the last of them carries. See
     /// [`ask_sync_switch`](Self::ask_sync_switch).
@@ -190,10 +199,11 @@ impl AppContext {
 
     /// A context over the given store, secret store and helper path, with no
     /// overlay attached and nobody listening yet. Tests use it with a
-    /// temporary store and an in-memory secret store; the settings file is the
-    /// one beside the store, as in the app. The secret store is watched: every
-    /// call made on the thread that makes the context (the main thread, in the
-    /// window tests) is counted (`keyring::MainThreadWatch`).
+    /// temporary store and an in-memory secret store; the settings file and
+    /// Local terminal's are the ones beside the store, as in the app. The
+    /// secret store is watched: every call made on the thread that makes the
+    /// context (the main thread, in the window tests) is counted
+    /// (`keyring::MainThreadWatch`).
     #[cfg(test)]
     pub fn with_parts(
         store: ProfileStore,
@@ -223,6 +233,7 @@ impl AppContext {
         runtime_dir: Option<PathBuf>,
     ) -> AppContext {
         let pings = settings::load(&settings_path).ping_hosts;
+        let local_terminal_path = settings_path.with_file_name(local_terminal::FILE_NAME);
         AppContext {
             hosts: crate::hosts::Hosts::new(pings, host_check()),
             store: RefCell::new(ProfileSnapshot(store)),
@@ -232,6 +243,7 @@ impl AppContext {
             notice: Notice::default(),
             sync_running: Cell::new(false),
             settings_path,
+            local_terminal_path,
             sync_switch_saves: Cell::new(0),
             sync_switch_asked: Cell::new(true),
             listeners: RefCell::new(Vec::new()),
@@ -260,6 +272,14 @@ impl AppContext {
     /// anywhere shows the next time this is asked.
     pub fn settings(&self) -> GuiSettings {
         settings::load(&self.settings_path)
+    }
+
+    /// Local terminal's startup sequences, default and "Save transcript"
+    /// switch, read from its file now (a missing or unusable file is the
+    /// default: [`local_terminal::load`]). Nothing is cached, so a change made
+    /// anywhere shows the next time this is asked.
+    pub fn local_terminal(&self) -> LocalTerminal {
+        local_terminal::load(&self.local_terminal_path)
     }
 
     /// Where transcripts are saved and listed: the folder chosen in the
@@ -723,6 +743,28 @@ mod tests {
         let now = ctx.settings();
         assert!(now.save_all_transcripts);
         assert_eq!(now.scrollback_lines, 2_000);
+    }
+
+    #[test]
+    fn local_terminal_is_read_from_its_own_file_each_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context_in(dir.path());
+        assert_eq!(
+            ctx.local_terminal_path,
+            dir.path().join("local-terminal.json"),
+            "beside the profile file and the settings file"
+        );
+        assert_eq!(
+            ctx.local_terminal(),
+            LocalTerminal::default(),
+            "no file yet"
+        );
+
+        local_terminal::set_transcript(&ctx.local_terminal_path, true).unwrap();
+        assert!(ctx.local_terminal().transcript);
+        assert!(!ctx.settings_path.exists(), "not the settings file");
+        local_terminal::set_transcript(&ctx.local_terminal_path, false).unwrap();
+        assert!(!ctx.local_terminal().transcript);
     }
 
     #[test]

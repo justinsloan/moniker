@@ -1,18 +1,19 @@
 //! Scenarios: startup sequences for the local terminal (issue #13). A plain
 //! pick of Local terminal in the new-tab list runs its default sequence and
 //! leaves an interactive shell; the choices behind its "›" offer "Just open"
-//! and each sequence, built from the settings file each time they open, with a
-//! "Save transcript" box that starts as Local terminal's own switch and "Save
-//! transcripts of all sessions" say; a sequence's tab ends as a connection's
-//! does; a shell whose path has a space still runs one; a window's first tab
-//! runs none but follows the switch; a restored local pane runs the default in
-//! its folder.
+//! and each sequence, built from Local terminal's file each time they open,
+//! with a "Save transcript" box that starts as Local terminal's own switch and
+//! "Save transcripts of all sessions" say; a sequence's tab ends as a
+//! connection's does; a shell whose path has a space still runs one; a
+//! window's first tab runs none but follows the switch; a restored local pane
+//! runs the default in its folder.
 //!
-//! Every scenario writes Local terminal's settings into its own settings file
-//! before it opens anything, and some change them while a list is up, to see
-//! that the list reads the file at the pick. The window suite has no `$SHELL`,
-//! so the shell is `/bin/sh`. Markers are printed with `printf 'X-%s\n' y`, so
-//! the command line the terminal echoes never holds the text waited for.
+//! Every scenario writes Local terminal's file (`local-terminal.json`, beside
+//! its own profile file) before it opens anything, and some change it while a
+//! list is up, to see that the list reads the file at the pick. The window
+//! suite has no `$SHELL`, so the shell is `/bin/sh`. Markers are printed with
+//! `printf 'X-%s\n' y`, so the command line the terminal echoes never holds
+//! the text waited for.
 
 use std::fs;
 use std::path::Path;
@@ -36,13 +37,13 @@ use super::{
     wait_for_text,
 };
 use crate::context::AppContext;
-use crate::local_terminal::LocalTerminal;
+use crate::local_terminal::{self, LocalTerminal};
 use crate::session_file::{self, Kind, Node, TabRecord};
 use crate::session_layout::{capture, restore};
 use crate::terminal_tab::{
     new_holder_page, open_local_pick, start_sequence_in, terminal_of, terminal_text,
 };
-use crate::{connect_menu, new_tab, settings, window};
+use crate::{connect_menu, new_tab, window};
 
 fn seq(name: &str, commands: &[&str]) -> StartupSequence {
     StartupSequence {
@@ -62,21 +63,21 @@ fn other() -> StartupSequence {
 }
 
 /// Put Local terminal's `sequences`, its `default` and its own "Save
-/// transcript" switch into the settings file of `ctx`, keeping the rest.
+/// transcript" switch into its file beside the profile file of `ctx`.
 fn set_local(
     ctx: &AppContext,
     sequences: &[StartupSequence],
     default: Option<usize>,
     transcript: bool,
 ) {
-    settings::update(&ctx.settings_path, |s| {
-        s.local_terminal = LocalTerminal {
+    local_terminal::update(&ctx.local_terminal_path, |local| {
+        *local = LocalTerminal {
             sequences: sequences.to_vec(),
             startup_sequence: default,
             transcript,
         };
     })
-    .expect("write the settings");
+    .expect("write Local terminal's file");
 }
 
 /// A new tab in `view` showing the new-tab list, and its search entry.
@@ -198,13 +199,13 @@ fn labels(column: &gtk::Widget) -> Vec<String> {
 
 /// The choices behind Local terminal's "›": with sequences, "Just open" (a
 /// shell, no sequence, whatever the default) and each sequence by name (that
-/// one only); with none, "Open". They are built from the settings file each
-/// time they open, so a change made while the list is up shows, and the "Save
-/// transcript" box starts checked when Local terminal's own switch or "Save
-/// transcripts of all sessions" is on. With its own switch on, a plain pick
-/// saves a transcript too. The new tab the Connection Profiles window's Open
-/// will make (`open_local_pick`) runs the sequence it is given and saves a
-/// transcript when asked.
+/// one only); with none, "Open". They are built from Local terminal's file
+/// each time they open, so a change made while the list is up shows, and the
+/// "Save transcript" box starts checked when Local terminal's own switch or
+/// "Save transcripts of all sessions" is on. With its own switch on, a plain
+/// pick saves a transcript too. The new tab the Connection Profiles window's
+/// Open will make (`open_local_pick`) runs the sequence it is given and saves
+/// a transcript when asked.
 pub(super) fn the_choices_offer_just_open_and_each_sequence(dir: &Path) {
     let transcripts = dir.join("transcripts");
     let ctx = ctx_with(dir, &[]);

@@ -32,8 +32,9 @@ impl StartupSequence {
     /// Whether the sequence is safe to store and to run: a name that is not
     /// blank and has no control character, and commands without a newline or a
     /// NUL. These are the rules [`Profile::validate`] applies to each of a
-    /// profile's sequences; the local terminal's sequences, which are kept in
-    /// the GUI settings and not in a profile, follow the same ones.
+    /// profile's sequences; the local terminal's sequences, which the GUI keeps
+    /// in a file of their own on this machine and not in a profile, follow the
+    /// same ones.
     pub fn check(&self) -> Result<(), ProfileError> {
         if self.name.trim().is_empty() || has_control_char(&self.name) {
             return Err(ProfileError::SequenceName);

@@ -3,9 +3,8 @@
 //! automatically on launch, the text size the next launch starts at, and the
 //! Preferences (terminal font, scrollback lines, whether to show the Sessions
 //! button, whether to ping the saved hosts, whether to save a transcript of
-//! every session, and the transcripts folder), and Local terminal's own startup
-//! sequences, default sequence and transcript switch ([`crate::local_terminal`],
-//! one field, `local_terminal`, left out of the file while it holds nothing).
+//! every session, and the transcripts folder). Local terminal's startup
+//! sequences are not here but in a file of their own ([`crate::local_terminal`]).
 //!
 //! They live in `gui-settings.json` next to `profiles.json` ([`default_path`]),
 //! not in it: they describe this machine only, so they are never synced. The
@@ -42,7 +41,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use moniker_core::store::ProfileStore;
 use serde::Serialize;
 
-use crate::local_terminal::LocalTerminal;
 use crate::zoom;
 
 /// The settings file's name, beside `profiles.json`.
@@ -98,11 +96,6 @@ pub struct GuiSettings {
     pub profiles_window: Option<WindowSize>,
     /// The same for the Transcripts window.
     pub transcripts_window: Option<WindowSize>,
-    /// Local terminal's startup sequences, default sequence and transcript
-    /// switch (issue #13). Kept here, never in `profiles.json`, so it is never
-    /// synced; not written while it is the default.
-    #[serde(skip_serializing_if = "LocalTerminal::is_default")]
-    pub local_terminal: LocalTerminal,
 }
 
 /// A window's size as it was when it closed: its size when not maximized or
@@ -212,7 +205,6 @@ impl GuiSettings {
             transcripts_window: fields
                 .get("transcripts_window")
                 .and_then(WindowSize::from_json),
-            local_terminal: LocalTerminal::from_value(fields.get("local_terminal")),
         })
     }
 }
@@ -251,7 +243,6 @@ impl Default for GuiSettings {
             main_window: None,
             profiles_window: None,
             transcripts_window: None,
-            local_terminal: LocalTerminal::default(),
         }
     }
 }
@@ -301,8 +292,9 @@ pub fn save(path: &Path, settings: &GuiSettings) -> io::Result<()> {
 /// Write `bytes` to `path` so readers see the old file or the new one, never
 /// part of one: a temporary file in the same directory, created with mode
 /// 0600, fsynced, then renamed over `path`. The directory is created (mode
-/// 0700) if it is missing. Both of this machine's own files, the settings and
-/// the saved sessions ([`crate::session_file`]), are written through here.
+/// 0700) if it is missing. This machine's own files, the settings, the saved
+/// sessions ([`crate::session_file`]) and Local terminal's
+/// ([`crate::local_terminal`]), are written through here.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path
         .parent()
@@ -391,19 +383,6 @@ mod tests {
         fs::metadata(path).unwrap().permissions().mode() & 0o777
     }
 
-    /// Local terminal's settings with something in every field, for the tests
-    /// that check a write keeps (or round-trips) the whole file.
-    fn a_local_terminal() -> LocalTerminal {
-        LocalTerminal {
-            sequences: vec![moniker_core::profile::StartupSequence {
-                name: "Update".to_owned(),
-                commands: vec!["sudo apt update".to_owned(), "uptime".to_owned()],
-            }],
-            startup_sequence: Some(0),
-            transcript: true,
-        }
-    }
-
     #[test]
     fn settings_round_trip_with_mode_0600() {
         let dir = tempfile::tempdir().unwrap();
@@ -430,7 +409,6 @@ mod tests {
                 maximized: false,
             }),
             transcripts_window: None,
-            local_terminal: a_local_terminal(),
         };
         save(&path, &settings).unwrap();
         assert_eq!(load(&path), settings);
@@ -611,7 +589,6 @@ mod tests {
             }),
             profiles_window: None,
             transcripts_window: None,
-            local_terminal: a_local_terminal(),
         };
         save(&path, &before).unwrap();
         save_font_scale(&path, 1.5).unwrap();
@@ -1012,7 +989,6 @@ mod tests {
             }),
             profiles_window: None,
             transcripts_window: None,
-            local_terminal: a_local_terminal(),
         };
         save(&path, &before).unwrap();
 
