@@ -1,8 +1,8 @@
 //! The Layouts menu beside ＋ in a main window (issue #12, named Sessions
 //! until issue #16): the layouts of windows that were saved
-//! ([`crate::session_file`]), added back to this window with a click, and the
-//! questions that save this window as a layout, rename a saved one and delete
-//! it. The code and the file call a layout a session; the interface says
+//! ([`crate::session_file`]), opened again in a new window with a click, and
+//! the questions that save this window as a layout, rename a saved one and
+//! delete it. The code and the file call a layout a session; the interface says
 //! layout, because "session" means a running connection everywhere else.
 //!
 //! The button reads "Layouts", then an icon of several windows, then the
@@ -15,27 +15,33 @@
 //! shows, so it lists what is saved now, whichever window saved it: each
 //! layout by name (sorted ignoring case) with a › for Rename… and Delete…, or
 //! "No saved layouts", or why the file cannot be read; then Save Layout…. A
-//! click on a layout adds its tabs to this window ([`session_layout::restore`]).
+//! click on a layout opens a new window holding its tabs and nothing else
+//! ([`window::open_layout`], issue #16; until then it added them to the window
+//! the menu was in). The window the menu was in is not changed: its tabs and
+//! selection stay, and its keyboard goes back to its terminal (below).
 //!
 //! Nothing here keeps what the file said for later: the file is read again at
 //! every decision, because another window may have changed it since the menu
-//! was built. A pick reads the layout as it is then (a replaced one adds the
-//! layout now saved, a deleted one says so); Save asks "Replace" when the name
-//! is in use or the file unreadable *as it is when Save is answered*, and
-//! captures the window when the answer is final, not when the dialog opened.
-//! A file that cannot be read is never written over without asking.
+//! was built. A pick reads the layout as it is then (a replaced one opens the
+//! layout now saved, a deleted one says so and opens no window); Save asks
+//! "Replace" when the name is in use or the file unreadable *as it is when Save
+//! is answered*, and captures the window when the answer is final, not when the
+//! dialog opened. A file that cannot be read is never written over without
+//! asking.
 //!
 //! A pick and every question wait for the closing menu to hand the keyboard
 //! focus back (`terminal_tab::after_the_menu_lets_go`): a dialog opened too soon
-//! loses the keyboard to one of its buttons, and a restored pane that takes the
-//! keyboard would have it taken back by the closing menu.
+//! loses the keyboard to one of its buttons, and a closing menu takes the
+//! keyboard back from whatever was given it too soon.
 //!
 //! When a question closes, whatever the answer (its action, Cancel or Escape),
 //! the keyboard goes back to the terminal: the focused pane of the tab in front
 //! (user, 2026-10-26), not the Layouts button, where libadwaita puts it back
 //! for a menu button. Only if that pane may have it (`panes::in_front`): not
-//! while another question is open, as the next one of a chain is. A pick keeps
-//! its own rule: the restored tab's recorded pane takes it
+//! while another question is open, as the next one of a chain is. A pick does
+//! the same for the window the menu was in, whether it opens a new window or
+//! says why it cannot (builder's call, extending that rule to a pick); the new
+//! window's own keyboard goes to the recorded pane of its first tab
 //! ([`session_layout::restore`]).
 //!
 //! Layout names are chosen by the person but may come from a file that was
@@ -62,7 +68,7 @@ use crate::panes;
 use crate::session_file::{self, Loaded, Session};
 use crate::session_layout;
 use crate::terminal_tab::{self, after_the_menu_lets_go};
-use crate::window::MainWindow;
+use crate::window::{self, MainWindow};
 
 /// Widget name of the box that holds one saved layout's button and its › in
 /// the menu (tests look for it).
@@ -98,8 +104,9 @@ pub(crate) fn sessions_path(ctx: &AppContext) -> PathBuf {
 /// The Layouts button for `main`: "Layouts", an icon of several windows and
 /// the drop-down arrow, shown unless the Preferences turned it off
 /// ([`show_buttons`]). Its popover lists the saved layouts (module docs), and
-/// a pick adds one's tabs to `main.view`. It holds the window's view and
-/// notification area weakly: the window owns the button.
+/// a pick opens one in a new window of the application `main` belongs to. It
+/// holds the application, the window's view and its notification area weakly:
+/// the window owns the button.
 pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton {
     let popover = gtk::Popover::new();
     let face = gtk::Box::builder().spacing(6).build();
@@ -144,6 +151,12 @@ pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton
     ));
     let menu = Rc::new(Menu {
         ctx: Rc::clone(ctx),
+        app: main
+            .window
+            .application()
+            .and_downcast::<adw::Application>()
+            .map(|app| app.downgrade())
+            .unwrap_or_default(),
         view: main.view.downgrade(),
         area: main.notifications.downgrade(),
         button: button.downgrade(),
@@ -206,7 +219,10 @@ fn keyboard_to_the_terminal(view: &glib::WeakRef<adw::TabView>) {
 /// What the menu's closures share. Nothing here is a snapshot of the file.
 struct Menu {
     ctx: Rc<AppContext>,
-    /// The tabs a pick adds to.
+    /// The application a pick opens a window of.
+    app: glib::WeakRef<adw::Application>,
+    /// The tabs of the window the menu is in: what Save captures, and where
+    /// the keyboard goes back to.
     view: glib::WeakRef<adw::TabView>,
     /// Where messages appear: the window's own.
     area: glib::WeakRef<NotificationArea>,
@@ -296,7 +312,7 @@ impl Menu {
             .build()
     }
 
-    /// The row of the layout `name`: its button, which adds it, and a › with
+    /// The row of the layout `name`: its button, which opens it, and a › with
     /// Rename… and Delete….
     fn row(self: &Rc<Self>, outer: &gtk::Popover, name: &str) -> gtk::Box {
         let row = gtk::Box::builder().name(ROW_NAME).spacing(2).build();
@@ -367,25 +383,32 @@ impl Menu {
         after_the_menu_lets_go(self.window().as_ref(), move || then(&menu));
     }
 
-    /// Add the layout `name` to this window's tabs.
+    /// Open the layout `name` in a new window, once the closing menu has let go
+    /// of the keyboard.
     fn pick(self: &Rc<Self>, popover: &gtk::Popover, name: &str) {
         let name = name.to_owned();
-        self.leave(&[popover], move |menu| menu.add(&name));
+        self.leave(&[popover], move |menu| menu.open(&name));
     }
 
-    /// Add the layout `name`, as the file has it now.
-    fn add(&self, name: &str) {
+    /// Open the layout `name`, as the file has it now, in a new window
+    /// ([`window::open_layout`]). A file that cannot be read, or a layout that
+    /// has gone since the menu was built, opens nothing and is told in this
+    /// window. This window is not changed whichever it is, and its keyboard
+    /// goes back to its terminal, not to the Layouts button where the closing
+    /// menu left it.
+    fn open(&self, name: &str) {
         match session_file::load(&self.path()) {
             Loaded::Unreadable(why) => self.tell(&unreadable_text(&why)),
             Loaded::Sessions(sessions) => match sessions.iter().find(|s| s.name == name) {
                 Some(session) => {
-                    if let Some(view) = self.view.upgrade() {
-                        session_layout::restore(&view, &self.ctx, &session.tabs);
+                    if let Some(app) = self.app.upgrade() {
+                        window::open_layout(&app, &self.ctx, &session.tabs);
                     }
                 }
                 None => self.tell(session_file::GONE),
             },
         }
+        keyboard_to_the_terminal(&self.view);
     }
 
     /// Ask for a name to save this window under.

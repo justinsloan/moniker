@@ -780,7 +780,7 @@ fn canonical(dir: &Path) -> String {
 }
 
 /// How many main windows `app` has.
-fn main_windows(app: &adw::Application) -> usize {
+pub(super) fn main_windows(app: &adw::Application) -> usize {
     app.windows()
         .iter()
         .filter(|w| w.widget_name() == "moniker-main")

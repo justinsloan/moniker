@@ -2,16 +2,16 @@
 //!
 //! The header bar holds, left to right: ＋ (a new tab here showing the new-tab
 //! list, [`crate::new_tab`], where a saved profile becomes a session in that
-//! tab), Layouts (the saved layouts of windows, to add back to this one, and
-//! saving this one: [`crate::sessions_menu`]; the Preferences can hide it),
-//! the selected tab's title (after a record icon while that tab saves a
-//! transcript, `crate::panes`), and ☰ (the app's actions, which `main.rs`
-//! defines, under a zoom row for the selected tab's text size). There is no
-//! Connect button: connections come
-//! from the new-tab list and the Connection Profiles window.
-//! Below it the tab bar, which hides itself while there is one tab, so a fresh
-//! window looks like a plain terminal; then the tabs ([`crate::terminal_tab`])
-//! inside a notification area ([`crate::notify`]) attached to the context's
+//! tab), Layouts (the saved layouts of windows, each opened in a new window by
+//! [`open_layout`], and saving this one: [`crate::sessions_menu`]; the
+//! Preferences can hide it), the selected tab's title (after a record icon
+//! while that tab saves a transcript, `crate::panes`), and ☰ (the app's
+//! actions, which `main.rs` defines, under a zoom row for the selected tab's
+//! text size). There is no Connect button: connections come from the new-tab
+//! list and the Connection Profiles window. Below it the tab bar, which hides
+//! itself while there is one tab, so a fresh window looks like a plain
+//! terminal; then the tabs ([`crate::terminal_tab`]) inside a notification
+//! area ([`crate::notify`]) attached to the context's
 //! [`crate::context::Notice`], so messages appear at the top center of the
 //! terminal, below the bars.
 //!
@@ -66,6 +66,8 @@ use moniker_core::profile::Profile;
 use crate::context::AppContext;
 use crate::launch_args::Start;
 use crate::notify::NotificationArea;
+use crate::session_file::TabRecord;
+use crate::session_layout;
 use crate::sessions_menu;
 use crate::window_size::{self, Kind};
 use crate::{new_tab, panes, profiles, recordings, settings, terminal_tab, zoom};
@@ -98,7 +100,7 @@ pub struct MainWindow {
 
 impl MainWindow {
     /// The parts of `window`, if it is a main window.
-    fn of(window: &gtk::Window) -> Option<MainWindow> {
+    pub(crate) fn of(window: &gtk::Window) -> Option<MainWindow> {
         if window.widget_name() != WINDOW_NAME {
             return None;
         }
@@ -167,6 +169,32 @@ pub fn new_window_with(app: &adw::Application, ctx: &Rc<AppContext>, start: &Sta
     let main = build_with(app, ctx, start);
     main.window.present();
     main
+}
+
+/// Open a new main window holding exactly the saved layout `tabs` (issue #16;
+/// what a pick in the Layouts menu does, [`crate::sessions_menu`]), and present
+/// it, so it comes to the front. It is built empty and the layout is restored
+/// into it before it is shown ([`session_layout::restore`]: the first tab
+/// selected, its recorded pane given the keyboard, the connections asking the
+/// keyring in pane order), because the window closes when its last tab does and
+/// not before it had one ([`build_empty`]). It has no tab of its own, so what
+/// [`build_with`] says about a window's first tab does not apply: a restored
+/// local pane runs Local terminal's default sequence, as every restored one
+/// does. No window is opened for a layout with no tab (the file's reader never
+/// gives one), so none is left empty. It is an ordinary main window, at the
+/// size New Window uses, with its own Layouts menu.
+pub(crate) fn open_layout(
+    app: &adw::Application,
+    ctx: &Rc<AppContext>,
+    tabs: &[TabRecord],
+) -> Option<MainWindow> {
+    if tabs.is_empty() {
+        return None;
+    }
+    let main = build_empty(app, ctx);
+    session_layout::restore(&main.view, ctx, tabs);
+    main.window.present();
+    Some(main)
 }
 
 /// Build a main window with no tab yet. Its first tab must come before it is

@@ -13,10 +13,10 @@
 //! same way.
 //!
 //! The Layouts menu beside ＋ (the last scenarios) is how a person does it:
-//! saving a window under a name, adding a saved layout to another window,
-//! renaming and deleting, the questions each asks, a name in use, a file that
-//! cannot be read, two windows saving at once, a layout gone since the menu
-//! was built, and a write that fails.
+//! saving a window under a name, opening a saved layout in a new window (issue
+//! #16), renaming and deleting, the questions each asks, a name in use, a file
+//! that cannot be read, two windows saving at once, a layout gone since the
+//! menu was built, and a write that fails.
 
 use std::cell::RefCell;
 use std::fs;
@@ -37,7 +37,7 @@ use vte4::Terminal;
 use vte4::prelude::*;
 use zeroize::Zeroizing;
 
-use super::main_window::{ctx_with, ctx_with_secrets, test_app};
+use super::main_window::{ctx_with, ctx_with_secrets, main_windows, test_app};
 use super::windows::{list_in, main_window, named, row, ssh_args};
 use super::{
     HeldKeyring, MARKUP_NAME, all_widgets, button_labeled, close_popover, fake_shell, fake_ssh,
@@ -1565,13 +1565,38 @@ pub(super) fn the_sessions_button_can_be_hidden(dir: &Path) {
     pump_for(Duration::from_millis(200));
 }
 
-/// A window saved from the menu and added to another from its menu: Save
-/// Layout\u{2026} names it (the first free "Layout N" to start with, a name of
-/// nothing refused with the reason, Enter answering Save) and saves the window
-/// as it is when Save is answered; the other window's menu, rebuilt each time it
-/// opens, then lists it, and picking it adds its tabs after the window's own,
-/// the first added selected, connecting the profile's pane.
-pub(super) fn saving_and_adding_from_the_menu(bin: &Path, dir: &Path) {
+/// The one main window of `app` that is none of `known`, once it is there.
+pub(super) fn the_new_window(
+    app: &adw::Application,
+    known: &[&window::MainWindow],
+) -> window::MainWindow {
+    let new = || {
+        let mut found: Vec<_> = app
+            .windows()
+            .iter()
+            .filter(|window| {
+                known
+                    .iter()
+                    .all(|main| main.window.upcast_ref::<gtk::Window>() != *window)
+            })
+            .filter_map(window::MainWindow::of)
+            .collect();
+        if found.len() == 1 { found.pop() } else { None }
+    };
+    pump_until("exactly one new main window", || new().is_some());
+    new().expect("the new window")
+}
+
+/// A window saved from the menu and opened from another window's menu (issue
+/// #16): Save Layout… names it (the first free "Layout N" to start with, a
+/// name of nothing refused with the reason, Enter answering Save) and saves the
+/// window as it is when Save is answered; the other window's menu, rebuilt each
+/// time it opens, then lists it, and picking it opens a new window holding
+/// exactly the layout's tabs, the first selected and its recorded pane with the
+/// keyboard, connecting the profile's pane, presented, while the window the menu
+/// was in is as it was with its keyboard back in its terminal. Picked twice, it
+/// opens two windows.
+pub(super) fn saving_and_opening_from_the_menu(bin: &Path, dir: &Path) {
     let fake = fake_ssh(bin, "menu-ssh", "echo FAKE-END\nexec sleep 600");
     let mut web = profile(&[]);
     web.name = "web".to_owned();
@@ -1653,29 +1678,63 @@ pub(super) fn saving_and_adding_from_the_menu(bin: &Path, dir: &Path) {
     assert_eq!(*kind_of(&sessions[0].tabs[2]), Kind::List);
     assert_eq!(a.view.n_pages(), 3, "A is as it was");
 
-    // B's menu is rebuilt as it opens: it lists the session now, and picking
-    // it adds the tabs after B's own, the first added selected.
+    // B's menu is rebuilt as it opens: it lists the layout now, and picking it
+    // opens a new window holding exactly its tabs.
     let popover = open_menu(&b);
     assert_eq!(listed(&popover), ["Work"]);
     literal_labels("the menu", &popover, "Work");
+    let before = main_windows(&app);
     pick_session(&popover, "Work");
     assert_eq!(
-        b.view.n_pages(),
-        1,
-        "added once the menu has let go of the keyboard"
+        main_windows(&app),
+        before,
+        "opened once the menu has let go of the keyboard"
     );
-    pump_until("the tabs to be added", || b.view.n_pages() == 4);
-    pump_until("the menu to close", || !popover.is_visible());
-    assert_eq!(b.view.selected_page().as_ref(), Some(&b.view.nth_page(1)));
-    let terminal = session_in(&pane(&b.view.nth_page(2)));
+    pump_until("the layout's window", || main_windows(&app) == before + 1);
+    let w = the_new_window(&app, &[&a, &b]);
+    assert!(w.window.is_visible(), "presented");
+    assert_eq!(w.view.n_pages(), 3, "the layout's tabs and nothing else");
+    assert_eq!(w.view.selected_page().as_ref(), Some(&w.view.nth_page(0)));
+    assert!(
+        keyboard_in_the_focused_pane(&w),
+        "the keyboard in the recorded focused pane of its first tab"
+    );
+    let terminal = session_in(&pane(&w.view.nth_page(1)));
     wait_for_text(&terminal, "FAKE-END");
     assert!(ssh_args(&terminal).contains(&format!("{}@{}", web.username, web.host)));
-    assert!(list_in(&b.view.nth_page(3)).is_some(), "the list tab");
-    assert_eq!(a.view.n_pages(), 3, "A is still as it was");
+    assert!(list_in(&w.view.nth_page(2)).is_some(), "the list tab");
+    assert_eq!(b.view.n_pages(), 1, "B is as it was");
+    assert_eq!(a.view.n_pages(), 3, "A is as it was");
+    pump_until("the menu to close", || !popover.is_visible());
+    assert_keyboard_back(&b, "a pick");
+
+    // A layout picked twice opens two windows.
+    let popover = open_menu(&b);
+    pick_session(&popover, "Work");
+    pump_until("a second window", || main_windows(&app) == before + 2);
+    assert_eq!(b.view.n_pages(), 1, "B is still as it was");
+    assert_eq!(w.view.n_pages(), 3, "the first window of the layout is too");
+    assert_keyboard_back(&b, "a second pick");
 
     set_test_ssh_program(None);
+    for window in app.windows() {
+        window.destroy();
+    }
+    pump_for(Duration::from_millis(200));
+}
+
+/// A layout with no tab (the file's reader never gives one, a caller could)
+/// opens no window: none is left empty.
+pub(super) fn opening_no_tabs_opens_no_window(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let before = main_windows(&app);
+    assert!(window::open_layout(&app, &ctx, &[]).is_none());
+    pump_for(Duration::from_millis(200));
+    assert_eq!(main_windows(&app), before, "no window");
+    assert_eq!(a.view.n_pages(), 1, "A is as it was");
     a.window.destroy();
-    b.window.destroy();
     pump_for(Duration::from_millis(200));
 }
 
@@ -1977,9 +2036,9 @@ pub(super) fn two_windows_saving_keep_both(dir: &Path) {
 }
 
 /// A session gone or changed since the menu was built: picking reads the file
-/// again, so a replaced session adds the layout now saved, and one that is
-/// gone says so and adds nothing; renaming a gone one says so and writes
-/// nothing. What is told appears in the window the menu is in, also when
+/// again, so a replaced layout opens a window with the layout now saved, and one
+/// that is gone says so and opens no window; renaming a gone one says so and
+/// writes nothing. What is told appears in the window the menu is in, also when
 /// another window that was opened earlier has the keyboard too.
 pub(super) fn a_session_changed_since_the_menu_opened_is_read_again(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
@@ -1995,20 +2054,36 @@ pub(super) fn a_session_changed_since_the_menu_opened_is_read_again(dir: &Path) 
         tabs
     };
 
-    // Replaced by another window while the menu is open: the layout now saved.
+    // Replaced by another window while the menu is open: a new window opens
+    // with the layout now saved, and A is as it was.
     let popover = open_menu(&a);
     assert_eq!(listed(&popover), ["Keep", "Work"]);
     save_as(&file, "Keep", two_tabs);
+    let windows = main_windows(&app);
     pick_session(&popover, "Keep");
-    pump_until("the two tabs", || a.view.n_pages() == 3);
+    pump_until("the layout's window", || main_windows(&app) == windows + 1);
+    let opened = the_new_window(&app, &[&other, &a]);
+    assert_eq!(opened.view.n_pages(), 2, "the layout now saved, two tabs");
+    assert_eq!(a.view.n_pages(), 1, "A is as it was");
+    opened.window.destroy();
+    pump_until("the window to go", || main_windows(&app) == windows);
+    assert_keyboard_back(&a, "the pick");
 
-    // Deleted meanwhile: told, and nothing added.
+    // Deleted meanwhile, with the new-tab list in front: told, no window, and
+    // the keyboard goes to the list's pane, not to the Layouts button.
+    new_tab::open(&a.view, &ctx);
+    assert!(list_in(&a.view.nth_page(1)).is_some(), "the list in front");
     let popover = open_menu(&a);
     session_file::delete(&file, "Work").expect("another window deletes it");
     let since = ctx.notice.delivered();
     pick_session(&popover, "Work");
     assert_eq!(told(&ctx, &a, since), "That layout is no longer saved.");
-    assert_eq!(a.view.n_pages(), 3, "nothing added");
+    pump_for(Duration::from_millis(300));
+    assert_eq!(main_windows(&app), windows, "no window opened");
+    assert_eq!(a.view.n_pages(), 2, "nothing added");
+    assert_keyboard_back(&a, "the pick of a layout that has gone");
+    a.view.close_page(&a.view.nth_page(1));
+    pump_until("the list tab to close", || a.view.n_pages() == 1);
 
     // Renaming one that is gone: told, nothing written.
     let popover = open_menu(&a);
@@ -2348,20 +2423,25 @@ pub(super) fn a_file_repaired_while_asking_still_asks_about_a_name(dir: &Path) {
     pump_for(Duration::from_millis(200));
 }
 
-/// A session picked after the file went bad (the menu was built before) is not
-/// added: what is wrong with the file is told, as for a menu opened then.
+/// A layout picked after the file went bad (the menu was built before) opens no
+/// window: what is wrong with the file is told in the window the menu is in, as
+/// for a menu opened then, and that window's keyboard goes back to its pane, the
+/// new-tab list's here, not to the Layouts button.
 pub(super) fn a_pick_after_the_file_went_bad_is_told(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
     let a = main_window(&app, &ctx);
     let file = dir.join(session_file::FILE_NAME);
     save_as(&file, "Work", one_list_tab());
+    new_tab::open(&a.view, &ctx);
+    assert!(list_in(&a.view.nth_page(1)).is_some(), "the list in front");
     let popover = open_menu(&a);
     assert_eq!(listed(&popover), ["Work"]);
     fs::write(&file, "not json").expect("damage the file");
     let Loaded::Unreadable(why) = session_file::load(&file) else {
         panic!("the file cannot be read");
     };
+    let windows = main_windows(&app);
     let since = ctx.notice.delivered();
     pick_session(&popover, "Work");
     assert_eq!(
@@ -2369,7 +2449,9 @@ pub(super) fn a_pick_after_the_file_went_bad_is_told(dir: &Path) {
         format!("Could not read the saved layouts: {why}")
     );
     pump_for(Duration::from_millis(300));
-    assert_eq!(a.view.n_pages(), 1, "nothing added");
+    assert_eq!(main_windows(&app), windows, "no window opened");
+    assert_eq!(a.view.n_pages(), 2, "nothing added");
+    assert_keyboard_back(&a, "the pick of a file that cannot be read");
     assert_eq!(fs::read(&file).expect("the file"), b"not json", "kept");
     a.window.destroy();
     pump_for(Duration::from_millis(200));

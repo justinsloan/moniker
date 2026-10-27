@@ -1,8 +1,9 @@
 //! Saved layouts in a window (issue #12): a window's tabs and panes as the
-//! records a session keeps ([`capture`]), and records added back to a window
-//! as tabs ([`restore`]). The code and the file call a layout a session; the
-//! interface says layout (issue #16), because "session" means a running
-//! connection everywhere else.
+//! records a session keeps ([`capture`]), and records restored into a window as
+//! tabs ([`restore`]), which the Layouts menu does into a new window's empty
+//! view ([`crate::window::open_layout`], issue #16). The code and the file call
+//! a layout a session; the interface says layout (issue #16), because "session"
+//! means a running connection everywhere else.
 //!
 //! # Capturing
 //!
@@ -24,11 +25,14 @@
 //!
 //! # Restoring
 //!
-//! [`restore`] adds the tabs after the window's own, the first added selected.
-//! Each tab's panes are made at their recorded text sizes and arranged as
-//! recorded ([`panes::layout_from`]: a split takes its fraction once its tab is
-//! first shown, as a tab not selected has no size before), the recorded names
-//! given back as renames and the recorded pane made the focused one. Then the
+//! [`restore`] adds the tabs after the view's own, the first added selected;
+//! into the empty view of a new window (what a pick in the Layouts menu does,
+//! before the window is shown) they are all it has, and the window's keyboard
+//! goes to the first tab's recorded pane. Each tab's panes are made at their
+//! recorded text sizes and arranged as recorded ([`panes::layout_from`]: a
+//! split takes its fraction once its tab is first shown, as a tab not selected
+//! has no size before), the recorded names given back as renames and the
+//! recorded pane made the focused one. Then the
 //! panes are filled in reading order, tab after tab: a profile pane connects as
 //! a plain click does ([`terminal_tab::start_profile`], with the profile's
 //! default sequence), so the connections ask the keyring worker one after the
@@ -129,7 +133,9 @@ fn kept(text: &str) -> String {
 }
 
 /// Add `tabs` to `view`, after its own tabs, and select the first added
-/// (module docs).
+/// (module docs). The Layouts menu calls it on the empty view of a window it
+/// has just built ([`crate::window::open_layout`]); it works as well on a view
+/// that has tabs.
 pub(crate) fn restore(view: &adw::TabView, ctx: &Rc<AppContext>, tabs: &[TabRecord]) {
     // Read once: whether every session saves a transcript, and Local
     // terminal's default sequence and own switch.

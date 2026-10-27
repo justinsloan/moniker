@@ -466,7 +466,8 @@ fn gui_integration() {
     // Issue #12, the Layouts menu beside ＋.
     sessions::the_menu_with_no_sessions(&tmp.path().join("sm-none"));
     sessions::the_sessions_button_can_be_hidden(&tmp.path().join("sm-hidden"));
-    sessions::saving_and_adding_from_the_menu(&bin, &tmp.path().join("sm-save"));
+    sessions::saving_and_opening_from_the_menu(&bin, &tmp.path().join("sm-save"));
+    sessions::opening_no_tabs_opens_no_window(&tmp.path().join("sm-no-tabs"));
     sessions::saving_under_a_name_in_use_asks(&tmp.path().join("sm-replace"));
     sessions::rename_and_delete_ask_first(&tmp.path().join("sm-rename"));
     sessions::a_damaged_file_is_told_and_kept(&tmp.path().join("sm-damaged"));
@@ -1006,9 +1007,9 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     );
     literal_labels("notification", &main.notifications, MARKUP_NAME);
 
-    // A saved session named like this, added from the Layouts menu: its pane
+    // A saved layout named like this, opened from the Layouts menu: its pane
     // whose profile is gone says so above the list, naming the profile as the
-    // session recorded it.
+    // layout recorded it.
     let gone = TabRecord {
         root: Node::Pane(PaneRecord {
             kind: Kind::Profile {
@@ -1046,15 +1047,27 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         "sessions menu tooltip"
     );
     let tabs = main.view.n_pages();
+    let windows = main_window::main_windows(&app);
     sessions::pick_session(&sessions_menu, MARKUP_NAME);
-    pump_until("the session's tab", || main.view.n_pages() == tabs + 1);
-    let restored = main.view.selected_page().expect("the restored tab");
+    pump_until("the layout's window", || {
+        main_window::main_windows(&app) == windows + 1
+    });
+    let opened = sessions::the_new_window(&app, &[&main]);
+    let restored = opened.view.selected_page().expect("the restored tab");
     literal_labels(
         "gone profile note",
         &restored.child(),
         &format!("{MARKUP_NAME} is no longer saved."),
     );
-    main.view.close_page(&restored);
+    assert_eq!(
+        main.view.n_pages(),
+        tabs,
+        "the window of the menu is as it was"
+    );
+    opened.window.destroy();
+    pump_until("the layout's window to go", || {
+        main_window::main_windows(&app) == windows
+    });
     // Its Rename field, and the questions of Delete and Replace, name it as it
     // is too.
     let sessions_menu = sessions::open_menu(&main);
