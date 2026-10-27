@@ -117,7 +117,7 @@ pub(super) fn a_folder_reported_for_another_machine_is_not_saved(dir: &Path) {
 }
 
 /// Wait until `terminal` shows the line `line`, exactly.
-fn wait_for_line(terminal: &Terminal, line: &str) {
+pub(super) fn wait_for_line(terminal: &Terminal, line: &str) {
     pump_until(&format!("the line {line:?}"), || {
         shown(terminal).iter().any(|shown| shown == line)
     });
@@ -131,7 +131,7 @@ fn assert_shell_in(terminal: &Terminal, expected: &str) {
     wait_for_line(terminal, &format!("PWD={expected}"));
 }
 
-fn canonical(dir: &Path) -> String {
+pub(super) fn canonical(dir: &Path) -> String {
     fs::canonicalize(dir)
         .expect("an existing directory")
         .to_string_lossy()
@@ -191,7 +191,7 @@ fn assert_fraction(split: &gtk::Paned, fraction: f64, what: &str) {
 
 /// The terminal of `holder` once its session has started (a profile's waits
 /// for the keyring).
-fn session_in(holder: &PaneHolder) -> Terminal {
+pub(super) fn session_in(holder: &PaneHolder) -> Terminal {
     pump_until("the session", || terminal_in(holder).is_some());
     terminal_in(holder).expect("the session")
 }
@@ -211,7 +211,7 @@ fn sequence_ran(terminal: &Terminal) -> Vec<String> {
         .collect()
 }
 
-fn pane_record(kind: Kind, name: Option<&str>, scale: f64) -> PaneRecord {
+pub(super) fn pane_record(kind: Kind, name: Option<&str>, scale: f64) -> PaneRecord {
     PaneRecord {
         kind,
         name: name.map(str::to_owned),
@@ -1350,7 +1350,7 @@ pub(super) fn save_dialog(main: &window::MainWindow) -> adw::AlertDialog {
 }
 
 /// The sessions in the file at `file`; panics if it cannot be read.
-fn saved(file: &Path) -> Vec<Session> {
+pub(super) fn saved(file: &Path) -> Vec<Session> {
     match session_file::load(file) {
         Loaded::Sessions(sessions) => sessions,
         Loaded::Unreadable(why) => panic!("the sessions file cannot be read: {why}"),
@@ -1366,7 +1366,7 @@ fn names_saved(file: &Path) -> Vec<String> {
 }
 
 /// Save `tabs` in the file at `file` as another window would.
-fn save_as(file: &Path, name: &str, tabs: Vec<TabRecord>) {
+pub(super) fn save_as(file: &Path, name: &str, tabs: Vec<TabRecord>) {
     session_file::put(
         file,
         Session {

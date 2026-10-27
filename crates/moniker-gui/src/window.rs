@@ -125,14 +125,23 @@ pub fn build(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
 /// Build a main window whose one local tab is as `start` says (the command
 /// line, [`crate::launch_args`]): the shell or a command, in a folder, with a
 /// name given or not. The caller presents it. The tab saves its transcript when
-/// "Save transcripts of all sessions" is on: that covers the tab a window opens
-/// with, at launch and for New Window too, and is decided here, before the shell
-/// starts. A folder asked for that was not a folder is said so in the window's
-/// own notification area (plain text); the terminal started in the home folder.
+/// Local terminal's own "Save transcript" switch or "Save transcripts of all
+/// sessions" is on, as every local tab does (issue #13): that covers the tab a
+/// window opens with, at launch, for New Window and for every command-line
+/// launch, command tabs included, and is decided here, before the shell starts.
+/// It never runs one of Local terminal's startup sequences: a window's first
+/// tab is where Moniker is the terminal of other programs ("Open in Terminal"),
+/// and a sequence there would run at every launch and could move the shell
+/// away from the folder it was asked to start in. A folder asked for that was
+/// not a folder is said so in the window's own notification area (plain text);
+/// the terminal started in the home folder.
 pub fn build_with(app: &adw::Application, ctx: &Rc<AppContext>, start: &Start) -> MainWindow {
     let main = build_empty(app, ctx);
     let settings = ctx.settings();
-    let save = terminal_tab::default_save(false, settings.save_all_transcripts);
+    let save = terminal_tab::default_save(
+        settings.local_terminal.transcript,
+        settings.save_all_transcripts,
+    );
     terminal_tab::open_local(
         &main.view,
         settings.font_scale,

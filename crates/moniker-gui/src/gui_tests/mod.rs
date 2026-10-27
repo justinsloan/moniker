@@ -15,7 +15,7 @@
 //! The scenarios live in one file per area ([`tabs`], [`main_window`],
 //! [`windows`], [`save_transcripts`], [`transcript_indicator`],
 //! [`preferences`], [`notifications`], [`sync`], [`profiles`], [`recordings`],
-//! [`sessions`]);
+//! [`sessions`], [`local_terminal`]);
 //! this file holds the test function that calls them, the helpers they
 //! share, and [`markup_is_shown_literally_everywhere`], the one scenario that
 //! spans the areas. The transcripts go to a temporary directory the tests pass
@@ -48,6 +48,7 @@ use crate::terminal_tab::{
 use crate::{form, new_tab, window};
 
 mod hosts;
+mod local_terminal;
 mod main_window;
 mod notifications;
 mod panes;
@@ -445,6 +446,15 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #13, startup sequences for the local terminal.
+    local_terminal::a_plain_pick_runs_the_default_and_leaves_a_shell(&tmp.path().join("ls-pick"));
+    local_terminal::the_choices_offer_just_open_and_each_sequence(&tmp.path().join("ls-choices"));
+    local_terminal::a_sequence_s_tab_ends_like_a_connection(&tmp.path().join("ls-ends"));
+    local_terminal::a_shell_path_with_a_space_runs_the_sequence(&tmp.path().join("ls-space"));
+    local_terminal::a_window_s_first_tab_runs_no_sequence(&tmp.path().join("ls-first"));
+    local_terminal::a_restored_local_pane_runs_the_default_in_its_folder(
+        &tmp.path().join("ls-restored"),
+    );
     // The REC indicator of a tab that saves a transcript.
     transcript_indicator::a_tab_saving_a_transcript_shows_rec(&bin, &tmp.path().join("rec-shows"));
     transcript_indicator::rec_goes_when_the_transcript_is_written(&tmp.path().join("rec-goes"));

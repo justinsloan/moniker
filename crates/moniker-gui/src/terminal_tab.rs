@@ -4,7 +4,7 @@
 //! [`setup_tab_bar`] wire one up. A tab holds one pane or several
 //! (`crate::panes`), and each pane one session: its holder ([`PaneHolder`]), an
 //! empty box that later receives a chooser or a session. A page starts with one
-//! empty pane ([`new_holder_page`]); [`start_local_shell`], [`start_profile`]
+//! empty pane ([`new_holder_page`]); [`start_local_in`], [`start_profile`]
 //! and [`start_command`] put a terminal in a pane, and the `open_*` functions
 //! are a new holder page followed by one of those. Everything below that is
 //! said of a tab holds for each pane of a tab with several: its own session,
@@ -42,6 +42,17 @@
 //! with the note a connection shows ([`exit_action`]); `hold` keeps it with
 //! [`hold_note`] on success too. One that cannot be started is a "[could not
 //! start …]" note in the tab, as a connection that cannot is.
+//!
+//! Local terminal has startup sequences of its own (issue #13,
+//! `crate::local_terminal`, never synced). One runs when Local terminal is
+//! picked ([`start_local_in`]: its default for a plain pick in the new-tab list
+//! and for a pane a saved session adds back, the one chosen under "›"
+//! otherwise; [`open_local_pick`] for a new tab), never in the first tab of a
+//! window. Its commands are the person's own, run by their shell as
+//! `shell -c <script>` ([`start_sequence_in`]), with the shell's path in the
+//! environment only; the script ends by `exec`ing that shell, so the tab is an
+//! interactive shell afterwards. Such a tab ends as a command tab does, not as
+//! a plain shell: success closes it, any other end keeps it with the note.
 //!
 //! # Stored passwords
 //!
@@ -104,7 +115,8 @@
 //! records is decided before its tab starts: "Save transcripts of all
 //! sessions" in the settings turns it on for every new tab, the launch tab
 //! included ([`default_save`]); without it, a connection follows its profile's
-//! setting and a local shell saves nothing.
+//! setting and a local tab follows Local terminal's own "Save transcript"
+//! switch (issue #13), which is off unless the person turned it on.
 //! Either way the person can choose otherwise for one session with the "Save
 //! transcript" box in the choices behind "›" in the new-tab list
 //! ([`transcript_spec`], [`local_transcript_spec`]). The folder a session saves
@@ -146,9 +158,9 @@ use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::askpass::{AskpassToken, release_marker};
-use moniker_core::profile::Profile;
+use moniker_core::profile::{Profile, StartupSequence};
 use moniker_core::secrets::{SecretStore, password_key};
-use moniker_core::ssh::{SshCommand, terminal_command};
+use moniker_core::ssh::{SshCommand, local_command, terminal_command};
 use moniker_core::transcript::{transcript_path, write_transcript};
 use rustix::ioctl;
 use rustix::process::{Pid, Signal, getpgrp, getpid, getsid, kill_process, kill_process_group};
@@ -370,8 +382,9 @@ impl TabTitle {
 }
 
 /// What a pane shows, as a saved session records it (issue #12): set where the
-/// pane is filled ([`show_chooser`], [`start_shell_in`], [`start_command_in`],
-/// [`start_profile`]) and kept with the pane's holder, so it moves with it.
+/// pane is filled ([`show_chooser`], [`start_shell_in`], [`start_sequence_in`],
+/// [`start_command_in`], [`start_profile`]) and kept with the pane's holder,
+/// so it moves with it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum PaneKind {
     /// Nothing yet: a pane just made, before its list or session.
@@ -379,11 +392,12 @@ pub(crate) enum PaneKind {
     Empty,
     /// The new-tab list.
     List,
-    /// A local terminal: the person's shell, or a command started with
-    /// `moniker -- COMMAND` (issue #15). A session saves both as a shell in the
-    /// folder the terminal last reported; `started_in` is the folder a command
-    /// was started in, for one that never reports one (none for a shell, which
-    /// reports its own).
+    /// A local terminal: the person's shell (after one of Local terminal's
+    /// startup sequences or not, issue #13), or a command started with
+    /// `moniker -- COMMAND` (issue #15). A session saves each as a shell in the
+    /// folder the terminal last reported, never a sequence or a command;
+    /// `started_in` is the folder a command was started in, for one that never
+    /// reports one (none for a shell, which reports its own).
     Local { started_in: Option<PathBuf> },
     /// A connection to the saved profile `id`, from the moment it is picked:
     /// while it waits for the keyring, and after its session has ended too.
@@ -845,9 +859,10 @@ pub fn transcript_spec(
 
 /// Whether a session's "Save transcript" choice starts out checked (and what a
 /// plain click or Enter does): "Save transcripts of all sessions" (`save_all`)
-/// wins over everything, else the profile's own setting. A local terminal has no
-/// setting of its own, so it passes `false`. The person can still uncheck one
-/// session in the choices behind "›".
+/// wins over everything, else the profile's own setting. A local terminal
+/// passes Local terminal's own switch (issue #13), for every local tab: a pick
+/// in the new-tab list, a window's first tab and a restored local pane. The
+/// person can still uncheck one session in the choices behind "›".
 pub fn default_save(profile_setting: bool, save_all: bool) -> bool {
     save_all || profile_setting
 }
@@ -1429,7 +1444,7 @@ pub(crate) fn new_holder_page(view: &adw::TabView, title: &str) -> adw::TabPage 
 
 /// A new, selected page of `view` called `title` that holds nothing yet: one
 /// pane, whose holder ([`holder_of`]) a chooser or a session
-/// ([`start_local_shell`], [`start_profile`], [`start_command`]) later fills.
+/// ([`start_local_in`], [`start_profile`], [`start_command`]) later fills.
 /// The tab starts at the text size of the focused pane of the tab that is
 /// selected in `view` now, or at what `fallback_scale` returns if there is
 /// none. (A function, so that the saved size is read from its file only for a
@@ -1767,22 +1782,45 @@ pub(crate) fn open_local(
     }
 }
 
-/// Run the person's shell in `holder`'s pane, in their home directory. The pane
-/// is called after what the shell says its title is, and closes when the shell
-/// exits. With a `transcript` its text is saved when the shell exits or the
-/// pane, tab or window closes.
-pub(crate) fn start_local_shell(
+/// A local terminal picked plainly in `holder`'s pane, in the folder `dir` (as
+/// [`start_local_shell_in`] takes it): the person's shell, after running
+/// `sequence` first if one is given (one of Local terminal's startup
+/// sequences, issue #13: its default for a plain pick or a restored pane, the
+/// one chosen under "›" otherwise).
+///
+/// With no sequence, or one with nothing to run ([`local_command`] makes
+/// nothing of it), this is exactly [`start_local_shell_in`]: a plain local
+/// tab, unchanged. Otherwise it is [`start_sequence_in`] with the shell a plain
+/// local tab runs ([`shell_choice`]) in the same folder, or in the home folder
+/// when `dir` is not a folder or cannot be entered.
+pub(crate) fn start_local_in(
     holder: &PaneHolder,
+    dir: &Path,
+    sequence: Option<&StartupSequence>,
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
-    start_local_shell_in(holder, &glib::home_dir(), transcript)
+    let Some(script) = local_command(sequence) else {
+        return start_local_shell_in(holder, dir, transcript);
+    };
+    let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
+    let home = glib::home_dir();
+    start_sequence_in(
+        holder,
+        &shell,
+        enterable_or(dir, &home),
+        &script,
+        transcript,
+    )
 }
 
-/// [`start_local_shell`] in the folder `dir`, or in the home folder when `dir`
-/// is not a folder (any more: a restored session's folder may have gone) or is
-/// one this process may not enter (no search permission), with nothing said
-/// about it. (VTE falls back to the home folder by itself when it cannot enter
-/// a folder; this does not leave the rule to it.)
+/// Run the person's shell in `holder`'s pane, in the folder `dir`, or in the
+/// home folder when `dir` is not a folder (any more: a restored session's
+/// folder may have gone) or is one this process may not enter (no search
+/// permission), with nothing said about it. (VTE falls back to the home folder
+/// by itself when it cannot enter a folder; this does not leave the rule to
+/// it.) The pane is called after what the shell says its title is, and closes
+/// when the shell exits. With a `transcript` its text is saved when the shell
+/// exits or the pane, tab or window closes.
 pub(crate) fn start_local_shell_in(
     holder: &PaneHolder,
     dir: &Path,
@@ -1790,12 +1828,42 @@ pub(crate) fn start_local_shell_in(
 ) -> Terminal {
     let shell = shell_choice(std::env::var("SHELL").ok().as_deref());
     let home = glib::home_dir();
-    let dir = if folder_to_spawn_in(dir).is_some() && can_enter(dir) {
+    start_shell_in(holder, &shell, enterable_or(dir, &home), transcript)
+}
+
+/// `dir` if a local terminal can start in it (a folder, named in text, that
+/// this process may enter), else `home`.
+fn enterable_or<'a>(dir: &'a Path, home: &'a Path) -> &'a Path {
+    if folder_to_spawn_in(dir).is_some() && can_enter(dir) {
         dir
     } else {
-        &home
-    };
-    start_shell_in(holder, &shell, dir, transcript)
+        home
+    }
+}
+
+/// A new tab in `view` for Local terminal picked anywhere but the new-tab list
+/// (the Connection Profiles window's Local terminal entry, issue #13): in the
+/// home folder, running `sequence` first if one is given ([`start_local_in`]),
+/// and saving a transcript if `record` ([`local_transcript_spec`]). The tab
+/// starts at the text size of the tab selected in `view`, or, in a window with
+/// none, at the size saved for the next launch, as [`open_profile`]'s does.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Connection Profiles window's Local terminal entry opens it (issue #13, a later task)"
+    )
+)]
+pub(crate) fn open_local_pick(
+    view: &adw::TabView,
+    ctx: &Rc<AppContext>,
+    sequence: Option<&StartupSequence>,
+    record: bool,
+) -> Terminal {
+    let page = new_holder_page_at(view, LOCAL_TITLE, || ctx.saved_font_scale());
+    let holder = holder_of(&page).expect("a new page has its pane");
+    let transcript = local_transcript_spec(ctx, record);
+    start_local_in(&holder, &glib::home_dir(), sequence, transcript)
 }
 
 /// Whether this process may enter the folder `dir`, as a shell started in it
@@ -1827,8 +1895,8 @@ fn folder_of_uri(uri: &str, node_name: &str) -> Option<PathBuf> {
     (here && path.is_absolute()).then_some(path)
 }
 
-/// [`start_local_shell`] with the shell and the directory given (the tests run a
-/// stand-in shell). A directory that is not there leaves the shell in the
+/// [`start_local_shell_in`] with the shell and the directory given (the tests
+/// run a stand-in shell). A directory that is not there leaves the shell in the
 /// directory Moniker was started in.
 pub(crate) fn start_shell_in(
     holder: &PaneHolder,
@@ -1887,6 +1955,73 @@ pub(crate) fn start_command_in(
             .filter(|dir| dir.is_absolute()),
     });
     let session = start_recording(&terminal, transcript);
+    end_as_a_command(holder, &terminal, session, hold);
+    follow_program_title(holder, &terminal);
+    if program.is_empty() {
+        // Nothing to start: say so as a failed start does, without asking VTE
+        // or GLib to run a program with no name. There is no child to wait for
+        // when the pane closes.
+        show_note(&terminal, "[could not start: no program to run]");
+        holder.child_gone().set(true);
+    } else {
+        spawn(&terminal, folder_to_spawn_in(dir), argv, &[]);
+    }
+    terminal
+}
+
+/// Run the startup sequence `script` (what [`local_command`] makes of one of
+/// Local terminal's sequences, issue #13) in `holder`'s pane with the shell
+/// `shell`, in the folder `dir` (as [`start_shell_in`] takes it): the argument
+/// list `[shell, "-c", script]`, with `SHELL=<shell>` added to the inherited
+/// environment, so the script's last line, `exec "$SHELL"`, leaves that same
+/// shell, interactive, even when Moniker has no `$SHELL`. The shell's path
+/// travels in the environment only, never in the script, so a path with a space
+/// or a quote cannot change what runs. The commands are the person's own, in
+/// their own shell's language, as a profile's are in the remote login shell's.
+///
+/// The pane is named as a plain local tab is ([`TabTitle::local`], following
+/// the shell's title until renamed), saves a transcript as one does, and is
+/// saved by a saved session as a local pane in the folder its shell last
+/// reports (never its commands). It ends as a command tab does
+/// ([`start_command_in`] without `hold`), not as a plain shell: a clean exit
+/// closes the pane, any other end keeps it with the note ([`exit_action`]).
+/// Ctrl+C during a long command of the sequence ends the non-interactive shell
+/// running it too, and a plain shell's rule would close the pane and take the
+/// output with it. The cost: `exit 3` in the shell it leaves keeps the pane. A
+/// transcript is written when the shell ends or the pane, tab or window closes,
+/// whichever is first.
+pub(crate) fn start_sequence_in(
+    holder: &PaneHolder,
+    shell: &str,
+    dir: &Path,
+    script: &str,
+    transcript: Option<TranscriptSpec>,
+) -> Terminal {
+    let terminal = begin_session(holder, TabTitle::local());
+    // The shell it leaves reports its own folder, as a plain one does.
+    holder.kind().replace(PaneKind::Local { started_in: None });
+    let session = start_recording(&terminal, transcript);
+    end_as_a_command(holder, &terminal, session, false);
+    follow_program_title(holder, &terminal);
+    let argv = [shell.to_owned(), "-c".to_owned(), script.to_owned()];
+    spawn(
+        &terminal,
+        folder_to_spawn_in(dir),
+        &argv,
+        &[format!("SHELL={shell}")],
+    );
+    terminal
+}
+
+/// When the child in `terminal` (`holder`'s pane) exits, end as a command tab
+/// does: write the transcript of `session`, if it records, then close the pane
+/// or keep it with the note, as [`command_exit_action`] says for `hold`.
+fn end_as_a_command(
+    holder: &PaneHolder,
+    terminal: &Terminal,
+    session: Option<Rc<Session>>,
+    hold: bool,
+) {
     terminal.connect_child_exited(glib::clone!(
         #[weak]
         holder,
@@ -1900,17 +2035,6 @@ pub(crate) fn start_command_in(
             }
         }
     ));
-    follow_program_title(holder, &terminal);
-    if program.is_empty() {
-        // Nothing to start: say so as a failed start does, without asking VTE
-        // or GLib to run a program with no name. There is no child to wait for
-        // when the pane closes.
-        show_note(&terminal, "[could not start: no program to run]");
-        holder.child_gone().set(true);
-    } else {
-        spawn(&terminal, folder_to_spawn_in(dir), argv, &[]);
-    }
-    terminal
 }
 
 /// Let the title the program in `terminal` sets name `holder`'s pane, until the

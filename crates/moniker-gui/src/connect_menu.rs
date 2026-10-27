@@ -1,32 +1,42 @@
 //! The choices a "›" opens in the new-tab list: for a profile ([`choices`]),
 //! "Just connect", each startup sequence, and "Save transcript"; for the Local
-//! terminal ([`local_choices`]), "Open" and "Save transcript".
+//! terminal ([`local_choices`]), "Just open" and each of its own startup
+//! sequences (issue #13), or "Open" while it has none, and "Save transcript".
 //!
 //! A click (or Enter) on a row opens it at once, with "Save transcript" checked
-//! if the profile says so or "Save transcripts of all sessions" is on
-//! ([`crate::terminal_tab::default_save`]), and running the profile's default
-//! sequence if it has one (issue #12). These choices are the way round that:
-//! "Just connect" skips the default and runs no sequence, and each sequence by
-//! name runs that one, whichever is the default (the default is not marked
-//! here). The choices are for every profile, with or without sequences, and
-//! for the Local terminal, so the choice of saving one session's transcript is
-//! reachable by keyboard.
+//! if the profile (or Local terminal) says so or "Save transcripts of all
+//! sessions" is on ([`crate::terminal_tab::default_save`]), and running its
+//! default sequence if it has one (a profile's: issue #12; Local terminal's:
+//! issue #13). These choices are the way round that: "Just connect" and "Just
+//! open" skip the default and run no sequence, and each sequence by name runs
+//! that one, whichever is the default (the default is not marked here). "Just"
+//! says "without a sequence", which only means something when there are
+//! sequences: Local terminal without any offers "Open", as before; a profile's
+//! choices say "Just connect" always. The choices are for every profile, with
+//! or without sequences, and for the Local terminal, so the choice of saving
+//! one session's transcript is reachable by keyboard.
 //!
-//! Profile names and sequence names come from other machines through sync:
-//! every label here has Pango markup off.
+//! Profile names and sequence names come from other machines through sync, and
+//! Local terminal's from a settings file that can be edited by hand: every
+//! label here has Pango markup off.
 
 use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk::{glib, pango};
 use gtk4 as gtk;
-use moniker_core::profile::Profile;
+use moniker_core::profile::{Profile, StartupSequence};
 
 /// Label of the transcript check box in the connect choices.
 pub(crate) const RECORD_LABEL: &str = "Save transcript";
 
-/// Label of the button of the Local terminal's choices.
+/// Label of the button of the Local terminal's choices while it has no startup
+/// sequence.
 pub(crate) const OPEN_LABEL: &str = "Open";
+
+/// Label of the Local terminal's first choice while it has startup sequences:
+/// a shell, without running any of them, the default included.
+pub(crate) const JUST_OPEN_LABEL: &str = "Just open";
 
 /// Widget name of the column [`choices`] returns (tests look for it).
 pub(crate) const CHOICES_NAME: &str = "connect-choices";
@@ -44,6 +54,23 @@ fn entries(profile: &Profile) -> Vec<(String, Option<usize>)> {
                 .iter()
                 .enumerate()
                 .map(|(index, sequence)| (sequence.name.clone(), Some(index))),
+        )
+        .collect()
+}
+
+/// What the Local terminal's choices offer for its startup `sequences`: with
+/// none, "Open" alone (`None`); with some, "Just open" (`None`), then each
+/// sequence by name, carrying the sequence itself, so what runs is what was
+/// shown even if the settings file changes before the click.
+fn local_entries(sequences: &[StartupSequence]) -> Vec<(String, Option<StartupSequence>)> {
+    if sequences.is_empty() {
+        return vec![(OPEN_LABEL.to_owned(), None)];
+    }
+    std::iter::once((JUST_OPEN_LABEL.to_owned(), None))
+        .chain(
+            sequences
+                .iter()
+                .map(|sequence| (sequence.name.clone(), Some(sequence.clone()))),
         )
         .collect()
 }
@@ -131,24 +158,44 @@ pub fn choices(
     column(CHOICES_NAME, &buttons, &record).upcast()
 }
 
-/// The Local terminal's choices: an "Open" button, then the "Save transcript"
-/// check box, checked if `save`. "Open" calls `on_open` with whether the box is
-/// checked; it takes the focus when the column is shown, so Enter opens.
-pub fn local_choices(save: bool, on_open: impl Fn(bool) + 'static) -> gtk::Widget {
+/// The Local terminal's choices for its startup `sequences`: a button per
+/// [`local_entries`] entry ("Open" alone while there is none; else "Just open",
+/// then each sequence by name), then the "Save transcript" check box, checked
+/// if `save` (the caller works that out from Local terminal's own switch and
+/// "Save transcripts of all sessions", [`crate::terminal_tab::default_save`]).
+///
+/// Clicking a button calls `on_open` with the sequence to run (`None` for "Open"
+/// and "Just open": a plain shell) and whether the box is checked. The first
+/// button takes the focus when the column is shown, so Enter opens a plain
+/// shell. The labels are plain text: the names are the person's own, from a
+/// file that can be edited by hand.
+pub fn local_choices(
+    sequences: &[StartupSequence],
+    save: bool,
+    on_open: impl Fn(Option<StartupSequence>, bool) + 'static,
+) -> gtk::Widget {
+    let on_open = Rc::new(on_open);
     let record = save_box(save);
-    let open = entry_button(OPEN_LABEL);
-    open.connect_clicked(glib::clone!(
-        #[weak]
-        record,
-        move |_| on_open(record.is_active())
-    ));
-    column(LOCAL_CHOICES_NAME, &[open], &record).upcast()
+    let buttons: Vec<gtk::Button> = local_entries(sequences)
+        .into_iter()
+        .map(|(name, sequence)| {
+            let button = entry_button(&name);
+            button.connect_clicked(glib::clone!(
+                #[weak]
+                record,
+                #[strong]
+                on_open,
+                move |_| on_open(sequence.clone(), record.is_active())
+            ));
+            button
+        })
+        .collect();
+    column(LOCAL_CHOICES_NAME, &buttons, &record).upcast()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use moniker_core::profile::StartupSequence;
 
     fn sequence(name: &str) -> StartupSequence {
         StartupSequence {
@@ -175,5 +222,26 @@ mod tests {
     fn a_profile_without_sequences_has_only_just_connect() {
         let p = Profile::new("web", "example.com", "alice");
         assert_eq!(entries(&p), [("Just connect".to_owned(), None)]);
+    }
+
+    #[test]
+    fn local_terminal_without_sequences_offers_open() {
+        assert_eq!(local_entries(&[]), [("Open".to_owned(), None)]);
+        assert_eq!(OPEN_LABEL, "Open");
+    }
+
+    #[test]
+    fn local_terminal_offers_just_open_then_each_sequence_in_order() {
+        let update = sequence("update");
+        let odd = sequence("<b>x</b> & _y_");
+        assert_eq!(
+            local_entries(&[update.clone(), odd.clone()]),
+            [
+                ("Just open".to_owned(), None),
+                ("update".to_owned(), Some(update)),
+                ("<b>x</b> & _y_".to_owned(), Some(odd)),
+            ]
+        );
+        assert_eq!(JUST_OPEN_LABEL, "Just open");
     }
 }

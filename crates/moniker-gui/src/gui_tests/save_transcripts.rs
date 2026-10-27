@@ -66,7 +66,11 @@ pub(super) fn click(list: &gtk::ListBox, name: &str) {
 /// Open the choices behind the "›" of the row `name` with the Right arrow, as
 /// the keyboard does, and return the popover and the column of choices
 /// (`column_name`). Looking at the choices opens nothing.
-fn open_choices(list: &gtk::ListBox, name: &str, column_name: &str) -> (gtk::Popover, gtk::Widget) {
+pub(super) fn open_choices(
+    list: &gtk::ListBox,
+    name: &str,
+    column_name: &str,
+) -> (gtk::Popover, gtk::Widget) {
     let row = row(list, name);
     let more: gtk::MenuButton = find_widget(&row).expect("the › button");
     let popover = more.popover().expect("its popover");
