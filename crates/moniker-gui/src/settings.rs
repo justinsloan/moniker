@@ -1,7 +1,8 @@
 //! The GUI's own settings: which saved profile is the sync partner (the other
 //! machine automatic sync and Sync Now talk to), whether to sync
 //! automatically on launch, the text size the next launch starts at, and the
-//! Preferences (terminal font, scrollback lines, whether to save a transcript of
+//! Preferences (terminal font, scrollback lines, whether to show the Sessions
+//! button, whether to ping the saved hosts, whether to save a transcript of
 //! every session, and the transcripts folder).
 //!
 //! They live in `gui-settings.json` next to `profiles.json` ([`default_path`]),

@@ -4,9 +4,9 @@
 //! list, [`crate::new_tab`], where a saved profile becomes a session in that
 //! tab), Sessions (the saved layouts of windows, to add back to this one, and
 //! saving this one: [`crate::sessions_menu`]; the Preferences can hide it),
-//! the selected tab's title, and ☰
-//! (the app's actions, which `main.rs` defines, under a zoom row for the
-//! selected tab's text size). There is no Connect button: connections come
+//! the selected tab's title, and ☰ (the app's actions, which `main.rs`
+//! defines, under a zoom row for the selected tab's text size). There is no
+//! Connect button: connections come
 //! from the new-tab list and the Connection Profiles window.
 //! Below it the tab bar, which hides itself while there is one tab, so a fresh
 //! window looks like a plain terminal; then the tabs ([`crate::terminal_tab`])

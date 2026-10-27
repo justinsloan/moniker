@@ -263,6 +263,43 @@ fn save(
 // value then looked like the person's change, failed to save in turn and was
 // put back again, forever.
 
+/// A switch row titled `title` with `subtitle` (plain text) for the setting
+/// `field`, which the file now says is `now`. Each change is saved at once
+/// ([`save`]) and then handed to `apply`; one that cannot be saved is not used,
+/// and the row goes back.
+fn switch_row(
+    ctx: &Rc<AppContext>,
+    (title, subtitle): (&str, &str),
+    now: bool,
+    field: fn(&mut GuiSettings) -> &mut bool,
+    apply: impl Fn(bool) + 'static,
+) -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .use_markup(false)
+        .active(now)
+        .build();
+    let saved = Cell::new(now);
+    row.connect_active_notify(glib::clone!(
+        #[strong]
+        ctx,
+        move |row| {
+            let on = row.is_active();
+            if on == saved.get() {
+                return;
+            }
+            if save(&ctx, row, |s| *field(s) = on) {
+                saved.set(on);
+                apply(on);
+            } else {
+                row.set_active(saved.get());
+            }
+        }
+    ));
+    row
+}
+
 // ----- Terminal -----
 
 fn terminal_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGroup {
@@ -435,43 +472,6 @@ fn profiles_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGr
         move |on| hosts.set_enabled(on),
     ));
     group
-}
-
-/// A switch row titled `title` with `subtitle` (plain text) for the setting
-/// `field`, which the file now says is `now`. Each change is saved at once
-/// ([`save`]) and then handed to `apply`; one that cannot be saved is not used,
-/// and the row goes back.
-fn switch_row(
-    ctx: &Rc<AppContext>,
-    (title, subtitle): (&str, &str),
-    now: bool,
-    field: fn(&mut GuiSettings) -> &mut bool,
-    apply: impl Fn(bool) + 'static,
-) -> adw::SwitchRow {
-    let row = adw::SwitchRow::builder()
-        .title(title)
-        .subtitle(subtitle)
-        .use_markup(false)
-        .active(now)
-        .build();
-    let saved = Cell::new(now);
-    row.connect_active_notify(glib::clone!(
-        #[strong]
-        ctx,
-        move |row| {
-            let on = row.is_active();
-            if on == saved.get() {
-                return;
-            }
-            if save(&ctx, row, |s| *field(s) = on) {
-                saved.set(on);
-                apply(on);
-            } else {
-                row.set_active(saved.get());
-            }
-        }
-    ));
-    row
 }
 
 // ----- Sessions -----

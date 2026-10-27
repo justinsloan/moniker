@@ -72,6 +72,9 @@ pub(crate) const BUTTON_NAME: &str = "sessions-button";
 const LABEL: &str = "Sessions";
 /// The icon after the word: several windows (user, 2026-10-26).
 const ICON: &str = "focus-windows-symbolic";
+/// The icon shown instead by an icon theme that lacks [`ICON`], which is
+/// Adwaita's own rather than a standard name: the first build's icon.
+const FALLBACK_ICON: &str = "view-grid-symbolic";
 /// The entry that saves this window.
 const SAVE_ENTRY: &str = "Save Session\u{2026}";
 /// What the menu says with nothing saved.
@@ -98,7 +101,13 @@ pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton
     let popover = gtk::Popover::new();
     let face = gtk::Box::builder().spacing(6).build();
     face.append(&gtk::Label::builder().label(LABEL).use_markup(false).build());
-    face.append(&gtk::Image::from_icon_name(ICON));
+    // The word names the button; the icon adds nothing to read out.
+    face.append(
+        &gtk::Image::builder()
+            .gicon(&gio::ThemedIcon::from_names(&[ICON, FALLBACK_ICON]))
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
     let button = gtk::MenuButton::builder()
         .name(BUTTON_NAME)
         .child(&face)
@@ -106,7 +115,30 @@ pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton
         .visible(ctx.settings().show_sessions)
         .popover(&popover)
         .build();
-    BUTTONS.with_borrow_mut(|all| all.push((button.downgrade(), main.view.downgrade())));
+    BUTTONS.with_borrow_mut(|all| {
+        all.retain(|(button, _)| button.upgrade().is_some());
+        all.push((button.downgrade(), main.view.downgrade()));
+    });
+    // The keyboard never stays on the button while it is hidden. A dialog
+    // that closes gives the keyboard back to the widget that had it when the
+    // dialog opened, shown or not (libadwaita 1.9), and the Preferences that
+    // hide the button are such a dialog. From an idle callback, as a margin:
+    // libadwaita 1.9 has already taken the dialog away when it gives the
+    // keyboard back, so the pane may have it.
+    let view = main.view.downgrade();
+    main.window.connect_focus_widget_notify(glib::clone!(
+        #[weak]
+        button,
+        move |window| {
+            let on_hidden_button = !button.is_visible()
+                && gtk::prelude::GtkWindowExt::focus(window)
+                    .is_some_and(|focus| focus.is_ancestor(&button));
+            if on_hidden_button {
+                let view = view.clone();
+                glib::idle_add_local_once(move || keyboard_to_the_terminal(&view));
+            }
+        }
+    ));
     let menu = Rc::new(Menu {
         ctx: Rc::clone(ctx),
         view: main.view.downgrade(),
@@ -129,7 +161,8 @@ thread_local! {
 /// switch, `settings::GuiSettings::show_sessions`); a window opened later reads
 /// the setting itself. The saved sessions are not touched. A button hidden
 /// while it has the keyboard gives it to the terminal of its window
-/// ([`keyboard_to_the_terminal`]), so the keys never go nowhere.
+/// ([`keyboard_to_the_terminal`]), so the keys never go nowhere; one given
+/// the keyboard while hidden does the same ([`button`]).
 pub(crate) fn show_buttons(shown: bool) {
     // Collected first, so no borrow is held while GTK runs.
     let live: Vec<_> = BUTTONS.with_borrow_mut(|all| {

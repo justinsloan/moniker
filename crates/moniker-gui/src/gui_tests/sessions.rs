@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::profile::Profile;
@@ -1130,7 +1130,9 @@ fn sessions_button(main: &window::MainWindow) -> gtk::MenuButton {
 }
 
 /// What `button` shows, in order: the text of its labels, the icon names of its
-/// images, and "arrow" for a drop-down arrow; only what is on screen.
+/// images ("first or fallback" for a themed icon of several, symbolic names
+/// only: GLib adds the full-color ones itself), and "arrow" for a drop-down
+/// arrow; only what is on screen.
 fn face_of(button: &gtk::MenuButton) -> Vec<String> {
     all_widgets::<gtk::Widget>(button)
         .into_iter()
@@ -1139,7 +1141,16 @@ fn face_of(button: &gtk::MenuButton) -> Vec<String> {
             if let Some(label) = widget.downcast_ref::<gtk::Label>() {
                 Some(label.label().to_string())
             } else if let Some(image) = widget.downcast_ref::<gtk::Image>() {
-                image.icon_name().map(|name| name.to_string())
+                image.icon_name().map(|name| name.to_string()).or_else(|| {
+                    let icon = image.gicon().and_downcast::<gio::ThemedIcon>()?;
+                    let names: Vec<String> = icon
+                        .names()
+                        .iter()
+                        .filter(|name| name.ends_with("-symbolic"))
+                        .map(|name| name.to_string())
+                        .collect();
+                    Some(names.join(" or "))
+                })
             } else if widget.css_name() == "arrow" {
                 Some("arrow".to_owned())
             } else {
@@ -1155,6 +1166,15 @@ fn sessions_switch(dialog: &adw::PreferencesDialog) -> adw::SwitchRow {
         .into_iter()
         .find(|row| row.title() == "Show the Sessions menu")
         .expect("the Sessions switch")
+}
+
+/// Give the Sessions button of `main` the keyboard, and wait until it has it.
+fn keyboard_on_the_sessions_button(main: &window::MainWindow) {
+    let button = sessions_button(main);
+    assert!(button.grab_focus(), "the button takes the keyboard");
+    pump_until("the Sessions button to have the keyboard", || {
+        gtk::prelude::GtkWindowExt::focus(&main.window).is_some_and(|f| f.is_ancestor(&button))
+    });
 }
 
 /// Open the Preferences over `main`, set the Sessions switch to `on` and close
@@ -1407,8 +1427,21 @@ pub(super) fn the_menu_with_no_sessions(dir: &Path) {
     );
     assert_eq!(
         face_of(&button),
-        ["Sessions", "focus-windows-symbolic", "arrow"],
-        "the word, the icon, the arrow"
+        [
+            "Sessions",
+            "focus-windows-symbolic or view-grid-symbolic",
+            "arrow"
+        ],
+        "the word, the icon (with a fallback for a theme without it), the arrow"
+    );
+    let icon = all_widgets::<gtk::Image>(&button)
+        .into_iter()
+        .next()
+        .expect("the icon");
+    assert_eq!(
+        icon.accessible_role(),
+        gtk::AccessibleRole::Presentation,
+        "the word names the button, the icon is not read"
     );
     assert!(button.tooltip_text().is_none(), "no tooltip");
 
@@ -1429,7 +1462,9 @@ pub(super) fn the_menu_with_no_sessions(dir: &Path) {
 /// Sessions button in every main window at once and in windows opened while it
 /// is off, and shows it again in all of them; the saved sessions are kept
 /// meanwhile. A change that cannot be saved (a damaged settings file) changes
-/// nothing: the row goes back and the buttons stay as they were.
+/// nothing: the row goes back and the buttons stay as they were. The keyboard
+/// never stays on a hidden button: hidden from another window, or given back
+/// to it by the closing Preferences, it goes to the terminal.
 pub(super) fn the_sessions_button_can_be_hidden(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let file = sessions_menu::sessions_path(&ctx);
@@ -1509,16 +1544,21 @@ pub(super) fn the_sessions_button_can_be_hidden(dir: &Path) {
 
     // Off from another window hides it in every window; one whose button had
     // the keyboard gives it to its terminal, so typing goes on reaching it.
-    let had = sessions_button(&b);
-    assert!(had.grab_focus(), "the button takes the keyboard");
-    pump_until("the button to have the keyboard", || {
-        gtk::prelude::GtkWindowExt::focus(&b.window).is_some_and(|focus| focus.is_ancestor(&had))
-    });
+    keyboard_on_the_sessions_button(&b);
     set_sessions_switch(&app, &ctx, &d, false);
     for main in [&a, &b, &c, &d] {
         assert!(!sessions_button(main).is_visible(), "hidden everywhere");
     }
     assert_keyboard_back(&b, "hiding the button that had it");
+
+    // Off from the Preferences over the window whose button has the keyboard:
+    // the dialog gives the keyboard back to the button it took it from, hidden
+    // by then, and it goes on to the terminal.
+    set_sessions_switch(&app, &ctx, &a, true);
+    keyboard_on_the_sessions_button(&a);
+    set_sessions_switch(&app, &ctx, &a, false);
+    assert!(!sessions_button(&a).is_visible());
+    assert_keyboard_back(&a, "closing the Preferences that hid the button");
     for main in [a, b, c, d] {
         main.window.destroy();
     }
