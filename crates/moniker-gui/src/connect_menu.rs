@@ -75,7 +75,7 @@ fn local_entries(sequences: &[StartupSequence]) -> Vec<(String, Option<StartupSe
         .collect()
 }
 
-/// A flat button called `label`, plain text. (The Sessions menu's buttons are
+/// A flat button called `label`, plain text. (The Layouts menu's buttons are
 /// made the same way.)
 pub(crate) fn entry_button(label: &str) -> gtk::Button {
     let label = gtk::Label::builder()

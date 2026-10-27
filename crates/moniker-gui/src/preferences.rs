@@ -9,9 +9,9 @@
 //!   scrollback of ordinary tabs, 1,000 to 1,000,000 lines, for tabs opened
 //!   after the change (`terminal_tab::set_scrollback`). Tabs that save a
 //!   transcript keep unlimited scrollback whatever it says.
-//! * **Sessions**: "Show the Sessions menu" (on by default), the Sessions
+//! * **Layouts**: "Show the Layouts menu" (on by default), the Layouts
 //!   button beside ＋ in every main window, hidden or shown at once
-//!   (`sessions_menu::show_buttons`). Off, the saved sessions are kept.
+//!   (`sessions_menu::show_buttons`). Off, the saved layouts are kept.
 //! * **Connection Profiles**: "Show whether hosts are reachable" (on by
 //!   default), the pings behind the marks in the profile lists
 //!   (`crate::hosts`). Off, no ping is sent and no mark is shown.
@@ -74,9 +74,9 @@ const SYNC_SUBTITLE: &str = "Sync key, the other machine, automatic sync";
 const PING_TITLE: &str = "Show whether hosts are reachable";
 const PING_SUBTITLE: &str = "Pings each saved host from this machine now and then, and \
 marks it in the lists. Turned off, no pings are sent.";
-const SESSIONS_TITLE: &str = "Show the Sessions menu";
+const SESSIONS_TITLE: &str = "Show the Layouts menu";
 const SESSIONS_SUBTITLE: &str = "The button beside \u{FF0B} that saves a window's tabs and \
-panes and adds them back. Turned off, the saved sessions are kept.";
+panes and opens them again in a new window. Turned off, the saved layouts are kept.";
 
 /// The font a font setting of `None` stands for, when nothing else says: the
 /// family VTE uses by default, at a common size.
@@ -474,10 +474,10 @@ fn profiles_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGr
     group
 }
 
-// ----- Sessions -----
+// ----- Layouts -----
 
 fn sessions_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder().title("Sessions").build();
+    let group = adw::PreferencesGroup::builder().title("Layouts").build();
     group.add(&switch_row(
         ctx,
         (SESSIONS_TITLE, SESSIONS_SUBTITLE),

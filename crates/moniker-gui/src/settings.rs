@@ -1,7 +1,7 @@
 //! The GUI's own settings: which saved profile is the sync partner (the other
 //! machine automatic sync and Sync Now talk to), whether to sync
 //! automatically on launch, the text size the next launch starts at, and the
-//! Preferences (terminal font, scrollback lines, whether to show the Sessions
+//! Preferences (terminal font, scrollback lines, whether to show the Layouts
 //! button, whether to ping the saved hosts, whether to save a transcript of
 //! every session, and the transcripts folder). Local terminal's startup
 //! sequences are not here but in a file of their own ([`crate::local_terminal`]).
@@ -85,9 +85,9 @@ pub struct GuiSettings {
     /// (`crate::hosts`; the Preferences switch, on by default). Off, no ping is
     /// sent and no mark is shown.
     pub ping_hosts: bool,
-    /// Show the Sessions button beside ＋ in every main window
+    /// Show the Layouts button beside ＋ in every main window
     /// (`crate::sessions_menu`; the Preferences switch, on by default). Off,
-    /// the saved sessions are kept and only the button is hidden.
+    /// the saved layouts are kept and only the button is hidden.
     pub show_sessions: bool,
     /// The size of the main window that closed last, which new main windows
     /// open at (issue #14); `None` is the built-in size.

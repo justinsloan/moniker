@@ -1,23 +1,25 @@
-//! The Sessions menu beside ＋ in a main window (issue #12): the layouts of
-//! windows that were saved ([`crate::session_file`]), added back to this window
-//! with a click, and the questions that save this window's layout, rename a
-//! saved one and delete it.
+//! The Layouts menu beside ＋ in a main window (issue #12, named Sessions
+//! until issue #16): the layouts of windows that were saved
+//! ([`crate::session_file`]), added back to this window with a click, and the
+//! questions that save this window as a layout, rename a saved one and delete
+//! it. The code and the file call a layout a session; the interface says
+//! layout, because "session" means a running connection everywhere else.
 //!
-//! The button reads "Sessions", then an icon of several windows, then the
+//! The button reads "Layouts", then an icon of several windows, then the
 //! drop-down arrow (user, 2026-10-26). The Preferences can hide it (on to
 //! start with, user): [`show_buttons`] hides or shows it in every main window
-//! at once, and a new window reads the setting. Hidden, the saved sessions stay
+//! at once, and a new window reads the setting. Hidden, the saved layouts stay
 //! in their file, untouched.
 //!
 //! The button opens a popover that is built again from the file every time it
 //! shows, so it lists what is saved now, whichever window saved it: each
-//! session by name (sorted ignoring case) with a › for Rename… and Delete…, or
-//! "No saved sessions", or why the file cannot be read; then Save Session…. A
-//! click on a session adds its tabs to this window ([`session_layout::restore`]).
+//! layout by name (sorted ignoring case) with a › for Rename… and Delete…, or
+//! "No saved layouts", or why the file cannot be read; then Save Layout…. A
+//! click on a layout adds its tabs to this window ([`session_layout::restore`]).
 //!
 //! Nothing here keeps what the file said for later: the file is read again at
 //! every decision, because another window may have changed it since the menu
-//! was built. A pick reads the session as it is then (a replaced one adds the
+//! was built. A pick reads the layout as it is then (a replaced one adds the
 //! layout now saved, a deleted one says so); Save asks "Replace" when the name
 //! is in use or the file unreadable *as it is when Save is answered*, and
 //! captures the window when the answer is final, not when the dialog opened.
@@ -30,13 +32,13 @@
 //!
 //! When a question closes, whatever the answer (its action, Cancel or Escape),
 //! the keyboard goes back to the terminal: the focused pane of the tab in front
-//! (user, 2026-10-26), not the Sessions button, where libadwaita puts it back
+//! (user, 2026-10-26), not the Layouts button, where libadwaita puts it back
 //! for a menu button. Only if that pane may have it (`panes::in_front`): not
 //! while another question is open, as the next one of a chain is. A pick keeps
 //! its own rule: the restored tab's recorded pane takes it
 //! ([`session_layout::restore`]).
 //!
-//! Session names are chosen by the person but may come from a file that was
+//! Layout names are chosen by the person but may come from a file that was
 //! edited or written by another Moniker: every label and dialog here shows
 //! them as plain text, never as Pango markup. A message goes to the
 //! notification area of the window the button is in (the button itself is in
@@ -62,39 +64,40 @@ use crate::session_layout;
 use crate::terminal_tab::{self, after_the_menu_lets_go};
 use crate::window::MainWindow;
 
-/// Widget name of the box that holds one saved session's button and its › in
+/// Widget name of the box that holds one saved layout's button and its › in
 /// the menu (tests look for it).
 pub(crate) const ROW_NAME: &str = "session-row";
 
-/// Widget name of the Sessions button beside ＋ (tests look for it).
+/// Widget name of the Layouts button beside ＋ (tests look for it).
 pub(crate) const BUTTON_NAME: &str = "sessions-button";
 /// The word on the button beside ＋. Being on it, it needs no tooltip.
-const LABEL: &str = "Sessions";
+const LABEL: &str = "Layouts";
 /// The icon after the word: several windows (user, 2026-10-26).
 const ICON: &str = "focus-windows-symbolic";
 /// The icon shown instead by an icon theme that lacks [`ICON`], which is
 /// Adwaita's own rather than a standard name: the first build's icon.
 const FALLBACK_ICON: &str = "view-grid-symbolic";
 /// The entry that saves this window.
-const SAVE_ENTRY: &str = "Save Session\u{2026}";
+const SAVE_ENTRY: &str = "Save Layout\u{2026}";
 /// What the menu says with nothing saved.
-const NONE_SAVED: &str = "No saved sessions";
+const NONE_SAVED: &str = "No saved layouts";
 /// What the Save question says it saves.
-const SAVE_BODY: &str = "Saves this window's tabs and panes to add them to a window later. \
+const SAVE_BODY: &str = "Saves this window's tabs and panes, to open them in a new window later. \
      No passwords, and nothing shown in the panes, are saved.";
 /// What the Replace question says is replaced.
-const REPLACE_BODY: &str = "The saved session with this name is replaced by this window's layout.";
+const REPLACE_BODY: &str =
+    "The saved layout with this name is replaced by this window's tabs and panes.";
 /// What the Delete question says is deleted.
 const DELETE_BODY: &str = "The saved layout is deleted. Windows that are open are not changed.";
 
-/// The sessions file of this machine: beside the GUI settings.
+/// The file of saved layouts of this machine: beside the GUI settings.
 pub(crate) fn sessions_path(ctx: &AppContext) -> PathBuf {
     ctx.settings_path.with_file_name(session_file::FILE_NAME)
 }
 
-/// The Sessions button for `main`: "Sessions", an icon of several windows and
+/// The Layouts button for `main`: "Layouts", an icon of several windows and
 /// the drop-down arrow, shown unless the Preferences turned it off
-/// ([`show_buttons`]). Its popover lists the saved sessions (module docs), and
+/// ([`show_buttons`]). Its popover lists the saved layouts (module docs), and
 /// a pick adds one's tabs to `main.view`. It holds the window's view and
 /// notification area weakly: the window owns the button.
 pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton {
@@ -150,16 +153,16 @@ pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton
 }
 
 thread_local! {
-    /// Every Sessions button made, with the tabs of its window, so that the
+    /// Every Layouts button made, with the tabs of its window, so that the
     /// Preferences switch reaches the one in each main window at once
     /// ([`show_buttons`]). GTK runs on one thread.
     static BUTTONS: RefCell<Vec<(glib::WeakRef<gtk::MenuButton>, glib::WeakRef<adw::TabView>)>> =
         const { RefCell::new(Vec::new()) };
 }
 
-/// Show or hide the Sessions button of every main window (the Preferences
+/// Show or hide the Layouts button of every main window (the Preferences
 /// switch, `settings::GuiSettings::show_sessions`); a window opened later reads
-/// the setting itself. The saved sessions are not touched. A button hidden
+/// the setting itself. The saved layouts are not touched. A button hidden
 /// while it has the keyboard gives it to the terminal of its window
 /// ([`keyboard_to_the_terminal`]), so the keys never go nowhere; one given
 /// the keyboard while hidden does the same ([`button`]).
@@ -293,7 +296,7 @@ impl Menu {
             .build()
     }
 
-    /// The row of the session `name`: its button, which adds it, and a › with
+    /// The row of the layout `name`: its button, which adds it, and a › with
     /// Rename… and Delete….
     fn row(self: &Rc<Self>, outer: &gtk::Popover, name: &str) -> gtk::Box {
         let row = gtk::Box::builder().name(ROW_NAME).spacing(2).build();
@@ -350,7 +353,7 @@ impl Menu {
         actions.append(&rename);
         actions.append(&delete);
         inner.set_child(Some(&actions));
-        row.append(&more_button("Session Menu", &inner));
+        row.append(&more_button("Layout Menu", &inner));
         row
     }
 
@@ -364,13 +367,13 @@ impl Menu {
         after_the_menu_lets_go(self.window().as_ref(), move || then(&menu));
     }
 
-    /// Add the session `name` to this window's tabs.
+    /// Add the layout `name` to this window's tabs.
     fn pick(self: &Rc<Self>, popover: &gtk::Popover, name: &str) {
         let name = name.to_owned();
         self.leave(&[popover], move |menu| menu.add(&name));
     }
 
-    /// Add the session `name`, as the file has it now.
+    /// Add the layout `name`, as the file has it now.
     fn add(&self, name: &str) {
         match session_file::load(&self.path()) {
             Loaded::Unreadable(why) => self.tell(&unreadable_text(&why)),
@@ -396,7 +399,7 @@ impl Menu {
             Loaded::Unreadable(_) => session_file::next_default_name(&[]),
         };
         let (dialog, entry) = name_dialog(
-            "Save Session",
+            "Save Layout",
             Some(SAVE_BODY),
             ("save", "Save"),
             &start,
@@ -422,7 +425,7 @@ impl Menu {
     }
 
     /// Save this window as `name`, if the file as it is now allows it without
-    /// asking: asks first to replace a session of that name or a file that
+    /// asking: asks first to replace a layout of that name or a file that
     /// cannot be read.
     fn save(self: &Rc<Self>, name: String) {
         match session_file::load(&self.path()) {
@@ -434,7 +437,7 @@ impl Menu {
         }
     }
 
-    /// Write this window, as it is now, as the session `name`.
+    /// Write this window, as it is now, as the layout `name`.
     /// `replace_unreadable` says the person chose to start a new file.
     fn put(&self, name: String, replace_unreadable: bool) {
         let Some(view) = self.view.upgrade() else {
@@ -473,7 +476,7 @@ impl Menu {
         });
     }
 
-    /// Ask before a session of the same name is replaced.
+    /// Ask before a layout of the same name is replaced.
     fn ask_to_replace(self: &Rc<Self>, name: String) {
         self.confirm(
             &format!("Replace \u{201c}{name}\u{201d}?"),
@@ -486,10 +489,10 @@ impl Menu {
     /// Ask before a file that cannot be read (`why`) is replaced by a new one.
     fn ask_to_replace_the_file(self: &Rc<Self>, name: String, why: &str) {
         self.confirm(
-            "Replace the Saved Sessions File?",
+            "Replace the Saved Layouts File?",
             &format!(
                 "Moniker could not read it: {why}. Saving starts a new file without the \
-                 sessions that were in it."
+                 layouts that were in it."
             ),
             ("replace", "Replace"),
             move |menu| menu.replace_the_file(name),
@@ -508,12 +511,12 @@ impl Menu {
         }
     }
 
-    /// Ask for a new name for the session `from`.
+    /// Ask for a new name for the layout `from`.
     fn ask_rename(self: &Rc<Self>, from: &str) {
         let Some(window) = self.window() else {
             return;
         };
-        // The names of the other sessions, as the file has them now; the file
+        // The names of the other layouts, as the file has them now; the file
         // is checked again when Rename is answered.
         let taken = match session_file::load(&self.path()) {
             Loaded::Sessions(sessions) => sessions
@@ -523,8 +526,7 @@ impl Menu {
                 .collect(),
             Loaded::Unreadable(_) => Vec::new(),
         };
-        let (dialog, entry) =
-            name_dialog("Rename Session", None, ("rename", "Rename"), from, taken);
+        let (dialog, entry) = name_dialog("Rename Layout", None, ("rename", "Rename"), from, taken);
         self.give_the_keyboard_back_when_closed(&dialog);
         let menu = Rc::clone(self);
         let from = from.to_owned();
@@ -545,7 +547,7 @@ impl Menu {
         );
     }
 
-    /// Ask before the session `name` is deleted.
+    /// Ask before the layout `name` is deleted.
     fn ask_delete(self: &Rc<Self>, name: &str) {
         let name_to_delete = name.to_owned();
         self.confirm(
@@ -583,10 +585,10 @@ fn note(text: &str, dim: bool) -> gtk::Label {
 
 /// What the menu and a pick say of a file that cannot be read.
 fn unreadable_text(why: &str) -> String {
-    format!("Could not read the saved sessions: {why}")
+    format!("Could not read the saved layouts: {why}")
 }
 
-/// The sessions' names as the menu lists them: sorted ignoring case.
+/// The layouts' names as the menu lists them: sorted ignoring case.
 fn names_in_order(sessions: &[Session]) -> Vec<String> {
     let mut names: Vec<String> = sessions
         .iter()
@@ -596,19 +598,19 @@ fn names_in_order(sessions: &[Session]) -> Vec<String> {
     names
 }
 
-/// What to say of a write that failed, by what failed: a session the file would
+/// What to say of a write that failed, by what failed: a layout the file would
 /// not read back ([`io::ErrorKind::InvalidInput`], a plain sentence), a file that
 /// cannot be read (`InvalidData`, which already says "Could not read the saved
-/// sessions"), or the write itself.
+/// layouts"), or the write itself.
 fn write_error(err: &io::Error) -> String {
     match err.kind() {
-        io::ErrorKind::InvalidInput => format!("Could not save the session: {err}"),
+        io::ErrorKind::InvalidInput => format!("Could not save the layout: {err}"),
         io::ErrorKind::InvalidData => err.to_string(),
-        _ => format!("Could not save the sessions: {err}"),
+        _ => format!("Could not save the layouts: {err}"),
     }
 }
 
-/// Why `raw` cannot be the name of a session, if it cannot: a name
+/// Why `raw` cannot be the name of a layout, if it cannot: a name
 /// [`session_file::check_name`] refuses, or one of the `taken` names.
 fn name_error(raw: &str, taken: &[String]) -> Option<&'static str> {
     match session_file::check_name(raw) {
@@ -634,11 +636,11 @@ fn question(heading: &str, body: &str, action: (&str, &str)) -> adw::AlertDialog
     dialog
 }
 
-/// A dialog that asks for a session's name, in a field that starts as `start`,
+/// A dialog that asks for a layout's name, in a field that starts as `start`,
 /// with Cancel (also Escape) and the `action` response (id, label), which Enter
 /// in the field answers. A plain label under the field gives the reason the name
 /// cannot be used (as [`name_error`] says, with `taken` the names of other
-/// sessions) and the response is off meanwhile. Plain text.
+/// layouts) and the response is off meanwhile. Plain text.
 fn name_dialog(
     heading: &str,
     body: Option<&str>,
@@ -748,24 +750,24 @@ mod tests {
 
     #[test]
     fn a_write_error_is_told_by_what_failed() {
-        let refused = io::Error::new(io::ErrorKind::InvalidInput, "the session has no tab");
+        let refused = io::Error::new(io::ErrorKind::InvalidInput, "the layout has no tab");
         assert_eq!(
             write_error(&refused),
-            "Could not save the session: the session has no tab"
+            "Could not save the layout: the layout has no tab"
         );
         // Already says what it is.
         let unreadable = io::Error::new(
             io::ErrorKind::InvalidData,
-            "Could not read the saved sessions: it is not JSON (x)",
+            "Could not read the saved layouts: it is not JSON (x)",
         );
         assert_eq!(
             write_error(&unreadable),
-            "Could not read the saved sessions: it is not JSON (x)"
+            "Could not read the saved layouts: it is not JSON (x)"
         );
         let failed = io::Error::from(io::ErrorKind::PermissionDenied);
         assert_eq!(
             write_error(&failed),
-            format!("Could not save the sessions: {failed}")
+            format!("Could not save the layouts: {failed}")
         );
     }
 }

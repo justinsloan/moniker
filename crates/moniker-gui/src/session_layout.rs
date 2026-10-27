@@ -1,6 +1,8 @@
-//! Saved sessions in a window (issue #12): a window's tabs and panes as the
+//! Saved layouts in a window (issue #12): a window's tabs and panes as the
 //! records a session keeps ([`capture`]), and records added back to a window
-//! as tabs ([`restore`]).
+//! as tabs ([`restore`]). The code and the file call a layout a session; the
+//! interface says layout (issue #16), because "session" means a running
+//! connection everywhere else.
 //!
 //! # Capturing
 //!

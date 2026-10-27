@@ -1,5 +1,7 @@
-//! Saved sessions: the layouts of windows, kept in `sessions.json` beside
-//! `gui-settings.json` (issue #12).
+//! Saved layouts: the tabs and panes of windows, kept in `sessions.json`
+//! beside `gui-settings.json` (issue #12). The code and the file call a layout
+//! a session; the interface says layout (issue #16), because "session" means a
+//! running connection everywhere else.
 //!
 //! A session is a name and a list of tabs; a tab is a tree of splits with a
 //! pane at each leaf. Per pane the file says what it was (a profile by id, with
@@ -48,9 +50,9 @@ use crate::zoom;
 pub(crate) const FILE_NAME: &str = "sessions.json";
 
 /// What [`rename`] says of a session that is not in the file any more.
-pub(crate) const GONE: &str = "That session is no longer saved.";
+pub(crate) const GONE: &str = "That layout is no longer saved.";
 /// What [`rename`] says of a name another session has.
-pub(crate) const NAME_TAKEN: &str = "A session with this name exists.";
+pub(crate) const NAME_TAKEN: &str = "A layout with this name exists.";
 
 /// The format version this build reads and writes.
 const VERSION: u64 = 1;
@@ -138,7 +140,7 @@ pub(crate) enum Loaded {
     /// The sessions in the file, in file order; none for a missing file.
     Sessions(Vec<Session>),
     /// The file exists but cannot be used. The text is short and plain, fits
-    /// after "Could not read the saved sessions: ", and never holds anything
+    /// after "Could not read the saved layouts: ", and never holds anything
     /// the file said.
     Unreadable(String),
 }
@@ -185,7 +187,7 @@ pub(crate) fn check_name(raw: &str) -> Result<String, &'static str> {
 /// `replace_unreadable` says the person was told and chose to start over: then
 /// the file is replaced by one holding only `session`. A session that reading
 /// would skip is an error too, whose text is a plain sentence ("a tab holds
-/// more than 32 panes"; it fits after "Could not save the session: "), so what
+/// more than 32 panes"; it fits after "Could not save the layout: "), so what
 /// is saved is always found again. So is one that would make the file larger
 /// than 4 MiB.
 pub(crate) fn put(path: &Path, session: Session, replace_unreadable: bool) -> io::Result<()> {
@@ -213,7 +215,7 @@ pub(crate) fn put(path: &Path, session: Session, replace_unreadable: bool) -> io
 pub(crate) fn rename(path: &Path, from: &str, to: &str) -> Result<(), String> {
     let to = check_name(to).map_err(str::to_owned)?;
     let mut entries =
-        read(path).map_err(|why| format!("Could not read the saved sessions: {why}"))?;
+        read(path).map_err(|why| format!("Could not read the saved layouts: {why}"))?;
     let index = entries
         .iter()
         .position(|entry| matches!(entry, Entry::Session(saved) if saved.name == from))
@@ -230,7 +232,7 @@ pub(crate) fn rename(path: &Path, from: &str, to: &str) -> Result<(), String> {
     if let Entry::Session(saved) = &mut entries[index] {
         saved.name = to;
     }
-    write(path, &entries).map_err(|err| format!("Could not save the sessions: {err}"))
+    write(path, &entries).map_err(|err| format!("Could not save the layouts: {err}"))
 }
 
 /// Remove the session `name`; nothing to do if there is none (another window
@@ -246,11 +248,11 @@ pub(crate) fn delete(path: &Path, name: &str) -> io::Result<()> {
     write(path, &entries)
 }
 
-/// "Session N" for the smallest N from 1 that no session in `sessions` uses.
+/// "Layout N" for the smallest N from 1 that no session in `sessions` uses.
 pub(crate) fn next_default_name(sessions: &[Session]) -> String {
     let mut n = 1_u64;
     loop {
-        let name = format!("Session {n}");
+        let name = format!("Layout {n}");
         if !sessions.iter().any(|saved| saved.name == name) {
             return name;
         }
@@ -262,7 +264,7 @@ pub(crate) fn next_default_name(sessions: &[Session]) -> String {
 fn unreadable_error(why: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("Could not read the saved sessions: {why}"),
+        format!("Could not read the saved layouts: {why}"),
     )
 }
 
@@ -280,7 +282,7 @@ enum Entry {
 
 // Reading
 
-const NOT_A_LIST: &str = "it is not a list of sessions";
+const NOT_A_LIST: &str = "it is not a list of layouts";
 const TOO_LARGE: &str = "it is larger than 4 MiB";
 
 /// The entries in the file at `path`, in file order (none if there is no
@@ -472,10 +474,10 @@ fn refusal(session: &Session) -> Option<String> {
         return Some("the name is not allowed".to_owned());
     }
     if session.tabs.is_empty() {
-        return Some("the session has no tab".to_owned());
+        return Some("the layout has no tab".to_owned());
     }
     if session.tabs.len() > MAX_TABS {
-        return Some(format!("the session has more than {MAX_TABS} tabs"));
+        return Some(format!("the layout has more than {MAX_TABS} tabs"));
     }
     session.tabs.iter().find_map(|tab| {
         let mut panes = 0;
@@ -544,7 +546,7 @@ fn write(path: &Path, entries: &[Entry]) -> io::Result<()> {
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the saved sessions would be larger than 4 MiB",
+            "the saved layouts would be larger than 4 MiB",
         ));
     }
     write_private(path, &bytes)
@@ -1188,7 +1190,7 @@ mod tests {
             assert!(!why.contains("hunter2"), "the file's text is shown: {why}");
 
             // Nothing writes over it, whatever the change, and each says why.
-            let told = "Could not read the saved sessions: it ";
+            let told = "Could not read the saved layouts: it ";
             let error = put(&path, session("New"), false).unwrap_err();
             assert!(error.to_string().starts_with(told), "{error}");
             let error = rename(&path, "a", "b").unwrap_err();
@@ -1211,7 +1213,7 @@ mod tests {
         fs::write(&path, r#"{"version":1,"sessions":5}"#).unwrap();
         assert_eq!(
             load(&path),
-            Loaded::Unreadable("it is not a list of sessions".to_owned())
+            Loaded::Unreadable("it is not a list of layouts".to_owned())
         );
         fs::write(&path, "not json").unwrap();
         let Loaded::Unreadable(why) = load(&path) else {
@@ -1366,7 +1368,7 @@ mod tests {
             }))
         };
         // Each is refused with its own sentence, which Task 5 shows after
-        // "Could not save the session: ".
+        // "Could not save the layout: ".
         let bad = [
             (session(""), name),
             (session("a\tb"), name),
@@ -1377,10 +1379,10 @@ mod tests {
                     name: "S".to_owned(),
                     tabs: vec![],
                 },
-                "the session has no tab",
+                "the layout has no tab",
             ),
-            (with_tabs(65), "the session has more than 64 tabs"),
-            (with_tabs(1000), "the session has more than 64 tabs"),
+            (with_tabs(65), "the layout has more than 64 tabs"),
+            (with_tabs(1000), "the layout has more than 64 tabs"),
             (
                 with_root(chain(17)),
                 "a tab's panes are split more than 16 deep",
@@ -1458,7 +1460,7 @@ mod tests {
 
         assert_eq!(
             rename(&path, "A", "B"),
-            Err("A session with this name exists.".to_owned())
+            Err("A layout with this name exists.".to_owned())
         );
         assert_eq!(rename(&path, "A", "  "), Err("Enter a name.".to_owned()));
         assert_eq!(
@@ -1576,19 +1578,19 @@ mod tests {
 
     #[test]
     fn the_next_default_name() {
-        assert_eq!(next_default_name(&[]), "Session 1");
+        assert_eq!(next_default_name(&[]), "Layout 1");
         assert_eq!(
-            next_default_name(&[session("Session 1"), session("Session 3")]),
-            "Session 2"
+            next_default_name(&[session("Layout 1"), session("Layout 3")]),
+            "Layout 2"
         );
-        assert_eq!(next_default_name(&[session("Session 2")]), "Session 1");
+        assert_eq!(next_default_name(&[session("Layout 2")]), "Layout 1");
         assert_eq!(
-            next_default_name(&[session("Session 1"), session("Session 2")]),
-            "Session 3"
+            next_default_name(&[session("Layout 1"), session("Layout 2")]),
+            "Layout 3"
         );
         assert_eq!(
-            next_default_name(&[session("Work"), session("session 1"), session("Session 01")]),
-            "Session 1"
+            next_default_name(&[session("Work"), session("layout 1"), session("Layout 01")]),
+            "Layout 1"
         );
     }
 
@@ -1764,7 +1766,7 @@ mod tests {
         assert_eq!(load(&path), large);
 
         // Nothing writes over it.
-        let told = "Could not read the saved sessions: it is larger than 4 MiB";
+        let told = "Could not read the saved layouts: it is larger than 4 MiB";
         let error = put(&path, session("New"), false).unwrap_err();
         assert_eq!(error.to_string(), told);
         assert_eq!(rename(&path, "a", "b").unwrap_err(), told);
@@ -1797,7 +1799,7 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
-            "the saved sessions would be larger than 4 MiB"
+            "the saved layouts would be larger than 4 MiB"
         );
         assert_eq!(fs::read(&path).unwrap(), before, "the file is as it was");
 

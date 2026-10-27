@@ -2,7 +2,7 @@
 //!
 //! The header bar holds, left to right: ＋ (a new tab here showing the new-tab
 //! list, [`crate::new_tab`], where a saved profile becomes a session in that
-//! tab), Sessions (the saved layouts of windows, to add back to this one, and
+//! tab), Layouts (the saved layouts of windows, to add back to this one, and
 //! saving this one: [`crate::sessions_menu`]; the Preferences can hide it),
 //! the selected tab's title (after a record icon while that tab saves a
 //! transcript, `crate::panes`), and ☰ (the app's actions, which `main.rs`
@@ -302,7 +302,7 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
         view,
         notifications,
     };
-    // Sessions, right after ＋: it needs the window's own view and
+    // Layouts, right after ＋: it needs the window's own view and
     // notification area.
     header.pack_start(&sessions_menu::button(&main, ctx));
     main

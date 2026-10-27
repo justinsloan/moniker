@@ -463,7 +463,7 @@ fn gui_integration() {
     transcript_indicator::rec_goes_when_the_transcript_is_written(&tmp.path().join("rec-goes"));
     transcript_indicator::a_split_shows_rec_on_the_pane_that_saves(&tmp.path().join("rec-split"));
     transcript_indicator::rec_is_not_part_of_the_name(&tmp.path().join("rec-name"));
-    // Issue #12, the Sessions menu beside ＋.
+    // Issue #12, the Layouts menu beside ＋.
     sessions::the_menu_with_no_sessions(&tmp.path().join("sm-none"));
     sessions::the_sessions_button_can_be_hidden(&tmp.path().join("sm-hidden"));
     sessions::saving_and_adding_from_the_menu(&bin, &tmp.path().join("sm-save"));
@@ -830,7 +830,7 @@ fn close_popover(popover: &gtk::Popover) {
 /// Local terminal's, whose sequence is named the same way), the tab (title,
 /// tooltip, as the tab bar draws it), the window title, the same two and a
 /// pane's header for a tab that saves a transcript (REC before the name), a
-/// notification (and the toast of the Preferences dialog), the Sessions menu (a
+/// notification (and the toast of the Preferences dialog), the Layouts menu (a
 /// saved session's row, its rename field and the questions of delete and
 /// replace) and, from it, the note over the list of a restored pane whose
 /// profile is gone, the sync
@@ -1006,7 +1006,7 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     );
     literal_labels("notification", &main.notifications, MARKUP_NAME);
 
-    // A saved session named like this, added from the Sessions menu: its pane
+    // A saved session named like this, added from the Layouts menu: its pane
     // whose profile is gone says so above the list, naming the profile as the
     // session recorded it.
     let gone = TabRecord {

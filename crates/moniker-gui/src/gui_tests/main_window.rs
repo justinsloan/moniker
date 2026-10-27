@@ -488,7 +488,7 @@ pub(super) fn about_shows_copyright_and_mit() {
     assert_eq!(about.website(), REPOSITORY_URL, "the About box's website");
 }
 
-/// The header bar has ＋, Sessions (saved layouts of windows, issue #12), the
+/// The header bar has ＋, Layouts (saved layouts of windows, issue #12), the
 /// tab's title and ☰ and no Connect button: new connections come from the
 /// new-tab list and the Connection Profiles window.
 pub(super) fn header_has_no_connect_button(dir: &Path) {
@@ -511,13 +511,13 @@ pub(super) fn header_has_no_connect_button(dir: &Path) {
             .all(|b| b.icon_name().as_deref() != Some("network-server-symbolic")),
         "no server-icon button either"
     );
-    // Sessions (issue #12; its word is on it, so it has no tooltip) and ☰, in
+    // Layouts (issue #12; its word is on it, so it has no tooltip) and ☰, in
     // that order, and nothing else.
     assert_eq!(menus.len(), 2, "the header's menu buttons: {tooltips:?}");
     assert_eq!(
         menus[0].widget_name(),
         sessions_menu::BUTTON_NAME,
-        "Sessions first"
+        "Layouts first"
     );
     assert_eq!(
         menus[1].tooltip_text().as_deref(),
