@@ -31,15 +31,15 @@ If you log in to the same machines many times a day, an ordinary terminal has yo
 Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, renders htop, tmux and vim, and Moniker adds no per-frame work on top of it. Next to that, a saved **connection profile** is one click from a logged-in shell, and profiles sync between your own machines over plain SSH, encrypted with a key that only those machines hold.
 
 > [!NOTE]
-> Moniker is alpha software (0.5.0, alpha 5). Expect rough edges, and see the [known limitations](#known-limitations).
+> Moniker is alpha software (0.6.0, alpha 6). Expect rough edges, and see the [known limitations](#known-limitations).
 
 ## Features
 
 - 🔑 **One click to a logged-in shell.** A profile holds the host, user name, port, an optional key file and a password. Pick it in the new-tab list and the tab logs in with no typing. The password lives in the system keyring and reaches `ssh` through a helper that answers only that host's password prompt, never through a file, the command line or the environment.
 - ▶️ **Startup sequences.** Give a profile as many named command lists as you like ("update", "tail the logs"). Connect with one and its commands run after login, then you are left in your normal interactive shell. Name one as the profile's default and every plain click on it runs that one.
 - 🔄 **Sync with no server.** Profiles and passwords sync between your own machines over plain SSH. The bundle is encrypted with a shared sync key (Argon2id, XChaCha20-Poly1305) before it leaves the machine, and the key itself is never sent. Changes merge both ways: profiles added on either side are kept, the newest edit of a profile wins and deletions propagate. Once set up, Moniker syncs in the background at every launch. You can turn sync off on a machine, and keep any one profile on a single machine.
-- 📝 **Transcripts.** Save a plain-text transcript of any session, remote or local: per profile, per connection, or of every session. The Transcripts window lists them by day, filters by host, searches across all of them, and exports or deletes them. Transcripts never leave the machine.
-- 🖥️ **A real terminal.** Tabs, panes side by side or one above the other in any arrangement (to compare two servers, say), several windows, tabs and panes dragged from one window to another, a text size per pane, copy and paste with bracketed paste, and saved sessions that add a whole window's tabs and panes back in one pick, reconnecting each one. Moniker keeps only a handful of [shortcuts](#keyboard-shortcuts); every other key, Ctrl+Tab and F10 included, goes to the program in the terminal.
+- 📝 **Transcripts.** Save a plain-text transcript of any session, remote or local: per profile, per connection, or of every session. The Transcripts window lists them by day, filters by host, searches across all of them, and exports or deletes them. A tab that is saving one shows a record icon and REC before its name. Transcripts never leave the machine.
+- 🖥️ **A real terminal.** Tabs, panes side by side or one above the other in any arrangement (to compare two servers, say), several windows, tabs and panes dragged from one window to another, a text size per pane, copy and paste with bracketed paste, and saved sessions that add a whole window's tabs and panes back in one pick, reconnecting each one. It can be your [default terminal](#the-command-line-and-moniker-as-the-default-terminal), for Files' "Open in Terminal" and apps that run in a terminal. Moniker keeps only a handful of [shortcuts](#keyboard-shortcuts); every other key, Ctrl+Tab and F10 included, goes to the program in the terminal.
 - 🎨 **The modern GNOME look.** libadwaita, following the system light or dark style, terminal colors close to GNOME Console's, and a Connection Profiles window laid out like GNOME Settings.
 - 🟢 **Which hosts answer.** A small mark before each profile's name, in the new-tab list and the Connection Profiles window, says whether its host answers a ping from this machine right now: a green dot if it does, a red ring if three pings got no reply or its name is not found, a gray dash until it is known. Hover it for the words. Turn it off in Preferences.
 - 🗄️ **Headless machines too.** `moniker-server` is a command line with no GTK, for a server that only takes part in sync.
@@ -72,9 +72,9 @@ Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, 
 
 ```sh
 # Ubuntu
-sudo apt install ./moniker_0.5.0_amd64.deb ./moniker-server_0.5.0_amd64.deb
+sudo apt install ./moniker_0.6.0_amd64.deb ./moniker-server_0.6.0_amd64.deb
 # Fedora
-sudo dnf install ./moniker-0.5.0-1.fc44.x86_64.rpm ./moniker-server-0.5.0-1.fc44.x86_64.rpm
+sudo dnf install ./moniker-0.6.0-1.fc44.x86_64.rpm ./moniker-server-0.6.0-1.fc44.x86_64.rpm
 ```
 
 A headless machine that only syncs needs just `moniker-server`. Passwords and the sync key are kept in the system keyring (a Secret Service such as GNOME Keyring), which must be running and unlocked.
@@ -83,7 +83,7 @@ To check a download against the release's `SHA256SUMS`, and, with GitHub CLI 2.4
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-gh attestation verify moniker_0.5.0_amd64.deb --repo justinsloan/moniker
+gh attestation verify moniker_0.6.0_amd64.deb --repo justinsloan/moniker
 ```
 
 ### Run from source
@@ -427,8 +427,8 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request.
 To make a release, raise `version` in `Cargo.toml`, add the version to the release list in `data/org.moniker.Moniker.metainfo.xml`, commit, and push a tag named after it:
 
 ```sh
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.6.0
+git push origin v0.6.0
 ```
 
 The workflow runs every check, builds and install-tests both packages, and only then makes a **draft** release with the four packages, `SHA256SUMS` and a build-provenance attestation for each package. A draft is not public: download its packages, try them, and publish it on GitHub when they are good. A tag that does not match the version in `Cargo.toml` makes no release.
