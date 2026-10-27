@@ -143,20 +143,9 @@ impl Inner {
     }
 
     /// Open the sub-page for the sequence at `index` (`None`: a new one) over
-    /// this page. If it cannot be read (the file changed under the rows on
-    /// show) the person is told and the rows are brought up to date.
+    /// this page ([`sequence_page::open_over`]).
     fn open_sequence(&self, index: Option<usize>) {
-        let nav = self
-            .sequences
-            .ancestor(adw::NavigationView::static_type())
-            .and_downcast::<adw::NavigationView>();
-        let Some(nav) = nav else {
-            return;
-        };
-        if let Err(message) = sequence_page::push(&nav, &self.ctx, &Owner::Local, index) {
-            self.ctx.notice.show_near(&self.sequences, &message);
-            self.ctx.profiles_changed();
-        }
+        sequence_page::open_over(&self.sequences, &self.ctx, &Owner::Local, index);
     }
 
     /// The person picked the default sequence in its row: save it, at once,
@@ -165,10 +154,9 @@ impl Inner {
     ///
     /// What the page then shows (every list told of a save that worked, the
     /// file shown again after one that did not) waits for the main loop: this
-    /// runs inside the row's own signal, and showing the file can make the
-    /// row's list again, which the row does not survive while it is still
-    /// telling of the pick (it crashes). Until then the row shows the pick, as
-    /// a profile's does while its save is out.
+    /// runs inside the row's own signal, where the rows must not be made again
+    /// (see [`SequenceRows::new`]'s `on_pick`). Until then the row shows the
+    /// pick, as a profile's does while its save is out.
     fn pick(&self, choice: Choice) {
         let row = self.rows.default_row();
         let saved = local_terminal::set_default(&self.ctx.settings_path, choice);

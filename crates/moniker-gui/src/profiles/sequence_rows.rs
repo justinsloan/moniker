@@ -101,6 +101,14 @@ impl SequenceRows {
     /// Rows for `group`, which the owner puts on its page; nothing is in the
     /// group until the first [`show`](Self::show). `on_open` and `on_pick` are
     /// held by the rows and must not hold the owner strongly.
+    ///
+    /// `on_pick` runs inside the default row's `notify::selected`, so it must
+    /// not remake the rows synchronously: a [`show`](Self::show) of names that
+    /// changed gives the row a new list, which the combo row does not survive
+    /// while it is still telling of the pick (it crashes). An owner whose save
+    /// is back at once shows the file again from the main loop instead (the
+    /// Local terminal page, issue #13); one whose save runs on a worker is
+    /// back later anyway (the profile page).
     pub(super) fn new(
         group: &adw::PreferencesGroup,
         wording: Wording,

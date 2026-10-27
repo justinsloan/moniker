@@ -107,8 +107,9 @@ pub(crate) const TITLE_NAME: &str = "profile-title";
 /// pushed over it, the startup-sequence sub-page (tests look for it).
 pub(crate) const NAV_NAME: &str = "profile-nav";
 
-/// Tag of the profile page in that navigation view.
-const PROFILE_TAG: &str = "profile";
+/// Tag of the page under the sub-page in that navigation view: a profile's,
+/// Local terminal's or the sync page (tests look for it).
+pub(crate) const PROFILE_TAG: &str = "profile";
 
 /// Tag of the startup-sequence sub-page.
 pub(crate) const SEQUENCE_TAG: &str = "sequence";

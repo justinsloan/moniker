@@ -1185,7 +1185,11 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     ActionRowExt::activate(&default_row);
     let list: gtk::Popover = find_widget(&default_row).expect("the row's list");
     pump_until("the default sequence list to open", || list.is_visible());
-    pump_for(Duration::from_millis(200));
+    pump_until("the default sequence list to show its entries", || {
+        let labels = labels_in(&list);
+        labels.iter().any(|l| l.label() == MARKUP_NAME)
+            && labels.iter().any(|l| l.label() == "None")
+    });
     literal_labels("default list", &list, MARKUP_NAME);
     literal_labels("default list", &list, "None");
     list.popdown();
@@ -1290,7 +1294,9 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     ActionRowExt::activate(&default_row);
     let list: gtk::Popover = find_widget(&default_row).expect("the row's list");
     pump_until("the local default list to open", || list.is_visible());
-    pump_for(Duration::from_millis(200));
+    pump_until("the local default list to show the name", || {
+        labels_in(&list).iter().any(|l| l.label() == MARKUP_NAME)
+    });
     literal_labels("local default list", &list, MARKUP_NAME);
     list.popdown();
     pump_until("the local default list to close", || !list.is_visible());

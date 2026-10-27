@@ -885,23 +885,10 @@ impl Inner {
     }
 
     /// Open the sub-page for the sequence at `index` (`None`: a new one) over
-    /// this page. If it cannot be read (the profile or the sequence changed
-    /// under the rows on show) the person is told and the rows are brought up
-    /// to date.
+    /// this page ([`sequence_page::open_over`]).
     fn open_sequence(&self, index: Option<usize>) {
-        let nav = self
-            .sequences
-            .ancestor(adw::NavigationView::static_type())
-            .and_downcast::<adw::NavigationView>();
-        let Some(nav) = nav else {
-            return;
-        };
         let owner = Owner::Profile(self.id.clone());
-        if let Err(message) = sequence_page::push(&nav, &self.ctx, &owner, index) {
-            // Tell first: refreshing may drop this page.
-            self.ctx.notice.show_near(&self.sequences, &message);
-            self.ctx.profiles_changed();
-        }
+        sequence_page::open_over(&self.sequences, &self.ctx, &owner, index);
     }
 
     fn ask_remove_password(self: &Rc<Self>) {

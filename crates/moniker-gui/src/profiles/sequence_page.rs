@@ -1,6 +1,6 @@
 //! The startup-sequence sub-page: one sequence of a profile, or of Local
-//! terminal (issue #13), pushed over its page in the content pane ([`push`]).
-//! Whose it is, and so where it is saved, is its [`Owner`].
+//! terminal (issue #13), pushed over its page in the content pane
+//! ([`open_over`]). Whose it is, and so where it is saved, is its [`Owner`].
 //!
 //! A Name row and a monospace editor with one command per line. A multi-line
 //! editor has no ✓, so the header has Cancel and Save. Save, Move Up, Move
@@ -79,11 +79,13 @@ struct Inner {
     /// Whose sequence this is.
     owner: Owner,
     nav: glib::WeakRef<adw::NavigationView>,
-    /// Where the sequence sits in the profile's list; `None` for a new one.
-    /// Move changes it.
+    /// Where the sequence sits in its owner's list (the profile's or Local
+    /// terminal's); `None` for a new one. Move changes it.
     index: Cell<Option<usize>>,
     /// The sequence as it was when the page was opened (`None` for a new
-    /// one): what [`form::apply_sequences`] expects to find at `index`.
+    /// one): what [`form::apply_sequences`] (a profile's) or
+    /// [`local_terminal::apply_sequences`] (Local terminal's) expects to find
+    /// at `index`.
     original: Option<StartupSequence>,
     /// How many sequences its owner had at the last read: Move Down is
     /// offered while there is a later one.
@@ -103,13 +105,39 @@ struct Inner {
     page: glib::WeakRef<adw::NavigationPage>,
 }
 
+/// Open the sub-page for the sequence at `index` of `owner` (`None`: a new
+/// sequence) over the page that holds `group`, its "Startup sequences" group:
+/// the sub-page is pushed onto the navigation view that page is in. If the
+/// sequence cannot be read (the profile, the sequence or the list changed under
+/// the rows on show) the person is told near `group`, every list and page is
+/// brought up to date, and nothing is pushed. The profile page and the Local
+/// terminal page both open their sequences this way.
+pub(super) fn open_over(
+    group: &adw::PreferencesGroup,
+    ctx: &Rc<AppContext>,
+    owner: &Owner,
+    index: Option<usize>,
+) {
+    let nav = group
+        .ancestor(adw::NavigationView::static_type())
+        .and_downcast::<adw::NavigationView>();
+    let Some(nav) = nav else {
+        return;
+    };
+    if let Err(message) = push(&nav, ctx, owner, index) {
+        // Tell first: refreshing may drop the page `group` is on.
+        ctx.notice.show_near(group, &message);
+        ctx.profiles_changed();
+    }
+}
+
 /// Push the sub-page for the sequence at `index` of `owner` (`None`: a new
 /// sequence) onto `nav`.
 ///
 /// The sequence is read from the file as it is now. If it cannot be (the
 /// profile or the sequence is gone) the message is returned and nothing is
 /// pushed.
-pub(super) fn push(
+fn push(
     nav: &adw::NavigationView,
     ctx: &Rc<AppContext>,
     owner: &Owner,
@@ -274,7 +302,10 @@ impl Inner {
         moves.append(&self.down);
         let order = adw::PreferencesGroup::builder()
             .title("Order")
-            .description("The connect options list sequences in this order.")
+            .description(match self.owner {
+                Owner::Profile(_) => "The connect options list sequences in this order.",
+                Owner::Local => "Local terminal's options list sequences in this order.",
+            })
             .visible(existing)
             .build();
         order.add(&moves);
@@ -340,11 +371,24 @@ impl Inner {
     /// the default sequence as the file has it then and returns the one to
     /// save with it. When it is back, `then` gets the number of sequences now
     /// saved, or `None` if the list came out the same and nothing was written;
-    /// a failure is shown ([`fail`](Self::fail)). A profile's change runs on
-    /// the keyring worker, and if the page has gone by the time it is back, a
-    /// failure is told in the window; Local terminal's runs here, at once.
+    /// a failure is shown ([`fail`](Self::fail)).
     fn apply(
         self: &Rc<Self>,
+        change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence> + Send + 'static,
+        follow: impl FnOnce(Option<usize>) -> Option<usize> + Send + 'static,
+        then: impl FnOnce(&Rc<Inner>, Option<usize>) + 'static,
+    ) {
+        match &self.owner {
+            Owner::Profile(id) => self.apply_profile(id.clone(), change, follow, then),
+            Owner::Local => self.apply_local(change, follow, then),
+        }
+    }
+
+    /// [`apply`](Self::apply) for profile `id`, on the keyring worker. If the
+    /// page has gone by the time it is back, a failure is told in the window.
+    fn apply_profile(
+        self: &Rc<Self>,
+        id: String,
         change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence> + Send + 'static,
         follow: impl FnOnce(Option<usize>) -> Option<usize> + Send + 'static,
         then: impl FnOnce(&Rc<Inner>, Option<usize>) + 'static,
@@ -352,25 +396,6 @@ impl Inner {
         self.saving.begin();
         self.set_waiting(true);
         let target = self.index.get().zip(self.original.clone());
-        let id = match &self.owner {
-            Owner::Profile(id) => id.clone(),
-            Owner::Local => {
-                let target = target.as_ref().map(|(index, sequence)| (*index, sequence));
-                let result = local_terminal::apply_sequences(
-                    &self.ctx.settings_path,
-                    target,
-                    change,
-                    follow,
-                );
-                self.saving.end();
-                self.set_waiting(false);
-                match result {
-                    Ok(saved) => then(self, saved),
-                    Err(message) => self.fail(&message),
-                }
-                return;
-            }
-        };
         let ctx = Rc::clone(&self.ctx);
         let saving = Rc::clone(&self.saving);
         let weak = Rc::downgrade(self);
@@ -397,6 +422,28 @@ impl Inner {
                 }
             },
         );
+    }
+
+    /// [`apply`](Self::apply) for Local terminal, in the settings file on the
+    /// main thread: back at once (module docs).
+    fn apply_local(
+        self: &Rc<Self>,
+        change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence>,
+        follow: impl FnOnce(Option<usize>) -> Option<usize>,
+        then: impl FnOnce(&Rc<Inner>, Option<usize>),
+    ) {
+        self.saving.begin();
+        self.set_waiting(true);
+        let target = self.index.get().zip(self.original.clone());
+        let target = target.as_ref().map(|(index, sequence)| (*index, sequence));
+        let result =
+            local_terminal::apply_sequences(&self.ctx.settings_path, target, change, follow);
+        self.saving.end();
+        self.set_waiting(false);
+        match result {
+            Ok(saved) => then(self, saved),
+            Err(message) => self.fail(&message),
+        }
     }
 
     /// While a change is under way (module docs): no typing, and no leaving

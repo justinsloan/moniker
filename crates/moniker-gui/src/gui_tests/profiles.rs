@@ -478,6 +478,16 @@ fn inline_error(page: &adw::NavigationPage) -> Option<String> {
         .map(|label| label.label().to_string())
 }
 
+/// The description of the sub-page's Order group.
+fn order_description(page: &adw::NavigationPage) -> Option<String> {
+    all_widgets::<adw::PreferencesGroup>(page)
+        .into_iter()
+        .find(|group| group.title() == "Order")
+        .expect("the Order group")
+        .description()
+        .map(|text| text.to_string())
+}
+
 fn seq(name: &str, commands: &[&str]) -> StartupSequence {
     StartupSequence {
         name: name.to_owned(),
@@ -1105,6 +1115,10 @@ pub(super) fn add_edit_move_delete_a_sequence(dir: &Path) {
     let page = s.open_sequence("update");
     assert_eq!(sub_name(&page).text(), "update");
     assert_eq!(commands_text(&page), "sudo apt update\ndf -h");
+    assert_eq!(
+        order_description(&page).as_deref(),
+        Some("The connect options list sequences in this order.")
+    );
     // First in the list: Move Up has nowhere to go.
     let up = button_labeled(&page, "Move Up").expect("Move Up");
     let down = button_labeled(&page, "Move Down").expect("Move Down");
@@ -2876,6 +2890,49 @@ pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
     assert!(open.is_visible());
     assert_eq!(open.label().as_deref(), Some("Open"));
 
+    // A profile's sequence sub-page open, with text typed in it: selecting the
+    // entry closes it, shows Local terminal's page and writes nothing; and the
+    // other way round.
+    s.select(&p.id);
+    let profile_before = s.file_bytes();
+    let settings_before = s.settings_bytes();
+    let page = s.open_sequence("Add sequence");
+    sub_name(&page).set_text("unsaved");
+    set_commands(&page, "echo unsaved");
+    s.select_local();
+    s.wait_for_sub_page_to_close();
+    assert_eq!(
+        s.content_nav()
+            .visible_page()
+            .and_then(|page| page.tag())
+            .as_deref(),
+        Some(profiles::PROFILE_TAG)
+    );
+    assert_eq!(s.title(), "Local terminal");
+    assert_eq!(
+        s.page_groups()[0].description().as_deref(),
+        Some(LOCAL_SEQUENCES_NOTE),
+        "Local terminal's page"
+    );
+    assert_eq!(s.file_bytes(), profile_before, "nothing saved");
+    assert_eq!(s.settings_bytes(), settings_before, "nothing saved");
+    let page = s.open_sequence("Add sequence");
+    sub_name(&page).set_text("unsaved");
+    set_commands(&page, "echo unsaved");
+    s.select(&p.id);
+    s.wait_for_sub_page_to_close();
+    assert_eq!(
+        s.content_nav()
+            .visible_page()
+            .and_then(|page| page.tag())
+            .as_deref(),
+        Some(profiles::PROFILE_TAG)
+    );
+    assert_eq!(s.title(), "web");
+    assert_eq!(s.file_bytes(), profile_before, "nothing saved");
+    assert_eq!(s.settings_bytes(), settings_before, "nothing saved");
+    s.select_local();
+
     // Opening: a double click or Enter on the entry, and Open.
     assert!(s.connected.borrow().is_empty(), "selecting opens nothing");
     entry.emit_by_name::<()>("row-activated", &[&row]);
@@ -2993,6 +3050,10 @@ pub(super) fn local_sequences_are_edited_like_a_profile_s(dir: &Path) {
     s.wait_for_sub_page_to_close();
     let page = s.open_sequence("Second");
     assert_eq!(page.title(), "Startup Sequence");
+    assert_eq!(
+        order_description(&page).as_deref(),
+        Some("Local terminal's options list sequences in this order.")
+    );
     s.click(&page, "Move Up");
     assert_eq!(
         s.local().sequences,
