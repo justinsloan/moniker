@@ -4,7 +4,9 @@
 //! profile ([`page`]), where each field saves on its own. ＋ opens the New
 //! Profile dialog ([`new_profile`]). A startup sequence opens as a sub-page
 //! ([`sequence_page`]) pushed over the profile page in the content pane;
-//! Cancel (or Escape) returns to it.
+//! Cancel (or Escape) returns to it. The rows that list the sequences, with
+//! the "Default sequence" row, are one component ([`sequence_rows`]) so that
+//! the Local terminal page (issue #13) can use them too.
 //!
 //! Below the profiles, the sidebar has a Sync entry: it shows the sync page
 //! ([`sync_page`]) in the content pane ([`present_sync`] opens the window on
@@ -31,6 +33,7 @@ mod new_profile;
 mod page;
 mod saving;
 mod sequence_page;
+mod sequence_rows;
 pub(crate) mod sync_page;
 
 use std::cell::{Cell, RefCell};
