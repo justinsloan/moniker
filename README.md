@@ -31,7 +31,7 @@ If you log in to the same machines many times a day, an ordinary terminal has yo
 Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, renders htop, tmux and vim, and Moniker adds no per-frame work on top of it. Next to that, a saved **connection profile** is one click from a logged-in shell, and profiles sync between your own machines over plain SSH, encrypted with a key that only those machines hold.
 
 > [!NOTE]
-> Moniker is alpha software (0.6.0, alpha 6). Expect rough edges, and see the [known limitations](#known-limitations).
+> Moniker is alpha software (0.6.1, alpha 6). Expect rough edges, and see the [known limitations](#known-limitations).
 
 ## Features
 
@@ -72,9 +72,9 @@ Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, 
 
 ```sh
 # Ubuntu
-sudo apt install ./moniker_0.6.0_amd64.deb ./moniker-server_0.6.0_amd64.deb
+sudo apt install ./moniker_0.6.1_amd64.deb ./moniker-server_0.6.1_amd64.deb
 # Fedora
-sudo dnf install ./moniker-0.6.0-1.fc44.x86_64.rpm ./moniker-server-0.6.0-1.fc44.x86_64.rpm
+sudo dnf install ./moniker-0.6.1-1.fc44.x86_64.rpm ./moniker-server-0.6.1-1.fc44.x86_64.rpm
 ```
 
 A headless machine that only syncs needs just `moniker-server`. Passwords and the sync key are kept in the system keyring (a Secret Service such as GNOME Keyring), which must be running and unlocked.
@@ -83,7 +83,7 @@ To check a download against the release's `SHA256SUMS`, and, with GitHub CLI 2.4
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-gh attestation verify moniker_0.6.0_amd64.deb --repo justinsloan/moniker
+gh attestation verify moniker_0.6.1_amd64.deb --repo justinsloan/moniker
 ```
 
 ### Run from source
@@ -443,8 +443,8 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request.
 To make a release, raise `version` in `Cargo.toml`, add the version to the release list in `data/org.moniker.Moniker.metainfo.xml`, commit, and push a tag named after it:
 
 ```sh
-git tag v0.6.0
-git push origin v0.6.0
+git tag v0.6.1
+git push origin v0.6.1
 ```
 
 The workflow runs every check, builds and install-tests both packages, and only then makes a **draft** release with the four packages, `SHA256SUMS` and a build-provenance attestation for each package. A draft is not public: download its packages, try them, and publish it on GitHub when they are good. A tag that does not match the version in `Cargo.toml` makes no release.
