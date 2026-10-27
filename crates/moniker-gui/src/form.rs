@@ -82,7 +82,7 @@ fn key_file_from(trimmed: &str) -> Option<PathBuf> {
 }
 
 /// A message for the user for each way validation can fail.
-fn describe(err: ProfileError) -> String {
+pub(crate) fn describe(err: ProfileError) -> String {
     match err {
         ProfileError::Id => "Internal error: the profile id is not valid.",
         ProfileError::Name => "Name must not be empty or contain control characters.",

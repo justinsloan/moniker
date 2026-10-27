@@ -29,6 +29,7 @@ mod hosts;
 mod keyring;
 mod launch_args;
 mod local_only;
+mod local_terminal;
 mod new_tab;
 mod notify;
 mod panes;

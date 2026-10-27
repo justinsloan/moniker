@@ -28,6 +28,27 @@ pub struct StartupSequence {
     pub commands: Vec<String>,
 }
 
+impl StartupSequence {
+    /// Whether the sequence is safe to store and to run: a name that is not
+    /// blank and has no control character, and commands without a newline or a
+    /// NUL. These are the rules [`Profile::validate`] applies to each of a
+    /// profile's sequences; the local terminal's sequences, which are kept in
+    /// the GUI settings and not in a profile, follow the same ones.
+    pub fn check(&self) -> Result<(), ProfileError> {
+        if self.name.trim().is_empty() || has_control_char(&self.name) {
+            return Err(ProfileError::SequenceName);
+        }
+        if self
+            .commands
+            .iter()
+            .any(|c| c.contains('\n') || c.contains('\0'))
+        {
+            return Err(ProfileError::Command);
+        }
+        Ok(())
+    }
+}
+
 /// A saved SSH connection. Holds no password.
 ///
 /// `Debug` prints every field, startup commands included, and those can hold
@@ -161,16 +182,7 @@ impl Profile {
             return Err(ProfileError::KeyFile);
         }
         for seq in &self.sequences {
-            if seq.name.trim().is_empty() || has_control_char(&seq.name) {
-                return Err(ProfileError::SequenceName);
-            }
-            if seq
-                .commands
-                .iter()
-                .any(|c| c.contains('\n') || c.contains('\0'))
-            {
-                return Err(ProfileError::Command);
-            }
+            seq.check()?;
         }
         Ok(())
     }
@@ -375,6 +387,22 @@ mod tests {
             commands: vec!["ls".to_string()],
         });
         assert_eq!(p.validate(), Err(ProfileError::SequenceName));
+    }
+
+    #[test]
+    fn a_sequence_checks_its_name_and_commands() {
+        let s = |name: &str, cmd: &str| StartupSequence {
+            name: name.into(),
+            commands: vec![cmd.into()],
+        };
+        assert_eq!(s("ok", "uptime").check(), Ok(()));
+        assert_eq!(s("  ", "uptime").check(), Err(ProfileError::SequenceName));
+        assert_eq!(
+            s("a\u{1b}b", "uptime").check(),
+            Err(ProfileError::SequenceName)
+        );
+        assert_eq!(s("ok", "a\nb").check(), Err(ProfileError::Command));
+        assert_eq!(s("ok", "a\0b").check(), Err(ProfileError::Command));
     }
 
     #[test]

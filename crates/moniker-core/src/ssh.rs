@@ -53,7 +53,28 @@ pub struct SshCommand {
 /// remain, or `seq` is `None`, the result is `None`. The remaining commands are
 /// passed through verbatim: they are the user's own shell commands.
 pub fn remote_command(seq: Option<&StartupSequence>) -> Option<String> {
-    let commands: Vec<&str> = seq?
+    script(seq?, "exec \"$SHELL\" -l")
+}
+
+/// The script a local terminal runs for a startup sequence, or `None` when
+/// there is nothing to run. It is [`remote_command`] for this machine: the
+/// caller runs it with the person's own shell as `shell -c <script>`, with
+/// `SHELL` set to that shell, and it ends in `exec "$SHELL"`.
+///
+/// There is no `-l`: a plain local terminal's shell is not a login shell, so
+/// the shell this leaves is the same kind. The shell's path travels in the
+/// environment (`$SHELL`), never in the script, so a path with a space or a
+/// quote cannot change what runs. The commands are joined and skipped exactly
+/// as [`remote_command`] does.
+pub fn local_command(seq: Option<&StartupSequence>) -> Option<String> {
+    script(seq?, "exec \"$SHELL\"")
+}
+
+/// The non-blank commands of `seq`, one to a line, followed by `last` on a line
+/// of its own; `None` when no command is left. The joining is the one
+/// [`remote_command`] documents.
+fn script(seq: &StartupSequence, last: &str) -> Option<String> {
+    let commands: Vec<&str> = seq
         .commands
         .iter()
         .map(String::as_str)
@@ -62,7 +83,7 @@ pub fn remote_command(seq: Option<&StartupSequence>) -> Option<String> {
     if commands.is_empty() {
         return None;
     }
-    Some(format!("{}\nexec \"$SHELL\" -l", commands.join("\n")))
+    Some(format!("{}\n{last}", commands.join("\n")))
 }
 
 /// `ssh` invocation for an interactive terminal tab.
@@ -290,6 +311,29 @@ mod tests {
             assert!(!cmd.args.contains(&"-t".to_string()), "{:?}", cmd.args);
             assert_eq!(cmd.args.last().unwrap(), "alice@example.com");
         }
+    }
+
+    #[test]
+    fn local_command_runs_the_commands_then_the_same_shell() {
+        let seq = StartupSequence {
+            name: "u".into(),
+            commands: vec![
+                "sudo apt update".into(),
+                "  ".into(),
+                "uptime # check".into(),
+                "sleep 1 &".into(),
+            ],
+        };
+        assert_eq!(
+            local_command(Some(&seq)).as_deref(),
+            Some("sudo apt update\nuptime # check\nsleep 1 &\nexec \"$SHELL\"")
+        );
+        let blank = StartupSequence {
+            name: "b".into(),
+            commands: vec![" ".into()],
+        };
+        assert_eq!(local_command(Some(&blank)), None);
+        assert_eq!(local_command(None), None);
     }
 
     #[test]
