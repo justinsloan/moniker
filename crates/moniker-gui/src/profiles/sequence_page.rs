@@ -1,38 +1,44 @@
-//! The startup-sequence sub-page: one sequence of a profile, pushed over the
-//! profile page in the content pane ([`push`]).
+//! The startup-sequence sub-page: one sequence of a profile, or of Local
+//! terminal (issue #13), pushed over its page in the content pane ([`push`]).
+//! Whose it is, and so where it is saved, is its [`Owner`].
 //!
 //! A Name row and a monospace editor with one command per line. A multi-line
 //! editor has no ✓, so the header has Cancel and Save. Save, Move Up, Move
-//! Down and Delete Sequence all go through [`form::apply_sequences`]: the list
-//! they save is built, under the profile file's lock, from the sequences the
-//! file holds *then*, not from what the page was opened on, and only if the
-//! sequence at its place is still the one the page was opened on. A sync that
-//! reordered or changed the list meanwhile is therefore never overwritten, and
-//! Move or Delete never acts on a different sequence.
+//! Down and Delete Sequence all build the list they save from the sequences
+//! the file holds *then*, not from what the page was opened on, and only if
+//! the sequence at its place is still the one the page was opened on: a
+//! profile's under the profile file's lock ([`form::apply_sequences`]), Local
+//! terminal's in the settings file ([`local_terminal::apply_sequences`]). A
+//! sync (or another window, or a hand edit) that reordered or changed the list
+//! meanwhile is therefore never overwritten, and Move or Delete never acts on
+//! a different sequence.
 //!
-//! The profile's default sequence is kept by position, so each of them says
-//! how the default follows, and the same write saves both: Save leaves it, Move
-//! takes it along with its sequence ([`form::moved_default`]), and Delete
-//! clears it or moves it up by one ([`form::default_without`]).
+//! The default sequence is kept by position, so each of them says how the
+//! default follows, and the same write saves both: Save leaves it, Move takes
+//! it along with its sequence ([`form::moved_default`]), and Delete clears it
+//! or moves it up by one ([`form::default_without`]).
 //!
 //! Move and Delete act on what is saved, at once. Text typed in the editor is
 //! kept by Move (the page stays open at the sequence's new place) and is
-//! discarded by Cancel, Escape, Delete, or selecting another profile.
+//! discarded by Cancel, Escape, Delete, or selecting another entry of the
+//! sidebar.
 //!
-//! Each of them runs on the keyring worker ([`keyring::write_profiles`]), never
-//! on the main thread (issue #7): a sync that waits for the keyring holds the
-//! profile file. Until it is back the page takes no typing and no other Save,
-//! Move or Delete, Cancel and Escape wait too, and after a moment a spinner in
-//! the header says it waits. Selecting another profile still closes the page;
-//! the change asked for goes on, and a failure is then told in the window.
+//! A profile's change runs on the keyring worker ([`keyring::write_profiles`]),
+//! never on the main thread (issue #7): a sync that waits for the keyring
+//! holds the profile file. Until it is back the page takes no typing and no
+//! other Save, Move or Delete, Cancel and Escape wait too, and after a moment a
+//! spinner in the header says it waits. Selecting another entry still closes
+//! the page; the change asked for goes on, and a failure is then told in the
+//! window. Local terminal's settings file takes no lock and is written quickly,
+//! so its changes run on the main thread and are back at once, as the
+//! Preferences' are.
 //!
-//! The page does not follow the profile file: a refresh of the profile page
-//! under it leaves what was typed alone. If the profile is deleted by a sync
-//! while the page is open, Save fails with the usual message and writes
-//! nothing.
+//! The page does not follow the file: a refresh of the page under it leaves
+//! what was typed alone. If the profile is deleted by a sync while the page is
+//! open, Save fails with the usual message and writes nothing.
 //!
 //! Commands can hold secrets, so no message here quotes one: errors come from
-//! [`form`] and name the rule, not the text.
+//! [`form`] and [`local_terminal`] and name the rule, not the text.
 
 use std::cell::Cell;
 use std::rc::{Rc, Weak};
@@ -41,7 +47,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
-use moniker_core::profile::{Profile, StartupSequence};
+use moniker_core::profile::StartupSequence;
 
 use super::page::SECRETS_WARNING;
 use super::saving::Saving;
@@ -49,6 +55,7 @@ use super::{PROFILE_TAG, SEQUENCE_TAG};
 use crate::context::AppContext;
 use crate::form::{self, Move};
 use crate::keyring;
+use crate::local_terminal::{self, LOCAL_SECRETS_WARNING};
 
 /// The page's title and the header's. They name no sequence: the name is data,
 /// shown in the Name row with markup off.
@@ -57,11 +64,20 @@ const TITLE: &str = "Startup Sequence";
 /// The same, for a sequence that is not saved yet.
 const NEW_TITLE: &str = "New Startup Sequence";
 
+/// Whose sequence a sub-page is, and so where it is read from and saved.
+#[derive(Clone)]
+pub(super) enum Owner {
+    /// The profile with this id: the profile file.
+    Profile(String),
+    /// Local terminal (issue #13): the settings file.
+    Local,
+}
+
 /// Widgets and state of an open sub-page.
 struct Inner {
     ctx: Rc<AppContext>,
-    /// The profile whose sequence this is.
-    id: String,
+    /// Whose sequence this is.
+    owner: Owner,
     nav: glib::WeakRef<adw::NavigationView>,
     /// Where the sequence sits in the profile's list; `None` for a new one.
     /// Move changes it.
@@ -69,7 +85,7 @@ struct Inner {
     /// The sequence as it was when the page was opened (`None` for a new
     /// one): what [`form::apply_sequences`] expects to find at `index`.
     original: Option<StartupSequence>,
-    /// How many sequences the profile had at the last read: Move Down is
+    /// How many sequences its owner had at the last read: Move Down is
     /// offered while there is a later one.
     count: Cell<usize>,
     name: adw::EntryRow,
@@ -87,7 +103,7 @@ struct Inner {
     page: glib::WeakRef<adw::NavigationPage>,
 }
 
-/// Push the sub-page for the sequence at `index` of profile `id` (`None`: a new
+/// Push the sub-page for the sequence at `index` of `owner` (`None`: a new
 /// sequence) onto `nav`.
 ///
 /// The sequence is read from the file as it is now. If it cannot be (the
@@ -96,13 +112,18 @@ struct Inner {
 pub(super) fn push(
     nav: &adw::NavigationView,
     ctx: &Rc<AppContext>,
-    id: &str,
+    owner: &Owner,
     index: Option<usize>,
 ) -> Result<(), String> {
-    // Bind first so the store borrow ends here.
-    let reloaded = ctx.store.borrow_mut().reload();
-    reloaded.map_err(|err| format!("Could not read the profile file: {err}"))?;
-    let current = form::sequences_of(&ctx.store.borrow(), id)?;
+    let current = match owner {
+        Owner::Profile(id) => {
+            // Bind first so the store borrow ends here.
+            let reloaded = ctx.store.borrow_mut().reload();
+            reloaded.map_err(|err| format!("Could not read the profile file: {err}"))?;
+            form::sequences_of(&ctx.store.borrow(), id)?
+        }
+        Owner::Local => ctx.settings().local_terminal.sequences,
+    };
     let original = match index {
         None => None,
         Some(i) => Some(
@@ -145,7 +166,7 @@ pub(super) fn push(
 
     let inner = Rc::new(Inner {
         ctx: Rc::clone(ctx),
-        id: id.to_owned(),
+        owner: owner.clone(),
         nav: nav.downgrade(),
         index: Cell::new(index),
         original,
@@ -235,7 +256,10 @@ impl Inner {
         editor.append(&self.error);
         let commands = adw::PreferencesGroup::builder()
             .title("Commands, one per line")
-            .description(SECRETS_WARNING)
+            .description(match self.owner {
+                Owner::Profile(_) => SECRETS_WARNING,
+                Owner::Local => LOCAL_SECRETS_WARNING,
+            })
             .build();
         commands.add(&editor);
         page.add(&commands);
@@ -311,23 +335,42 @@ impl Inner {
         })
     }
 
-    /// Change the profile's sequences on the keyring worker (module docs):
-    /// `change` gets the list as it is in the file then and returns the one to
-    /// save, and `follow` gets the default sequence as the file has it then and
-    /// returns the one to save with it. When it is back, `then` gets the
-    /// profile as stored, or `None` if the list came out the same and nothing
-    /// was written; a failure is shown ([`fail`](Self::fail)). If the page has
-    /// gone by then, a failure is told in the window.
+    /// Change the owner's sequences (module docs): `change` gets the list as
+    /// it is in the file then and returns the one to save, and `follow` gets
+    /// the default sequence as the file has it then and returns the one to
+    /// save with it. When it is back, `then` gets the number of sequences now
+    /// saved, or `None` if the list came out the same and nothing was written;
+    /// a failure is shown ([`fail`](Self::fail)). A profile's change runs on
+    /// the keyring worker, and if the page has gone by the time it is back, a
+    /// failure is told in the window; Local terminal's runs here, at once.
     fn apply(
         self: &Rc<Self>,
         change: impl FnOnce(&[StartupSequence]) -> Vec<StartupSequence> + Send + 'static,
         follow: impl FnOnce(Option<usize>) -> Option<usize> + Send + 'static,
-        then: impl FnOnce(&Rc<Inner>, Option<Profile>) + 'static,
+        then: impl FnOnce(&Rc<Inner>, Option<usize>) + 'static,
     ) {
         self.saving.begin();
         self.set_waiting(true);
-        let id = self.id.clone();
         let target = self.index.get().zip(self.original.clone());
+        let id = match &self.owner {
+            Owner::Profile(id) => id.clone(),
+            Owner::Local => {
+                let target = target.as_ref().map(|(index, sequence)| (*index, sequence));
+                let result = local_terminal::apply_sequences(
+                    &self.ctx.settings_path,
+                    target,
+                    change,
+                    follow,
+                );
+                self.saving.end();
+                self.set_waiting(false);
+                match result {
+                    Ok(saved) => then(self, saved),
+                    Err(message) => self.fail(&message),
+                }
+                return;
+            }
+        };
         let ctx = Rc::clone(&self.ctx);
         let saving = Rc::clone(&self.saving);
         let weak = Rc::downgrade(self);
@@ -336,6 +379,7 @@ impl Inner {
             move |store| {
                 let target = target.as_ref().map(|(index, sequence)| (*index, sequence));
                 form::apply_sequences(store, &id, target, change, follow)
+                    .map(|saved| saved.map(|profile| profile.sequences.len()))
             },
             move |result| {
                 saving.end();
@@ -379,7 +423,7 @@ impl Inner {
         }
     }
 
-    /// Back to the profile page. The text is dropped by [`discard`](Self::discard)
+    /// Back to the page under it. The text is dropped by [`discard`](Self::discard)
     /// once the page is out of sight.
     fn close(&self) {
         if let Some(nav) = self.nav.upgrade() {
@@ -423,13 +467,13 @@ impl Inner {
             move |current| form::moved(current, index, dir),
             move |default| form::moved_default(default, index, dir),
             move |inner, saved| {
-                if let Some(profile) = saved {
+                if let Some(count) = saved {
                     // It moved: the sequence now sits one place over.
                     inner.index.set(Some(match dir {
                         Move::Up => index.saturating_sub(1),
                         Move::Down => index + 1,
                     }));
-                    inner.count.set(profile.sequences.len());
+                    inner.count.set(count);
                     inner.ctx.profiles_changed();
                 }
                 inner.update_moves();

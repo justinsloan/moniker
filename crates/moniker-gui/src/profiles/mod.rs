@@ -1,34 +1,45 @@
-//! The Connection Profiles window, laid out like GNOME Settings: a sidebar listing the
-//! saved profiles (with ＋ and search; a profile kept on this machine only has a
-//! mark, [`local_only::mark`]) and, beside it, the page of the selected
-//! profile ([`page`]), where each field saves on its own. ＋ opens the New
-//! Profile dialog ([`new_profile`]). A startup sequence opens as a sub-page
-//! ([`sequence_page`]) pushed over the profile page in the content pane;
+//! The Connection Profiles window, laid out like GNOME Settings: a sidebar
+//! listing the saved profiles (with ＋ and search; a profile kept on this
+//! machine only has a mark, [`local_only::mark`]) and, beside it, the page of
+//! the selected profile ([`page`]), where each field saves on its own. ＋ opens
+//! the New Profile dialog ([`new_profile`]). A startup sequence opens as a
+//! sub-page ([`sequence_page`]) pushed over the page in the content pane;
 //! Cancel (or Escape) returns to it. The rows that list the sequences, with
-//! the "Default sequence" row, are one component ([`sequence_rows`]) so that
-//! the Local terminal page (issue #13) can use them too.
+//! the "Default sequence" row, are one component ([`sequence_rows`]) that the
+//! profile page and the Local terminal page share.
 //!
-//! Below the profiles, the sidebar has a Sync entry: it shows the sync page
-//! ([`sync_page`]) in the content pane ([`present_sync`] opens the window on
-//! it).
+//! Above the profiles, the sidebar has a Local terminal entry (issue #13),
+//! always shown whatever the search: it is not a profile, and nothing about
+//! it is in the profile file. It shows the Local terminal page
+//! ([`local_page`]): Local terminal's startup sequences, its default and its
+//! own "Save transcript" switch, kept in the GUI settings file and never
+//! synced. Below the profiles, the sidebar has a Sync entry: it shows the sync
+//! page ([`sync_page`]) in the content pane ([`present_sync`] opens the window
+//! on it). Selecting one of the three (a profile, Local terminal, Sync)
+//! unselects the other two.
 //!
-//! One Connection Profiles window per application ([`present`]). It is not modal and
-//! stays open while sessions start from it: double click or Enter on a
-//! profile, or the Connect button in its header, hand the profile to the
+//! One Connection Profiles window per application ([`present`]). It is not
+//! modal and stays open while sessions start from it: double click or Enter on
+//! a profile, or the Connect button in its header, hand the profile to the
 //! [`ConnectFn`] the window was opened with, with the profile's default
-//! sequence if it has one (issue #12).
+//! sequence if it has one (issue #12). On the Local terminal entry the same
+//! button reads Open, and it, a double click or Enter hand Local terminal to
+//! it ([`Pick::Local`]) with its default sequence, as the settings file has
+//! them at that moment.
 //!
 //! The window follows the profile file through
 //! [`AppContext::on_profiles_changed`]: the sidebar is rebuilt (keeping the
 //! selection while that profile exists), rows without an unapplied edit show
 //! the new values, and a selected profile that a sync deleted leaves an empty
-//! state. An open sub-page keeps its text through a refresh, and stays open
-//! if its profile is deleted (saving then says so); selecting another profile
-//! closes it.
+//! state. A change to Local terminal tells the same listeners, and the Local
+//! terminal page then shows the settings file again. An open sub-page keeps
+//! its text through a refresh, and stays open if its profile is deleted
+//! (saving then says so); selecting another entry closes it.
 //!
 //! Profile data is shown with Pango markup off everywhere, and the page title
 //! is a plain label, because names come from other machines.
 
+mod local_page;
 mod new_profile;
 mod page;
 mod saving;
@@ -44,26 +55,46 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
-use moniker_core::profile::Profile;
+use moniker_core::profile::{Profile, StartupSequence};
 
 use crate::context::AppContext;
+use crate::new_tab::LOCAL_LABEL;
 use crate::notify::NotificationArea;
-use crate::terminal_tab::default_save;
+use crate::terminal_tab::{default_local_save, default_save};
 use crate::window_size::{self, Kind};
 use crate::{form, local_only};
+use local_page::LocalPage;
 use page::ProfilePage;
 use sync_page::SyncPage;
 
-/// What connecting from the Connection Profiles window does: start a session for the
-/// profile with this startup sequence (`None`: just connect; the window passes
-/// the profile's default sequence), recording a transcript or not.
-pub type ConnectFn = Rc<dyn Fn(&Profile, Option<usize>, bool)>;
+/// What the Connection Profiles window asks to open: a profile's session with
+/// this startup sequence (an index into its sequences; `None`: just connect),
+/// or a local terminal running this sequence (`None`: a plain shell). The
+/// window passes the default sequence of the one picked, as a plain click in
+/// the new-tab list does.
+pub enum Pick<'a> {
+    Profile {
+        profile: &'a Profile,
+        sequence: Option<usize>,
+    },
+    Local {
+        sequence: Option<StartupSequence>,
+    },
+}
+
+/// What opening from the Connection Profiles window does: open what was picked
+/// ([`Pick`]), recording a transcript or not.
+pub type ConnectFn = Rc<dyn Fn(Pick<'_>, bool)>;
 
 /// Widget name of the Connection Profiles window, how [`present`] finds an open one.
 const WINDOW_NAME: &str = "moniker-profiles";
 
 /// Widget name of the sidebar list, how [`select`] finds it.
 pub(crate) const SIDEBAR_NAME: &str = "profiles-sidebar";
+
+/// Widget name of the sidebar's Local terminal entry (a list of one row, above
+/// the profiles).
+pub(crate) const LOCAL_ENTRY_NAME: &str = "profiles-local-entry";
 
 /// Widget name of the sidebar's Sync entry (a list of one row), how
 /// [`present_sync`] finds it.
@@ -161,6 +192,8 @@ struct State {
     split: adw::NavigationSplitView,
     list: gtk::ListBox,
     search: gtk::SearchEntry,
+    /// The sidebar's Local terminal entry, above the profiles.
+    local_list: gtk::ListBox,
     /// The sidebar's Sync entry.
     sync_list: gtk::ListBox,
     content: adw::NavigationPage,
@@ -168,6 +201,7 @@ struct State {
     nav: adw::NavigationView,
     body: adw::ToolbarView,
     title: gtk::Label,
+    /// Connect for a profile, Open for Local terminal.
     connect_button: gtk::Button,
     /// The listed profiles by id, for the search filter.
     listed: RefCell<HashMap<String, Profile>>,
@@ -178,6 +212,8 @@ struct State {
     page: RefCell<Option<Rc<ProfilePage>>>,
     /// The sync page, while it is shown (instead of a profile's page).
     sync_page: RefCell<Option<Rc<SyncPage>>>,
+    /// The Local terminal page, while it is shown (instead of a profile's page).
+    local_page: RefCell<Option<Rc<LocalPage>>>,
     /// The sidebar is being rebuilt: its selection signals are not the person's.
     rebuilding: Cell<bool>,
 }
@@ -219,6 +255,22 @@ fn build(app: &adw::Application, ctx: &Rc<AppContext>, connect: ConnectFn) -> ad
             .margin_bottom(24)
             .build(),
     ));
+    // The Local terminal entry, at the top of the sidebar, above the scrolling
+    // list: a single click selects (and shows its page); a double click or
+    // Enter opens it, as on a profile.
+    let local_list = gtk::ListBox::builder()
+        .name(LOCAL_ENTRY_NAME)
+        .selection_mode(gtk::SelectionMode::Single)
+        .activate_on_single_click(false)
+        .css_classes(["navigation-sidebar"])
+        .build();
+    let local_row = adw::ActionRow::builder()
+        .title(LOCAL_LABEL)
+        .use_markup(false)
+        .activatable(true)
+        .build();
+    local_row.add_prefix(&gtk::Image::from_icon_name("utilities-terminal-symbolic"));
+    local_list.append(&local_row);
     // The Sync entry, at the bottom of the sidebar, below the scrolling list.
     let sync_list = gtk::ListBox::builder()
         .name(SYNC_ENTRY_NAME)
@@ -234,6 +286,8 @@ fn build(app: &adw::Application, ctx: &Rc<AppContext>, connect: ConnectFn) -> ad
     sync_row.add_prefix(&gtk::Image::from_icon_name("emblem-synchronizing-symbolic"));
     sync_list.append(&sync_row);
     let sidebar_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_column.append(&local_list);
+    sidebar_column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     sidebar_column.append(
         &gtk::ScrolledWindow::builder()
             .child(&list)
@@ -316,6 +370,7 @@ fn build(app: &adw::Application, ctx: &Rc<AppContext>, connect: ConnectFn) -> ad
         split,
         list,
         search,
+        local_list,
         sync_list,
         content,
         nav,
@@ -326,6 +381,7 @@ fn build(app: &adw::Application, ctx: &Rc<AppContext>, connect: ConnectFn) -> ad
         selected: RefCell::new(None),
         page: RefCell::new(None),
         sync_page: RefCell::new(None),
+        local_page: RefCell::new(None),
         rebuilding: Cell::new(false),
     });
     state.wire(&window, &add);
@@ -378,6 +434,24 @@ impl State {
                 }
             }
         ));
+        self.local_list.connect_row_selected(glib::clone!(
+            #[strong]
+            weak,
+            move |_, row| {
+                if let (Some(state), Some(_)) = (weak.upgrade(), row) {
+                    state.show_local();
+                }
+            }
+        ));
+        self.local_list.connect_row_activated(glib::clone!(
+            #[strong]
+            weak,
+            move |_, _| {
+                if let Some(state) = weak.upgrade() {
+                    state.open_local();
+                }
+            }
+        ));
         self.sync_list.connect_row_activated(glib::clone!(
             #[strong]
             weak,
@@ -403,6 +477,10 @@ impl State {
                 let Some(state) = weak.upgrade() else {
                     return;
                 };
+                if state.local_page.borrow().is_some() {
+                    state.open_local();
+                    return;
+                }
                 let selected = state.selected.borrow().clone();
                 if let Some(id) = selected {
                     state.connect_to(&id);
@@ -474,6 +552,7 @@ impl State {
             // Dropping the pages here empties their password and key rows.
             keep.page.replace(None);
             keep.sync_page.replace(None);
+            keep.local_page.replace(None);
         });
     }
 
@@ -490,8 +569,60 @@ impl State {
         if let Some(profile) = profile {
             // "Save transcripts of all sessions" covers this way in too.
             let save = default_save(profile.transcript, self.ctx.settings().save_all_transcripts);
-            (self.connect)(&profile, profile.startup_choice(), save);
+            let sequence = profile.startup_choice();
+            (self.connect)(
+                Pick::Profile {
+                    profile: &profile,
+                    sequence,
+                },
+                save,
+            );
         }
+    }
+
+    /// Open Local terminal the way the window was told to, running its default
+    /// sequence if it has one, with a transcript as its own switch and "Save
+    /// transcripts of all sessions" say: as the settings file has them now
+    /// (the double click, Enter and the Open button all come here).
+    fn open_local(&self) {
+        let settings = self.ctx.settings();
+        let save = default_local_save(&settings);
+        let sequence = settings.local_terminal.default_sequence().cloned();
+        (self.connect)(Pick::Local { sequence }, save);
+    }
+
+    /// Show the Local terminal page (the sidebar's Local terminal entry), in
+    /// place of a profile's page or the sync page, which go with whatever was
+    /// typed in them, as when another profile is chosen.
+    fn show_local(&self) {
+        if self.local_page.borrow().is_some() {
+            self.split.set_show_content(true);
+            return;
+        }
+        self.leave_sync();
+        self.nav.pop_to_tag(PROFILE_TAG);
+        let page = LocalPage::new(&self.ctx, &self.ctx.settings().local_terminal);
+        self.body.set_content(Some(&page.widget));
+        // Replacing the profile page drops it, which saves a port change
+        // still settling there and empties its password row.
+        self.page.replace(None);
+        self.selected.replace(None);
+        self.local_page.replace(Some(page));
+        self.show_title(LOCAL_LABEL);
+        self.connect_button.set_label("Open");
+        self.connect_button.set_visible(true);
+        self.rebuilding.set(true);
+        self.list.unselect_all();
+        self.rebuilding.set(false);
+        self.split.set_show_content(true);
+    }
+
+    /// The Local terminal page goes, if it is shown, and its entry is
+    /// unselected; the header's button is Connect again.
+    fn leave_local(&self) {
+        self.local_page.replace(None);
+        self.local_list.unselect_all();
+        self.connect_button.set_label("Connect");
     }
 
     /// Show the page of profile `id` (a new page, so any unapplied edit on the
@@ -508,6 +639,7 @@ impl State {
             return;
         };
         self.leave_sync();
+        self.leave_local();
         // A sub-page belongs to the profile it was opened on: it goes, with
         // whatever was typed in it, like any unapplied edit.
         self.nav.pop_to_tag(PROFILE_TAG);
@@ -530,6 +662,7 @@ impl State {
             self.split.set_show_content(true);
             return;
         }
+        self.leave_local();
         self.nav.pop_to_tag(PROFILE_TAG);
         let sync_page = SyncPage::new(&self.ctx);
         self.body.set_content(Some(&sync_page.widget));
@@ -558,6 +691,7 @@ impl State {
     /// Nothing selected: a status page instead of a profile.
     fn show_empty(&self) {
         self.leave_sync();
+        self.leave_local();
         self.page.replace(None);
         self.selected.replace(None);
         self.body.set_content(Some(
@@ -581,11 +715,17 @@ impl State {
             .set_title(if name.is_empty() { "Profile" } else { name });
     }
 
-    /// The profile file changed (the store is already reloaded): rebuild the
-    /// sidebar and update the page, or leave an empty state if the selected
-    /// profile is gone.
+    /// The profile file changed (the store is already reloaded), or Local
+    /// terminal did: rebuild the sidebar and update the page (the Local
+    /// terminal page from the settings file), or leave an empty state if the
+    /// selected profile is gone.
     fn refresh(&self) {
         self.rebuild_sidebar();
+        // Bind first so the borrow ends before the page is refreshed.
+        let local_page = self.local_page.borrow().clone();
+        if let Some(local_page) = local_page {
+            local_page.refresh(&self.ctx.settings().local_terminal);
+        }
         let selected = self.selected.borrow().clone();
         let Some(id) = selected else {
             return;

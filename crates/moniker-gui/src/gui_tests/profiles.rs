@@ -24,11 +24,12 @@ use zeroize::Zeroizing;
 use super::windows::list_in;
 use super::{
     HeldKeyring, HeldProfileFile, MARKUP_NAME, alert_in, all_widgets, button_labeled, find_widget,
-    has_focus_in, make_helper, pump_for, pump_until, row_for,
+    has_focus_in, literal_labels, make_helper, pump_for, pump_until, row_for,
 };
 use crate::context::AppContext;
-use crate::profiles::{self, ConnectFn};
-use crate::{form, keyring, new_tab, window};
+use crate::local_terminal::{self, LOCAL_SECRETS_WARNING, LOCAL_SEQUENCES_NOTE, LocalTerminal};
+use crate::profiles::{self, ConnectFn, Pick};
+use crate::{form, keyring, new_tab, settings, window};
 
 /// An in-memory keyring that counts `get` calls: the profile page must never
 /// read the keyring.
@@ -68,7 +69,18 @@ impl SecretStore for CountingSecrets {
     }
 }
 
-type Connected = Rc<RefCell<Vec<(String, Option<usize>, bool)>>>;
+/// What the window asked to open, in the order asked.
+#[derive(Clone, Debug, PartialEq)]
+enum Opened {
+    /// A profile by id, with the sequence (an index) and whether a transcript
+    /// is saved.
+    Profile(String, Option<usize>, bool),
+    /// Local terminal, with the sequence by name and whether a transcript is
+    /// saved.
+    Local(Option<String>, bool),
+}
+
+type Connected = Rc<RefCell<Vec<Opened>>>;
 
 /// An open Connection Profiles window and what is behind it.
 struct Setup {
@@ -113,10 +125,14 @@ impl Setup {
         let connected: Connected = Rc::default();
         let record: ConnectFn = {
             let connected = Rc::clone(&connected);
-            Rc::new(move |p: &Profile, sequence, transcript| {
-                connected
-                    .borrow_mut()
-                    .push((p.id.clone(), sequence, transcript));
+            Rc::new(move |pick: Pick<'_>, transcript| {
+                let opened = match pick {
+                    Pick::Profile { profile, sequence } => {
+                        Opened::Profile(profile.id.clone(), sequence, transcript)
+                    }
+                    Pick::Local { sequence } => Opened::Local(sequence.map(|s| s.name), transcript),
+                };
+                connected.borrow_mut().push(opened);
             })
         };
         let window = profiles::present(&app, &ctx, record);
@@ -321,6 +337,76 @@ impl Setup {
             .into_iter()
             .map(|s| (s.name, s.commands))
             .collect()
+    }
+
+    /// The sidebar's Local terminal entry (issue #13): its list, and the one
+    /// row in it.
+    fn local_entry(&self) -> (gtk::ListBox, adw::ActionRow) {
+        let list = all_widgets::<gtk::ListBox>(&self.window)
+            .into_iter()
+            .find(|list| list.widget_name() == profiles::LOCAL_ENTRY_NAME)
+            .expect("the Local terminal entry");
+        let row = list
+            .row_at_index(0)
+            .and_downcast::<adw::ActionRow>()
+            .expect("its row");
+        (list, row)
+    }
+
+    /// Select the Local terminal entry, as a click on it does, which shows
+    /// its page.
+    fn select_local(&self) {
+        let (list, row) = self.local_entry();
+        list.select_row(Some(&row));
+        pump_for(Duration::from_millis(100));
+    }
+
+    /// The content pane's title.
+    fn title(&self) -> String {
+        all_widgets::<gtk::Label>(&self.window)
+            .into_iter()
+            .find(|label| label.widget_name() == profiles::TITLE_NAME)
+            .expect("the page title")
+            .label()
+            .to_string()
+    }
+
+    /// The groups of the page shown in the content pane, in order.
+    fn page_groups(&self) -> Vec<adw::PreferencesGroup> {
+        let page = all_widgets::<adw::PreferencesPage>(&self.window)
+            .into_iter()
+            .find(|page| page.is_mapped())
+            .expect("a page in the content pane");
+        all_widgets::<adw::PreferencesGroup>(&page)
+    }
+
+    /// Local terminal as the settings file has it now.
+    fn local(&self) -> LocalTerminal {
+        settings::load(&self.ctx.settings_path).local_terminal
+    }
+
+    /// Write Local terminal's `sequences` and `default` into the settings file,
+    /// as another window (or a hand edit) would: nobody is told.
+    fn local_elsewhere(&self, sequences: &[StartupSequence], default: Option<usize>) {
+        settings::update(&self.ctx.settings_path, |x| {
+            x.local_terminal.sequences = sequences.to_vec();
+            x.local_terminal.startup_sequence = default;
+        })
+        .expect("write the settings");
+    }
+
+    fn settings_bytes(&self) -> Vec<u8> {
+        fs::read(&self.ctx.settings_path).expect("the settings file")
+    }
+
+    /// How many times the lists and windows are told of a change from now on
+    /// ([`AppContext::profiles_changed`]), while the window is open.
+    fn heard(&self) -> Rc<Cell<usize>> {
+        let heard = Rc::new(Cell::new(0));
+        let count = Rc::clone(&heard);
+        self.ctx
+            .on_profiles_changed(&self.window, move || count.set(count.get() + 1));
+        heard
     }
 
     fn shows_empty_state(&self) -> bool {
@@ -768,14 +854,17 @@ pub(super) fn double_click_and_connect_button_connect(dir: &Path) {
         .find(|r| r.widget_name() == p.id.as_str())
         .expect("p's row");
     s.sidebar().emit_by_name::<()>("row-activated", &[&row]);
-    assert_eq!(*s.connected.borrow(), [(p.id.clone(), None, true)]);
+    assert_eq!(
+        *s.connected.borrow(),
+        [Opened::Profile(p.id.clone(), None, true)]
+    );
 
     let connect = button_labeled(&s.window, "Connect").expect("the Connect button");
     assert!(connect.has_css_class("suggested-action"));
     connect.emit_clicked();
     assert_eq!(
         s.connected.borrow().last(),
-        Some(&(q.id.clone(), None, false))
+        Some(&Opened::Profile(q.id.clone(), None, false))
     );
 
     // "Save transcripts of all sessions" covers this way in too: q does not
@@ -791,7 +880,7 @@ pub(super) fn double_click_and_connect_button_connect(dir: &Path) {
     );
     assert_eq!(
         s.connected.borrow().last(),
-        Some(&(q.id.clone(), None, true))
+        Some(&Opened::Profile(q.id.clone(), None, true))
     );
     s.close();
 }
@@ -1376,7 +1465,10 @@ pub(super) fn the_default_is_chosen_on_the_profile_page(dir: &Path) {
     button_labeled(&s.window, "Connect")
         .expect("the Connect button")
         .emit_clicked();
-    assert_eq!(*s.connected.borrow(), [(p.id.clone(), Some(1), false)]);
+    assert_eq!(
+        *s.connected.borrow(),
+        [Opened::Profile(p.id.clone(), Some(1), false)]
+    );
 
     // Its sequence moves up: the default goes with it, in the same write.
     let page = s.open_sequence("b");
@@ -1653,7 +1745,7 @@ pub(super) fn present_reuses_the_open_window(dir: &Path) {
     let s = Setup::open(dir, &[web()]);
     let app = s.window.application().expect("an application");
     let app: adw::Application = app.downcast().expect("an adw application");
-    let again = profiles::present(&app, &s.ctx, Rc::new(|_: &Profile, _, _| {}));
+    let again = profiles::present(&app, &s.ctx, Rc::new(|_, _| {}));
     assert_eq!(again, s.window);
     s.close();
     pump_for(Duration::from_millis(100));
@@ -2640,4 +2732,414 @@ fn create_in_the_dialog(
         .find(|p| p.name == name)
         .map(|p| p.id.clone())
         .expect("the new profile")
+}
+
+// ----- Local terminal (issue #13) -----
+
+/// The subtitle of every "Save transcript" switch of the window, a profile's
+/// and Local terminal's.
+const TRANSCRIPT_SUBTITLE: &str = "Saves the session as plain text when its tab closes, \
+     including anything you type or paste. Keep passwords out of it.";
+
+/// The sidebar's Local terminal entry sits above the profiles, whatever the
+/// search, and shows Local terminal's page: its startup sequences and its own
+/// "Save transcript" switch, which saves into the settings file and never the
+/// profile file. Selecting it, a profile or Sync unselects the others, and the
+/// header's button reads Open for Local terminal and Connect for a profile.
+/// Opening it (a double click or Enter on the entry, or Open) asks for a local
+/// terminal running its default sequence, with a transcript as its switch and
+/// "Save transcripts of all sessions" say, as the settings file has them then.
+pub(super) fn the_local_terminal_entry_and_its_page(dir: &Path) {
+    let p = web();
+    let s = Setup::open(dir, std::slice::from_ref(&p));
+    let profile_file = s.file_bytes();
+
+    // One row, plain text, with the terminal icon, above the profiles (the
+    // Sync entry is below them).
+    let (entry, row) = s.local_entry();
+    assert!(entry.row_at_index(1).is_none(), "one row");
+    // Plain text, and no subtitle (libadwaita's is empty, not none).
+    assert_eq!(row.title(), "Local terminal");
+    assert!(!row.uses_markup());
+    literal_labels("Local terminal entry", &row, "Local terminal");
+    assert!(row.subtitle().as_deref().is_none_or(str::is_empty));
+    assert!(
+        all_widgets::<gtk::Image>(&row)
+            .iter()
+            .any(|image| image.icon_name().as_deref() == Some("utilities-terminal-symbolic")),
+        "the terminal icon"
+    );
+    let order: Vec<String> = all_widgets::<gtk::ListBox>(&s.window)
+        .iter()
+        .map(|list| list.widget_name().to_string())
+        .filter(|name| {
+            [
+                profiles::LOCAL_ENTRY_NAME,
+                profiles::SIDEBAR_NAME,
+                profiles::SYNC_ENTRY_NAME,
+            ]
+            .contains(&name.as_str())
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [
+            profiles::LOCAL_ENTRY_NAME,
+            profiles::SIDEBAR_NAME,
+            profiles::SYNC_ENTRY_NAME
+        ]
+    );
+    assert!(row.is_mapped());
+
+    // A search that matches no profile leaves it on show.
+    let search: gtk::SearchEntry = find_widget(&s.window).expect("the search entry");
+    search.set_text("zzz");
+    pump_until("the filter to apply", || {
+        s.rows().iter().all(|r| !r.is_child_visible())
+    });
+    assert!(row.is_child_visible() && row.is_mapped(), "never filtered");
+    search.set_text("");
+    pump_until("the filter to clear", || {
+        s.rows().iter().all(|r| r.is_child_visible())
+    });
+
+    // Its page.
+    s.select_local();
+    assert_eq!(s.title(), "Local terminal");
+    let open = button_labeled(&s.window, "Open").expect("the header's Open button");
+    assert!(open.is_visible() && open.is_mapped());
+    assert!(open.has_css_class("suggested-action"));
+    assert!(button_labeled(&s.window, "Connect").is_none());
+    let groups = s.page_groups();
+    let titles: Vec<String> = groups.iter().map(|g| g.title().to_string()).collect();
+    assert_eq!(titles, ["Startup sequences", "Session"]);
+    assert_eq!(
+        groups[0].description().as_deref(),
+        Some(LOCAL_SEQUENCES_NOTE)
+    );
+    assert_eq!(
+        s.group_row_titles(),
+        ["None: opening gives a plain shell", "Add sequence"]
+    );
+    assert!(
+        all_widgets::<adw::ComboRow>(&s.window).is_empty(),
+        "no Default sequence row with no sequence"
+    );
+    let switch = s.switch("Save transcript");
+    assert!(!switch.is_active());
+    assert!(!switch.uses_markup());
+    assert_eq!(switch.subtitle().as_deref(), Some(TRANSCRIPT_SUBTITLE));
+    assert!(switch.is_ancestor(&groups[1]), "in the Session group");
+
+    // The switch saves into the settings file at once, not the profile file,
+    // and every list and window hears of it.
+    let heard = s.heard();
+    switch.set_active(true);
+    assert!(s.local().transcript);
+    assert!(switch.is_active());
+    assert_eq!(s.file_bytes(), profile_file);
+    assert_eq!(heard.get(), 1, "told");
+
+    // A profile, then the entry again: each unselects the other, and the
+    // button says what it does.
+    s.select(&p.id);
+    assert_eq!(s.title(), "web");
+    assert!(entry.selected_row().is_none(), "the entry unselected");
+    let connect = button_labeled(&s.window, "Connect").expect("the Connect button");
+    assert_eq!(connect, open, "the same button");
+    assert!(connect.is_visible());
+    assert!(button_labeled(&s.window, "Open").is_none());
+    s.select_local();
+    assert_eq!(s.title(), "Local terminal");
+    assert!(
+        s.sidebar().selected_row().is_none(),
+        "the profile unselected"
+    );
+    assert!(button_labeled(&s.window, "Open").is_some_and(|b| b.is_visible()));
+    assert!(s.switch("Save transcript").is_active(), "as the file says");
+
+    // Sync, then the entry again.
+    let sync = all_widgets::<gtk::ListBox>(&s.window)
+        .into_iter()
+        .find(|list| list.widget_name() == profiles::SYNC_ENTRY_NAME)
+        .expect("the Sync entry");
+    let sync_row = sync.row_at_index(0).expect("its row");
+    sync.emit_by_name::<()>("row-activated", &[&sync_row]);
+    pump_for(Duration::from_millis(100));
+    assert_eq!(s.title(), "Sync");
+    assert!(entry.selected_row().is_none(), "the entry unselected");
+    assert!(!open.is_visible(), "no button for the sync page");
+    assert_eq!(open.label().as_deref(), Some("Connect"));
+    s.select_local();
+    assert_eq!(s.title(), "Local terminal");
+    assert!(sync.selected_row().is_none(), "Sync unselected");
+    assert!(open.is_visible());
+    assert_eq!(open.label().as_deref(), Some("Open"));
+
+    // Opening: a double click or Enter on the entry, and Open.
+    assert!(s.connected.borrow().is_empty(), "selecting opens nothing");
+    entry.emit_by_name::<()>("row-activated", &[&row]);
+    assert_eq!(*s.connected.borrow(), [Opened::Local(None, true)]);
+
+    // A default saved since, in another window: read when it opens.
+    local_terminal::apply_sequences(
+        &s.ctx.settings_path,
+        None,
+        |current| form::with_sequence(current, None, seq("Hello", &["printf hi"])),
+        |default| default,
+    )
+    .expect("add a sequence");
+    local_terminal::set_default(
+        &s.ctx.settings_path,
+        Some((0, seq("Hello", &["printf hi"]))),
+    )
+    .expect("choose it");
+    entry.emit_by_name::<()>("row-activated", &[&row]);
+    open.emit_clicked();
+    assert_eq!(
+        *s.connected.borrow(),
+        [
+            Opened::Local(None, true),
+            Opened::Local(Some("Hello".to_owned()), true),
+            Opened::Local(Some("Hello".to_owned()), true),
+        ]
+    );
+
+    // Its own switch off: "Save transcripts of all sessions" still saves one.
+    local_terminal::set_transcript(&s.ctx.settings_path, false).expect("switch off");
+    open.emit_clicked();
+    assert_eq!(
+        s.connected.borrow().last(),
+        Some(&Opened::Local(Some("Hello".to_owned()), false))
+    );
+    settings::update(&s.ctx.settings_path, |x| x.save_all_transcripts = true)
+        .expect("write the settings");
+    open.emit_clicked();
+    assert_eq!(
+        s.connected.borrow().last(),
+        Some(&Opened::Local(Some("Hello".to_owned()), true))
+    );
+
+    // A profile's Connect still connects the profile.
+    s.select(&p.id);
+    connect.emit_clicked();
+    assert_eq!(
+        s.connected.borrow().last(),
+        Some(&Opened::Profile(p.id.clone(), None, true))
+    );
+    assert_eq!(s.file_bytes(), profile_file, "the profile file untouched");
+    s.close();
+}
+
+/// Local terminal's sequences are edited on the profile's sub-page, which saves
+/// them into the settings file (never the profile file), with the same rules:
+/// the default follows Move and Delete, a pick saves it, and the file as it is
+/// has the last word (a sequence changed meanwhile refuses Save, a list changed
+/// meanwhile refuses a pick, and a default past the end shows as "None"). A
+/// refresh that brings nothing new to the rows leaves them as they are.
+pub(super) fn local_sequences_are_edited_like_a_profile_s(dir: &Path) {
+    let s = Setup::open(dir, &[web()]);
+    let profile_file = s.file_bytes();
+    s.select_local();
+
+    // Add: the sub-page warns about the settings file.
+    let page = s.open_sequence("Add sequence");
+    assert_eq!(page.title(), "New Startup Sequence");
+    let commands = all_widgets::<adw::PreferencesGroup>(&page)
+        .into_iter()
+        .find(|group| group.title() == "Commands, one per line")
+        .expect("the commands group");
+    assert_eq!(
+        commands.description().as_deref(),
+        Some(LOCAL_SECRETS_WARNING)
+    );
+    sub_name(&page).set_text("Hello");
+    set_commands(&page, "printf hi");
+    s.click(&page, "Save");
+    s.wait_for_sub_page_to_close();
+    assert_eq!(s.local().sequences, [seq("Hello", &["printf hi"])]);
+    assert_eq!(s.sequence_row_titles(), ["Hello", "Add sequence"]);
+    assert_eq!(
+        s.sequence_rows()[0].subtitle().as_deref(),
+        Some("1 command")
+    );
+    let combo = s.default_row();
+    assert_eq!(
+        combo.subtitle().as_deref(),
+        Some("Runs every time Local terminal is picked or restored")
+    );
+    assert!(!combo.uses_markup());
+    assert_eq!(items_of(&combo), ["None", "Hello"]);
+    assert_eq!(shown_item(&combo), "None");
+    assert_eq!(
+        s.group_row_titles(),
+        ["Hello", "Default sequence", "Add sequence"]
+    );
+    assert_eq!(s.file_bytes(), profile_file);
+
+    // A pick saves the default, and every list and window hears of it (from
+    // the main loop).
+    let heard = s.heard();
+    s.pick_default("Hello");
+    assert_eq!(s.local().startup_sequence, Some(0));
+    assert_eq!(shown_item(&combo), "Hello");
+    pump_until("the lists to hear of the pick", || heard.get() == 1);
+
+    // Move Up takes the default along.
+    let page = s.open_sequence("Add sequence");
+    sub_name(&page).set_text("Second");
+    set_commands(&page, "uptime");
+    s.click(&page, "Save");
+    s.wait_for_sub_page_to_close();
+    let page = s.open_sequence("Second");
+    assert_eq!(page.title(), "Startup Sequence");
+    s.click(&page, "Move Up");
+    assert_eq!(
+        s.local().sequences,
+        [seq("Second", &["uptime"]), seq("Hello", &["printf hi"])]
+    );
+    assert_eq!(s.local().startup_sequence, Some(1), "still on Hello");
+    assert!(s.sequence_page().is_some(), "still on the sub-page");
+    assert_eq!(s.sequence_row_titles(), ["Second", "Hello", "Add sequence"]);
+    assert_eq!(shown_item(&combo), "Hello");
+    s.click(&page, "Cancel");
+    s.wait_for_sub_page_to_close();
+
+    // Delete Sequence on the default clears it.
+    let page = s.open_sequence("Hello");
+    s.click(&page, "Delete Sequence");
+    s.wait_for_sub_page_to_close();
+    assert_eq!(s.local().sequences, [seq("Second", &["uptime"])]);
+    assert_eq!(s.local().startup_sequence, None);
+    assert_eq!(items_of(&combo), ["None", "Second"]);
+    assert_eq!(shown_item(&combo), "None");
+    assert_eq!(s.file_bytes(), profile_file);
+
+    // The rows are made again only when what they show changes: a command's
+    // text changed elsewhere leaves them (the same rows, in the same order); a
+    // name or a number of commands makes them again.
+    let before = s.sequence_rows();
+    s.local_elsewhere(&[seq("Second", &["df -h"])], None);
+    s.ctx.profiles_changed();
+    assert_eq!(s.sequence_rows(), before, "the same rows");
+    s.local_elsewhere(&[seq("Renamed", &["df -h"])], None);
+    s.ctx.profiles_changed();
+    let renamed = s.sequence_rows();
+    assert_eq!(s.sequence_row_titles(), ["Renamed", "Add sequence"]);
+    assert_ne!(renamed[0], before[0], "a new name, a new row");
+    s.local_elsewhere(&[seq("Renamed", &["df -h", "uptime"])], None);
+    s.ctx.profiles_changed();
+    let longer = s.sequence_rows();
+    assert_ne!(longer[0], renamed[0], "a new count, a new row");
+    assert_eq!(longer[0].subtitle().as_deref(), Some("2 commands"));
+
+    // The sequence changed in the file while its sub-page is open: Save is
+    // refused, and the file keeps that change.
+    let page = s.open_sequence("Renamed");
+    local_terminal::apply_sequences(
+        &s.ctx.settings_path,
+        None,
+        |current| form::with_sequence(current, Some(0), seq("Theirs", &["ls"])),
+        |default| default,
+    )
+    .expect("change it elsewhere");
+    set_commands(&page, "whoami");
+    s.click(&page, "Save");
+    assert_eq!(inline_error(&page).as_deref(), Some(form::SEQUENCE_CHANGED));
+    assert_eq!(
+        s.ctx.notice.last_text().as_deref(),
+        Some(form::SEQUENCE_CHANGED)
+    );
+    assert!(s.sequence_page().is_some(), "the page stays");
+    assert_eq!(s.local().sequences, [seq("Theirs", &["ls"])]);
+    s.click(&page, "Cancel");
+    s.wait_for_sub_page_to_close();
+    assert_eq!(s.sequence_row_titles(), ["Theirs", "Add sequence"]);
+
+    // The list changed in the file while the default row shows it: a pick is
+    // refused, nothing is written, and the row shows the file again.
+    s.local_elsewhere(&[seq("a", &["echo A"]), seq("b", &["echo B"])], None);
+    s.ctx.profiles_changed();
+    assert_eq!(items_of(&combo), ["None", "a", "b"]);
+    s.local_elsewhere(&[seq("b", &["echo B"]), seq("a", &["echo A"])], None);
+    let written = s.settings_bytes();
+    s.pick_default("a");
+    assert_eq!(
+        s.ctx.notice.last_text().as_deref(),
+        Some(form::CHOICE_CHANGED)
+    );
+    assert_eq!(s.settings_bytes(), written, "nothing was written");
+    assert!(combo.has_css_class("error"));
+    // The row shows the file again from the main loop, not from inside its own
+    // signal.
+    pump_until("the row to show the file's list", || {
+        items_of(&combo) == ["None", "b", "a"]
+    });
+    assert_eq!(shown_item(&combo), "None", "the file's choice");
+    // The same pick on the list as it is now works, and clears the mark.
+    s.pick_default("a");
+    assert_eq!(s.local().startup_sequence, Some(1));
+    assert!(!combo.has_css_class("error"));
+
+    // A default past the end of the list (a hand edit) shows as "None", and
+    // showing it writes nothing.
+    s.local_elsewhere(&[seq("a", &["echo A"])], Some(7));
+    let written = s.settings_bytes();
+    s.ctx.profiles_changed();
+    assert_eq!(items_of(&combo), ["None", "a"]);
+    assert_eq!(shown_item(&combo), "None");
+    assert_eq!(s.settings_bytes(), written);
+    assert_eq!(s.local().startup_sequence, Some(7), "left as it was");
+    assert_eq!(s.file_bytes(), profile_file, "the profile file untouched");
+    s.close();
+}
+
+/// A settings file that cannot be read: Local terminal's page shows what the
+/// defaults say, and every change is refused, the file left as it is.
+pub(super) fn a_damaged_settings_file_refuses_local_changes(dir: &Path) {
+    let s = Setup::open(dir, &[web()]);
+    fs::write(&s.ctx.settings_path, "not json").expect("damage the settings");
+    s.select_local();
+    assert_eq!(
+        s.group_row_titles(),
+        ["None: opening gives a plain shell", "Add sequence"]
+    );
+
+    // The switch goes back, with the reason.
+    let switch = s.switch("Save transcript");
+    switch.set_active(true);
+    assert!(!switch.is_active(), "back off");
+    assert!(
+        s.ctx
+            .notice
+            .last_text()
+            .is_some_and(|text| text.starts_with("Could not save the local terminal: ")),
+        "{:?}",
+        s.ctx.notice.last_text()
+    );
+
+    // A new sequence is not saved, and says why on its page.
+    let page = s.open_sequence("Add sequence");
+    sub_name(&page).set_text("Hello");
+    set_commands(&page, "printf hi");
+    s.click(&page, "Save");
+    let error = inline_error(&page).expect("the reason on the sub-page");
+    assert!(
+        error.starts_with("Could not save the local terminal: "),
+        "{error}"
+    );
+    assert!(s.sequence_page().is_some(), "the page stays");
+    assert_eq!(
+        fs::read_to_string(&s.ctx.settings_path).expect("the settings"),
+        "not json"
+    );
+    s.click(&page, "Cancel");
+    s.wait_for_sub_page_to_close();
+    let settings_path = s.ctx.settings_path.clone();
+    s.close();
+    assert_eq!(
+        fs::read_to_string(settings_path).expect("the settings"),
+        "not json",
+        "closing the window wrote nothing either"
+    );
 }

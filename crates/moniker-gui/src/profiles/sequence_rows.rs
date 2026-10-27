@@ -55,6 +55,12 @@ pub(super) const PROFILE_WORDING: Wording = Wording {
     default_subtitle: "Runs every time this profile connects",
 };
 
+/// The Local terminal page's words (issue #13).
+pub(super) const LOCAL_WORDING: Wording = Wording {
+    empty: "None: opening gives a plain shell",
+    default_subtitle: "Runs every time Local terminal is picked or restored",
+};
+
 /// The rows of one group (module docs).
 pub(super) struct SequenceRows {
     /// Itself, for the handlers of the rows it makes: they hold it weakly.

@@ -258,7 +258,7 @@ fn sync_rig(dir: &Path, with_profile: bool, key: Option<&str>) -> SyncRig {
 /// The Connection Profiles window of `app`, on its sync page. Connecting from it does
 /// nothing.
 fn open_sync_page(app: &adw::Application, ctx: &Rc<AppContext>) -> adw::Window {
-    let window = profiles::present_sync(app, ctx, Rc::new(|_: &Profile, _, _| {}));
+    let window = profiles::present_sync(app, ctx, Rc::new(|_, _| {}));
     pump_for(Duration::from_millis(300));
     window
 }
@@ -1793,7 +1793,7 @@ pub(super) fn a_sync_refreshes_the_sidebar_and_new_tab_list(dir: &Path) {
     set_partner(&ctx, &profile.expect("a profile"), true);
     let app = test_app();
     crate::add_actions(&app, &ctx);
-    let profiles_window = profiles::present(&app, &ctx, Rc::new(|_: &Profile, _, _| {}));
+    let profiles_window = profiles::present(&app, &ctx, Rc::new(|_, _| {}));
     let main = window::build(&app, &ctx);
     main.window.present();
     pump_for(Duration::from_millis(300));

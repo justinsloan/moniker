@@ -1108,7 +1108,13 @@ pub(super) fn a_new_tab_starts_at_the_active_tabs_size(bin: &Path, dir: &Path) {
     let p = profile(&[]);
     set_test_ssh_program_for(bin, "zoom-ssh");
     let connect = window::connect_fn(&app, &ctx);
-    connect(&p, None, false);
+    connect(
+        profiles::Pick::Profile {
+            profile: &p,
+            sequence: None,
+        },
+        false,
+    );
     pump_for(Duration::from_millis(300));
     let connected = main.view.selected_page().expect("the session tab");
     assert_ne!(connected, page);
@@ -1285,7 +1291,13 @@ pub(super) fn launch_starts_at_the_saved_size(bin: &Path, dir: &Path) {
     fs::write(&ctx.settings_path, r#"{"font_scale": 0.8}"#).expect("write the settings");
     set_test_ssh_program_for(bin, "launch-ssh");
     let connect = window::connect_fn(&app, &ctx);
-    connect(&profile(&[]), None, false);
+    connect(
+        profiles::Pick::Profile {
+            profile: &profile(&[]),
+            sequence: None,
+        },
+        false,
+    );
     pump_for(Duration::from_millis(400));
     let made = window::last_active(&app).expect("a window made for the session");
     let connected = made.view.selected_page().expect("the session tab");
@@ -1552,7 +1564,7 @@ pub(super) fn a_main_window_opens_at_the_size_the_last_one_closed_at(dir: &Path)
 pub(super) fn the_side_windows_open_at_the_size_they_closed_at(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
-    let nothing: crate::profiles::ConnectFn = Rc::new(|_: &Profile, _, _| {});
+    let nothing: crate::profiles::ConnectFn = Rc::new(|_, _| {});
     let profiles = crate::profiles::present(&app, &ctx, Rc::clone(&nothing));
     pump_for(Duration::from_millis(200));
     assert_eq!(profiles.default_size(), (900, 640), "the built-in size");

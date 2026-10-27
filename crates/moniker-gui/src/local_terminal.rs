@@ -28,14 +28,6 @@
 //! opened on, and a pick of the default carries the sequence it means. Both
 //! are refused otherwise, with the profile's texts, and nothing is written.
 
-// This task is the data only: the new-tab list, the Connection Profiles window
-// and the tabs that use the rest come in the tasks after it. The lint says so
-// when nothing here is unused any more, and then this line goes.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by the tasks that follow in issue #13")
-)]
-
 use std::path::Path;
 
 use moniker_core::profile::StartupSequence;
@@ -56,6 +48,8 @@ pub const LOCAL_SEQUENCES_NOTE: &str = "These run in a shell on this computer wh
 /// Local terminal's sequences, default and transcript switch, as the settings
 /// file holds them. The default value (no sequences, no default, transcript
 /// off) is what a machine that never used any of this has, and is not written.
+///
+/// `Debug` prints every command, and commands can hold secrets: do not log it.
 #[derive(Serialize, Clone, Debug, PartialEq, Default)]
 pub struct LocalTerminal {
     /// Every sequence is one [`StartupSequence::check`] accepts.

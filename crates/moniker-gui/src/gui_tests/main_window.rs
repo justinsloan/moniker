@@ -34,6 +34,7 @@ use super::{
 use crate::connect_menu::{self, RECORD_LABEL};
 use crate::context::AppContext;
 use crate::launch_args::{Refused, Run, Start, decode, encode};
+use crate::profiles::Pick;
 use crate::terminal_tab::{
     launch, new_holder_page, rename_page, start_command, tab_title, terminal_of,
 };
@@ -551,7 +552,13 @@ pub(super) fn profiles_connect_opens_in_the_last_active_window(dir: &Path) {
     let connect = window::connect_with(&app, &ctx, |view, _ctx, p, _sequence, _record| {
         new_holder_page(view, &tab_title(p));
     });
-    connect(&p, None, false);
+    connect(
+        Pick::Profile {
+            profile: &p,
+            sequence: None,
+        },
+        false,
+    );
     assert_eq!(
         b.view.n_pages(),
         2,
@@ -589,7 +596,13 @@ pub(super) fn profiles_connect_opens_in_the_last_active_window(dir: &Path) {
     b.window.destroy();
     pump_for(Duration::from_millis(200));
     assert!(window::last_active(&app).is_none());
-    connect(&p, Some(0), true);
+    connect(
+        Pick::Profile {
+            profile: &p,
+            sequence: Some(0),
+        },
+        true,
+    );
     pump_for(Duration::from_millis(200));
     let c = window::last_active(&app).expect("a new main window");
     assert_eq!(c.view.n_pages(), 1, "no extra local tab");
@@ -598,8 +611,44 @@ pub(super) fn profiles_connect_opens_in_the_last_active_window(dir: &Path) {
         Some(tab_title(&p))
     );
     assert!(c.window.is_visible());
+
+    // Local terminal (issue #13) opens the same way: a local tab running the
+    // sequence picked, in the main window that was active last.
+    let hello = StartupSequence {
+        name: "Hello".to_owned(),
+        commands: vec!["printf 'PICKED-%s\\n' ran".to_owned()],
+    };
+    connect(
+        Pick::Local {
+            sequence: Some(hello.clone()),
+        },
+        false,
+    );
+    assert_eq!(c.view.n_pages(), 2, "in the last active window");
+    let local = c.view.selected_page().expect("the local tab");
+    assert_eq!(local.title(), crate::new_tab::LOCAL_LABEL);
+    let terminal = terminal_of(&local).expect("a local terminal");
+    wait_for_text(&terminal, "PICKED-ran");
+
+    // With no main window left, in a new one that holds only it.
     profiles_window.close();
     c.window.destroy();
+    pump_for(Duration::from_millis(200));
+    assert!(window::last_active(&app).is_none());
+    connect(
+        Pick::Local {
+            sequence: Some(hello),
+        },
+        false,
+    );
+    pump_for(Duration::from_millis(200));
+    let d = window::last_active(&app).expect("a new main window");
+    assert_eq!(d.view.n_pages(), 1, "no extra local tab");
+    let terminal =
+        terminal_of(&d.view.selected_page().expect("the local tab")).expect("a local terminal");
+    wait_for_text(&terminal, "PICKED-ran");
+    assert!(d.window.is_visible());
+    d.window.destroy();
     pump_for(Duration::from_millis(200));
     assert!(app.windows().is_empty());
 }
@@ -642,7 +691,7 @@ pub(super) fn wording_uses_transcripts_and_connection_profiles(dir: &Path) {
     pump_for(Duration::from_millis(200));
 
     // The profiles window: its title, its sidebar's title, and the switch.
-    let connect: profiles::ConnectFn = Rc::new(|_, _, _| {});
+    let connect: profiles::ConnectFn = Rc::new(|_, _| {});
     let profiles_window = profiles::present(&app, &ctx, connect);
     pump_for(Duration::from_millis(300));
     assert_eq!(

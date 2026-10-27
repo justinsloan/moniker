@@ -1863,13 +1863,6 @@ fn enterable_or<'a>(dir: &'a Path, home: &'a Path) -> &'a Path {
 /// and saving a transcript if `record` ([`local_transcript_spec`]). The tab
 /// starts at the text size of the tab selected in `view`, or, in a window with
 /// none, at the size saved for the next launch, as [`open_profile`]'s does.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the Connection Profiles window's Local terminal entry opens it (issue #13, a later task)"
-    )
-)]
 pub(crate) fn open_local_pick(
     view: &adw::TabView,
     ctx: &Rc<AppContext>,

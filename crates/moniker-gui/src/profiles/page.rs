@@ -61,7 +61,7 @@ use moniker_core::secrets::password_key;
 use zeroize::Zeroizing;
 
 use super::saving::Saving;
-use super::sequence_page;
+use super::sequence_page::{self, Owner};
 use super::sequence_rows::{PROFILE_WORDING, SequenceRows};
 use crate::context::AppContext;
 use crate::form::{self, Field};
@@ -896,7 +896,8 @@ impl Inner {
         let Some(nav) = nav else {
             return;
         };
-        if let Err(message) = sequence_page::push(&nav, &self.ctx, &self.id, index) {
+        let owner = Owner::Profile(self.id.clone());
+        if let Err(message) = sequence_page::push(&nav, &self.ctx, &owner, index) {
             // Tell first: refreshing may drop this page.
             self.ctx.notice.show_near(&self.sequences, &message);
             self.ctx.profiles_changed();

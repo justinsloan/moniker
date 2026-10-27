@@ -114,7 +114,7 @@ pub(super) fn notifications_appear_at_the_top_center(dir: &Path) {
 pub(super) fn the_side_windows_keep_notifications_below_their_header_bars(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
-    let nothing: profiles::ConnectFn = Rc::new(|_, _, _| {});
+    let nothing: profiles::ConnectFn = Rc::new(|_, _| {});
     let profiles_window = profiles::present(&app, &ctx, nothing);
     let transcripts_window = recordings::present(&app, dir.join("transcripts"), &ctx.settings_path);
     pump_for(Duration::from_millis(400));

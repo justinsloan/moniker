@@ -455,6 +455,9 @@ fn gui_integration() {
     local_terminal::a_restored_local_pane_runs_the_default_in_its_folder(
         &tmp.path().join("ls-restored"),
     );
+    profiles::the_local_terminal_entry_and_its_page(&tmp.path().join("ls-entry"));
+    profiles::local_sequences_are_edited_like_a_profile_s(&tmp.path().join("ls-edit"));
+    profiles::a_damaged_settings_file_refuses_local_changes(&tmp.path().join("ls-damaged"));
     // The REC indicator of a tab that saves a transcript.
     transcript_indicator::a_tab_saving_a_transcript_shows_rec(&bin, &tmp.path().join("rec-shows"));
     transcript_indicator::rec_goes_when_the_transcript_is_written(&tmp.path().join("rec-goes"));
@@ -823,7 +826,8 @@ fn close_popover(popover: &gtk::Popover) {
 /// later belongs here too, above all one built from a libadwaita widget that
 /// parses markup unless told not to.
 ///
-/// Surfaces: the new-tab list (row and the choices behind "›"), the tab (title,
+/// Surfaces: the new-tab list (row and the choices behind "›", a profile's and
+/// Local terminal's, whose sequence is named the same way), the tab (title,
 /// tooltip, as the tab bar draws it), the window title, the same two and a
 /// pane's header for a tab that saves a transcript (REC before the name), a
 /// notification (and the toast of the Preferences dialog), the Sessions menu (a
@@ -832,8 +836,9 @@ fn close_popover(popover: &gtk::Popover) {
 /// profile is gone, the sync
 /// page's profile choice, and in the Connection Profiles window the sidebar row, the page
 /// title, the key-file row, the sequence row, the Default sequence row (as chosen
-/// and in its open list) and the delete confirmation. The session runs a fake
-/// `ssh`.
+/// and in its open list), the delete confirmation, and Local terminal's page
+/// (its sequence row, its Default sequence row's list and the sequence's
+/// sub-page). The session runs a fake `ssh`.
 fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     const KEY_FILE: &str = "/tmp/<i>k</i>";
     let mut p = Profile::new(MARKUP_NAME, "h", "u");
@@ -846,6 +851,19 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     p.startup_sequence = Some(0);
     let subtitle = form::subtitle(&p);
     let ctx = main_window::ctx_with(dir, std::slice::from_ref(&p));
+    // Local terminal (issue #13) has a sequence named the same way, chosen as
+    // its default.
+    crate::settings::update(&ctx.settings_path, |s| {
+        s.local_terminal = crate::local_terminal::LocalTerminal {
+            sequences: vec![StartupSequence {
+                name: MARKUP_NAME.to_owned(),
+                commands: vec!["uptime".to_owned()],
+            }],
+            startup_sequence: Some(0),
+            transcript: false,
+        };
+    })
+    .expect("write the settings");
     let app = main_window::test_app();
     let main = window::build(&app, &ctx);
     main.window.present();
@@ -868,6 +886,18 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     let popover = open_popover(&menu_button(&row, "Connect Options"));
     let shown = literal_labels("new-tab choices", &popover, MARKUP_NAME);
     assert_eq!(shown.len(), 1, "the sequence: this popover has no heading");
+    close_popover(&popover);
+    // Local terminal's choices name its sequence on a button, as it is.
+    let local_row = row_for(&list, new_tab::LOCAL_ROW);
+    let popover = open_popover(&menu_button(&local_row, "Terminal Options"));
+    let shown = literal_labels("Local terminal choices", &popover, MARKUP_NAME);
+    assert_eq!(shown.len(), 1, "the sequence's button");
+    assert!(
+        shown[0]
+            .parent()
+            .is_some_and(|parent| parent.is::<gtk::Button>()),
+        "a button's label"
+    );
     close_popover(&popover);
 
     // Picking the profile turns that tab into the session, named after the
@@ -1081,7 +1111,7 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
 
     // The Connection Profiles window, on the sync page first (nothing selected yet): the
     // choice of the other machine lists the profile by name.
-    let nothing: crate::profiles::ConnectFn = Rc::new(|_, _, _| {});
+    let nothing: crate::profiles::ConnectFn = Rc::new(|_, _| {});
     let profiles_window = crate::profiles::present_sync(&app, &ctx, nothing);
     pump_for(Duration::from_millis(300));
     let sync_page: adw::PreferencesPage = find_widget(&profiles_window).expect("the sync page");
@@ -1219,6 +1249,73 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         .emit_clicked();
     pump_until("the alert to go", || {
         all_widgets::<adw::AlertDialog>(&profiles_window).is_empty()
+    });
+
+    // Local terminal's page (issue #13): its sequence row, its Default
+    // sequence row's list, and the sequence's sub-page show the name as it is.
+    let local_entry = all_widgets::<gtk::ListBox>(&profiles_window)
+        .into_iter()
+        .find(|l| l.widget_name() == crate::profiles::LOCAL_ENTRY_NAME)
+        .expect("the Local terminal entry");
+    local_entry.select_row(local_entry.row_at_index(0).as_ref());
+    pump_for(Duration::from_millis(100));
+    let title = all_widgets::<gtk::Label>(&profiles_window)
+        .into_iter()
+        .find(|l| l.widget_name() == crate::profiles::TITLE_NAME)
+        .expect("the page title");
+    assert_eq!(title.label(), "Local terminal");
+    let sequences = all_widgets::<adw::PreferencesGroup>(&profiles_window)
+        .into_iter()
+        .find(|group| group.title() == "Startup sequences")
+        .expect("Local terminal's Startup sequences group");
+    let local_sequence_row = all_widgets::<adw::ActionRow>(&sequences)
+        .into_iter()
+        .find(|row| row.title() == MARKUP_NAME)
+        .expect("the local sequence row");
+    assert_plain_row(
+        "local sequence row",
+        &local_sequence_row,
+        MARKUP_NAME,
+        Some("1 command"),
+    );
+    let default_row = all_widgets::<adw::ComboRow>(&profiles_window)
+        .into_iter()
+        .find(|row| row.title() == "Default sequence")
+        .expect("Local terminal's Default sequence row");
+    assert!(
+        !default_row.uses_markup(),
+        "local default row parses markup"
+    );
+    literal_labels("local default row", &default_row, MARKUP_NAME);
+    ActionRowExt::activate(&default_row);
+    let list: gtk::Popover = find_widget(&default_row).expect("the row's list");
+    pump_until("the local default list to open", || list.is_visible());
+    pump_for(Duration::from_millis(200));
+    literal_labels("local default list", &list, MARKUP_NAME);
+    list.popdown();
+    pump_until("the local default list to close", || !list.is_visible());
+    ActionRowExt::activate(&local_sequence_row);
+    let nav = all_widgets::<adw::NavigationView>(&profiles_window)
+        .into_iter()
+        .find(|view| view.widget_name() == crate::profiles::NAV_NAME)
+        .expect("the content pane's navigation view");
+    pump_until("the local sequence's sub-page", || {
+        nav.visible_page()
+            .is_some_and(|page| page.tag().as_deref() == Some(crate::profiles::SEQUENCE_TAG))
+    });
+    let sub_page = nav.visible_page().expect("the sub-page");
+    let name = all_widgets::<adw::EntryRow>(&sub_page)
+        .into_iter()
+        .find(|row| row.title() == "Name")
+        .expect("the sub-page's Name row");
+    assert_eq!(name.text(), MARKUP_NAME);
+    assert!(!name.uses_markup(), "local sub-page Name row parses markup");
+    button_labeled(&sub_page, "Cancel")
+        .expect("the sub-page's Cancel button")
+        .emit_clicked();
+    pump_until("the sub-page to close", || {
+        nav.visible_page()
+            .is_some_and(|page| page.tag().as_deref() != Some(crate::profiles::SEQUENCE_TAG))
     });
 
     profiles_window.close();

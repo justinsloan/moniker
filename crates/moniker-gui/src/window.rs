@@ -44,7 +44,8 @@
 //! leaves closes. A moved tab keeps its sessions, titles and transcript
 //! settings. A pane moves the same way, to another tab or window
 //! (`crate::panes`).
-//! Sessions started from the Connection Profiles window ([`crate::profiles`])
+//! Sessions started from the Connection Profiles window ([`crate::profiles`]),
+//! a profile's or a local terminal's (its Local terminal entry, issue #13),
 //! open in the one that was active last ([`last_active`], [`connect_fn`]), or in
 //! a new one if none is left. When the last main window goes, the Connection
 //! Profiles and Transcripts windows go with it, so the app quits
@@ -701,15 +702,19 @@ pub fn open_profiles(app: &adw::Application, ctx: &Rc<AppContext>) -> adw::Windo
     profiles::present(app, ctx, connect_fn(app, ctx))
 }
 
-/// What connecting from the Connection Profiles window does: a new tab in the main window
-/// that was active last (a new window if none is left), which is raised.
+/// What opening from the Connection Profiles window does: a new tab in the
+/// main window that was active last (a new window if none is left), which is
+/// raised. The tab is a profile's session, or a local shell for Local terminal
+/// (issue #13), running the sequence picked.
 pub fn connect_fn(app: &adw::Application, ctx: &Rc<AppContext>) -> profiles::ConnectFn {
     connect_with(app, ctx, terminal_tab::open_profile)
 }
 
-/// [`connect_fn`] with the session opened by `open` (tests swap in one that
-/// starts no `ssh`). Holds the application weakly: the Connection Profiles window keeps
-/// this, and the application keeps that window.
+/// [`connect_fn`] with a profile's session opened by `open` (tests swap in one
+/// that starts no `ssh`); Local terminal's tab is always
+/// [`terminal_tab::open_local_pick`]'s. Holds the application weakly: the
+/// Connection Profiles window keeps this, and the application keeps that
+/// window.
 pub(crate) fn connect_with(
     app: &adw::Application,
     ctx: &Rc<AppContext>,
@@ -717,12 +722,19 @@ pub(crate) fn connect_with(
 ) -> profiles::ConnectFn {
     let app = app.downgrade();
     let ctx = Rc::clone(ctx);
-    Rc::new(move |profile, sequence, record| {
+    Rc::new(move |pick, record| {
         let Some(app) = app.upgrade() else {
             return;
         };
         let main = last_active(&app).unwrap_or_else(|| build_empty(&app, &ctx));
-        open(&main.view, &ctx, profile, sequence, record);
+        match pick {
+            profiles::Pick::Profile { profile, sequence } => {
+                open(&main.view, &ctx, profile, sequence, record);
+            }
+            profiles::Pick::Local { sequence } => {
+                terminal_tab::open_local_pick(&main.view, &ctx, sequence.as_ref(), record);
+            }
+        }
         main.window.present();
     })
 }
