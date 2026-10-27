@@ -38,7 +38,7 @@ use vte4::prelude::*;
 use zeroize::Zeroizing;
 
 use super::main_window::{ctx_with, ctx_with_secrets, test_app};
-use super::windows::{list_in, main_window, row, ssh_args};
+use super::windows::{list_in, main_window, named, row, ssh_args};
 use super::{
     HeldKeyring, MARKUP_NAME, all_widgets, button_labeled, close_popover, fake_shell, fake_ssh,
     files_in, find_widget, labels_in, literal_labels, menu_button, open_popover, pane, profile,
@@ -54,7 +54,7 @@ use crate::terminal_tab::{
     self, PaneHolder, open_local, open_profile, rename_pane, set_test_ssh_program, shown_title,
     terminal_in,
 };
-use crate::{new_tab, settings, window, zoom};
+use crate::{new_tab, preferences, settings, window, zoom};
 
 /// `path` with every byte but the unreserved ones and `/` percent-encoded, as a
 /// shell's OSC 7 sends it (`My Files` is `My%20Files`, `Ü` is `%C3%9C`).
@@ -1124,7 +1124,59 @@ const SAVE_ENTRY: &str = "Save Session\u{2026}";
 
 /// The Sessions button of `main`.
 fn sessions_button(main: &window::MainWindow) -> gtk::MenuButton {
-    menu_button(&main.window, "Sessions")
+    named(&main.window, sessions_menu::BUTTON_NAME)
+        .and_downcast()
+        .expect("the Sessions button")
+}
+
+/// What `button` shows, in order: the text of its labels, the icon names of its
+/// images, and "arrow" for a drop-down arrow; only what is on screen.
+fn face_of(button: &gtk::MenuButton) -> Vec<String> {
+    all_widgets::<gtk::Widget>(button)
+        .into_iter()
+        .filter(|widget| widget.is_mapped())
+        .filter_map(|widget| {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                Some(label.label().to_string())
+            } else if let Some(image) = widget.downcast_ref::<gtk::Image>() {
+                image.icon_name().map(|name| name.to_string())
+            } else if widget.css_name() == "arrow" {
+                Some("arrow".to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// The Preferences switch that shows or hides the Sessions button.
+fn sessions_switch(dialog: &adw::PreferencesDialog) -> adw::SwitchRow {
+    all_widgets::<adw::SwitchRow>(dialog)
+        .into_iter()
+        .find(|row| row.title() == "Show the Sessions menu")
+        .expect("the Sessions switch")
+}
+
+/// Open the Preferences over `main`, set the Sessions switch to `on` and close
+/// them again.
+fn set_sessions_switch(
+    app: &adw::Application,
+    ctx: &Rc<AppContext>,
+    main: &window::MainWindow,
+    on: bool,
+) {
+    let dialog = preferences::present(&main.window, app, ctx);
+    pump_until("the Preferences dialog", || {
+        main.window.visible_dialog().is_some()
+    });
+    let switch = sessions_switch(&dialog);
+    assert_eq!(switch.is_active(), !on, "the dialog shows what was saved");
+    switch.set_active(on);
+    assert_eq!(ctx.settings().show_sessions, on, "saved");
+    dialog.force_close();
+    pump_until("the dialog to close", || {
+        main.window.visible_dialog().is_none()
+    });
 }
 
 /// The text of `button`, one the menu made: a label is its only child.
@@ -1335,9 +1387,10 @@ pub(super) fn told(ctx: &Rc<AppContext>, main: &window::MainWindow, since: usize
     ctx.notice.last_text().expect("its text")
 }
 
-/// The Sessions button is right after ＋ (the same icon, tooltip and place the
-/// brief says), and a menu with nothing saved says so and offers only to save.
-/// Looking at it writes nothing.
+/// The Sessions button is right after ＋ and reads "Sessions", then an icon of
+/// several windows, then the drop-down arrow (user, 2026-10-26); the word is on
+/// it, so no tooltip repeats it. A menu with nothing saved says so and offers
+/// only to save. Looking at it writes nothing.
 pub(super) fn the_menu_with_no_sessions(dir: &Path) {
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
@@ -1352,7 +1405,12 @@ pub(super) fn the_menu_with_no_sessions(dir: &Path) {
         Some(button.upcast_ref::<gtk::Widget>()),
         "right after ＋"
     );
-    assert_eq!(button.icon_name().as_deref(), Some("view-grid-symbolic"));
+    assert_eq!(
+        face_of(&button),
+        ["Sessions", "focus-windows-symbolic", "arrow"],
+        "the word, the icon, the arrow"
+    );
+    assert!(button.tooltip_text().is_none(), "no tooltip");
 
     let popover = open_menu(&main);
     assert_eq!(texts_in(&popover), ["No saved sessions", SAVE_ENTRY]);
@@ -1364,6 +1422,106 @@ pub(super) fn the_menu_with_no_sessions(dir: &Path) {
     );
     close_popover(&popover);
     main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The Preferences switch "Show the Sessions menu" (on to start with) hides the
+/// Sessions button in every main window at once and in windows opened while it
+/// is off, and shows it again in all of them; the saved sessions are kept
+/// meanwhile. A change that cannot be saved (a damaged settings file) changes
+/// nothing: the row goes back and the buttons stay as they were.
+pub(super) fn the_sessions_button_can_be_hidden(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let file = sessions_menu::sessions_path(&ctx);
+    save_as(&file, "Work", one_list_tab());
+    let kept = fs::read(&file).expect("the sessions file");
+    let app = test_app();
+    let a = main_window(&app, &ctx);
+    let b = main_window(&app, &ctx);
+    assert!(
+        sessions_button(&a).is_visible() && sessions_button(&b).is_visible(),
+        "shown to start with"
+    );
+
+    let dialog = preferences::present(&a.window, &app, &ctx);
+    pump_until("the Preferences dialog", || {
+        a.window.visible_dialog().is_some()
+    });
+    let switch = sessions_switch(&dialog);
+    assert!(switch.is_active(), "on to start with");
+    assert!(!switch.uses_markup());
+    assert_eq!(
+        switch.subtitle().as_deref(),
+        Some(
+            "The button beside \u{FF0B} that saves a window's tabs and panes and adds them \
+             back. Turned off, the saved sessions are kept."
+        )
+    );
+    switch.set_active(false);
+    assert!(!ctx.settings().show_sessions, "saved");
+    assert!(!sessions_button(&a).is_visible(), "hidden in this window");
+    assert!(
+        !sessions_button(&b).is_visible(),
+        "and in the other, at once"
+    );
+
+    // A change that cannot be saved is not used.
+    let good = fs::read(&ctx.settings_path).expect("the settings file");
+    fs::write(&ctx.settings_path, "{ not json").expect("damage the settings file");
+    switch.set_active(true);
+    pump_until("the row to go back", || !switch.is_active());
+    pump_for(Duration::from_millis(200));
+    assert!(!switch.is_active(), "it stays back");
+    assert!(
+        !sessions_button(&a).is_visible() && !sessions_button(&b).is_visible(),
+        "still hidden"
+    );
+    assert_eq!(
+        fs::read_to_string(&ctx.settings_path).expect("the settings file"),
+        "{ not json",
+        "the damaged file is left alone"
+    );
+    fs::write(&ctx.settings_path, good).expect("repair the settings file");
+    dialog.force_close();
+    pump_until("the dialog to close", || {
+        a.window.visible_dialog().is_none()
+    });
+
+    // A window opened while it is off has none either; the sessions are kept.
+    let c = main_window(&app, &ctx);
+    assert!(!sessions_button(&c).is_visible(), "a new window too");
+    assert_eq!(
+        fs::read(&file).expect("the sessions file"),
+        kept,
+        "the sessions are kept"
+    );
+
+    // On again: every window shows it, and its menu lists what was saved.
+    set_sessions_switch(&app, &ctx, &c, true);
+    for main in [&a, &b, &c] {
+        assert!(sessions_button(main).is_visible(), "shown again");
+    }
+    let popover = open_menu(&b);
+    assert_eq!(listed(&popover), ["Work"]);
+    close_popover(&popover);
+    let d = main_window(&app, &ctx);
+    assert!(sessions_button(&d).is_visible(), "and in a new window");
+
+    // Off from another window hides it in every window; one whose button had
+    // the keyboard gives it to its terminal, so typing goes on reaching it.
+    let had = sessions_button(&b);
+    assert!(had.grab_focus(), "the button takes the keyboard");
+    pump_until("the button to have the keyboard", || {
+        gtk::prelude::GtkWindowExt::focus(&b.window).is_some_and(|focus| focus.is_ancestor(&had))
+    });
+    set_sessions_switch(&app, &ctx, &d, false);
+    for main in [&a, &b, &c, &d] {
+        assert!(!sessions_button(main).is_visible(), "hidden everywhere");
+    }
+    assert_keyboard_back(&b, "hiding the button that had it");
+    for main in [a, b, c, d] {
+        main.window.destroy();
+    }
     pump_for(Duration::from_millis(200));
 }
 

@@ -3,6 +3,12 @@
 //! with a click, and the questions that save this window's layout, rename a
 //! saved one and delete it.
 //!
+//! The button reads "Sessions", then an icon of several windows, then the
+//! drop-down arrow (user, 2026-10-26). The Preferences can hide it (on to
+//! start with, user): [`show_buttons`] hides or shows it in every main window
+//! at once, and a new window reads the setting. Hidden, the saved sessions stay
+//! in their file, untouched.
+//!
 //! The button opens a popover that is built again from the file every time it
 //! shows, so it lists what is saved now, whichever window saved it: each
 //! session by name (sorted ignoring case) with a › for Rename… and Delete…, or
@@ -36,6 +42,7 @@
 //! notification area of the window the button is in (the button itself is in
 //! the header bar, outside the area, so the area is held by the menu).
 
+use std::cell::RefCell;
 use std::io;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -59,8 +66,12 @@ use crate::window::MainWindow;
 /// the menu (tests look for it).
 pub(crate) const ROW_NAME: &str = "session-row";
 
-/// Tooltip of the button beside ＋.
-const TOOLTIP: &str = "Sessions";
+/// Widget name of the Sessions button beside ＋ (tests look for it).
+pub(crate) const BUTTON_NAME: &str = "sessions-button";
+/// The word on the button beside ＋. Being on it, it needs no tooltip.
+const LABEL: &str = "Sessions";
+/// The icon after the word: several windows (user, 2026-10-26).
+const ICON: &str = "focus-windows-symbolic";
 /// The entry that saves this window.
 const SAVE_ENTRY: &str = "Save Session\u{2026}";
 /// What the menu says with nothing saved.
@@ -78,16 +89,24 @@ pub(crate) fn sessions_path(ctx: &AppContext) -> PathBuf {
     ctx.settings_path.with_file_name(session_file::FILE_NAME)
 }
 
-/// The Sessions button for `main`: its popover lists the saved sessions
-/// (module docs), and a pick adds one's tabs to `main.view`. It holds the
-/// window's view and notification area weakly: the window owns the button.
+/// The Sessions button for `main`: "Sessions", an icon of several windows and
+/// the drop-down arrow, shown unless the Preferences turned it off
+/// ([`show_buttons`]). Its popover lists the saved sessions (module docs), and
+/// a pick adds one's tabs to `main.view`. It holds the window's view and
+/// notification area weakly: the window owns the button.
 pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton {
     let popover = gtk::Popover::new();
+    let face = gtk::Box::builder().spacing(6).build();
+    face.append(&gtk::Label::builder().label(LABEL).use_markup(false).build());
+    face.append(&gtk::Image::from_icon_name(ICON));
     let button = gtk::MenuButton::builder()
-        .icon_name("view-grid-symbolic")
-        .tooltip_text(TOOLTIP)
+        .name(BUTTON_NAME)
+        .child(&face)
+        .always_show_arrow(true)
+        .visible(ctx.settings().show_sessions)
         .popover(&popover)
         .build();
+    BUTTONS.with_borrow_mut(|all| all.push((button.downgrade(), main.view.downgrade())));
     let menu = Rc::new(Menu {
         ctx: Rc::clone(ctx),
         view: main.view.downgrade(),
@@ -96,6 +115,56 @@ pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton
     });
     popover.connect_show(move |popover| popover.set_child(Some(&menu.content(popover))));
     button
+}
+
+thread_local! {
+    /// Every Sessions button made, with the tabs of its window, so that the
+    /// Preferences switch reaches the one in each main window at once
+    /// ([`show_buttons`]). GTK runs on one thread.
+    static BUTTONS: RefCell<Vec<(glib::WeakRef<gtk::MenuButton>, glib::WeakRef<adw::TabView>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Show or hide the Sessions button of every main window (the Preferences
+/// switch, `settings::GuiSettings::show_sessions`); a window opened later reads
+/// the setting itself. The saved sessions are not touched. A button hidden
+/// while it has the keyboard gives it to the terminal of its window
+/// ([`keyboard_to_the_terminal`]), so the keys never go nowhere.
+pub(crate) fn show_buttons(shown: bool) {
+    // Collected first, so no borrow is held while GTK runs.
+    let live: Vec<_> = BUTTONS.with_borrow_mut(|all| {
+        all.retain(|(button, _)| button.upgrade().is_some());
+        all.iter()
+            .filter_map(|(button, view)| Some((button.upgrade()?, view.clone())))
+            .collect()
+    });
+    for (button, view) in live {
+        let had_keyboard = button
+            .root()
+            .and_then(|root| root.focus())
+            .is_some_and(|focus| focus.is_ancestor(&button));
+        button.set_visible(shown);
+        if had_keyboard && !shown {
+            keyboard_to_the_terminal(&view);
+        }
+    }
+}
+
+/// Give the keyboard to the focused pane of the tab in front of `view` (its
+/// terminal, or the first thing in it that takes the keyboard: the new-tab
+/// list's search entry), if it may have it (`panes::in_front`: never a tab out
+/// of sight, never while a dialog is open over the window).
+fn keyboard_to_the_terminal(view: &glib::WeakRef<adw::TabView>) {
+    let holder = view
+        .upgrade()
+        .and_then(|view| view.selected_page())
+        .as_ref()
+        .and_then(terminal_tab::holder_of);
+    if let Some(holder) = holder
+        && panes::in_front(&holder)
+    {
+        panes::focus_pane(&holder);
+    }
 }
 
 /// What the menu's closures share. Nothing here is a snapshot of the file.
@@ -123,29 +192,16 @@ impl Menu {
     }
 
     /// Once `dialog` has closed, whatever the answer, give the keyboard to the
-    /// focused pane of the tab in front (its terminal, or the first thing in it
-    /// that takes the keyboard: the new-tab list's search entry), if it may have
-    /// it (`panes::in_front`: never a tab out of sight, never while another
-    /// dialog is open, such as the next question of a chain, whose own closing
-    /// does it). From an idle callback: by then the dialog has gone from the
-    /// window, and libadwaita has given the keyboard back to the widget that
-    /// had it before the dialog opened, which this then overrides.
+    /// terminal of the tab in front ([`keyboard_to_the_terminal`]; not while
+    /// another dialog is open, such as the next question of a chain, whose own
+    /// closing does it). From an idle callback: by then the dialog has gone
+    /// from the window, and libadwaita has given the keyboard back to the
+    /// widget that had it before the dialog opened, which this then overrides.
     fn give_the_keyboard_back_when_closed(&self, dialog: &adw::AlertDialog) {
         let view = self.view.clone();
         dialog.connect_closed(move |_| {
             let view = view.clone();
-            glib::idle_add_local_once(move || {
-                let holder = view
-                    .upgrade()
-                    .and_then(|view| view.selected_page())
-                    .as_ref()
-                    .and_then(terminal_tab::holder_of);
-                if let Some(holder) = holder
-                    && panes::in_front(&holder)
-                {
-                    panes::focus_pane(&holder);
-                }
-            });
+            glib::idle_add_local_once(move || keyboard_to_the_terminal(&view));
         });
     }
 

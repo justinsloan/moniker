@@ -3,7 +3,8 @@
 //! The header bar holds, left to right: ＋ (a new tab here showing the new-tab
 //! list, [`crate::new_tab`], where a saved profile becomes a session in that
 //! tab), Sessions (the saved layouts of windows, to add back to this one, and
-//! saving this one: [`crate::sessions_menu`]), the selected tab's title, and ☰
+//! saving this one: [`crate::sessions_menu`]; the Preferences can hide it),
+//! the selected tab's title, and ☰
 //! (the app's actions, which `main.rs` defines, under a zoom row for the
 //! selected tab's text size). There is no Connect button: connections come
 //! from the new-tab list and the Connection Profiles window.

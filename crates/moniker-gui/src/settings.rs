@@ -83,6 +83,10 @@ pub struct GuiSettings {
     /// (`crate::hosts`; the Preferences switch, on by default). Off, no ping is
     /// sent and no mark is shown.
     pub ping_hosts: bool,
+    /// Show the Sessions button beside ＋ in every main window
+    /// (`crate::sessions_menu`; the Preferences switch, on by default). Off,
+    /// the saved sessions are kept and only the button is hidden.
+    pub show_sessions: bool,
     /// The size of the main window that closed last, which new main windows
     /// open at (issue #14); `None` is the built-in size.
     pub main_window: Option<WindowSize>,
@@ -188,6 +192,10 @@ impl GuiSettings {
                 .get("ping_hosts")
                 .and_then(Value::as_bool)
                 .unwrap_or(defaults.ping_hosts),
+            show_sessions: fields
+                .get("show_sessions")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.show_sessions),
             main_window: fields.get("main_window").and_then(WindowSize::from_json),
             profiles_window: fields
                 .get("profiles_window")
@@ -229,6 +237,7 @@ impl Default for GuiSettings {
             font: None,
             transcripts_dir: None,
             ping_hosts: true,
+            show_sessions: true,
             main_window: None,
             profiles_window: None,
             transcripts_window: None,
@@ -385,6 +394,7 @@ mod tests {
             font: Some("Monospace Bold 12".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/transcripts")),
             ping_hosts: false,
+            show_sessions: false,
             main_window: Some(WindowSize {
                 width: 1200,
                 height: 800,
@@ -568,6 +578,7 @@ mod tests {
             font: Some("Monospace 11".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/transcripts")),
             ping_hosts: false,
+            show_sessions: false,
             main_window: Some(WindowSize {
                 width: 1000,
                 height: 600,
@@ -716,12 +727,14 @@ mod tests {
             assert_eq!(loaded.font, None, "{text}");
             assert_eq!(loaded.transcripts_dir, None, "{text}");
             assert!(loaded.ping_hosts, "{text}: on unless turned off");
+            assert!(loaded.show_sessions, "{text}: shown unless turned off");
             assert_eq!(loaded.main_window, None, "{text}");
             assert_eq!(loaded.profiles_window, None, "{text}");
             assert_eq!(loaded.transcripts_window, None, "{text}");
         }
         let default = GuiSettings::default();
         assert!(default.ping_hosts);
+        assert!(default.show_sessions);
         assert!(!default.save_all_transcripts);
         assert_eq!(default.scrollback_lines, 10_000);
         assert_eq!(default.font, None);
@@ -799,6 +812,21 @@ mod tests {
         ] {
             fs::write(&path, text).unwrap();
             assert_eq!(load(&path).ping_hosts, want, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_sessions_button_is_hidden_only_when_the_file_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        for (text, want) in [
+            (r#"{"show_sessions": false}"#, false),
+            (r#"{"show_sessions": true}"#, true),
+            (r#"{"show_sessions": "no"}"#, true),
+            (r#"{"show_sessions": null}"#, true),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(load(&path).show_sessions, want, "{text}");
         }
     }
 
@@ -950,6 +978,7 @@ mod tests {
             font: Some("Monospace 11".to_owned()),
             transcripts_dir: Some(PathBuf::from("/srv/t")),
             ping_hosts: false,
+            show_sessions: false,
             main_window: Some(WindowSize {
                 width: 1000,
                 height: 600,

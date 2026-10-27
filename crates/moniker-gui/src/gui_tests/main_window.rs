@@ -37,7 +37,7 @@ use crate::launch_args::{Refused, Run, Start, decode, encode};
 use crate::terminal_tab::{
     launch, new_holder_page, rename_page, start_command, tab_title, terminal_of,
 };
-use crate::{ABOUT_COPYRIGHT, REPOSITORY_URL, preferences, profiles, window};
+use crate::{ABOUT_COPYRIGHT, REPOSITORY_URL, preferences, profiles, sessions_menu, window};
 
 fn sequence(name: &str) -> StartupSequence {
     StartupSequence {
@@ -510,12 +510,18 @@ pub(super) fn header_has_no_connect_button(dir: &Path) {
             .all(|b| b.icon_name().as_deref() != Some("network-server-symbolic")),
         "no server-icon button either"
     );
-    // Sessions (issue #12) and ☰, in that order, and nothing else.
-    let tooltips: Vec<_> = tooltips.iter().map(|t| t.as_deref()).collect();
+    // Sessions (issue #12; its word is on it, so it has no tooltip) and ☰, in
+    // that order, and nothing else.
+    assert_eq!(menus.len(), 2, "the header's menu buttons: {tooltips:?}");
     assert_eq!(
-        tooltips,
-        [Some("Sessions"), Some("Main Menu")],
-        "the header's menu buttons"
+        menus[0].widget_name(),
+        sessions_menu::BUTTON_NAME,
+        "Sessions first"
+    );
+    assert_eq!(
+        menus[1].tooltip_text().as_deref(),
+        Some("Main Menu"),
+        "then ☰"
     );
     let new_tab = widgets_outside_popovers::<gtk::Button>(&header)
         .into_iter()

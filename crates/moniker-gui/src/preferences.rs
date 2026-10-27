@@ -9,6 +9,9 @@
 //!   scrollback of ordinary tabs, 1,000 to 1,000,000 lines, for tabs opened
 //!   after the change (`terminal_tab::set_scrollback`). Tabs that save a
 //!   transcript keep unlimited scrollback whatever it says.
+//! * **Sessions**: "Show the Sessions menu" (on by default), the Sessions
+//!   button beside ＋ in every main window, hidden or shown at once
+//!   (`sessions_menu::show_buttons`). Off, the saved sessions are kept.
 //! * **Connection Profiles**: "Show whether hosts are reachable" (on by
 //!   default), the pings behind the marks in the profile lists
 //!   (`crate::hosts`). Off, no ping is sent and no mark is shown.
@@ -48,7 +51,7 @@ use moniker_core::transcript::{MoveReport, move_transcripts, prepare_folder};
 use crate::context::AppContext;
 use crate::notify;
 use crate::settings::{self, GuiSettings};
-use crate::{profiles, recordings, terminal_tab, window};
+use crate::{profiles, recordings, sessions_menu, terminal_tab, window};
 
 /// Widget name of the dialog, how [`present`] finds an open one.
 const DIALOG_NAME: &str = "moniker-preferences";
@@ -71,6 +74,9 @@ const SYNC_SUBTITLE: &str = "Sync key, the other machine, automatic sync";
 const PING_TITLE: &str = "Show whether hosts are reachable";
 const PING_SUBTITLE: &str = "Pings each saved host from this machine now and then, and \
 marks it in the lists. Turned off, no pings are sent.";
+const SESSIONS_TITLE: &str = "Show the Sessions menu";
+const SESSIONS_SUBTITLE: &str = "The button beside \u{FF0B} that saves a window's tabs and \
+panes and adds them back. Turned off, the saved sessions are kept.";
 
 /// The font a font setting of `None` stands for, when nothing else says: the
 /// family VTE uses by default, at a common size.
@@ -205,6 +211,7 @@ fn build(app: &adw::Application, ctx: &Rc<AppContext>) -> adw::PreferencesDialog
     let now = ctx.settings();
     let page = adw::PreferencesPage::new();
     page.add(&terminal_group(ctx, &now));
+    page.add(&sessions_group(ctx, &now));
     page.add(&profiles_group(ctx, &now));
     page.add(&transcripts_group(app, ctx, &now));
     page.add(&sync_group(app, ctx));
@@ -419,14 +426,36 @@ fn profiles_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGr
     let group = adw::PreferencesGroup::builder()
         .title("Connection Profiles")
         .build();
-    let pings = adw::SwitchRow::builder()
-        .title(PING_TITLE)
-        .subtitle(PING_SUBTITLE)
+    let hosts = Rc::clone(&ctx.hosts);
+    group.add(&switch_row(
+        ctx,
+        (PING_TITLE, PING_SUBTITLE),
+        now.ping_hosts,
+        |s| &mut s.ping_hosts,
+        move |on| hosts.set_enabled(on),
+    ));
+    group
+}
+
+/// A switch row titled `title` with `subtitle` (plain text) for the setting
+/// `field`, which the file now says is `now`. Each change is saved at once
+/// ([`save`]) and then handed to `apply`; one that cannot be saved is not used,
+/// and the row goes back.
+fn switch_row(
+    ctx: &Rc<AppContext>,
+    (title, subtitle): (&str, &str),
+    now: bool,
+    field: fn(&mut GuiSettings) -> &mut bool,
+    apply: impl Fn(bool) + 'static,
+) -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder()
+        .title(title)
+        .subtitle(subtitle)
         .use_markup(false)
-        .active(now.ping_hosts)
+        .active(now)
         .build();
-    let saved = Rc::new(Cell::new(now.ping_hosts));
-    pings.connect_active_notify(glib::clone!(
+    let saved = Cell::new(now);
+    row.connect_active_notify(glib::clone!(
         #[strong]
         ctx,
         move |row| {
@@ -434,15 +463,28 @@ fn profiles_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGr
             if on == saved.get() {
                 return;
             }
-            if save(&ctx, row, |s| s.ping_hosts = on) {
+            if save(&ctx, row, |s| *field(s) = on) {
                 saved.set(on);
-                ctx.hosts.set_enabled(on);
+                apply(on);
             } else {
                 row.set_active(saved.get());
             }
         }
     ));
-    group.add(&pings);
+    row
+}
+
+// ----- Sessions -----
+
+fn sessions_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Sessions").build();
+    group.add(&switch_row(
+        ctx,
+        (SESSIONS_TITLE, SESSIONS_SUBTITLE),
+        now.show_sessions,
+        |s| &mut s.show_sessions,
+        sessions_menu::show_buttons,
+    ));
     group
 }
 
@@ -458,29 +500,13 @@ fn transcripts_group(
         .description(recordings::SECRETS_WARNING)
         .build();
 
-    let save_all = adw::SwitchRow::builder()
-        .title(SAVE_ALL_TITLE)
-        .subtitle(SAVE_ALL_SUBTITLE)
-        .use_markup(false)
-        .active(now.save_all_transcripts)
-        .build();
-    let saved = Rc::new(Cell::new(now.save_all_transcripts));
-    save_all.connect_active_notify(glib::clone!(
-        #[strong]
+    group.add(&switch_row(
         ctx,
-        move |row| {
-            let on = row.is_active();
-            if on == saved.get() {
-                return;
-            }
-            if save(&ctx, row, |s| s.save_all_transcripts = on) {
-                saved.set(on);
-            } else {
-                row.set_active(saved.get());
-            }
-        }
+        (SAVE_ALL_TITLE, SAVE_ALL_SUBTITLE),
+        now.save_all_transcripts,
+        |s| &mut s.save_all_transcripts,
+        |_| {},
     ));
-    group.add(&save_all);
 
     let folder = adw::ActionRow::builder()
         .name(FOLDER_ROW_NAME)

@@ -244,8 +244,23 @@ pub(super) fn preferences_has_the_four_settings_and_sync(dir: &Path) {
         .collect();
     assert_eq!(
         titles,
-        ["Terminal", "Connection Profiles", "Transcripts", "Sync"]
+        [
+            "Terminal",
+            "Sessions",
+            "Connection Profiles",
+            "Transcripts",
+            "Sync"
+        ]
     );
+
+    // Sessions: the switch that shows the Sessions button, on.
+    let sessions = all_widgets::<adw::SwitchRow>(&group(&dialog, "Sessions"))
+        .into_iter()
+        .next()
+        .expect("the Sessions switch");
+    assert_eq!(sessions.title(), "Show the Sessions menu");
+    assert!(sessions.is_active(), "on by default");
+    assert!(!sessions.uses_markup());
 
     // Connection Profiles: the switch for the host marks' pings, on.
     let pings = all_widgets::<adw::SwitchRow>(&group(&dialog, "Connection Profiles"))

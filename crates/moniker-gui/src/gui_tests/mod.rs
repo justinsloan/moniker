@@ -445,6 +445,7 @@ fn gui_integration() {
 
     // Issue #12, the Sessions menu beside ＋.
     sessions::the_menu_with_no_sessions(&tmp.path().join("sm-none"));
+    sessions::the_sessions_button_can_be_hidden(&tmp.path().join("sm-hidden"));
     sessions::saving_and_adding_from_the_menu(&bin, &tmp.path().join("sm-save"));
     sessions::saving_under_a_name_in_use_asks(&tmp.path().join("sm-replace"));
     sessions::rename_and_delete_ask_first(&tmp.path().join("sm-rename"));
