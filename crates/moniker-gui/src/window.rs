@@ -182,7 +182,10 @@ pub fn new_window_with(app: &adw::Application, ctx: &Rc<AppContext>, start: &Sta
 /// local pane runs Local terminal's default sequence, as every restored one
 /// does. No window is opened for a layout with no tab (the file's reader never
 /// gives one), so none is left empty. It is an ordinary main window, at the
-/// size New Window uses, with its own Layouts menu.
+/// size New Window uses, with its own Layouts menu. Its keyboard is in the
+/// recorded pane, or on nothing while that pane waits for the keyring
+/// ([`keep_the_keyboard_where_restore_put_it`]: showing a window would put it
+/// somewhere else).
 pub(crate) fn open_layout(
     app: &adw::Application,
     ctx: &Rc<AppContext>,
@@ -193,8 +196,36 @@ pub(crate) fn open_layout(
     }
     let main = build_empty(app, ctx);
     session_layout::restore(&main.view, ctx, tabs);
+    let recorded = main
+        .view
+        .selected_page()
+        .as_ref()
+        .and_then(terminal_tab::holder_of);
     main.window.present();
+    if let Some(recorded) = &recorded {
+        keep_the_keyboard_where_restore_put_it(&main, recorded);
+    }
     Some(main)
+}
+
+/// Showing a window that has no keyboard focus makes GTK give it to the first
+/// widget that takes it (`gtk_window_show`): a terminal of another pane than the
+/// recorded one, which then counts as the focused pane, or a button of the
+/// header bar. A recorded pane that still waits for the keyring has left the
+/// keyboard on nothing ([`session_layout::restore`]), and it must stay so until
+/// that pane's session takes it, or keys would go to a pane that is not the
+/// focused one. So after showing, a keyboard outside the `recorded` pane (the
+/// focused pane of the tab in front before the window was shown) is taken
+/// away, and that pane is made the focused one again and gets the keyboard if
+/// it can (a pane that cannot leaves it on nothing).
+fn keep_the_keyboard_where_restore_put_it(main: &MainWindow, recorded: &terminal_tab::PaneHolder) {
+    let in_the_pane = gtk::prelude::GtkWindowExt::focus(&main.window).is_some_and(|focus| {
+        focus == *recorded.upcast_ref::<gtk::Widget>() || focus.is_ancestor(recorded)
+    });
+    if !in_the_pane {
+        gtk::prelude::GtkWindowExt::set_focus(&main.window, gtk::Widget::NONE);
+        panes::focus_pane(recorded);
+    }
 }
 
 /// Build a main window with no tab yet. Its first tab must come before it is
@@ -332,7 +363,7 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
     };
     // Layouts, right after ＋: it needs the window's own view and
     // notification area.
-    header.pack_start(&sessions_menu::button(&main, ctx));
+    header.pack_start(&sessions_menu::button(&main, app, ctx));
     main
 }
 

@@ -219,18 +219,22 @@ pub(super) fn pane_record(kind: Kind, name: Option<&str>, scale: f64) -> PaneRec
     }
 }
 
-/// A window saved and added back to another window: window A has a tab split
+/// A window saved and opened as a layout (issue #16): window A has a tab split
 /// three ways (a local pane in a folder whose name has a space and letters
 /// that are not ASCII, side by side with a profile pane renamed "Logs" at a
 /// larger text size over a new-tab list) and a tab with a profile pane whose
 /// profile saves its transcripts. Its capture (saved and read back as the file
-/// does) is restored into window B: B gains two tabs after its own, the first
-/// added selected; the splits have the same arrangement and fractions once
-/// sized, the panes their names and sizes and the recorded pane the focus; the
-/// local pane's shell starts in the folder; both profile panes connect through
-/// the fake `ssh` with their default sequence; the second tab's pane saves a
-/// transcript, as its profile's switch says. Nothing of a host, a user, a
-/// command or a sequence is in the session.
+/// does) is opened in a new window B, as a pick in the Layouts menu opens it
+/// (`window::open_layout`, the only way a person restores one), while the
+/// keyring is held: B has the two tabs and none of its own, the first
+/// selected; the keyboard is on nothing while Logs, the recorded pane, waits
+/// for the keyring (not on ＋ or another header bar widget, where GTK puts it
+/// when it shows a window that has none), and in Logs once it connects; the
+/// splits have the same arrangement and fractions once sized, the panes their
+/// names and sizes; the local pane's shell starts in the folder; both profile
+/// panes connect through the fake `ssh` with their default sequence; the second
+/// tab's pane saves a transcript, as its profile's switch says. Nothing of a
+/// host, a user, a command or a sequence is in the saved file.
 pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     let folder = dir.join("My Files").join("Ünï");
     fs::create_dir_all(&folder).expect("the folder");
@@ -245,7 +249,8 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     db.host = "db.example.test".to_owned();
     db.startup_sequence = Some(0);
     db.transcript = true;
-    let ctx = ctx_with(dir, &[web.clone(), db.clone()]);
+    let keyring = Arc::new(HeldKeyring::new(Arc::new(MemorySecretStore::default())));
+    let ctx = ctx_with_secrets(dir, &[web.clone(), db.clone()], Arc::clone(&keyring) as _);
     settings::update(&ctx.settings_path, |s| {
         s.transcripts_dir = Some(transcripts.clone());
     })
@@ -374,24 +379,29 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].tabs, tabs, "the file keeps it all");
 
-    // Restored into window B, after its own tab; the first added is selected.
-    let b = main_window(&app, &ctx);
-    let own = b.view.selected_page().expect("B's own tab");
-    restore(&b.view, &ctx, &saved[0].tabs);
-    assert_eq!(b.view.n_pages(), 3, "B's own tab and the two");
-    assert_eq!(b.view.nth_page(0), own, "B's own tab stays first");
-    let first = b.view.nth_page(1);
-    let second = b.view.nth_page(2);
-    assert_eq!(b.view.selected_page().as_ref(), Some(&first));
-    // Logs waits for the keyring (its answer needs the main loop): selecting
-    // the tab gave the keyboard to the first pane that takes it, and that is
-    // undone, so the keyboard is in no other pane.
-    let layout = layout_of(&first);
-    assert!(
-        gtk::prelude::GtkWindowExt::focus(&b.window)
-            .is_none_or(|focus| !focus.is_ancestor(&layout)),
-        "the keyboard in a pane that is not the focused one"
+    // Opened in a new window B, as a pick opens it, with the keyring held: the
+    // layout's two tabs and none of its own, the first selected.
+    keyring.hold();
+    let b = window::open_layout(&app, &ctx, &saved[0].tabs).expect("the layout's window");
+    assert!(b.window.is_visible(), "presented");
+    assert_eq!(
+        b.view.n_pages(),
+        2,
+        "the layout's two tabs and nothing else"
     );
+    let first = b.view.nth_page(0);
+    let second = b.view.nth_page(1);
+    assert_eq!(b.view.selected_page().as_ref(), Some(&first));
+    // Logs, the recorded pane, waits for the keyring (its answer needs the
+    // main loop). The keyboard is on nothing: not in another pane, and not on
+    // ＋ or any other widget of the header bar, where GTK moves it when it shows
+    // a window that has none. It stays so while Logs waits.
+    let layout = layout_of(&first);
+    assert_keyboard_on_nothing(&b, "the layout's window is shown");
+    pump_for(Duration::from_millis(300));
+    assert_keyboard_on_nothing(&b, "Logs has waited for the keyring");
+    assert!(terminal_in(layout.focused_holder().as_ref().expect("Logs")).is_none());
+    keyring.release();
 
     // The arrangement, the fractions once sized, the panes and the focus.
     let (outer, left, right) = top_split(&layout);
@@ -1678,6 +1688,14 @@ pub(super) fn saving_and_opening_from_the_menu(bin: &Path, dir: &Path) {
     assert_eq!(*kind_of(&sessions[0].tabs[2]), Kind::List);
     assert_eq!(a.view.n_pages(), 3, "A is as it was");
 
+    // B gets a second tab and its first stays selected, so that a pick that
+    // touched its tabs or its selection would show; A's selection is noted too.
+    new_tab::open(&b.view, &ctx);
+    let b_first = b.view.nth_page(0);
+    b.view.set_selected_page(&b_first);
+    assert_eq!(b.view.n_pages(), 2);
+    let a_selected = a.view.selected_page();
+
     // B's menu is rebuilt as it opens: it lists the layout now, and picking it
     // opens a new window holding exactly its tabs.
     let popover = open_menu(&b);
@@ -1695,24 +1713,35 @@ pub(super) fn saving_and_opening_from_the_menu(bin: &Path, dir: &Path) {
     assert!(w.window.is_visible(), "presented");
     assert_eq!(w.view.n_pages(), 3, "the layout's tabs and nothing else");
     assert_eq!(w.view.selected_page().as_ref(), Some(&w.view.nth_page(0)));
-    assert!(
-        keyboard_in_the_focused_pane(&w),
-        "the keyboard in the recorded focused pane of its first tab"
-    );
+    assert_keyboard_back(&w, "it opened (the recorded focused pane of its first tab)");
     let terminal = session_in(&pane(&w.view.nth_page(1)));
     wait_for_text(&terminal, "FAKE-END");
     assert!(ssh_args(&terminal).contains(&format!("{}@{}", web.username, web.host)));
     assert!(list_in(&w.view.nth_page(2)).is_some(), "the list tab");
-    assert_eq!(b.view.n_pages(), 1, "B is as it was");
+    assert_eq!(b.view.n_pages(), 2, "B is as it was");
+    assert_eq!(
+        b.view.selected_page().as_ref(),
+        Some(&b_first),
+        "B's selection is as it was"
+    );
     assert_eq!(a.view.n_pages(), 3, "A is as it was");
+    assert_eq!(a.view.selected_page(), a_selected, "A's selection too");
     pump_until("the menu to close", || !popover.is_visible());
     assert_keyboard_back(&b, "a pick");
 
-    // A layout picked twice opens two windows.
+    // A layout picked twice opens two windows, each with the layout's tabs.
     let popover = open_menu(&b);
     pick_session(&popover, "Work");
     pump_until("a second window", || main_windows(&app) == before + 2);
-    assert_eq!(b.view.n_pages(), 1, "B is still as it was");
+    let w2 = the_new_window(&app, &[&a, &b, &w]);
+    assert_eq!(
+        w2.view.n_pages(),
+        3,
+        "the second window has the layout's tabs"
+    );
+    assert_eq!(w2.view.selected_page().as_ref(), Some(&w2.view.nth_page(0)));
+    assert_eq!(b.view.n_pages(), 2, "B is still as it was");
+    assert_eq!(b.view.selected_page().as_ref(), Some(&b_first));
     assert_eq!(w.view.n_pages(), 3, "the first window of the layout is too");
     assert_keyboard_back(&b, "a second pick");
 
@@ -2333,10 +2362,23 @@ fn keyboard_in_the_focused_pane(main: &window::MainWindow) -> bool {
     })
 }
 
+/// The keyboard is on no widget of `main`'s window: a layout's window whose
+/// recorded pane waits for the keyring has nothing to give it to, and must not
+/// leave it on the header bar's first button, where GTK puts it when a window is
+/// shown with none.
+fn assert_keyboard_on_nothing(main: &window::MainWindow, what: &str) {
+    let focus = gtk::prelude::GtkWindowExt::focus(&main.window);
+    assert!(
+        focus.is_none(),
+        "the keyboard is on a {} after {what}",
+        focus.map_or_else(String::new, |widget| widget.type_().name().to_owned())
+    );
+}
+
 /// Wait until the keyboard is back in the terminal after the answer to a
-/// question: in the focused pane of the selected tab (user, 2026-10-26), not
-/// on the Layouts button where a menu button leaves it; and see that it stays
-/// there.
+/// question (or a pick, or a window opening): in the focused pane of the
+/// selected tab (user, 2026-10-26), not on the Layouts button where a menu
+/// button leaves it; and see that it stays there.
 fn assert_keyboard_back(main: &window::MainWindow, what: &str) {
     pump_until(
         &format!("the keyboard back in the terminal after {what}"),

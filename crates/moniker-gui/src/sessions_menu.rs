@@ -119,10 +119,14 @@ pub(crate) fn sessions_path(ctx: &AppContext) -> PathBuf {
 /// The Layouts button for `main`: "Layouts", an icon of several windows and
 /// the drop-down arrow, shown unless the Preferences turned it off
 /// ([`show_buttons`]). Its popover lists the saved layouts (module docs), and
-/// a pick opens one in a new window of the application `main` belongs to. It
-/// holds the application, the window's view and its notification area weakly:
-/// the window owns the button.
-pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton {
+/// a pick opens one in a new window of `app`, the application `main` belongs
+/// to. It holds the application, the window's view and its notification area
+/// weakly: the window owns the button.
+pub(crate) fn button(
+    main: &MainWindow,
+    app: &adw::Application,
+    ctx: &Rc<AppContext>,
+) -> gtk::MenuButton {
     let popover = gtk::Popover::new();
     let face = gtk::Box::builder().spacing(6).build();
     face.append(&gtk::Label::builder().label(LABEL).use_markup(false).build());
@@ -166,12 +170,7 @@ pub(crate) fn button(main: &MainWindow, ctx: &Rc<AppContext>) -> gtk::MenuButton
     ));
     let menu = Rc::new(Menu {
         ctx: Rc::clone(ctx),
-        app: main
-            .window
-            .application()
-            .and_downcast::<adw::Application>()
-            .map(|app| app.downgrade())
-            .unwrap_or_default(),
+        app: app.downgrade(),
         view: main.view.downgrade(),
         area: main.notifications.downgrade(),
         button: button.downgrade(),
@@ -684,14 +683,17 @@ fn names_in_order(sessions: &[Session]) -> Vec<String> {
 /// What to say of a write that failed, by what failed: a layout the file would
 /// not read back ([`io::ErrorKind::InvalidInput`], a plain sentence), a file that
 /// cannot be read (`InvalidData`, which already says "Could not read the saved
-/// layouts"), a layout that Update found gone (`NotFound`, whose text is
-/// [`session_file::GONE`]), or the write itself.
+/// layouts"), a layout that Update found gone (`NotFound` with the text
+/// [`session_file::GONE`]), or the write itself (any other error, a `NotFound`
+/// from the system included).
 fn write_error(err: &io::Error) -> String {
     match err.kind() {
         io::ErrorKind::InvalidInput => format!("Could not save the layout: {err}"),
-        // Update's layout that has gone ([`session_file::GONE`]) and a file that
-        // cannot be read: both texts say it all.
-        io::ErrorKind::NotFound | io::ErrorKind::InvalidData => err.to_string(),
+        // Update's layout that has gone ([`session_file::GONE`], told by its
+        // text and nothing else: any other `NotFound` is the write's own, from
+        // the system) and a file that cannot be read: both texts say it all.
+        io::ErrorKind::NotFound if err.to_string() == session_file::GONE => err.to_string(),
+        io::ErrorKind::InvalidData => err.to_string(),
         _ => format!("Could not save the layouts: {err}"),
     }
 }
@@ -857,6 +859,16 @@ mod tests {
         assert_eq!(
             write_error(&failed),
             format!("Could not save the layouts: {failed}")
+        );
+        // A `NotFound` of the write itself (a folder gone) is not "gone": only
+        // Update's own text is shown bare.
+        let missing = io::Error::new(
+            io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        );
+        assert_eq!(
+            write_error(&missing),
+            "Could not save the layouts: No such file or directory (os error 2)"
         );
     }
 }
