@@ -314,7 +314,7 @@ If `gui-settings.json` is damaged, Moniker uses the defaults and leaves the file
 3. **Make sure the other machine has an unlocked Secret Service** that a non-interactive ssh session can reach: received passwords are stored there. Without one the sync fails with a message and changes nothing.
 4. **Save a profile for the other machine and connect to it once from a tab** to accept its host key. Sync never asks about host keys; it refuses unknown ones.
 5. **Sync** from the Sync page of the Connection Profiles window, after choosing the other machine's profile there, or with `moniker-server sync <profile name>` (the name must be unique).
-6. **From then on it is automatic.** Once a sync from the Sync page has succeeded, that profile is your sync partner: Moniker syncs with it at each launch, in the background (the terminal never waits, and a success is silent), and **☰ → Sync Now** syncs on request. A failure is one notification. The Sync page's **Sync Automatically** switch turns the launch sync off.
+6. **From then on it is automatic.** Once a sync from the Sync page has succeeded, that profile is your sync partner: Moniker syncs with it at each launch, in the background (the terminal never waits, and a success is silent), and **☰ → Sync Now** syncs on request. A failure is one notification. The Sync page's **Sync Automatically** switch turns the launch sync off. **Forget**, on its **Sync Partner** row, forgets it (see [Forgetting the sync partner](#forgetting-the-sync-partner)).
 
 **Deleting a profile** deletes it on every machine you sync. Moniker remembers a deletion for a year, then forgets it, so that deletions do not pile up forever. A machine that has not synced for longer than that could still hold the deleted profile and bring it back. So when this machine or the other one has not completed a sync for more than 180 days, a sync asks first: Sync Now and the Sync page show **Sync Anyway?**, the sync at launch does not run and says so, and `moniker-server sync` stops unless you add `--allow-stale`. If a deleted profile does come back, delete it again.
 
@@ -333,6 +333,20 @@ The **Sync** switch at the top of the Sync page turns sync off on this machine. 
 The check is made by the code that does the syncing, in both roles, so a grayed-out button is a convenience and not the protection. The sync key and the sync partner are kept, so turning sync on again just works. A sync that is already running finishes; the next one is refused. If the setting is in the file but cannot be read, sync counts as off.
 
 **Turning sync on asks first.** "Turn Sync On?" says that at the next sync every profile on this machine that syncs, including any added while sync was off, will be copied to your other machines with its stored password, and that to keep a profile on this machine only you cancel and turn off "Sync to other machines" on its page first. `moniker-server sync-switch on` says the same and asks `Turn sync on? [y/N]` when its input is a terminal; otherwise it changes nothing unless you add `--yes`. Turning sync off asks nothing, since it only stops data leaving. Profiles you add while sync is off sync like any other once it is turned back on.
+
+### Forgetting the sync partner
+
+To go back to having no sync partner, press **Forget** on the **Sync Partner** row of the Sync page. The row is in the Other Machine group, under **Sync Automatically**, and names the partner's profile; it is there only while there is a partner. Forget asks nothing, since one sync from the Sync page undoes it. It is grayed out while a sync runs (a sync from the page that succeeded would record the partner again), but not while the **Sync** switch is off.
+
+- **What it does:** **☰ → Sync Now** leaves the menu, in every window, and Moniker does not sync at launch, until a sync from the Sync page succeeds and records a partner again.
+- **What it keeps:** the sync key, the **Sync Automatically** switch (it does nothing until there is a partner again), the choice in the **Profile** row, the **Sync** switch and every profile. Only the partner is cleared in `gui-settings.json`.
+- **What it says:** a line at the end of the Other Machine group, "*name* is no longer the sync partner. Other machines can still start a sync with this one while Sync is on.", until any sync starts.
+
+**Forget does not stop other machines from syncing with this one.** It only stops this machine from starting syncs. A machine that has your sync key and an ssh login here can still start a sync with this one while the **Sync** switch is on; turning that switch off (see [Turning sync off](#turning-sync-off)) is what stops it.
+
+**Forget does not take anything back from the old partner.** It keeps the copies of your profiles it already has, with their stored passwords, and it keeps the sync key. If that machine should no longer be trusted, change the sync key on the machines that stay, and delete what should not be on it.
+
+If `gui-settings.json` is damaged, Forget leaves it as it is and a notification says "Could not save the sync settings: …".
 
 ### Keeping a profile on this machine only
 
