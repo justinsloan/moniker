@@ -924,6 +924,45 @@ pub(super) fn first_manual_success_enables_sync_now(dir: &Path) {
     rig.finish();
 }
 
+pub(super) fn sync_now_follows_a_forgotten_partner(dir: &Path) {
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    let profile = rig.profile.clone().expect("a profile");
+    crate::add_actions(&rig.app, &rig.ctx);
+    let main = window::build(&rig.app, &rig.ctx);
+    main.window.present();
+    pump_for(Duration::from_millis(200));
+
+    // A partner, as a sync from the page records it: Sync Now is offered, and
+    // the launch has a target.
+    set_partner(&rig.ctx, &profile, true);
+    rig.ctx.profiles_changed();
+    assert!(sync_now_enabled(&rig.app), "Sync Now is offered");
+    assert_eq!(
+        sync::auto_sync_target(
+            &settings::load(&rig.ctx.settings_path),
+            &rig.ctx.store.borrow()
+        ),
+        Some(profile.id.clone()),
+        "the launch syncs with it"
+    );
+
+    // Forgotten: no profile changed and no sync ended, only the partner
+    // setting, and Sync Now goes at once.
+    sync::forget_partner(&rig.ctx.settings_path).unwrap();
+    rig.ctx.partner_changed();
+    assert!(!sync_now_exists(&rig.app), "no partner: no Sync Now");
+    assert_eq!(
+        sync::auto_sync_target(
+            &settings::load(&rig.ctx.settings_path),
+            &rig.ctx.store.borrow()
+        ),
+        None,
+        "the next launch does not sync"
+    );
+    main.window.destroy();
+    rig.finish();
+}
+
 pub(super) fn sync_now_while_running_says_so(dir: &Path) {
     let (ctx, _secrets, profile) = sync_ctx(dir, true, Some(SYNC_KEY));
     let profile = profile.expect("a profile");

@@ -601,6 +601,26 @@ pub(crate) fn record_partner(ctx: &AppContext, partner_id: &str) -> io::Result<(
     )
 }
 
+/// Forget the sync partner (issue #11): clear `sync_partner` in the settings
+/// file, so there is no Sync Now and no sync at launch until a sync from the
+/// sync page succeeds again ([`record_partner`]). Every other setting stays as
+/// the file has it, the automatic-sync switch included.
+///
+/// This goes through [`settings::update`], not [`settings::save`]: a file that
+/// exists but cannot be read or parsed is left as it is (an error), where
+/// `save` would replace it with the defaults, and a file with no partner is not
+/// written at all (`Ok`).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the sync page's Forget button calls it, and comes next: remove this then"
+    )
+)]
+pub(crate) fn forget_partner(path: &Path) -> io::Result<()> {
+    settings::update(path, |settings| settings.sync_partner = None)
+}
+
 // ----- texts of the sync page -----
 
 /// The title of the empty sync key field.
@@ -1265,6 +1285,67 @@ mod tests {
             after_manual_success(&on, "id-b"),
             settings(Some("id-b"), true)
         );
+    }
+
+    // ----- forgetting the partner -----
+
+    #[test]
+    fn forget_partner_clears_only_the_partner() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(settings::FILE_NAME);
+        // A file a hand edit has put other settings in.
+        let before = GuiSettings {
+            sync_partner: Some("id-a".to_owned()),
+            auto_sync: false,
+            font_scale: 1.5,
+            show_sessions: false,
+            scrollback_lines: 20_000,
+            font: Some("Monospace 11".to_owned()),
+            ping_hosts: false,
+            main_window: Some(settings::WindowSize {
+                width: 1000,
+                height: 600,
+                maximized: true,
+            }),
+            ..GuiSettings::default()
+        };
+        settings::save(&path, &before).unwrap();
+
+        forget_partner(&path).unwrap();
+
+        assert_eq!(
+            settings::load(&path),
+            GuiSettings {
+                sync_partner: None,
+                ..before
+            }
+        );
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn forget_partner_leaves_a_damaged_file_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(settings::FILE_NAME);
+        for bytes in [&b"{ not json"[..], b"[1, 2]", b""] {
+            fs::write(&path, bytes).unwrap();
+            assert!(forget_partner(&path).is_err(), "{bytes:?}");
+            assert_eq!(fs::read(&path).unwrap(), bytes, "left as it was");
+        }
+    }
+
+    #[test]
+    fn forget_partner_without_a_partner_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(settings::FILE_NAME);
+        forget_partner(&path).unwrap();
+        assert!(!path.exists(), "no file, and none made");
+
+        let text = br#"{"auto_sync": false}"#;
+        fs::write(&path, text).unwrap();
+        forget_partner(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), text, "unchanged");
     }
 
     // ----- run_with: the real worker flow, with a fake ssh -----

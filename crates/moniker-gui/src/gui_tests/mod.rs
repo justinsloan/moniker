@@ -707,6 +707,7 @@ fn gui_integration() {
     sync::sync_page_profiles_change_during_a_sync(&tmp.path().join("s-chg"));
     sync::sync_page_closed_before_completion(&tmp.path().join("s-close"));
     sync::first_manual_success_enables_sync_now(&tmp.path().join("s-first"));
+    sync::sync_now_follows_a_forgotten_partner(&tmp.path().join("s-forget-now"));
     sync::sync_now_while_running_says_so(&tmp.path().join("s-busy"));
     sync::auto_sync_starts_after_the_window_is_shown(&tmp.path().join("s-launch"));
     sync::auto_sync_failure_is_one_notification(&tmp.path().join("s-launch-fail"));

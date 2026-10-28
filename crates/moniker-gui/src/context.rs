@@ -9,7 +9,10 @@
 //! the file watch of [`AppContext::watch_profile_file`] after anyone's) reloads
 //! the store once and tells them all. In the same way, whoever shows a sync's
 //! progress registers with [`AppContext::on_sync_event`] and hears when any
-//! sync starts and ends, whichever part of the app started it.
+//! sync starts and ends, whichever part of the app started it. Whoever shows
+//! the sync partner registers with [`AppContext::on_partner_changed`] and hears
+//! when it is forgotten ([`AppContext::partner_changed`], issue #11), which
+//! neither a sync nor a change of the profiles tells.
 //!
 //! It knows where this machine's own files are, beside the profile file: the
 //! GUI settings ([`AppContext::settings`]) and Local terminal's startup
@@ -44,8 +47,8 @@ use crate::sync::SyncEvent;
 /// burst of events one save makes (temp file, rename) reloads once.
 const RELOAD_DELAY: Duration = Duration::from_millis(200);
 
-/// Something to call when the profiles change (or a sync starts or ends),
-/// alive while its owner is.
+/// Something to call when the profiles change (or the sync partner, or a sync
+/// starts or ends), alive while its owner is.
 struct Listener<F: ?Sized> {
     owner: glib::WeakRef<glib::Object>,
     call: Rc<F>,
@@ -149,6 +152,8 @@ pub struct AppContext {
     sync_switch_asked: Cell<bool>,
     /// Called by [`profiles_changed`](Self::profiles_changed).
     listeners: RefCell<Vec<Listener<dyn Fn()>>>,
+    /// Called by [`partner_changed`](Self::partner_changed).
+    partner_listeners: RefCell<Vec<Listener<dyn Fn()>>>,
     /// Called when a sync starts and ends ([`sync_event`](Self::sync_event)).
     sync_listeners: RefCell<Vec<Listener<SyncListener>>>,
     /// In tests, what every sync runs instead of the real `ssh` exchange
@@ -247,6 +252,7 @@ impl AppContext {
             sync_switch_saves: Cell::new(0),
             sync_switch_asked: Cell::new(true),
             listeners: RefCell::new(Vec::new()),
+            partner_listeners: RefCell::new(Vec::new()),
             sync_listeners: RefCell::new(Vec::new()),
             #[cfg(test)]
             sync_runner: RefCell::new(None),
@@ -297,6 +303,37 @@ impl AppContext {
         self.listeners
             .borrow_mut()
             .push(Listener::new(owner, Rc::new(f)));
+    }
+
+    /// Call `f` after every [`partner_changed`](Self::partner_changed), for as
+    /// long as `owner` exists. As with
+    /// [`on_profiles_changed`](Self::on_profiles_changed), `f` should hold its
+    /// widgets weakly.
+    pub(crate) fn on_partner_changed(
+        &self,
+        owner: &impl IsA<glib::Object>,
+        f: impl Fn() + 'static,
+    ) {
+        self.partner_listeners
+            .borrow_mut()
+            .push(Listener::new(owner, Rc::new(f)));
+    }
+
+    /// The sync partner in the settings file was changed by something that is
+    /// not a sync (a forget, issue #11): tell every partner listener whose
+    /// owner still exists. Nothing is read here; the listeners read the
+    /// settings themselves.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the sync page's Forget button calls it, and comes next: remove this then"
+        )
+    )]
+    pub(crate) fn partner_changed(&self) {
+        for call in live_calls(&self.partner_listeners) {
+            call();
+        }
     }
 
     /// Call `f` when any sync starts and when it ends, for as long as `owner`
@@ -729,6 +766,25 @@ mod tests {
             ctx.store.borrow().sync_switch().is_on(),
             "but the snapshot was not read again"
         );
+    }
+
+    #[test]
+    fn partner_listeners_are_told_while_their_owner_lives() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context_in(dir.path());
+        let owner = glib::Object::new::<glib::Object>();
+        let heard = Rc::new(Cell::new(0));
+        ctx.on_partner_changed(&owner, {
+            let heard = Rc::clone(&heard);
+            move || heard.set(heard.get() + 1)
+        });
+        ctx.partner_changed();
+        assert_eq!(heard.get(), 1, "told");
+        ctx.profiles_changed();
+        assert_eq!(heard.get(), 1, "not told of the profiles");
+        drop(owner);
+        ctx.partner_changed();
+        assert_eq!(heard.get(), 1, "its owner is gone");
     }
 
     #[test]

@@ -354,9 +354,10 @@ fn add_actions(app: &adw::Application, ctx: &Rc<AppContext>) {
 /// Show Sync Now in the ☰ menu (have `app.sync-now`, whose menu entry is
 /// `hidden-when: action-missing`) only while a sync partner is recorded and
 /// its profile exists, and let it be chosen only while sync is turned on; check
-/// again whenever the profiles change (the switch is in the profile file) and
+/// again whenever the profiles change (the switch is in the profile file),
 /// after every sync, so the first successful sync from the sync page offers it
-/// at once.
+/// at once, and when the partner is forgotten, which is neither of those
+/// ([`AppContext::partner_changed`], issue #11).
 fn follow_sync_partner(app: &adw::Application, ctx: &Rc<AppContext>) {
     // Weak both: the context keeps these closures, and the app the context.
     let refresh: Rc<dyn Fn()> = {
@@ -370,6 +371,10 @@ fn follow_sync_partner(app: &adw::Application, ctx: &Rc<AppContext>) {
     };
     refresh();
     ctx.on_profiles_changed(app, {
+        let refresh = Rc::clone(&refresh);
+        move || refresh()
+    });
+    ctx.on_partner_changed(app, {
         let refresh = Rc::clone(&refresh);
         move || refresh()
     });
