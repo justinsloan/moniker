@@ -323,13 +323,6 @@ impl AppContext {
     /// not a sync (a forget, issue #11): tell every partner listener whose
     /// owner still exists. Nothing is read here; the listeners read the
     /// settings themselves.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the sync page's Forget button calls it, and comes next: remove this then"
-        )
-    )]
     pub(crate) fn partner_changed(&self) {
         for call in live_calls(&self.partner_listeners) {
             call();

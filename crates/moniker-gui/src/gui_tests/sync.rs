@@ -25,8 +25,9 @@ use zeroize::Zeroizing;
 
 use super::main_window::test_app;
 use super::{
-    HeldKeyring, HeldProfileFile, WAIT, alert_in, all_widgets, button_labeled, find_widget,
-    has_focus_in, labels_in, make_helper, pump_for, pump_until, widgets_of_type,
+    HeldKeyring, HeldProfileFile, WAIT, alert_in, all_widgets, assert_plain_row, button_labeled,
+    find_widget, has_focus_in, labels_in, make_helper, pump_for, pump_until, row_for,
+    widgets_of_type,
 };
 use crate::context::AppContext;
 use crate::launch_args::{Run, Start, encode};
@@ -159,6 +160,11 @@ struct Page {
     sync_switch: adw::SwitchRow,
     machine: adw::ComboRow,
     auto_sync: adw::SwitchRow,
+    /// The sync partner (issue #11), shown while there is one, its Forget
+    /// button, and the line a forget leaves.
+    partner_row: adw::ActionRow,
+    forget: gtk::Button,
+    partner_message: gtk::Label,
     hint: gtk::Label,
     sync_button: gtk::Button,
     result: gtk::Label,
@@ -189,6 +195,9 @@ fn page_in(window: &adw::Window) -> Page {
         sync_switch: switch_titled(&widget, "Sync"),
         machine: find_widget(&widget).expect("the profile choice"),
         auto_sync: switch_titled(&widget, "Sync Automatically"),
+        partner_row: row_for(&widget, sync_page::PARTNER_ROW_NAME),
+        forget: button_labeled(&widget, "Forget").expect("the Forget button"),
+        partner_message: named_label(&widget, sync_page::PARTNER_MESSAGE_NAME),
         hint: named_label(&widget, sync_page::HINT_NAME),
         sync_button: button_labeled(&widget, "Sync").expect("the Sync button"),
         result: named_label(&widget, sync_page::RESULT_NAME),
@@ -960,6 +969,259 @@ pub(super) fn sync_now_follows_a_forgotten_partner(dir: &Path) {
         "the next launch does not sync"
     );
     main.window.destroy();
+    rig.finish();
+}
+
+// ----- forgetting the partner (issue #11) -----
+
+pub(super) fn the_sync_page_names_and_forgets_the_partner(dir: &Path) {
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    let profile = rig.profile.clone().expect("a profile");
+    let (ctx, page) = (&rig.ctx, &rig.page);
+    crate::add_actions(&rig.app, ctx);
+    let main = window::build(&rig.app, ctx);
+    main.window.present();
+    pump_for(Duration::from_millis(200));
+
+    // No partner: no row.
+    assert!(!page.partner_row.is_visible());
+
+    // A sync from the page that succeeds records the partner, and the row
+    // names it, as plain text.
+    page.sync_with(ctx, |_| Ok(added(0)));
+    pump_until("the sync", || page.sync_button.is_sensitive());
+    assert!(page.partner_row.is_visible());
+    assert_plain_row("partner row", &page.partner_row, "Sync Partner", Some(NAME));
+    assert_eq!(
+        page.forget.tooltip_text().as_deref(),
+        Some("Forget the sync partner")
+    );
+    assert!(!page.forget.has_css_class("destructive-action"));
+
+    // The profile renamed elsewhere: the row shows the new name.
+    let path = ctx.store.borrow().path().to_path_buf();
+    let rename = |name: &str| {
+        let mut other = ProfileStore::open(&path).unwrap();
+        let mut renamed = other.get(&profile.id).expect("the profile").clone();
+        renamed.name = name.to_owned();
+        other.upsert(renamed).unwrap();
+        ctx.profiles_changed();
+    };
+    rename("<i>renamed</i> & _y_");
+    assert_plain_row(
+        "renamed partner row",
+        &page.partner_row,
+        "Sync Partner",
+        Some("<i>renamed</i> & _y_"),
+    );
+    rename(NAME);
+    assert_plain_row("partner row", &page.partner_row, "Sync Partner", Some(NAME));
+
+    // A settings file with other settings in it (a hand edit, say). The
+    // keyboard is on Forget when it is pressed.
+    let before = GuiSettings {
+        sync_partner: Some(profile.id.clone()),
+        auto_sync: false,
+        font_scale: 1.5,
+        show_sessions: false,
+        ..GuiSettings::default()
+    };
+    settings::save(&ctx.settings_path, &before).expect("save the settings");
+    ctx.profiles_changed();
+    let profile_file = fs::read(&path).expect("the profile file");
+    page.forget.grab_focus();
+    page.forget.emit_clicked();
+    pump_for(Duration::from_millis(100));
+
+    // Only the partner went.
+    assert_eq!(
+        settings::load(&ctx.settings_path),
+        GuiSettings {
+            sync_partner: None,
+            ..before
+        }
+    );
+    assert!(!page.partner_row.is_visible());
+    assert!(!sync_now_exists(&rig.app), "no partner: no Sync Now");
+    assert!(!page.auto_sync.is_active(), "the switch keeps its value");
+    assert_eq!(
+        page.auto_sync.subtitle().as_deref(),
+        Some(sync_page::AUTO_SYNC_NO_PARTNER)
+    );
+    // The page says what a forget does not do, in its ordinary style.
+    assert!(page.partner_message.is_visible());
+    assert_eq!(page.partner_message.label(), sync_page::forgotten(NAME));
+    assert!(!page.partner_message.uses_markup());
+    assert!(!has_css(&page.partner_message, "error"));
+    assert!(
+        has_focus_in(&rig.window, &page.sync_button),
+        "the keyboard went to the Sync button"
+    );
+    // The sync key and the profiles are not touched.
+    assert!(
+        rig.secrets.get(SYNC_PASSPHRASE_KEY).unwrap().is_some(),
+        "the sync key is kept"
+    );
+    assert_eq!(fs::read(&path).unwrap(), profile_file, "the profiles");
+
+    // A sync starting hides the line, so it never sits beside a newer
+    // partner; the sync's success records the partner again.
+    let (tx, rx) = mpsc::channel();
+    page.sync_with(
+        ctx,
+        fake_runner(
+            tx,
+            Arc::new(AtomicUsize::new(0)),
+            Duration::from_millis(300),
+            || Ok(added(0)),
+        ),
+    );
+    rx.recv_timeout(WAIT).expect("the worker started");
+    assert!(!page.partner_message.is_visible(), "hidden while it runs");
+    pump_until("the sync", || page.sync_button.is_sensitive());
+    assert!(!page.partner_message.is_visible());
+    assert!(page.partner_row.is_visible(), "the row is back");
+    assert!(sync_now_exists(&rig.app), "and Sync Now");
+
+    // The partner's profile deleted: no partner to show.
+    ProfileStore::open(&path)
+        .unwrap()
+        .delete(&profile.id)
+        .unwrap();
+    ctx.profiles_changed();
+    assert!(!page.partner_row.is_visible());
+    main.window.destroy();
+    rig.finish();
+}
+
+pub(super) fn forget_waits_for_a_sync_but_not_for_sync_off(dir: &Path) {
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    let profile = rig.profile.clone().expect("a profile");
+    let (ctx, page) = (&rig.ctx, &rig.page);
+    set_partner(ctx, &profile, true);
+    ctx.profiles_changed();
+    assert!(page.partner_row.is_visible());
+    assert!(page.forget.is_sensitive());
+
+    // A sync would record the partner again right after: Forget waits.
+    let (tx, rx) = mpsc::channel();
+    page.sync_with(
+        ctx,
+        fake_runner(
+            tx,
+            Arc::new(AtomicUsize::new(0)),
+            Duration::from_millis(300),
+            || Ok(added(0)),
+        ),
+    );
+    rx.recv_timeout(WAIT).expect("the worker started");
+    assert!(!page.forget.is_sensitive(), "a sync runs");
+    pump_until("the sync", || page.sync_button.is_sensitive());
+    assert!(page.forget.is_sensitive());
+
+    // Sync turned off (elsewhere): Sync is grayed out, Forget is not, since a
+    // forget sends nothing.
+    let path = ctx.store.borrow().path().to_path_buf();
+    ProfileStore::open(&path).unwrap().set_sync(false).unwrap();
+    ctx.profiles_changed();
+    assert!(!page.sync_switch.is_active());
+    assert!(!page.sync_button.is_sensitive());
+    assert!(page.machine.is_sensitive());
+    assert!(page.forget.is_sensitive());
+
+    // The keyboard goes to the Profile row, as the Sync button cannot have it.
+    page.forget.grab_focus();
+    page.forget.emit_clicked();
+    pump_for(Duration::from_millis(100));
+    assert_eq!(settings::load(&ctx.settings_path).sync_partner, None);
+    assert!(!page.partner_row.is_visible());
+    assert!(
+        has_focus_in(&rig.window, &page.machine),
+        "the keyboard went to the Profile row"
+    );
+    rig.finish();
+}
+
+pub(super) fn forget_leaves_a_bad_settings_file_and_says_so(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    const SAYS: &str = "Could not save the sync settings: ";
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    let profile = rig.profile.clone().expect("a profile");
+    let (ctx, page) = (&rig.ctx, &rig.page);
+    let area = super::bare_area();
+    ctx.notice.attach(&area);
+    let file = ctx.settings_path.clone();
+    let told = || {
+        ctx.notice
+            .last_text()
+            .is_some_and(|text| text.starts_with(SAYS))
+    };
+
+    // (a) A file that cannot be parsed is left as it is, and the click says so.
+    set_partner(ctx, &profile, true);
+    ctx.profiles_changed();
+    assert!(page.partner_row.is_visible());
+    fs::write(&file, b"{ not json").expect("damage the file");
+    let delivered = ctx.notice.delivered();
+    page.forget.emit_clicked();
+    assert_eq!(fs::read(&file).unwrap(), b"{ not json", "left as it was");
+    assert_eq!(ctx.notice.delivered(), delivered + 1);
+    assert!(told(), "{:?}", ctx.notice.last_text());
+    assert!(!page.partner_message.is_visible(), "nothing was forgotten");
+
+    // (b) A folder that cannot be written to: the write fails, the row stays.
+    set_partner(ctx, &profile, true);
+    ctx.profiles_changed();
+    assert!(page.partner_row.is_visible());
+    let before = fs::read(&file).unwrap();
+    let delivered = ctx.notice.delivered();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("chmod");
+    page.forget.emit_clicked();
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+    assert_eq!(ctx.notice.delivered(), delivered + 1);
+    assert!(told(), "{:?}", ctx.notice.last_text());
+    assert!(page.partner_row.is_visible(), "the row stays");
+    assert!(!page.partner_message.is_visible());
+    assert_eq!(fs::read(&file).unwrap(), before, "the file is unchanged");
+
+    // (c) A file with no partner any more: nothing is written, nothing is
+    // said, and the row catches up.
+    let text = br#"{"auto_sync": false}"#;
+    fs::write(&file, text).expect("rewrite the file");
+    let delivered = ctx.notice.delivered();
+    page.forget.emit_clicked();
+    assert_eq!(fs::read(&file).unwrap(), text, "unchanged");
+    assert!(!page.partner_row.is_visible());
+    assert!(!page.partner_message.is_visible(), "nothing was forgotten");
+    assert_eq!(ctx.notice.delivered(), delivered, "and nothing is told");
+    rig.finish();
+}
+
+pub(super) fn forget_twice_is_one_forget(dir: &Path) {
+    let rig = sync_rig(dir, true, Some(SYNC_KEY));
+    let profile = rig.profile.clone().expect("a profile");
+    let (ctx, page) = (&rig.ctx, &rig.page);
+    let area = super::bare_area();
+    ctx.notice.attach(&area);
+    set_partner(ctx, &profile, true);
+    ctx.profiles_changed();
+    let delivered = ctx.notice.delivered();
+
+    page.forget.emit_clicked();
+    assert_eq!(settings::load(&ctx.settings_path).sync_partner, None);
+    assert!(page.partner_message.is_visible());
+    assert_eq!(page.partner_message.label(), sync_page::forgotten(NAME));
+
+    // A double click: the second finds no partner, and says and writes
+    // nothing. (The line is marked, so that a second showing would be seen.)
+    page.partner_message.set_label("shown once");
+    let written = fs::read(&ctx.settings_path).unwrap();
+    page.forget.emit_clicked();
+    assert_eq!(settings::load(&ctx.settings_path).sync_partner, None);
+    assert_eq!(fs::read(&ctx.settings_path).unwrap(), written);
+    assert!(page.partner_message.is_visible());
+    assert_eq!(page.partner_message.label(), "shown once");
+    assert_eq!(ctx.notice.delivered(), delivered, "no error either");
     rig.finish();
 }
 

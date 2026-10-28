@@ -25,6 +25,17 @@
 //! first sync is always started by hand, so a mistyped key or a wrong host is
 //! seen on this page rather than as a notification at launch.
 //!
+//! The Sync Partner row, between Sync Automatically and the hint, names that
+//! profile while there is one ([`sync::live_partner`], the test Sync Now uses)
+//! and has a Forget button (issue #11). Forget clears only the partner in the
+//! settings file ([`sync::forget_partner`]) and tells the app
+//! ([`AppContext::partner_changed`]): Sync Now goes and the next launch does not
+//! sync, until a sync from this page succeeds again. It keeps the sync key, the
+//! Sync switch, Sync Automatically, the profile choice and every profile, and
+//! the line it leaves says that other machines can still start a sync with this
+//! one. It waits for a sync that runs, which would record the partner again, but
+//! not for Sync being off, as it sends nothing.
+//!
 //! The sync key is read from its field into a `Zeroizing` buffer, never shown
 //! again, and the field is emptied after a save and when the page goes. Every
 //! text is plain (Pango markup off): profile names come from other machines.
@@ -55,6 +66,8 @@ pub(crate) const KEY_STATUS_NAME: &str = "sync-key-status";
 pub(crate) const KEY_MESSAGE_NAME: &str = "sync-key-message";
 pub(crate) const HINT_NAME: &str = "sync-hint";
 pub(crate) const RESULT_NAME: &str = "sync-result";
+pub(crate) const PARTNER_ROW_NAME: &str = "sync-partner";
+pub(crate) const PARTNER_MESSAGE_NAME: &str = "sync-partner-message";
 
 /// The explanation of the "Other machine" group.
 const MACHINE_NOTE: &str = "Pick the saved profile of your other machine. Moniker connects \
@@ -68,6 +81,16 @@ pub(crate) const AUTO_SYNC_NO_PARTNER: &str = "Once a sync from this page succee
 /// The automatic-sync switch's subtitle once there is a partner.
 pub(crate) fn auto_sync_with(name: &str) -> String {
     format!("Sync with {name} each time Moniker starts.")
+}
+
+/// What the page says after the partner was forgotten (`name` is plain text):
+/// a forget only stops this machine from starting syncs, so the way to stop the
+/// others is said too.
+pub(crate) fn forgotten(name: &str) -> String {
+    format!(
+        "{name} is no longer the sync partner. Other machines can still start a sync with \
+         this one while Sync is on."
+    )
 }
 
 /// What the "Turn Sync On?" alert says: every profile that syncs goes out with
@@ -91,6 +114,11 @@ pub(crate) struct SyncPage {
     /// The other machine's profile; its subtitle says where it connects.
     machine: adw::ComboRow,
     auto_sync: adw::SwitchRow,
+    /// The sync partner, while there is one (issue #11), with its Forget button
+    /// and the line a forget leaves.
+    partner_row: adw::ActionRow,
+    forget: gtk::Button,
+    partner_message: gtk::Label,
     /// Why Sync is unavailable, if it is.
     hint: gtk::Label,
     sync_button: gtk::Button,
@@ -146,6 +174,20 @@ impl SyncPage {
             .title("Sync Automatically")
             .use_markup(false)
             .build();
+        // The subtitle, a profile's name, is set by `refresh_partner`: plain
+        // text, as the profile can come from another machine.
+        let forget = gtk::Button::builder()
+            .label("Forget")
+            .tooltip_text("Forget the sync partner")
+            .valign(gtk::Align::Center)
+            .build();
+        let partner_row = adw::ActionRow::builder()
+            .name(PARTNER_ROW_NAME)
+            .title("Sync Partner")
+            .use_markup(false)
+            .visible(false)
+            .build();
+        partner_row.add_suffix(&forget);
         let hint = gtk::Label::builder()
             .name(HINT_NAME)
             .xalign(0.0)
@@ -155,13 +197,16 @@ impl SyncPage {
             .css_classes(["dim-label"])
             .visible(false)
             .build();
+        let partner_message = inline_message(PARTNER_MESSAGE_NAME);
         let machine_group = adw::PreferencesGroup::builder()
             .title("Other Machine")
             .description(MACHINE_NOTE)
             .build();
         machine_group.add(&machine);
         machine_group.add(&auto_sync);
+        machine_group.add(&partner_row);
         machine_group.add(&hint);
+        machine_group.add(&partner_message);
 
         let sync_button = gtk::Button::builder()
             .label("Sync")
@@ -195,6 +240,9 @@ impl SyncPage {
             sync_switch,
             machine,
             auto_sync,
+            partner_row,
+            forget,
+            partner_message,
             hint,
             sync_button,
             result,
@@ -208,6 +256,7 @@ impl SyncPage {
         page.refresh_targets();
         page.refresh_auto_sync();
         page.refresh_sync_switch();
+        page.refresh_partner();
         // A sync started elsewhere (Sync Now, on launch) may be running.
         if ctx.sync_running.get() {
             page.show_result(sync::SYNCING, false);
@@ -264,6 +313,15 @@ impl SyncPage {
                 }
             }
         ));
+        self.forget.connect_clicked(glib::clone!(
+            #[strong]
+            weak,
+            move |_| {
+                if let Some(page) = weak.upgrade() {
+                    page.forget();
+                }
+            }
+        ));
         self.ctx.on_profiles_changed(
             &self.widget,
             glib::clone!(
@@ -274,6 +332,20 @@ impl SyncPage {
                         page.refresh_targets();
                         page.refresh_auto_sync();
                         page.refresh_sync_switch();
+                        page.refresh_partner();
+                    }
+                }
+            ),
+        );
+        self.ctx.on_partner_changed(
+            &self.widget,
+            glib::clone!(
+                #[strong]
+                weak,
+                move || {
+                    if let Some(page) = weak.upgrade() {
+                        page.refresh_partner();
+                        page.refresh_auto_sync();
                     }
                 }
             ),
@@ -368,20 +440,83 @@ impl SyncPage {
         self.machine.set_subtitle(&text);
     }
 
+    /// The name of the sync partner `settings` record, if its profile exists.
+    fn partner_name(&self, settings: &settings::GuiSettings) -> Option<String> {
+        let store = self.ctx.store.borrow();
+        sync::live_partner(settings, &store).and_then(|id| store.get(&id).map(|p| p.name.clone()))
+    }
+
     /// Set the switch, and its subtitle, to what the settings file says.
     fn refresh_auto_sync(&self) {
         let settings = settings::load(&self.ctx.settings_path);
-        let partner_name = {
-            let store = self.ctx.store.borrow();
-            sync::live_partner(&settings, &store)
-                .and_then(|id| store.get(&id).map(|p| p.name.clone()))
-        };
+        let partner_name = self.partner_name(&settings);
         self.auto_sync.set_subtitle(
             &partner_name.map_or_else(|| AUTO_SYNC_NO_PARTNER.to_owned(), |n| auto_sync_with(&n)),
         );
         self.loading.set(true);
         self.auto_sync.set_active(settings.auto_sync);
         self.loading.set(false);
+    }
+
+    /// Show the Sync Partner row, with the partner's name, while the settings
+    /// file records one whose profile exists; hide it otherwise. A row that
+    /// hides while it has the keyboard gives it away ([`Self::keyboard_away`]),
+    /// so the keys never go nowhere. It runs when something may have changed
+    /// the partner or its profile, never per frame.
+    fn refresh_partner(&self) {
+        let settings = settings::load(&self.ctx.settings_path);
+        let Some(name) = self.partner_name(&settings) else {
+            let row: &gtk::Widget = self.partner_row.upcast_ref();
+            let had_keyboard = row
+                .root()
+                .and_then(|root| root.focus())
+                .is_some_and(|focus| &focus == row || focus.is_ancestor(row));
+            self.partner_row.set_visible(false);
+            if had_keyboard {
+                self.keyboard_away();
+            }
+            return;
+        };
+        self.partner_row.set_subtitle(&name);
+        self.partner_row.set_visible(true);
+    }
+
+    /// Give the keyboard to the Sync button if it can be used, else to the
+    /// Profile row if it can, else to the Sync switch at the top.
+    fn keyboard_away(&self) {
+        if self.sync_button.is_sensitive() {
+            self.sync_button.grab_focus();
+        } else if self.machine.is_sensitive() {
+            self.machine.grab_focus();
+        } else {
+            self.sync_switch.grab_focus();
+        }
+    }
+
+    /// The Forget button: clear the sync partner in the settings file, keeping
+    /// every other setting (and leaving a file that cannot be read as it is),
+    /// then tell the app, so Sync Now and the rows follow. If the file named a
+    /// partner, say which one was forgotten and what that leaves; a second click
+    /// (a double click) finds none, and says nothing. A failure is a
+    /// notification near the page, and the row stays as the file has it.
+    fn forget(&self) {
+        let path = &self.ctx.settings_path;
+        let name = self.partner_name(&settings::load(path));
+        match sync::forget_partner(path) {
+            Ok(()) => {
+                if let Some(name) = name {
+                    show_message(&self.partner_message, &forgotten(&name), false);
+                }
+                self.ctx.partner_changed();
+            }
+            Err(err) => {
+                self.ctx.notice.show_near(
+                    &self.widget,
+                    &format!("Could not save the sync settings: {err}"),
+                );
+                self.refresh_partner();
+            }
+        }
     }
 
     /// The person flipped the switch: save it. If that fails, say so and put
@@ -523,12 +658,20 @@ impl SyncPage {
         self.machine.set_sensitive(idle && set_up);
         self.sync_button.set_sensitive(idle && set_up && sync_on);
         self.auto_sync.set_sensitive(sync_on);
+        // A page sync's success would record the partner again right after;
+        // Sync being off does not matter, as a forget sends nothing.
+        self.forget.set_sensitive(idle);
     }
 
     /// Any sync of the app started or ended.
     fn sync_event(&self, event: &SyncEvent) {
         match event {
-            SyncEvent::Started => self.show_result(sync::SYNCING, false),
+            SyncEvent::Started => {
+                self.show_result(sync::SYNCING, false);
+                // This sync may record a partner: the line about the old one
+                // must not sit beside it.
+                show_message(&self.partner_message, "", false);
+            }
             SyncEvent::Finished(result) => {
                 let (text, is_error) = sync::result_text(result);
                 self.show_result(&text, is_error);
@@ -543,6 +686,7 @@ impl SyncPage {
                 // partner.
                 self.refresh_targets();
                 self.refresh_auto_sync();
+                self.refresh_partner();
             }
         }
         self.refresh_controls();

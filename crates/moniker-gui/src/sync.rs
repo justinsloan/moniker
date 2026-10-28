@@ -610,13 +610,6 @@ pub(crate) fn record_partner(ctx: &AppContext, partner_id: &str) -> io::Result<(
 /// exists but cannot be read or parsed is left as it is (an error), where
 /// `save` would replace it with the defaults, and a file with no partner is not
 /// written at all (`Ok`).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the sync page's Forget button calls it, and comes next: remove this then"
-    )
-)]
 pub(crate) fn forget_partner(path: &Path) -> io::Result<()> {
     settings::update(path, |settings| settings.sync_partner = None)
 }
