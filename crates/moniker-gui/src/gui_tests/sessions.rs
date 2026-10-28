@@ -14,9 +14,9 @@
 //!
 //! The Layouts menu beside ＋ (the last scenarios) is how a person does it:
 //! saving a window under a name, opening a saved layout in a new window (issue
-//! #16), renaming and deleting, the questions each asks, a name in use, a file
-//! that cannot be read, two windows saving at once, a layout gone since the
-//! menu was built, and a write that fails.
+//! #16), updating, renaming and deleting, the questions each asks, a name in
+//! use, a file that cannot be read, two windows saving at once, a layout gone
+//! since the menu was built, and a write that fails.
 
 use std::cell::RefCell;
 use std::fs;
@@ -1276,7 +1276,7 @@ pub(super) fn pick_session(popover: &gtk::Popover, name: &str) {
 }
 
 /// Open the › of the session `name` in the open `popover` and click `entry`
-/// ("Rename\u{2026}" or "Delete\u{2026}") in what it shows.
+/// ("Update\u{2026}", "Rename\u{2026}" or "Delete\u{2026}") in what it shows.
 pub(super) fn from_session_menu(popover: &gtk::Popover, name: &str, entry: &str) {
     let more = menu_button(&row_of(popover, name), "Layout Menu");
     let inner = open_popover(&more);
@@ -1924,6 +1924,156 @@ pub(super) fn rename_and_delete_ask_first(dir: &Path) {
     assert_eq!(names_saved(&file), ["Zed", "Alpha", "Fresh"], "deleted");
     assert_eq!(a.view.n_pages(), 1, "open windows are not changed");
     a.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Update\u{2026} (issue #16): each layout's \u{203a} lists Update\u{2026},
+/// Rename\u{2026}, Delete\u{2026}, in that order. Update asks first (the name
+/// in curly quotes, plain text, Cancel the default and the answer to Escape,
+/// Update destructive), and Cancel and Escape write nothing. Update captures the
+/// window when it is answered, not when the question opened (a tab opened
+/// meanwhile is in it), and replaces the layout in its place: its name and its
+/// place stay, the others are untouched. A layout deleted meanwhile is not
+/// brought back and a file damaged meanwhile is not written over (and no
+/// "Replace the Saved Layouts File?" question opens): each is told in the
+/// window and writes nothing. The keyboard is back in the terminal after every
+/// answer.
+pub(super) fn update_asks_and_replaces_the_layout_in_its_place(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let file = dir.join(session_file::FILE_NAME);
+    save_as(&file, "Work", one_list_tab());
+    save_as(&file, "Home", one_list_tab());
+
+    // The \u{203a} of each layout: Update first.
+    let popover = open_menu(&main);
+    for name in ["Work", "Home"] {
+        let inner = menu_button(&row_of(&popover, name), "Layout Menu")
+            .popover()
+            .expect("the layout's menu");
+        let entries: Vec<String> = all_widgets::<gtk::Button>(&inner)
+            .iter()
+            .filter_map(text_of)
+            .collect();
+        assert_eq!(
+            entries,
+            ["Update\u{2026}", "Rename\u{2026}", "Delete\u{2026}"],
+            "{name}'s menu, in order"
+        );
+    }
+
+    // The question, and the two ways to say no.
+    let untouched = fs::read(&file).expect("the file");
+    from_session_menu(&popover, "Work", "Update\u{2026}");
+    let ask = dialog_over(&main, "the Update question");
+    assert_eq!(
+        ask.heading().as_deref(),
+        Some("Update \u{201c}Work\u{201d}?")
+    );
+    assert_eq!(
+        ask.body().as_str(),
+        "The saved layout is replaced by this window's tabs and panes, as they are now."
+    );
+    assert!(!ask.is_heading_use_markup() && !ask.is_body_use_markup());
+    assert_eq!(ask.close_response().as_str(), "cancel");
+    assert_eq!(ask.default_response().as_deref(), Some("cancel"));
+    assert_eq!(ask.response_label("cancel").as_str(), "Cancel");
+    assert_eq!(ask.response_label("update").as_str(), "Update");
+    assert_eq!(
+        ask.response_appearance("update"),
+        adw::ResponseAppearance::Destructive
+    );
+    assert_eq!(
+        fs::read(&file).expect("the file"),
+        untouched,
+        "nothing before the answer"
+    );
+    answer(&main, &ask, "Cancel");
+    assert_eq!(fs::read(&file).expect("the file"), untouched, "Cancel");
+    assert_keyboard_back(&main, "Cancel of Update");
+    let popover = open_menu(&main);
+    from_session_menu(&popover, "Work", "Update\u{2026}");
+    let ask = dialog_over(&main, "the Update question");
+    answer_or_escape(&main, &ask, None);
+    assert_eq!(fs::read(&file).expect("the file"), untouched, "Escape");
+    assert_keyboard_back(&main, "Escape of Update");
+
+    // Update: the window as it is when the answer is given. A tab is opened
+    // while the question is open, and is in the layout.
+    let popover = open_menu(&main);
+    from_session_menu(&popover, "Work", "Update\u{2026}");
+    let ask = dialog_over(&main, "the Update question");
+    new_tab::open(&main.view, &ctx);
+    assert_eq!(
+        main.view.n_pages(),
+        2,
+        "a tab opened with the question open"
+    );
+    answer(&main, &ask, "Update");
+    assert_eq!(names_saved(&file), ["Work", "Home"], "name and place stay");
+    let layouts = saved(&file);
+    assert_eq!(layouts[0].tabs.len(), 2, "the window as it was answered");
+    assert!(
+        matches!(kind_of(&layouts[0].tabs[0]), Kind::Local { .. }),
+        "its local tab, then"
+    );
+    assert_eq!(
+        *kind_of(&layouts[0].tabs[1]),
+        Kind::List,
+        "the new-tab list"
+    );
+    assert_eq!(layouts[1].tabs, one_list_tab(), "Home is untouched");
+    assert_keyboard_back(&main, "Update");
+    main.view.close_page(&main.view.nth_page(1));
+    pump_until("the list tab to close", || main.view.n_pages() == 1);
+
+    // Gone: deleted elsewhere while the question is open. Not brought back.
+    let popover = open_menu(&main);
+    from_session_menu(&popover, "Work", "Update\u{2026}");
+    let ask = dialog_over(&main, "the Update question");
+    session_file::delete(&file, "Work").expect("another window deletes it");
+    let before = fs::read(&file).expect("the file");
+    let since = ctx.notice.delivered();
+    answer(&main, &ask, "Update");
+    assert_eq!(
+        told(&ctx, &main, since),
+        "That layout is no longer saved.",
+        "a layout that is gone is told"
+    );
+    assert_eq!(names_saved(&file), ["Home"], "it is not brought back");
+    assert_eq!(
+        fs::read(&file).expect("the file"),
+        before,
+        "nothing written"
+    );
+    assert_keyboard_back(&main, "Update of a layout that is gone");
+
+    // Unreadable: damaged elsewhere while the question is open. Not written
+    // over, and nothing offers to.
+    let popover = open_menu(&main);
+    from_session_menu(&popover, "Home", "Update\u{2026}");
+    let ask = dialog_over(&main, "the Update question");
+    fs::write(&file, "not json").expect("damage the file");
+    let since = ctx.notice.delivered();
+    answer(&main, &ask, "Update");
+    let said = told(&ctx, &main, since);
+    assert!(
+        said.starts_with("Could not read the saved layouts: "),
+        "{said}"
+    );
+    pump_for(Duration::from_millis(300));
+    assert!(
+        main.window.visible_dialog().is_none(),
+        "no Replace the Saved Layouts File question"
+    );
+    assert_eq!(
+        fs::read(&file).expect("the file"),
+        b"not json",
+        "the damaged file is left alone"
+    );
+    assert_keyboard_back(&main, "Update of a file that cannot be read");
+    main.window.destroy();
     pump_for(Duration::from_millis(200));
 }
 

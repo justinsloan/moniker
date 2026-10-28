@@ -470,6 +470,7 @@ fn gui_integration() {
     sessions::opening_no_tabs_opens_no_window(&tmp.path().join("sm-no-tabs"));
     sessions::saving_under_a_name_in_use_asks(&tmp.path().join("sm-replace"));
     sessions::rename_and_delete_ask_first(&tmp.path().join("sm-rename"));
+    sessions::update_asks_and_replaces_the_layout_in_its_place(&tmp.path().join("sm-update"));
     sessions::a_damaged_file_is_told_and_kept(&tmp.path().join("sm-damaged"));
     sessions::two_windows_saving_keep_both(&tmp.path().join("sm-two"));
     sessions::a_session_changed_since_the_menu_opened_is_read_again(&tmp.path().join("sm-gone"));
@@ -1083,6 +1084,15 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     assert!(!dialog.is_heading_use_markup(), "delete session heading");
     assert!(!dialog.is_body_use_markup(), "delete session body");
     literal_labels("delete session dialog", &dialog, &heading);
+    sessions::answer(&main, &dialog, "Cancel");
+    let sessions_menu = sessions::open_menu(&main);
+    sessions::from_session_menu(&sessions_menu, MARKUP_NAME, "Update\u{2026}");
+    let dialog = sessions::dialog_over(&main, "the Update question");
+    let heading = format!("Update \u{201c}{MARKUP_NAME}\u{201d}?");
+    assert_eq!(dialog.heading().as_deref(), Some(heading.as_str()));
+    assert!(!dialog.is_heading_use_markup(), "update session heading");
+    assert!(!dialog.is_body_use_markup(), "update session body");
+    literal_labels("update session dialog", &dialog, &heading);
     sessions::answer(&main, &dialog, "Cancel");
     let dialog = sessions::save_dialog(&main);
     sessions::name_entry(&dialog).set_text(MARKUP_NAME);

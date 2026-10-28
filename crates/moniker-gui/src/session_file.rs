@@ -34,7 +34,10 @@
 //! limit before any of this runs.
 //!
 //! This module is pure: no GTK, no display. Every write reads the file again
-//! first, so a session saved meanwhile (from another window) is kept.
+//! first, so a session saved meanwhile (from another window) is kept. [`put`]
+//! saves a session (replacing one of the same name in its place, or adding it),
+//! and [`update`] replaces one that is saved and never adds (issue #16: a
+//! layout deleted or renamed elsewhere stays gone).
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -49,7 +52,8 @@ use crate::zoom;
 /// The file's name, beside `gui-settings.json`.
 pub(crate) const FILE_NAME: &str = "sessions.json";
 
-/// What [`rename`] says of a session that is not in the file any more.
+/// What [`rename`] and [`update`] say of a session that is not in the file any
+/// more.
 pub(crate) const GONE: &str = "That layout is no longer saved.";
 /// What [`rename`] says of a name another session has.
 pub(crate) const NAME_TAKEN: &str = "A layout with this name exists.";
@@ -199,13 +203,43 @@ pub(crate) fn put(path: &Path, session: Session, replace_unreadable: bool) -> io
         Err(_) if replace_unreadable => Vec::new(),
         Err(why) => return Err(unreadable_error(&why)),
     };
-    // Only a session of this name counts: a skipped entry is not one.
-    let same = entries
-        .iter_mut()
-        .find(|entry| matches!(entry, Entry::Session(saved) if saved.name == session.name));
-    match same {
+    match session_entry(&mut entries, &session.name) {
         Some(entry) => *entry = Entry::Session(session),
         None => entries.push(Entry::Session(session)),
+    }
+    write(path, &entries)
+}
+
+/// The entry of the session named `name` in `entries`, if there is one. Only a
+/// session of exactly this name counts: a skipped entry is not one, and a name
+/// that differs in case is another.
+fn session_entry<'a>(entries: &'a mut [Entry], name: &str) -> Option<&'a mut Entry> {
+    entries
+        .iter_mut()
+        .find(|entry| matches!(entry, Entry::Session(saved) if saved.name == name))
+}
+
+/// Replace the saved session of the name `session.name` with `session`, in
+/// its place in the file: read the file again, find the session of that exact
+/// name, and write the file with every other entry as [`put`] writes them
+/// (skipped entries as they were). Unlike [`put`] it never adds a session: the
+/// person chose to update one that was saved, and a session that another
+/// window deleted or renamed meanwhile stays gone.
+///
+/// A session that reading would skip is refused as [`put`] refuses it
+/// ([`io::ErrorKind::InvalidInput`], a plain sentence). A file that cannot be
+/// read is [`io::ErrorKind::InvalidData`] and is left as it is: there is no
+/// session in such a file to update, so nothing here offers to replace it. No
+/// session of that name is [`io::ErrorKind::NotFound`] with the text [`GONE`],
+/// and nothing is written (no file is made when there is none).
+pub(crate) fn update(path: &Path, session: Session) -> io::Result<()> {
+    if let Some(why) = refusal(&session) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+    }
+    let mut entries = read(path).map_err(|why| unreadable_error(&why))?;
+    match session_entry(&mut entries, &session.name) {
+        Some(entry) => *entry = Entry::Session(session),
+        None => return Err(io::Error::new(io::ErrorKind::NotFound, GONE)),
     }
     write(path, &entries)
 }
@@ -1747,6 +1781,158 @@ mod tests {
         let entries = entries_at(&path);
         assert_eq!(entries[1], raw[1]);
         assert_eq!(entries[2]["name"], "C");
+    }
+
+    /// A session of two tabs: a local one, then the new-tab list.
+    fn session_of_two_tabs(name: &str) -> Session {
+        let mut two = session(name);
+        two.tabs.insert(
+            0,
+            TabRecord {
+                root: leaf(Kind::Local {
+                    dir: Some(PathBuf::from("/tmp")),
+                }),
+                focused: 0,
+            },
+        );
+        two
+    }
+
+    #[test]
+    fn update_replaces_the_layout_in_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let skipped = session_json("Bad", r#"{"pane":"telnet","note":"fix me"}"#);
+        let raw = [
+            session_json("Work", WRITTEN_LIST),
+            skipped.clone(),
+            session_json("Home", WRITTEN_LIST),
+            session_json("Lab", WRITTEN_LIST),
+        ];
+        write_entries(&path, &raw);
+
+        update(&path, session_of_two_tabs("Work")).unwrap();
+        assert_eq!(
+            sessions_at(&path),
+            [session_of_two_tabs("Work"), session("Home"), session("Lab")],
+            "Work has the new tabs and keeps its place"
+        );
+        let entries = entries_at(&path);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[1], skipped, "the skipped entry is where it was");
+        assert_eq!(entries[2], raw[2]);
+        assert_eq!(entries[3], raw[3]);
+
+        // The same again changes nothing.
+        let bytes = fs::read(&path).unwrap();
+        update(&path, session_of_two_tabs("Work")).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn update_of_a_layout_gone_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        put(&path, session("Home"), false).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let error = update(&path, session("Work")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), "That layout is no longer saved.");
+        assert_eq!(fs::read(&path).unwrap(), bytes, "the file is as it was");
+
+        // A skipped entry of that name is not a layout.
+        write_entries(&path, &[session_json("Work", r#"{"pane":"telnet"}"#)]);
+        let bytes = fs::read(&path).unwrap();
+        let error = update(&path, session("Work")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        // With no file at all: the same, and no file is made.
+        let none = dir.path().join("none.json");
+        let error = update(&none, session("Work")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(error.to_string(), GONE);
+        assert!(!none.exists());
+    }
+
+    #[test]
+    fn update_leaves_an_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        write_text(&path, "not json");
+        let error = update(&path, session("Work")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .starts_with("Could not read the saved layouts: "),
+            "{error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"not json", "never written over");
+    }
+
+    #[test]
+    fn update_refuses_what_reading_would_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        put(&path, session("Work"), false).unwrap();
+        let bytes = fs::read(&path).unwrap();
+
+        let mut wide = session("Work");
+        wide.tabs = vec![wide.tabs[0].clone(); 65];
+        let error = update(&path, wide).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "the layout has more than 64 tabs");
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let mut empty = session("Work");
+        empty.tabs.clear();
+        let error = update(&path, empty).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn update_matches_the_exact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        put(&path, session("work"), false).unwrap();
+        put(&path, session("Work"), false).unwrap();
+
+        update(&path, session_of_two_tabs("work")).unwrap();
+        assert_eq!(
+            sessions_at(&path),
+            [session_of_two_tabs("work"), session("Work")],
+            "only work changed"
+        );
+        // A name that differs only in case is not found.
+        let error = update(&path, session_of_two_tabs("WORK")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(names_at(&path), ["work", "Work"]);
+    }
+
+    #[test]
+    fn update_keeps_a_repeated_name_s_second_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let second = session_json("Work", r#"{"pane":"local","dir":"/second"}"#);
+        let raw = [
+            session_json("Work", WRITTEN_LIST),
+            second.clone(),
+            session_json("Home", WRITTEN_LIST),
+        ];
+        write_entries(&path, &raw);
+
+        update(&path, session_of_two_tabs("Work")).unwrap();
+        assert_eq!(
+            sessions_at(&path),
+            [session_of_two_tabs("Work"), session("Home")]
+        );
+        let entries = entries_at(&path);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1], second, "the second Work is as it was");
+        assert_eq!(entries[2], raw[2]);
     }
 
     #[test]

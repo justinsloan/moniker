@@ -1,9 +1,10 @@
 //! The Layouts menu beside ＋ in a main window (issue #12, named Sessions
 //! until issue #16): the layouts of windows that were saved
 //! ([`crate::session_file`]), opened again in a new window with a click, and
-//! the questions that save this window as a layout, rename a saved one and
-//! delete it. The code and the file call a layout a session; the interface says
-//! layout, because "session" means a running connection everywhere else.
+//! the questions that save this window as a layout, update a saved one with
+//! this window, rename it and delete it. The code and the file call a layout a
+//! session; the interface says layout, because "session" means a running
+//! connection everywhere else.
 //!
 //! The button reads "Layouts", then an icon of several windows, then the
 //! drop-down arrow (user, 2026-10-26). The Preferences can hide it (on to
@@ -13,12 +14,13 @@
 //!
 //! The button opens a popover that is built again from the file every time it
 //! shows, so it lists what is saved now, whichever window saved it: each
-//! layout by name (sorted ignoring case) with a › for Rename… and Delete…, or
-//! "No saved layouts", or why the file cannot be read; then Save Layout…. A
-//! click on a layout opens a new window holding its tabs and nothing else
-//! ([`window::open_layout`], issue #16; until then it added them to the window
-//! the menu was in). The window the menu was in is not changed: its tabs and
-//! selection stay, and its keyboard goes back to its terminal (below).
+//! layout by name (sorted ignoring case) with a › for Update…, Rename… and
+//! Delete…, or "No saved layouts", or why the file cannot be read; then Save
+//! Layout…. A click on a layout opens a new window holding its tabs and
+//! nothing else ([`window::open_layout`], issue #16; until then it added them
+//! to the window the menu was in). The window the menu was in is not changed:
+//! its tabs and selection stay, and its keyboard goes back to its terminal
+//! (below).
 //!
 //! Nothing here keeps what the file said for later: the file is read again at
 //! every decision, because another window may have changed it since the menu
@@ -28,6 +30,16 @@
 //! is answered*, and captures the window when the answer is final, not when the
 //! dialog opened. A file that cannot be read is never written over without
 //! asking.
+//!
+//! Update… (issue #16) asks "Update “name”?" and, on Update, replaces that
+//! layout with the window the menu is in, as it is when Update is answered (a
+//! tab opened while the question was open is in it), keeping its name and its
+//! place in the file ([`session_file::update`]). Unlike Save it never adds
+//! and never replaces a file: a layout deleted or renamed in another window
+//! meanwhile is told ("That layout is no longer saved.") and stays gone, and a
+//! file that cannot be read is told and left as it is, with no "Replace the
+//! Saved Layouts File?" question, as there is no layout in such a file to
+//! update. Cancel and Escape write nothing.
 //!
 //! A pick and every question wait for the closing menu to hand the keyboard
 //! focus back (`terminal_tab::after_the_menu_lets_go`): a dialog opened too soon
@@ -93,6 +105,9 @@ const SAVE_BODY: &str = "Saves this window's tabs and panes, to open them in a n
 /// What the Replace question says is replaced.
 const REPLACE_BODY: &str =
     "The saved layout with this name is replaced by this window's tabs and panes.";
+/// What the Update question says is replaced.
+const UPDATE_BODY: &str =
+    "The saved layout is replaced by this window's tabs and panes, as they are now.";
 /// What the Delete question says is deleted.
 const DELETE_BODY: &str = "The saved layout is deleted. Windows that are open are not changed.";
 
@@ -313,7 +328,7 @@ impl Menu {
     }
 
     /// The row of the layout `name`: its button, which opens it, and a › with
-    /// Rename… and Delete….
+    /// Update…, Rename… and Delete….
     fn row(self: &Rc<Self>, outer: &gtk::Popover, name: &str) -> gtk::Box {
         let row = gtk::Box::builder().name(ROW_NAME).spacing(2).build();
         let name = name.to_owned();
@@ -338,6 +353,20 @@ impl Menu {
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
             .build();
+        let update = entry_button("Update\u{2026}");
+        let menu = Rc::clone(self);
+        update.connect_clicked(glib::clone!(
+            #[weak]
+            inner,
+            #[weak]
+            outer,
+            #[strong]
+            name,
+            move |_| {
+                let name = name.clone();
+                menu.leave(&[&inner, &outer], move |menu| menu.ask_update(&name));
+            }
+        ));
         let rename = entry_button("Rename\u{2026}");
         let menu = Rc::clone(self);
         rename.connect_clicked(glib::clone!(
@@ -366,6 +395,7 @@ impl Menu {
                 menu.leave(&[&inner, &outer], move |menu| menu.ask_delete(&name));
             }
         ));
+        actions.append(&update);
         actions.append(&rename);
         actions.append(&delete);
         inner.set_child(Some(&actions));
@@ -534,6 +564,36 @@ impl Menu {
         }
     }
 
+    /// Ask before the saved layout `name` is replaced by this window as it is
+    /// when the question is answered (a tab opened while it is open is in it).
+    /// The layout keeps its name and its place; one that has gone since, or a
+    /// file that cannot be read, is told and writes nothing
+    /// ([`session_file::update`]; unlike Save, no "Replace the Saved Layouts
+    /// File?" follows, as there is no layout in such a file to update).
+    fn ask_update(self: &Rc<Self>, name: &str) {
+        let name_to_update = name.to_owned();
+        self.confirm(
+            &format!("Update \u{201c}{name}\u{201d}?"),
+            UPDATE_BODY,
+            ("update", "Update"),
+            move |menu| menu.update(name_to_update),
+        );
+    }
+
+    /// Replace the layout `name` with this window, as it is now.
+    fn update(&self, name: String) {
+        let Some(view) = self.view.upgrade() else {
+            return;
+        };
+        let session = Session {
+            name,
+            tabs: session_layout::capture(&view),
+        };
+        if let Err(err) = session_file::update(&self.path(), session) {
+            self.tell(&write_error(&err));
+        }
+    }
+
     /// Ask for a new name for the layout `from`.
     fn ask_rename(self: &Rc<Self>, from: &str) {
         let Some(window) = self.window() else {
@@ -624,11 +684,14 @@ fn names_in_order(sessions: &[Session]) -> Vec<String> {
 /// What to say of a write that failed, by what failed: a layout the file would
 /// not read back ([`io::ErrorKind::InvalidInput`], a plain sentence), a file that
 /// cannot be read (`InvalidData`, which already says "Could not read the saved
-/// layouts"), or the write itself.
+/// layouts"), a layout that Update found gone (`NotFound`, whose text is
+/// [`session_file::GONE`]), or the write itself.
 fn write_error(err: &io::Error) -> String {
     match err.kind() {
         io::ErrorKind::InvalidInput => format!("Could not save the layout: {err}"),
-        io::ErrorKind::InvalidData => err.to_string(),
+        // Update's layout that has gone ([`session_file::GONE`]) and a file that
+        // cannot be read: both texts say it all.
+        io::ErrorKind::NotFound | io::ErrorKind::InvalidData => err.to_string(),
         _ => format!("Could not save the layouts: {err}"),
     }
 }
@@ -787,6 +850,9 @@ mod tests {
             write_error(&unreadable),
             "Could not read the saved layouts: it is not JSON (x)"
         );
+        // A layout that has gone, from Update: its text says all of it.
+        let gone = io::Error::new(io::ErrorKind::NotFound, session_file::GONE);
+        assert_eq!(write_error(&gone), "That layout is no longer saved.");
         let failed = io::Error::from(io::ErrorKind::PermissionDenied);
         assert_eq!(
             write_error(&failed),
