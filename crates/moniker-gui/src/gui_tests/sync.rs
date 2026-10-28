@@ -1453,6 +1453,10 @@ pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
     set_partner(&ctx, &profile, true);
     ctx.profiles_changed();
     assert!(page.partner_row.is_visible());
+    // Marked, as the new key hid the last forget's line: the new forget must
+    // hide it.
+    page.partner_message.set_label("marked");
+    page.partner_message.set_visible(true);
     keyring.refuse_changes(true);
     keyring.hold();
     let delivered = ctx.notice.delivered();
