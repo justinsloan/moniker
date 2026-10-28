@@ -1372,8 +1372,10 @@ pub(super) fn forget_leaves_a_bad_settings_file_and_says_so(dir: &Path) {
 /// partner. While that is out (an unlock prompt, say), Forget, Sync, the Profile
 /// row and the key field wait, and the partner is still there. A keyring that
 /// refuses changes nothing else: a notification says why, the row stays, the
-/// keyboard comes back to Forget, and Forget can be pressed again. A page that
-/// goes before the keyring is back does not cut the forget short.
+/// keyring is not read again (a locked one would prompt again), the keyboard
+/// comes back to Forget, and Forget can be pressed again. A page that goes
+/// before the keyring is back does not cut the forget short, and a refusal is
+/// still told.
 pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
     fs::create_dir_all(dir).expect("dir");
     let mut store = ProfileStore::open(&dir.join("profiles.json")).expect("open the store");
@@ -1383,7 +1385,11 @@ pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
     seeded
         .set(SYNC_PASSPHRASE_KEY, SYNC_KEY)
         .expect("set the key");
-    let keyring = Arc::new(HeldKeyring::new(Arc::clone(&seeded) as Arc<dyn SecretStore>));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let keyring = Arc::new(HeldKeyring::new(Arc::new(Shared {
+        store: Arc::clone(&seeded),
+        gets: Arc::clone(&reads),
+    })));
     let ctx = Rc::new(AppContext::with_parts(
         store,
         Arc::clone(&keyring) as Arc<dyn SecretStore>,
@@ -1402,7 +1408,8 @@ pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
     assert!(page.partner_row.is_visible());
 
     // While the key is being removed, what would use it waits, and the
-    // partner is still there.
+    // partner is still there. The keyboard has nowhere to be meanwhile (Forget
+    // is grayed out), and finds its place once the removal is back.
     keyring.hold();
     page.forget_button.grab_focus();
     let alert = page.press_forget(&window);
@@ -1415,7 +1422,7 @@ pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
     assert!(settings::load(&ctx.settings_path).sync_partner.is_some());
     // A click that gets through anyway asks nothing.
     page.forget_button.emit_clicked();
-    pump_for(Duration::from_millis(100));
+    pump_for(Duration::from_millis(300));
     assert!(
         all_widgets::<adw::AlertDialog>(&window).is_empty(),
         "no second question"
@@ -1427,21 +1434,42 @@ pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
     assert!(!sync_now_exists(&app));
     assert!(page.key_entry.is_sensitive());
     assert_eq!(page.partner_message.label(), sync_page::forgotten(NAME));
+    pump_until("the keyboard on the Sync switch", || {
+        has_focus_in(&window, &page.sync_switch)
+    });
 
-    // A keyring that refuses: nothing else changes, and the line about the
-    // last forget goes.
-    seeded
-        .set(SYNC_PASSPHRASE_KEY, SYNC_KEY)
-        .expect("the key again");
+    // A keyring that refuses (a locked one whose prompt was canceled), with
+    // the answer coming back after the question has gone: nothing else
+    // changes, the line about the last forget goes, and the keyring is not
+    // read again.
+    page.key_entry.set_text(SYNC_KEY);
+    page.key_entry.emit_by_name::<()>("apply", &[]);
+    pump_until("the key to be saved", || {
+        page.key_message.label() == "Sync key saved."
+    });
+    pump_until("the key's state", || {
+        page.key_status.label() == "Sync key: set"
+    });
     set_partner(&ctx, &profile, true);
     ctx.profiles_changed();
     assert!(page.partner_row.is_visible());
     keyring.refuse_changes(true);
+    keyring.hold();
     let delivered = ctx.notice.delivered();
     page.forget_button.grab_focus();
     let alert = page.press_forget(&window);
     answer(&window, &alert, "Forget");
+    pump_until("the forget to start", || !page.key_entry.is_sensitive());
+    pump_for(Duration::from_millis(300));
+    let reads_before = reads.load(Ordering::SeqCst);
+    keyring.release();
     pump_until("the refusal", || ctx.notice.delivered() > delivered);
+    pump_for(Duration::from_millis(300));
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        reads_before,
+        "no second read after a refusal"
+    );
     let told = ctx.notice.last_text().unwrap_or_default();
     assert!(
         told.starts_with("Could not remove the sync key: "),
@@ -1459,9 +1487,8 @@ pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
     assert!(page.partner_row.is_visible());
     assert!(sync_now_exists(&app));
     assert!(!page.partner_message.is_visible());
-    pump_until("the key's state", || {
-        page.key_status.label() == "Sync key: set"
-    });
+    assert_eq!(page.key_status.label(), "Sync key: set", "still");
+    assert!(page.machine.is_sensitive() && page.sync_button.is_sensitive());
     pump_until("the keyboard back on Forget", || {
         has_focus_in(&window, &page.forget_button)
     });
@@ -1474,15 +1501,49 @@ pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
     let alert = page.press_forget(&window);
     answer(&window, &alert, "Forget");
     pump_until("the forget to start", || !page.key_entry.is_sensitive());
-    window.destroy();
-    pump_for(Duration::from_millis(100));
+    let weak = page.widget.downgrade();
+    drop(page);
+    window.close();
+    drop(window);
+    pump_until("the page to be freed", || weak.upgrade().is_none());
     keyring.release();
     pump_until("the forget to finish", || {
         settings::load(&ctx.settings_path).sync_partner.is_none()
     });
     assert!(seeded.get(SYNC_PASSPHRASE_KEY).unwrap().is_none());
     assert!(!sync_now_exists(&app));
+
+    // And a refusal with the page gone is still told; the partner stays.
+    seeded
+        .set(SYNC_PASSPHRASE_KEY, SYNC_KEY)
+        .expect("the key again");
+    set_partner(&ctx, &profile, true);
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    pump_until("the key's state", || {
+        page.key_status.label() == "Sync key: set"
+    });
+    keyring.refuse_changes(true);
+    keyring.hold();
+    let delivered = ctx.notice.delivered();
+    let alert = page.press_forget(&window);
+    answer(&window, &alert, "Forget");
+    pump_until("the forget to start", || !page.key_entry.is_sensitive());
+    let weak = page.widget.downgrade();
     drop(page);
+    window.close();
+    drop(window);
+    pump_until("the page to be freed", || weak.upgrade().is_none());
+    keyring.release();
+    pump_until("the refusal", || ctx.notice.delivered() > delivered);
+    let told = ctx.notice.last_text().unwrap_or_default();
+    assert!(
+        told.starts_with("Could not remove the sync key: "),
+        "{told}"
+    );
+    assert!(seeded.get(SYNC_PASSPHRASE_KEY).unwrap().is_some());
+    assert!(settings::load(&ctx.settings_path).sync_partner.is_some());
+    keyring.refuse_changes(false);
     pump_for(Duration::from_millis(100));
 }
 

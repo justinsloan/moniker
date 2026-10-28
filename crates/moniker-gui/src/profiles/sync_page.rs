@@ -96,11 +96,14 @@ const NO_SYNC_UNTIL_KEY: &str =
 pub(crate) const FORGET_HEADING: &str = "Forget the Sync Partner?";
 
 /// What the question before a forget says (`name`, the partner the row shows,
-/// is plain text): the sync key goes too, and what that stops.
+/// is plain text): the sync key goes too, what that stops, and that the key
+/// must be known to sync again, as Moniker never shows it.
 pub(crate) fn forget_body(name: &str) -> String {
     format!(
         "Moniker will stop syncing with {name} and remove the sync key from this machine. \
-         {NO_SYNC_UNTIL_KEY} The profiles stay as they are on both machines."
+         {NO_SYNC_UNTIL_KEY} Moniker cannot show the key, so to sync again you will need \
+         to type it, or set a new one on every machine. The profiles stay as they are on \
+         both machines."
     )
 }
 
@@ -546,9 +549,10 @@ impl SyncPage {
                 }
             },
             move || {
-                // From an idle callback: by then the question has gone from the
-                // window, and libadwaita has given the keyboard back to the
-                // widget that had it before (Forget), if it still can.
+                // `closed` comes before the answer's `response`, once libadwaita
+                // has given the keyboard back to the widget that had it before
+                // (Forget, if it still can take it): the idle runs after the
+                // answer's handler.
                 let closed = closed.clone();
                 glib::idle_add_local_once(move || {
                     if let Some(page) = closed.upgrade() {
@@ -613,13 +617,16 @@ impl SyncPage {
                         }
                     };
                     show_message(&page.partner_message, &text, false);
+                    page.refresh_key_status();
                 }
                 Err(message) => {
+                    // The key is as it was, and so is the page's last answer:
+                    // no second read, which a locked keyring would answer with
+                    // its unlock prompt again.
                     page.ctx.notice.show_near(&page.widget, &message);
                     page.refresh_controls();
                 }
             }
-            page.refresh_key_status();
             page.settle_keyboard();
         });
     }
