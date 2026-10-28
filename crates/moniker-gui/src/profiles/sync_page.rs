@@ -34,7 +34,8 @@
 //! Sync switch, Sync Automatically, the profile choice and every profile, and
 //! the line it leaves says that other machines can still start a sync with this
 //! one. It waits for a sync that runs, which would record the partner again, but
-//! not for Sync being off, as it sends nothing.
+//! not for Sync being off, as it sends nothing. Whether it worked or not,
+//! everything that shows the partner reads the file again.
 //!
 //! The sync key is read from its field into a `Zeroizing` buffer, never shown
 //! again, and the field is emptied after a save and when the page goes. Every
@@ -117,7 +118,7 @@ pub(crate) struct SyncPage {
     /// The sync partner, while there is one (issue #11), with its Forget button
     /// and the line a forget leaves.
     partner_row: adw::ActionRow,
-    forget: gtk::Button,
+    forget_button: gtk::Button,
     partner_message: gtk::Label,
     /// Why Sync is unavailable, if it is.
     hint: gtk::Label,
@@ -176,7 +177,7 @@ impl SyncPage {
             .build();
         // The subtitle, a profile's name, is set by `refresh_partner`: plain
         // text, as the profile can come from another machine.
-        let forget = gtk::Button::builder()
+        let forget_button = gtk::Button::builder()
             .label("Forget")
             .tooltip_text("Forget the sync partner")
             .valign(gtk::Align::Center)
@@ -187,7 +188,7 @@ impl SyncPage {
             .use_markup(false)
             .visible(false)
             .build();
-        partner_row.add_suffix(&forget);
+        partner_row.add_suffix(&forget_button);
         let hint = gtk::Label::builder()
             .name(HINT_NAME)
             .xalign(0.0)
@@ -241,7 +242,7 @@ impl SyncPage {
             machine,
             auto_sync,
             partner_row,
-            forget,
+            forget_button,
             partner_message,
             hint,
             sync_button,
@@ -313,7 +314,7 @@ impl SyncPage {
                 }
             }
         ));
-        self.forget.connect_clicked(glib::clone!(
+        self.forget_button.connect_clicked(glib::clone!(
             #[strong]
             weak,
             move |_| {
@@ -481,12 +482,12 @@ impl SyncPage {
         self.partner_row.set_visible(true);
     }
 
-    /// Give the keyboard to the Sync button if it can be used, else to the
-    /// Profile row if it can, else to the Sync switch at the top.
+    /// Give the keyboard to the Profile row if it can be used, else to the Sync
+    /// switch at the top. Never to the Sync button: Enter pressed again there
+    /// would sync with the profile still chosen, the machine just forgotten, and
+    /// its success would record it as the partner again.
     fn keyboard_away(&self) {
-        if self.sync_button.is_sensitive() {
-            self.sync_button.grab_focus();
-        } else if self.machine.is_sensitive() {
+        if self.machine.is_sensitive() {
             self.machine.grab_focus();
         } else {
             self.sync_switch.grab_focus();
@@ -498,8 +499,15 @@ impl SyncPage {
     /// then tell the app, so Sync Now and the rows follow. If the file named a
     /// partner, say which one was forgotten and what that leaves; a second click
     /// (a double click) finds none, and says nothing. A failure is a
-    /// notification near the page, and the row stays as the file has it.
+    /// notification near the page. Whether it worked or not, everything that
+    /// shows the partner reads the file again: a file that cannot be read reads
+    /// as the defaults, so they show no partner, as a page opened now would.
     fn forget(&self) {
+        // As `begin_sync_with`: the button is grayed out while a sync runs, but a
+        // sync's success would record the partner again right after a forget.
+        if self.ctx.sync_running.get() {
+            return;
+        }
         let path = &self.ctx.settings_path;
         let name = self.partner_name(&settings::load(path));
         match sync::forget_partner(path) {
@@ -507,16 +515,15 @@ impl SyncPage {
                 if let Some(name) = name {
                     show_message(&self.partner_message, &forgotten(&name), false);
                 }
-                self.ctx.partner_changed();
             }
             Err(err) => {
                 self.ctx.notice.show_near(
                     &self.widget,
                     &format!("Could not save the sync settings: {err}"),
                 );
-                self.refresh_partner();
             }
         }
+        self.ctx.partner_changed();
     }
 
     /// The person flipped the switch: save it. If that fails, say so and put
@@ -660,7 +667,7 @@ impl SyncPage {
         self.auto_sync.set_sensitive(sync_on);
         // A page sync's success would record the partner again right after;
         // Sync being off does not matter, as a forget sends nothing.
-        self.forget.set_sensitive(idle);
+        self.forget_button.set_sensitive(idle);
     }
 
     /// Any sync of the app started or ended.

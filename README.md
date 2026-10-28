@@ -342,11 +342,11 @@ To go back to having no sync partner, press **Forget** on the **Sync Partner** r
 - **What it keeps:** the sync key, the **Sync Automatically** switch (it does nothing until there is a partner again), the choice in the **Profile** row, the **Sync** switch and every profile. Only the partner is cleared in `gui-settings.json`.
 - **What it says:** a line at the end of the Other Machine group, "*name* is no longer the sync partner. Other machines can still start a sync with this one while Sync is on.", until any sync starts.
 
-**Forget does not stop other machines from syncing with this one.** It only stops this machine from starting syncs. A machine that has your sync key and an ssh login here can still start a sync with this one while the **Sync** switch is on; turning that switch off (see [Turning sync off](#turning-sync-off)) is what stops it.
+**Forget does not stop other machines from syncing with this one.** It only stops this machine from starting syncs by itself (Sync Now and at launch); the Sync page and `moniker-server sync` still start one. A machine that has your sync key and an ssh login here can still start a sync with this one while the **Sync** switch is on; turning that switch off (see [Turning sync off](#turning-sync-off)) is what stops it.
 
-**Forget does not take anything back from the old partner.** It keeps the copies of your profiles it already has, with their stored passwords, and it keeps the sync key. If that machine should no longer be trusted, change the sync key on the machines that stay, and delete what should not be on it.
+**Forget does not take anything back from the old partner.** It keeps the copies of your profiles it already has, with their stored passwords, and it keeps the sync key. If that machine should no longer be trusted, change the sync key on the machines that stay, which stops its syncs, and delete what should not be on it. Changing the key does not take back the stored passwords it already received: change those passwords on their servers, and remove its ssh login to this machine.
 
-If `gui-settings.json` is damaged, Forget leaves it as it is and a notification says "Could not save the sync settings: …".
+If `gui-settings.json` is damaged, Forget leaves it as it is and a notification says "Could not save the sync settings: …". The page then shows no partner, as Moniker reads a damaged file as the defaults.
 
 ### Keeping a profile on this machine only
 

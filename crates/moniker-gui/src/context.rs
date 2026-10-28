@@ -319,9 +319,10 @@ impl AppContext {
             .push(Listener::new(owner, Rc::new(f)));
     }
 
-    /// The sync partner in the settings file was changed by something that is
-    /// not a sync (a forget, issue #11): tell every partner listener whose
-    /// owner still exists. Nothing is read here; the listeners read the
+    /// The sync partner in the settings file was changed, or was tried to be,
+    /// by something that is not a sync (a forget, issue #11, which raises it
+    /// whether or not the file could be written): tell every partner listener
+    /// whose owner still exists. Nothing is read here; the listeners read the
     /// settings themselves.
     pub(crate) fn partner_changed(&self) {
         for call in live_calls(&self.partner_listeners) {
