@@ -207,6 +207,16 @@ pub(crate) fn save_sync_key(secrets: &dyn SecretStore, typed: &str) -> Result<()
         .map_err(|err| format!("Could not save the sync key: {err}"))
 }
 
+/// Remove the sync key from the keyring (the Sync page's Forget, issue #11),
+/// leaving every other entry, the profiles' passwords included. A key that is
+/// not there is not an error. `Err` is a message for a notification and never
+/// contains the key.
+pub(crate) fn remove_sync_key(secrets: &dyn SecretStore) -> Result<(), String> {
+    secrets
+        .delete(SYNC_PASSPHRASE_KEY)
+        .map_err(|err| format!("Could not remove the sync key: {err}"))
+}
+
 /// `message` as a sentence for the sync page: first letter capitalized, period at the end.
 fn sentence(message: &str) -> String {
     let mut chars = message.chars();
@@ -945,6 +955,33 @@ mod tests {
         assert!(err.starts_with("Could not save the sync key"), "{err}");
         assert!(err.contains("keyring is locked"), "{err}");
         assert!(!err.contains(SENTINEL), "{err}");
+    }
+
+    // ----- remove_sync_key -----
+
+    #[test]
+    fn removing_the_key_leaves_the_passwords() {
+        let secrets = MemorySecretStore::default();
+        secrets.set(SYNC_PASSPHRASE_KEY, KEY).unwrap();
+        secrets.set(&password_key("id-a"), SENTINEL).unwrap();
+        remove_sync_key(&secrets).unwrap();
+        assert_eq!(key_state(&secrets), KeyState::NotSet);
+        let password = secrets.get(&password_key("id-a")).unwrap().unwrap();
+        assert_eq!(password.as_str(), SENTINEL, "a profile's password stays");
+    }
+
+    #[test]
+    fn removing_a_key_that_is_not_there_is_not_an_error() {
+        let secrets = MemorySecretStore::default();
+        remove_sync_key(&secrets).unwrap();
+        assert_eq!(key_state(&secrets), KeyState::NotSet);
+    }
+
+    #[test]
+    fn a_keyring_that_cannot_remove_the_key_says_so() {
+        let err = remove_sync_key(&Broken).unwrap_err();
+        assert!(err.starts_with("Could not remove the sync key: "), "{err}");
+        assert!(err.contains("keyring is locked"), "{err}");
     }
 
     // ----- gather_inputs -----

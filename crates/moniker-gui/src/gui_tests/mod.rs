@@ -711,7 +711,7 @@ fn gui_integration() {
     sync::the_sync_page_names_and_forgets_the_partner(&tmp.path().join("s-forget"));
     sync::forget_waits_for_a_sync_but_not_for_sync_off(&tmp.path().join("s-forget-busy"));
     sync::forget_leaves_a_bad_settings_file_and_says_so(&tmp.path().join("s-forget-bad"));
-    sync::forget_twice_is_one_forget(&tmp.path().join("s-forget-twice"));
+    sync::forget_waits_for_the_keyring(&tmp.path().join("s-forget-key"));
     sync::sync_now_while_running_says_so(&tmp.path().join("s-busy"));
     sync::auto_sync_starts_after_the_window_is_shown(&tmp.path().join("s-launch"));
     sync::auto_sync_failure_is_one_notification(&tmp.path().join("s-launch-fail"));

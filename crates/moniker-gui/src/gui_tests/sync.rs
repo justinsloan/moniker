@@ -227,6 +227,22 @@ impl Page {
         set_runner(ctx, run);
         self.sync_button.emit_clicked();
     }
+
+    /// Press Forget and wait for its question (issue #11).
+    fn press_forget(&self, window: &adw::Window) -> adw::AlertDialog {
+        self.forget_button.emit_clicked();
+        alert_in(window)
+    }
+}
+
+/// Answer `alert` with its button labeled `label`, and wait for it to go.
+fn answer(window: &adw::Window, alert: &adw::AlertDialog, label: &str) {
+    button_labeled(alert, label)
+        .unwrap_or_else(|| panic!("the {label} button"))
+        .emit_clicked();
+    pump_until("the question to go", || {
+        all_widgets::<adw::AlertDialog>(window).is_empty()
+    });
 }
 
 /// The sync page in a Connection Profiles window, with a counter of profile reloads.
@@ -994,8 +1010,9 @@ pub(super) fn the_sync_page_names_and_forgets_the_partner(dir: &Path) {
     assert_plain_row("partner row", &page.partner_row, "Sync Partner", Some(NAME));
     assert_eq!(
         page.forget_button.tooltip_text().as_deref(),
-        Some("Forget the sync partner")
+        Some("Forget the sync partner and the sync key")
     );
+    // The question it asks has the destructive answer, not the button.
     assert!(!page.forget_button.has_css_class("destructive-action"));
 
     // The profile renamed elsewhere: the row shows the new name.
@@ -1017,8 +1034,8 @@ pub(super) fn the_sync_page_names_and_forgets_the_partner(dir: &Path) {
     rename(NAME);
     assert_plain_row("partner row", &page.partner_row, "Sync Partner", Some(NAME));
 
-    // A settings file with other settings in it (a hand edit, say). The
-    // keyboard is on Forget when it is pressed.
+    // A settings file with other settings in it (a hand edit, say), and a
+    // profile's stored password, which a forget must leave alone.
     let before = GuiSettings {
         sync_partner: Some(profile.id.clone()),
         auto_sync: false,
@@ -1028,12 +1045,86 @@ pub(super) fn the_sync_page_names_and_forgets_the_partner(dir: &Path) {
     };
     settings::save(&ctx.settings_path, &before).expect("save the settings");
     ctx.profiles_changed();
+    rig.secrets
+        .set(&password_key(&profile.id), "hunter2")
+        .expect("store a password");
     let profile_file = fs::read(&path).expect("the profile file");
+
+    // Forget asks first, naming the partner as plain text. The keyboard is on
+    // Forget when it is pressed.
     page.forget_button.grab_focus();
+    let alert = page.press_forget(&rig.window);
+    assert_eq!(alert.heading().as_deref(), Some(sync_page::FORGET_HEADING));
+    assert!(!alert.is_heading_use_markup());
+    assert_eq!(alert.body().as_str(), sync_page::forget_body(NAME));
+    assert!(alert.body().contains("remove the sync key"));
+    assert!(!alert.is_body_use_markup());
+    assert_eq!(alert.default_response().as_deref(), Some("cancel"));
+    assert_eq!(alert.close_response().as_str(), "cancel");
+    assert_eq!(alert.response_label("cancel").as_str(), "Cancel");
+    assert_eq!(alert.response_label("forget").as_str(), "Forget");
+    assert_eq!(
+        alert.response_appearance("forget"),
+        adw::ResponseAppearance::Destructive
+    );
+    // A second click (a double click) asks no second question.
     page.forget_button.emit_clicked();
     pump_for(Duration::from_millis(100));
+    assert_eq!(
+        all_widgets::<adw::AlertDialog>(&rig.window).len(),
+        1,
+        "one question"
+    );
 
-    // Only the partner went.
+    // Cancel, and closing the question (Escape), change nothing, and the
+    // keyboard comes back to Forget.
+    let unchanged = |what: &str| {
+        assert_eq!(
+            settings::load(&ctx.settings_path),
+            before,
+            "{what}: the settings"
+        );
+        assert!(
+            rig.secrets.get(SYNC_PASSPHRASE_KEY).unwrap().is_some(),
+            "{what}: the key"
+        );
+        assert!(page.partner_row.is_visible(), "{what}: the row");
+        assert!(sync_now_exists(&rig.app), "{what}: Sync Now");
+        assert!(!page.partner_message.is_visible(), "{what}: no line");
+    };
+    answer(&rig.window, &alert, "Cancel");
+    pump_until("the keyboard back on Forget after Cancel", || {
+        has_focus_in(&rig.window, &page.forget_button)
+    });
+    unchanged("Cancel");
+    let alert = page.press_forget(&rig.window);
+    alert.close();
+    pump_until("the question to go", || {
+        all_widgets::<adw::AlertDialog>(&rig.window).is_empty()
+    });
+    pump_until("the keyboard back on Forget after Escape", || {
+        has_focus_in(&rig.window, &page.forget_button)
+    });
+    unchanged("Escape");
+
+    // Forget: the sync key goes, then the partner, and nothing else.
+    let alert = page.press_forget(&rig.window);
+    answer(&rig.window, &alert, "Forget");
+    pump_until("the forget", || !page.partner_row.is_visible());
+    assert!(
+        rig.secrets.get(SYNC_PASSPHRASE_KEY).unwrap().is_none(),
+        "the sync key is removed"
+    );
+    assert_eq!(
+        rig.secrets
+            .get(&password_key(&profile.id))
+            .unwrap()
+            .expect("the password")
+            .as_str(),
+        "hunter2",
+        "the password stays"
+    );
+    assert_eq!(page.key_status.label(), "Sync key: not set");
     assert_eq!(
         settings::load(&ctx.settings_path),
         GuiSettings {
@@ -1041,39 +1132,42 @@ pub(super) fn the_sync_page_names_and_forgets_the_partner(dir: &Path) {
             ..before
         }
     );
-    assert!(!page.partner_row.is_visible());
     assert!(!sync_now_exists(&rig.app), "no partner: no Sync Now");
     assert!(!page.auto_sync.is_active(), "the switch keeps its value");
     assert_eq!(
         page.auto_sync.subtitle().as_deref(),
         Some(sync_page::AUTO_SYNC_NO_PARTNER)
     );
-    // The page says what a forget does not do, in its ordinary style.
+    // The page says what was done, in its ordinary style.
     assert!(page.partner_message.is_visible());
     assert_eq!(page.partner_message.label(), sync_page::forgotten(NAME));
     assert!(!page.partner_message.uses_markup());
     assert!(!has_css(&page.partner_message, "error"));
-    // Not to the Sync button (usable here too): Enter pressed again there would
-    // sync with the profile still chosen, the machine just forgotten, and its
-    // success would record it as the partner again.
-    assert!(page.sync_button.is_sensitive());
-    assert!(
-        has_focus_in(&rig.window, &page.machine),
-        "the keyboard went to the Profile row"
-    );
-    assert!(
-        !has_focus_in(&rig.window, &page.sync_button),
-        "and not to the Sync button"
-    );
-    // The sync key and the profiles are not touched.
-    assert!(
-        rig.secrets.get(SYNC_PASSPHRASE_KEY).unwrap().is_some(),
-        "the sync key is kept"
-    );
+    // With no key, Sync and the Profile row wait for one, so the keyboard goes
+    // to the Sync switch, never to the Sync button: Enter pressed again there
+    // would sync with the machine just forgotten.
+    assert_eq!(page.hint.label(), "Set a sync key first.");
+    assert!(!page.sync_button.is_sensitive());
+    assert!(!page.machine.is_sensitive());
+    pump_until("the keyboard on the Sync switch", || {
+        has_focus_in(&rig.window, &page.sync_switch)
+    });
     assert_eq!(fs::read(&path).unwrap(), profile_file, "the profiles");
 
-    // A sync starting hides the line, so it never sits beside a newer
-    // partner; the sync's success records the partner again.
+    // A new key hides the line, which says what is wanted until then.
+    page.key_entry.set_text(SYNC_KEY);
+    page.key_entry.emit_by_name::<()>("apply", &[]);
+    pump_until("the key to be saved", || {
+        page.key_message.label() == "Sync key saved."
+    });
+    assert!(!page.partner_message.is_visible(), "a key is set again");
+    pump_until("Sync to be usable", || page.sync_button.is_sensitive());
+
+    // A sync starting hides the line too, so it never sits beside a newer
+    // partner (marked here, as the new key hid it); the sync's success records
+    // the partner again.
+    page.partner_message.set_label("marked");
+    page.partner_message.set_visible(true);
     let (tx, rx) = mpsc::channel();
     page.sync_with(
         ctx,
@@ -1124,12 +1218,19 @@ pub(super) fn forget_waits_for_a_sync_but_not_for_sync_off(dir: &Path) {
     );
     rx.recv_timeout(WAIT).expect("the worker started");
     assert!(!page.forget_button.is_sensitive(), "a sync runs");
-    // A click that gets through anyway (the guard in `forget`) forgets nothing.
+    // A click that gets through anyway (the guard in `forget`) asks nothing
+    // and forgets nothing.
     page.forget_button.emit_clicked();
+    pump_for(Duration::from_millis(100));
+    assert!(
+        all_widgets::<adw::AlertDialog>(&rig.window).is_empty(),
+        "no question during a sync"
+    );
     assert!(
         settings::load(&ctx.settings_path).sync_partner.is_some(),
         "no forget during a sync"
     );
+    assert!(rig.secrets.get(SYNC_PASSPHRASE_KEY).unwrap().is_some());
     assert!(!page.partner_message.is_visible());
     pump_until("the sync", || page.sync_button.is_sensitive());
     assert!(page.forget_button.is_sensitive());
@@ -1144,17 +1245,17 @@ pub(super) fn forget_waits_for_a_sync_but_not_for_sync_off(dir: &Path) {
     assert!(page.machine.is_sensitive());
     assert!(page.forget_button.is_sensitive());
 
-    // The keyboard goes to the Profile row (here the Sync button could not have
-    // it anyway).
+    // It goes ahead. With the key gone the Profile row waits for one, so the
+    // keyboard goes to the Sync switch.
     page.forget_button.grab_focus();
-    page.forget_button.emit_clicked();
-    pump_for(Duration::from_millis(100));
+    let alert = page.press_forget(&rig.window);
+    answer(&rig.window, &alert, "Forget");
+    pump_until("the forget", || !page.partner_row.is_visible());
     assert_eq!(settings::load(&ctx.settings_path).sync_partner, None);
-    assert!(!page.partner_row.is_visible());
-    assert!(
-        has_focus_in(&rig.window, &page.machine),
-        "the keyboard went to the Profile row"
-    );
+    assert!(rig.secrets.get(SYNC_PASSPHRASE_KEY).unwrap().is_none());
+    pump_until("the keyboard on the Sync switch", || {
+        has_focus_in(&rig.window, &page.sync_switch)
+    });
     rig.finish();
 }
 
@@ -1174,12 +1275,20 @@ pub(super) fn forget_leaves_a_bad_settings_file_and_says_so(dir: &Path) {
             .last_text()
             .is_some_and(|text| text.starts_with(SAYS))
     };
+    // The key goes first, whatever the settings file then does: each case
+    // puts it back.
+    let key_back = || {
+        rig.secrets
+            .set(SYNC_PASSPHRASE_KEY, SYNC_KEY)
+            .expect("the key again");
+    };
+    let removed = || rig.secrets.get(SYNC_PASSPHRASE_KEY).unwrap().is_none();
 
-    // (a) A file that cannot be parsed is left as it is, and the click says so.
-    // Moniker reads such a file as the defaults, so everything that shows the
-    // partner then shows none, as a page opened now would. (The switch is off in
-    // the file before, and the defaults have it on: its change must not be saved
-    // over the damaged file.)
+    // (a) A file that cannot be parsed is left as it is, and a notification
+    // says so; the line says that only the key went. Moniker reads such a file
+    // as the defaults, so everything that shows the partner then shows none, as
+    // a page opened now would. (The switch is off in the file before, and the
+    // defaults have it on: its change must not be saved over the damaged file.)
     set_partner(ctx, &profile, false);
     ctx.profiles_changed();
     assert!(page.partner_row.is_visible());
@@ -1188,11 +1297,17 @@ pub(super) fn forget_leaves_a_bad_settings_file_and_says_so(dir: &Path) {
     fs::write(&file, b"{ not json").expect("damage the file");
     let delivered = ctx.notice.delivered();
     page.forget_button.grab_focus();
-    page.forget_button.emit_clicked();
+    let alert = page.press_forget(&rig.window);
+    // The question names what the row shows.
+    assert_eq!(alert.body().as_str(), sync_page::forget_body(NAME));
+    answer(&rig.window, &alert, "Forget");
+    pump_until("the forget", || ctx.notice.delivered() > delivered);
+    assert!(removed(), "the key went first");
     assert_eq!(fs::read(&file).unwrap(), b"{ not json", "left as it was");
     assert_eq!(ctx.notice.delivered(), delivered + 1);
     assert!(told(), "{:?}", ctx.notice.last_text());
-    assert!(!page.partner_message.is_visible(), "nothing was forgotten");
+    assert!(page.partner_message.is_visible());
+    assert_eq!(page.partner_message.label(), sync_page::KEY_REMOVED);
     assert!(!page.partner_row.is_visible(), "the file names no partner");
     assert_eq!(
         page.auto_sync.subtitle().as_deref(),
@@ -1201,23 +1316,28 @@ pub(super) fn forget_leaves_a_bad_settings_file_and_says_so(dir: &Path) {
     assert!(!sync_now_exists(&rig.app), "and Sync Now goes");
     assert!(page.auto_sync.is_active(), "the defaults, not saved");
     assert_eq!(fs::read(&file).unwrap(), b"{ not json", "still as it was");
-    // The row went while it had the keyboard: the Profile row is usable here (a
-    // key is stored, a profile exists, nothing runs), so it has it.
-    assert!(
-        has_focus_in(&rig.window, &page.machine),
-        "the keyboard went to the Profile row"
-    );
+    // The row went while it had the keyboard, and with no key the Profile row
+    // waits for one: the Sync switch has it.
+    pump_until("the keyboard on the Sync switch", || {
+        has_focus_in(&rig.window, &page.sync_switch)
+    });
 
-    // (b) A folder that cannot be written to: the write fails, the row stays.
+    // (b) A folder that cannot be written to: the key goes, the settings write
+    // fails, the row stays and the keyboard comes back to Forget.
+    key_back();
     set_partner(ctx, &profile, true);
     ctx.profiles_changed();
     assert!(page.partner_row.is_visible());
     assert!(sync_now_exists(&rig.app));
     let before = fs::read(&file).unwrap();
     let delivered = ctx.notice.delivered();
+    page.forget_button.grab_focus();
+    let alert = page.press_forget(&rig.window);
     fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).expect("chmod");
-    page.forget_button.emit_clicked();
+    answer(&rig.window, &alert, "Forget");
+    pump_until("the forget", || ctx.notice.delivered() > delivered);
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+    assert!(removed(), "the key went");
     assert_eq!(ctx.notice.delivered(), delivered + 1);
     assert!(told(), "{:?}", ctx.notice.last_text());
     assert!(page.partner_row.is_visible(), "the row stays");
@@ -1225,48 +1345,145 @@ pub(super) fn forget_leaves_a_bad_settings_file_and_says_so(dir: &Path) {
         sync_now_exists(&rig.app),
         "the file can be read: the partner stays"
     );
-    assert!(!page.partner_message.is_visible());
+    assert_eq!(page.partner_message.label(), sync_page::KEY_REMOVED);
     assert_eq!(fs::read(&file).unwrap(), before, "the file is unchanged");
+    pump_until("the keyboard back on Forget", || {
+        has_focus_in(&rig.window, &page.forget_button)
+    });
 
-    // (c) A file with no partner any more: nothing is written, nothing is
-    // said, and the row catches up.
+    // (c) A file with no partner any more (changed behind the page's back):
+    // the key goes, nothing is written or told, and the row catches up.
+    key_back();
+    set_partner(ctx, &profile, true);
+    ctx.profiles_changed();
     let text = br#"{"auto_sync": false}"#;
     fs::write(&file, text).expect("rewrite the file");
     let delivered = ctx.notice.delivered();
-    page.forget_button.emit_clicked();
+    let alert = page.press_forget(&rig.window);
+    answer(&rig.window, &alert, "Forget");
+    pump_until("the forget", || removed() && !page.partner_row.is_visible());
     assert_eq!(fs::read(&file).unwrap(), text, "unchanged");
-    assert!(!page.partner_row.is_visible());
-    assert!(!page.partner_message.is_visible(), "nothing was forgotten");
+    assert_eq!(page.partner_message.label(), sync_page::KEY_REMOVED);
     assert_eq!(ctx.notice.delivered(), delivered, "and nothing is told");
     rig.finish();
 }
 
-pub(super) fn forget_twice_is_one_forget(dir: &Path) {
-    let rig = sync_rig(dir, true, Some(SYNC_KEY));
-    let profile = rig.profile.clone().expect("a profile");
-    let (ctx, page) = (&rig.ctx, &rig.page);
+/// Forget removes the sync key on the keyring worker before it forgets the
+/// partner. While that is out (an unlock prompt, say), Forget, Sync, the Profile
+/// row and the key field wait, and the partner is still there. A keyring that
+/// refuses changes nothing else: a notification says why, the row stays, the
+/// keyboard comes back to Forget, and Forget can be pressed again. A page that
+/// goes before the keyring is back does not cut the forget short.
+pub(super) fn forget_waits_for_the_keyring(dir: &Path) {
+    fs::create_dir_all(dir).expect("dir");
+    let mut store = ProfileStore::open(&dir.join("profiles.json")).expect("open the store");
+    let profile = Profile::new(NAME, "app.example.test", "alice");
+    store.upsert(profile.clone()).expect("save the profile");
+    let seeded = Arc::new(MemorySecretStore::default());
+    seeded
+        .set(SYNC_PASSPHRASE_KEY, SYNC_KEY)
+        .expect("set the key");
+    let keyring = Arc::new(HeldKeyring::new(Arc::clone(&seeded) as Arc<dyn SecretStore>));
+    let ctx = Rc::new(AppContext::with_parts(
+        store,
+        Arc::clone(&keyring) as Arc<dyn SecretStore>,
+        make_helper(dir),
+    ));
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
     let area = super::bare_area();
     ctx.notice.attach(&area);
-    set_partner(ctx, &profile, true);
-    ctx.profiles_changed();
-    let delivered = ctx.notice.delivered();
+    set_partner(&ctx, &profile, true);
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    pump_until("the key's state", || {
+        page.key_status.label() == "Sync key: set"
+    });
+    assert!(page.partner_row.is_visible());
 
+    // While the key is being removed, what would use it waits, and the
+    // partner is still there.
+    keyring.hold();
+    page.forget_button.grab_focus();
+    let alert = page.press_forget(&window);
+    answer(&window, &alert, "Forget");
+    pump_until("the forget to start", || !page.key_entry.is_sensitive());
+    assert!(!page.forget_button.is_sensitive());
+    assert!(!page.sync_button.is_sensitive());
+    assert!(!page.machine.is_sensitive());
+    assert!(page.partner_row.is_visible(), "the key goes first");
+    assert!(settings::load(&ctx.settings_path).sync_partner.is_some());
+    // A click that gets through anyway asks nothing.
     page.forget_button.emit_clicked();
+    pump_for(Duration::from_millis(100));
+    assert!(
+        all_widgets::<adw::AlertDialog>(&window).is_empty(),
+        "no second question"
+    );
+    keyring.release();
+    pump_until("the forget", || !page.partner_row.is_visible());
+    assert!(seeded.get(SYNC_PASSPHRASE_KEY).unwrap().is_none());
     assert_eq!(settings::load(&ctx.settings_path).sync_partner, None);
-    assert!(page.partner_message.is_visible());
+    assert!(!sync_now_exists(&app));
+    assert!(page.key_entry.is_sensitive());
     assert_eq!(page.partner_message.label(), sync_page::forgotten(NAME));
 
-    // A double click: the second finds no partner, and says and writes
-    // nothing. (The line is marked, so that a second showing would be seen.)
-    page.partner_message.set_label("shown once");
-    let written = fs::read(&ctx.settings_path).unwrap();
-    page.forget_button.emit_clicked();
-    assert_eq!(settings::load(&ctx.settings_path).sync_partner, None);
-    assert_eq!(fs::read(&ctx.settings_path).unwrap(), written);
-    assert!(page.partner_message.is_visible());
-    assert_eq!(page.partner_message.label(), "shown once");
-    assert_eq!(ctx.notice.delivered(), delivered, "no error either");
-    rig.finish();
+    // A keyring that refuses: nothing else changes, and the line about the
+    // last forget goes.
+    seeded
+        .set(SYNC_PASSPHRASE_KEY, SYNC_KEY)
+        .expect("the key again");
+    set_partner(&ctx, &profile, true);
+    ctx.profiles_changed();
+    assert!(page.partner_row.is_visible());
+    keyring.refuse_changes(true);
+    let delivered = ctx.notice.delivered();
+    page.forget_button.grab_focus();
+    let alert = page.press_forget(&window);
+    answer(&window, &alert, "Forget");
+    pump_until("the refusal", || ctx.notice.delivered() > delivered);
+    let told = ctx.notice.last_text().unwrap_or_default();
+    assert!(
+        told.starts_with("Could not remove the sync key: "),
+        "{told}"
+    );
+    assert!(told.contains("the keyring is locked"), "{told}");
+    assert!(
+        seeded.get(SYNC_PASSPHRASE_KEY).unwrap().is_some(),
+        "the key stays"
+    );
+    assert!(
+        settings::load(&ctx.settings_path).sync_partner.is_some(),
+        "and the partner"
+    );
+    assert!(page.partner_row.is_visible());
+    assert!(sync_now_exists(&app));
+    assert!(!page.partner_message.is_visible());
+    pump_until("the key's state", || {
+        page.key_status.label() == "Sync key: set"
+    });
+    pump_until("the keyboard back on Forget", || {
+        has_focus_in(&window, &page.forget_button)
+    });
+    assert!(page.forget_button.is_sensitive(), "it can be pressed again");
+    assert!(page.key_entry.is_sensitive());
+    keyring.refuse_changes(false);
+
+    // The page gone before the keyring is back: the forget still finishes.
+    keyring.hold();
+    let alert = page.press_forget(&window);
+    answer(&window, &alert, "Forget");
+    pump_until("the forget to start", || !page.key_entry.is_sensitive());
+    window.destroy();
+    pump_for(Duration::from_millis(100));
+    keyring.release();
+    pump_until("the forget to finish", || {
+        settings::load(&ctx.settings_path).sync_partner.is_none()
+    });
+    assert!(seeded.get(SYNC_PASSPHRASE_KEY).unwrap().is_none());
+    assert!(!sync_now_exists(&app));
+    drop(page);
+    pump_for(Duration::from_millis(100));
 }
 
 pub(super) fn sync_now_while_running_says_so(dir: &Path) {

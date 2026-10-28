@@ -27,22 +27,25 @@
 //!
 //! The Sync Partner row, between Sync Automatically and the hint, names that
 //! profile while there is one ([`sync::live_partner`], the test Sync Now uses)
-//! and has a Forget button (issue #11). Forget clears only the partner in the
-//! settings file ([`sync::forget_partner`]) and tells the app
-//! ([`AppContext::partner_changed`]): Sync Now goes and the next launch does not
-//! sync, until a sync from this page succeeds again. It keeps the sync key, the
-//! Sync switch, Sync Automatically, the profile choice and every profile, and
-//! the line it leaves says that other machines can still start a sync with this
-//! one. It waits for a sync that runs, which would record the partner again, but
-//! not for Sync being off, as it sends nothing. Whether it worked or not,
-//! everything that shows the partner reads the file again.
+//! and has a Forget button (issue #11). Forget asks first ([`ask_to_forget`]),
+//! as it removes the sync key too: first the key, from the keyring, then, once
+//! that has worked, the partner in the settings file ([`sync::forget_partner`]),
+//! and it tells the app ([`AppContext::partner_changed`]). Sync Now goes, the
+//! next launch does not sync, and with no key no sync runs between this machine
+//! and any other, until a key is set again and a sync from this page succeeds.
+//! A key that cannot be removed leaves everything as it was. Forget keeps the
+//! Sync switch, Sync Automatically, the profile choice, every profile and their
+//! passwords. It waits for a sync that runs, which would record the partner
+//! again, and for a change of the key, but not for Sync being off, as it sends
+//! nothing. Whether the settings write worked or not, everything that shows the
+//! partner reads the file again.
 //!
 //! The sync key is read from its field into a `Zeroizing` buffer, never shown
 //! again, and the field is emptied after a save and when the page goes. Every
 //! text is plain (Pango markup off): profile names come from other machines.
 //!
-//! The page's keyring calls (whether a key is stored, saving one) run on the
-//! keyring worker ([`keyring::read`], [`keyring::change`]), never the main thread; until the answer
+//! The page's keyring calls (whether a key is stored, saving one, removing it)
+//! run on the keyring worker ([`keyring::read`], [`keyring::change`]), never the main thread; until the answer
 //! is back the status line says the keyring is being read and Sync waits.
 
 use std::cell::{Cell, RefCell};
@@ -84,15 +87,35 @@ pub(crate) fn auto_sync_with(name: &str) -> String {
     format!("Sync with {name} each time Moniker starts.")
 }
 
-/// What the page says after the partner was forgotten (`name` is plain text):
-/// a forget only stops this machine from starting syncs, so the way to stop the
-/// others is said too.
-pub(crate) fn forgotten(name: &str) -> String {
+/// What the sync key's removal stops, said by the question before a forget and
+/// by the line after it.
+const NO_SYNC_UNTIL_KEY: &str =
+    "Until a sync key is set here again, no sync can run between this machine and any other.";
+
+/// The heading of the question a forget asks first.
+pub(crate) const FORGET_HEADING: &str = "Forget the Sync Partner?";
+
+/// What the question before a forget says (`name`, the partner the row shows,
+/// is plain text): the sync key goes too, and what that stops.
+pub(crate) fn forget_body(name: &str) -> String {
     format!(
-        "{name} is no longer the sync partner. Other machines can still start a sync with \
-         this one while Sync is on."
+        "Moniker will stop syncing with {name} and remove the sync key from this machine. \
+         {NO_SYNC_UNTIL_KEY} The profiles stay as they are on both machines."
     )
 }
+
+/// What the page says after a forget (`name` is plain text).
+pub(crate) fn forgotten(name: &str) -> String {
+    format!(
+        "{name} is no longer the sync partner, and the sync key is removed from this \
+         machine. {NO_SYNC_UNTIL_KEY}"
+    )
+}
+
+/// What the page says after a forget that removed the key but no partner: the
+/// settings file could not be written, or named none any more.
+pub(crate) const KEY_REMOVED: &str = "The sync key is removed from this machine. Until a sync \
+    key is set here again, no sync can run between this machine and any other.";
 
 /// What the "Turn Sync On?" alert says: every profile that syncs goes out with
 /// its stored password, including any added while sync was off, and the way to
@@ -120,6 +143,11 @@ pub(crate) struct SyncPage {
     partner_row: adw::ActionRow,
     forget_button: gtk::Button,
     partner_message: gtk::Label,
+    /// The question before a forget is open.
+    forget_asked: Cell<bool>,
+    /// A forget is under way: the sync key's removal is out on the keyring
+    /// worker.
+    forgetting: Cell<bool>,
     /// Why Sync is unavailable, if it is.
     hint: gtk::Label,
     sync_button: gtk::Button,
@@ -179,7 +207,7 @@ impl SyncPage {
         // text, as the profile can come from another machine.
         let forget_button = gtk::Button::builder()
             .label("Forget")
-            .tooltip_text("Forget the sync partner")
+            .tooltip_text("Forget the sync partner and the sync key")
             .valign(gtk::Align::Center)
             .build();
         let partner_row = adw::ActionRow::builder()
@@ -244,6 +272,8 @@ impl SyncPage {
             partner_row,
             forget_button,
             partner_message,
+            forget_asked: Cell::new(false),
+            forgetting: Cell::new(false),
             hint,
             sync_button,
             result,
@@ -494,36 +524,130 @@ impl SyncPage {
         }
     }
 
-    /// The Forget button: clear the sync partner in the settings file, keeping
-    /// every other setting (and leaving a file that cannot be read as it is),
-    /// then tell the app, so Sync Now and the rows follow. If the file named a
-    /// partner, say which one was forgotten and what that leaves; a second click
-    /// (a double click) finds none, and says nothing. A failure is a
-    /// notification near the page. Whether it worked or not, everything that
-    /// shows the partner reads the file again: a file that cannot be read reads
-    /// as the defaults, so they show no partner, as a page opened now would.
-    fn forget(&self) {
-        // As `begin_sync_with`: the button is grayed out while a sync runs, but a
-        // sync's success would record the partner again right after a forget.
-        if self.ctx.sync_running.get() {
+    /// The Forget button: ask first ([`ask_to_forget`]), naming the partner the
+    /// row shows, since the sync key goes too. Nothing happens while a sync
+    /// runs (as in `begin_sync_with`: the button is grayed out then, but a page
+    /// sync's success would record the partner again right after), while the
+    /// question is open (a double click asks once) or while a forget is under
+    /// way.
+    fn forget(self: &Rc<Self>) {
+        if self.ctx.sync_running.get() || self.forget_asked.get() || self.forgetting.get() {
             return;
         }
-        let path = &self.ctx.settings_path;
-        let name = self.partner_name(&settings::load(path));
-        match sync::forget_partner(path) {
-            Ok(()) => {
-                if let Some(name) = name {
-                    show_message(&self.partner_message, &forgotten(&name), false);
+        let name = self.partner_row.subtitle().unwrap_or_default();
+        self.forget_asked.set(true);
+        let (go, closed) = (Rc::downgrade(self), Rc::downgrade(self));
+        ask_to_forget(
+            &self.forget_button,
+            &name,
+            move || {
+                if let Some(page) = go.upgrade() {
+                    page.remove_key_and_forget();
+                }
+            },
+            move || {
+                // From an idle callback: by then the question has gone from the
+                // window, and libadwaita has given the keyboard back to the
+                // widget that had it before (Forget), if it still can.
+                let closed = closed.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(page) = closed.upgrade() {
+                        page.forget_asked.set(false);
+                        page.settle_keyboard();
+                    }
+                });
+            },
+        );
+    }
+
+    /// Forget, answered: remove the sync key on the keyring worker first, then
+    /// the partner. Meanwhile the key field waits, and with it Sync, the Profile
+    /// row and Forget, as while a key is saved. A key that cannot be removed
+    /// changes nothing else: a notification says why, and the row stays, so
+    /// Forget can be pressed again. Once the key is gone the partner is
+    /// forgotten too, even if the page has gone meanwhile ([`forget_the_partner`]).
+    fn remove_key_and_forget(self: &Rc<Self>) {
+        // The line about an earlier forget must not sit beside this one.
+        show_message(&self.partner_message, "", false);
+        self.forgetting.set(true);
+        self.key_entry.set_sensitive(false);
+        self.refresh_controls();
+        let weak = Rc::downgrade(self);
+        let ctx = Rc::clone(&self.ctx);
+        keyring::change(&self.ctx, sync::remove_sync_key, move |removed| {
+            let removed = removed.unwrap_or_else(|| {
+                Err(format!(
+                    "Could not remove the sync key: {}.",
+                    keyring::STOPPED
+                ))
+            });
+            let Some(page) = weak.upgrade() else {
+                // The page has gone: the forget still ends, and a failure is
+                // still told.
+                let message = match removed {
+                    Ok(()) => forget_the_partner(&ctx).err(),
+                    Err(message) => Some(message),
+                };
+                if let Some(message) = message {
+                    ctx.notice.show(&message);
+                }
+                return;
+            };
+            page.forgetting.set(false);
+            page.key_entry.set_sensitive(true);
+            match removed {
+                Ok(()) => {
+                    // The keyring has just said so: no need to ask it again
+                    // before Sync and the Profile row wait for a key.
+                    page.key_status
+                        .set_label(&sync::key_status_text(&KeyState::NotSet));
+                    page.key_set.set(false);
+                    page.refresh_controls();
+                    let path = &page.ctx.settings_path;
+                    let name = page.partner_name(&settings::load(path));
+                    let text = match forget_the_partner(&page.ctx) {
+                        Ok(()) => name.map_or_else(|| KEY_REMOVED.to_owned(), |n| forgotten(&n)),
+                        Err(message) => {
+                            page.ctx.notice.show_near(&page.widget, &message);
+                            KEY_REMOVED.to_owned()
+                        }
+                    };
+                    show_message(&page.partner_message, &text, false);
+                }
+                Err(message) => {
+                    page.ctx.notice.show_near(&page.widget, &message);
+                    page.refresh_controls();
                 }
             }
-            Err(err) => {
-                self.ctx.notice.show_near(
-                    &self.widget,
-                    &format!("Could not save the sync settings: {err}"),
-                );
-            }
+            page.refresh_key_status();
+            page.settle_keyboard();
+        });
+    }
+
+    /// Once a forget's question has closed and nothing of it is out, give the
+    /// keyboard a place if it has none, or is in the Sync Partner row: Forget
+    /// while the row is there and can be used, else as [`Self::keyboard_away`].
+    /// A person who has moved on meanwhile (the keyring can wait at an unlock
+    /// prompt) is not pulled back.
+    fn settle_keyboard(&self) {
+        if self.forget_asked.get() || self.forgetting.get() {
+            return;
         }
-        self.ctx.partner_changed();
+        let row: &gtk::Widget = self.partner_row.upcast_ref();
+        let Some(root) = row.root() else {
+            return;
+        };
+        let lost = root
+            .focus()
+            .is_none_or(|focus| &focus == row || focus.is_ancestor(row));
+        if !lost {
+            return;
+        }
+        if self.partner_row.is_visible() && self.forget_button.is_sensitive() {
+            self.forget_button.grab_focus();
+        } else {
+            self.keyboard_away();
+        }
     }
 
     /// The person flipped the switch: save it. If that fails, say so and put
@@ -665,9 +789,11 @@ impl SyncPage {
         self.machine.set_sensitive(idle && set_up);
         self.sync_button.set_sensitive(idle && set_up && sync_on);
         self.auto_sync.set_sensitive(sync_on);
-        // A page sync's success would record the partner again right after;
-        // Sync being off does not matter, as a forget sends nothing.
-        self.forget_button.set_sensitive(idle);
+        // A page sync's success would record the partner again right after,
+        // and a forget changes the key: it waits for both. Sync being off does
+        // not matter, as a forget sends nothing.
+        self.forget_button
+            .set_sensitive(idle && self.key_entry.is_sensitive());
     }
 
     /// Any sync of the app started or ended.
@@ -738,6 +864,8 @@ impl SyncPage {
                     Ok(()) => {
                         page.clear_secret();
                         show_message(&page.key_message, "Sync key saved.", false);
+                        // The line a forget left says a key is wanted.
+                        show_message(&page.partner_message, "", false);
                     }
                     Err(message) => show_message(&page.key_message, &message, true),
                 }
@@ -820,6 +948,45 @@ fn begin_sync_with(page: &Rc<SyncPage>, stale: StaleSync) {
         // The profile list may be stale (that profile is gone).
         page.refresh_targets();
     }
+}
+
+/// Forget the sync partner in the settings file ([`sync::forget_partner`]:
+/// every other setting is kept, and a file that cannot be read is left as it
+/// is), then tell the app ([`AppContext::partner_changed`]), so Sync Now and the
+/// page follow. Whether it worked or not, everything that shows the partner
+/// reads the file again: a file that cannot be read reads as the defaults, so
+/// they show no partner, as a page opened now would. `Err` is what to tell.
+fn forget_the_partner(ctx: &AppContext) -> Result<(), String> {
+    let forgotten = sync::forget_partner(&ctx.settings_path)
+        .map_err(|err| format!("Could not save the sync settings: {err}"));
+    ctx.partner_changed();
+    forgotten
+}
+
+/// Before a forget (issue #11), over `near`: say that the sync key goes too
+/// and what that stops (`name` is the partner, plain text), and ask. `go` runs
+/// on Forget, `closed` once the question has closed, whatever the answer. All
+/// text is plain.
+fn ask_to_forget(
+    near: &impl IsA<gtk::Widget>,
+    name: &str,
+    go: impl Fn() + 'static,
+    closed: impl Fn() + 'static,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(FORGET_HEADING)
+        .heading_use_markup(false)
+        .body(forget_body(name))
+        .body_use_markup(false)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("forget", "Forget");
+    dialog.set_response_appearance("forget", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    dialog.connect_response(Some("forget"), move |_, _| go());
+    dialog.connect_closed(move |_| closed());
+    dialog.present(Some(near));
 }
 
 /// After a sync stopped because this machine or the other one has been away
@@ -918,4 +1085,17 @@ fn inline_message(name: &str) -> gtk::Label {
         .margin_top(12)
         .visible(false)
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_forget_texts_say_what_the_key_stops() {
+        assert!(forget_body("x").contains(NO_SYNC_UNTIL_KEY));
+        assert!(forgotten("x").ends_with(NO_SYNC_UNTIL_KEY));
+        // Spelled out, as a const cannot be put together from another.
+        assert!(KEY_REMOVED.ends_with(NO_SYNC_UNTIL_KEY), "{KEY_REMOVED}");
+    }
 }
