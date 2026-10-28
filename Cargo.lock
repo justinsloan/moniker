@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "moniker-cli"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "moniker-core"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1193,7 +1193,7 @@ dependencies = [
 
 [[package]]
 name = "moniker-gui"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "async-channel",
  "gtk4",
