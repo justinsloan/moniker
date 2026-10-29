@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/moniker-core", "crates/moniker-cli", "crates/moniker-gui"]
 
 [workspace.package]
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 # The oldest compiler moniker-core and moniker-cli build with: std's File::lock
 # (the profile store's lock) is stable since 1.89, and so is uuid 1.28's own
