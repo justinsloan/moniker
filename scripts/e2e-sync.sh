@@ -7,8 +7,9 @@
 #   private D-Bus session, with a private gnome-keyring-daemon (Secret Service)
 #   that it creates and unlocks itself, and throwaway user-level sshd servers
 #   on 127.0.0.1 (key login; key login without `moniker-server` on PATH; password
-#   login). Instance A is the script's own side, instance B is whatever
-#   `moniker-server sync-serve` runs inside the sshd session. Passwords and sync keys
+#   login; password and key login for the jump connection checks). Instance A is
+#   the script's own side, instance B is whatever `moniker-server sync-serve`
+#   runs inside the sshd session. Passwords and sync keys
 #   are passed only on stdin or through files, never argv or the environment,
 #   and are never printed.
 #
@@ -367,12 +368,15 @@ free_port() {
 
 # sshd_config for one throwaway server. B's environment is set with SetEnv, so
 # `moniker-server sync-serve` in the session is instance B on the private bus.
-write_sshd_config() { # write_sshd_config FILE PORT NAME REMOTE_PATH key|password
+write_sshd_config() { # write_sshd_config FILE PORT NAME REMOTE_PATH key|password|both
     local auth="PasswordAuthentication no" pubkey="PubkeyAuthentication yes" penalties=""
     # A user-level sshd cannot check passwords, so every password login fails;
     # OpenSSH 9.8 and later then penalize the source address, 127.0.0.1, and
-    # drop the next checks' connections. The password server has none.
+    # drop the next checks' connections. The password servers have none. "both"
+    # offers the key as well, so that a login which tried the password first
+    # (the askpass helper answered it) can still succeed with the key.
     [ "$5" = password ] && { auth="PasswordAuthentication yes"; pubkey="PubkeyAuthentication no"; penalties="PerSourcePenalties no"; }
+    [ "$5" = both ] && { auth="PasswordAuthentication yes"; penalties="PerSourcePenalties no"; }
     cat >"$1" <<EOF
 Port $2
 ListenAddress 127.0.0.1
@@ -398,7 +402,7 @@ port_speaks_ssh() { # the port answers with an SSH banner
 }
 
 # Start a throwaway sshd; sets SSHD_PORT. Retries on another port if it fails.
-start_sshd() { # start_sshd NAME REMOTE_PATH key|password
+start_sshd() { # start_sshd NAME REMOTE_PATH key|password|both
     local try port pid
     for try in 1 2 3; do
         port=$(free_port) || return 1
@@ -662,9 +666,9 @@ EOF
 }
 
 # Seed a profile on A with a stored password; prints its id.
-seed_password_profile() { # seed_password_profile NAME HOST
+seed_password_profile() { # seed_password_profile NAME HOST [PORT]
     local id
-    id=$(A "$HELPER" seed-profile --name "$1" --host "$2" --port "$PW_PORT" --user "$ME") || return 1
+    id=$(A "$HELPER" seed-profile --name "$1" --host "$2" --port "${3:-$PW_PORT}" --user "$ME") || return 1
     printf '%s\n' "pw-$(random_token)" | A "$HELPER" set-secret "$1" || return 1
     printf '%s' "$id"
 }
@@ -751,6 +755,276 @@ check_host_key_not_auto_answered() {
     [ ! -s "$T/kh2" ] || { REASON="the host key was written to known_hosts"; return 1; }
 }
 
+# ---------- jump connections through a shared ssh connection (issue #9) ----------
+#
+# The jump host is opened as the master of a shared ssh connection (-f -N -M -S
+# SOCKET), and the target's ssh reaches the target through it with a
+# ProxyCommand (-W). The checks show how OpenSSH behaves for exactly that: the
+# master's exit status, parent and pid, the socket, the hop, how the master
+# ends, and that no TCP port is opened. Every ssh is started the way Moniker
+# starts one (see ssh_like_moniker): a shell whose id is MONIKER_PID, the
+# askpass helper, a one-time token and the profile's id.
+#
+# Both sshds take a password and a key. A user-level sshd cannot check a
+# password, so a password-only server never lets a login succeed, and the
+# master could not sign in. ssh offers the password first: the helper answers
+# it (the token's marker shows that) and the sshd refuses it; then the key
+# signs in.
+
+JUMP_PORT=    # sshd of the jump host
+TARGET_PORT=  # sshd of the target
+JUMP_ID=      # profile ids, each with a stored password: the jump host, the target
+TARGET_ID=
+JUMP_DIR=     # where the sockets are
+JUMP_READY=   # set once jump_setup has done everything
+JUMP_SIGNIN=()  # ssh options: the password first, then the key
+JUMP_SOCKETS=() # sockets of the masters a check started
+JUMP_MASTERS=() # ids of those masters, once known (learn_master)
+MASTER_PID=     # set by learn_master
+
+new_token() { cat /proc/sys/kernel/random/uuid; }
+jump_socket() { printf '%s/%s' "$JUMP_DIR" "$(random_token | cut -c1-32)"; }
+now_ms() { local t=${EPOCHREALTIME/[.,]/}; printf '%s' $((t / 1000)); }
+marker_of() { printf '%s' "$T/run/moniker/askpass/$1"; } # the file the helper creates when it answers
+prompts_asked() { grep -c '^prompt=' "$T/askpass.log"; }
+
+# The process PID with start time START is running (a zombie is not).
+proc_alive() { # proc_alive PID START
+    local stat
+    stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    stat=${stat##*) }
+    [ "${stat%% *}" != Z ] && [ "$(proc_start "$1")" = "$2" ]
+}
+
+# The parent of a process (field 4 of /proc/PID/stat).
+proc_ppid() {
+    local stat
+    stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    stat=${stat##*) }
+    # shellcheck disable=SC2086
+    set -- $stat
+    printf '%s' "$2"
+}
+
+# Wait up to LIMIT_MS for the process to be gone and the socket removed. Prints
+# "P S", the milliseconds each took ('-' = still there at the limit); succeeds
+# if both went.
+wait_gone() { # wait_gone PID START SOCK LIMIT_MS
+    local t0 t p=- s=-
+    t0=$(now_ms)
+    while :; do
+        t=$(($(now_ms) - t0))
+        [ "$p" = - ] && ! proc_alive "$1" "$2" && p=$t
+        [ "$s" = - ] && [ ! -e "$3" ] && s=$t
+        [ "$p" != - ] && [ "$s" != - ] && break
+        [ "$t" -ge "$4" ] && break
+        sleep 0.05
+    done
+    printf '%s %s' "$p" "$s"
+    [ "$p" != - ] && [ "$s" != - ]
+}
+
+# Run ssh ARG... as Moniker runs a connection (see ssh_like_moniker) for the
+# profile and the one-time token given. The launching shell's id goes to
+# $T/launcher.pid.
+ssh_args_like_moniker() { # ssh_args_like_moniker PROFILE_ID TOKEN ARG...
+    local id=$1 token=$2
+    shift 2
+    : >"$T/askpass.log"
+    # shellcheck disable=SC2016
+    capture A env PATH="$T/shim:$PATH" SSH_ASKPASS="$T/askpass-exec.sh" SSH_ASKPASS_REQUIRE=force \
+        MONIKER_PROFILE_ID="$id" MONIKER_ASKPASS_TOKEN="$token" setsid -w timeout 30 \
+        sh -c 'f=$1; shift; MONIKER_PID=$$; export MONIKER_PID; echo "$$" >"$f"; ssh "$@"; exit $?' \
+        sh "$T/launcher.pid" "$@"
+}
+
+# The two sshds, the two profiles and the socket directory, once.
+jump_setup() {
+    [ -z "$JUMP_READY" ] || return 0
+    [ -x "$T/askpass-exec.sh" ] && [ -x "$T/shim/ssh" ] ||
+        { REASON="no askpass script or ssh shim (the askpass checks did not set them up)"; return 1; }
+    start_sshd pwjump "$SYSTEM_PATH" both || { REASON="cannot start the jump host's sshd"; return 1; }
+    JUMP_PORT=$SSHD_PORT
+    start_sshd pwtarget "$SYSTEM_PATH" both || { REASON="cannot start the target's sshd"; return 1; }
+    TARGET_PORT=$SSHD_PORT
+    JUMP_ID=$(seed_password_profile jump-host 127.0.0.1 "$JUMP_PORT") || { REASON="cannot seed the jump host's profile"; return 1; }
+    TARGET_ID=$(seed_password_profile jump-target 127.0.0.1 "$TARGET_PORT") || { REASON="cannot seed the target's profile"; return 1; }
+    JUMP_DIR=$T/run/moniker/jump
+    mkdir -p "$T/run/moniker" "$JUMP_DIR" && chmod 700 "$T/run/moniker" "$JUMP_DIR" ||
+        { REASON="cannot make the socket directory"; return 1; }
+    JUMP_SIGNIN=(-o PubkeyAuthentication=yes -o IdentitiesOnly=yes -i "$T/client_key"
+        -o PreferredAuthentications=password,publickey)
+    JUMP_READY=1
+}
+
+# The jump connection: ssh to the jump host, in the background after it signed
+# in, as the master of a shared connection at SOCK. Succeeds if the master
+# exited 0 and the helper answered its prompt.
+start_master() { # start_master SOCK TOKEN
+    ssh_args_like_moniker "$JUMP_ID" "$2" -p "$JUMP_PORT" "${JUMP_SIGNIN[@]}" \
+        -f -N -M -S "$1" -o ControlPersist=10 -- "$ME@127.0.0.1"
+    [ "$RC" -eq 0 ] || { REASON="the master exited $RC, expected 0: $(err_summary)"; return 1; }
+    JUMP_SOCKETS+=("$1")
+    [ -e "$(marker_of "$2")" ] ||
+        { REASON="the helper did not answer the master's prompt (askpass log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
+}
+
+# Ask the master at SOCK for its id the way Moniker will (-O check), and record
+# the process so that it is stopped in any case. Sets MASTER_PID.
+learn_master() { # learn_master SOCK
+    capture env PATH="$T/shim:$PATH" ssh -S "$1" -O check -- "$ME@127.0.0.1"
+    [ "$RC" -eq 0 ] || { REASON="-O check exited $RC: $(err_summary)"; return 1; }
+    MASTER_PID=$(tr -d '\r' <"$ERR" | sed -n 's/^Master running (pid=\([0-9][0-9]*\))$/\1/p')
+    [ -n "$MASTER_PID" ] || { REASON="-O check said: $(err_summary)"; return 1; }
+    register_pid "$MASTER_PID"
+    JUMP_MASTERS+=("$MASTER_PID")
+}
+
+# The target's ssh, reaching the target through the master at SOCK with a
+# ProxyCommand. HOP_OPTION... go to the hop's ssh (BatchMode=yes by default).
+run_target() { # run_target SOCK TOKEN COMMAND [HOP_OPTION...]
+    local sock=$1 token=$2 cmd=$3 hop="-o BatchMode=yes"
+    shift 3
+    [ "$#" -eq 0 ] || hop=$*
+    ssh_args_like_moniker "$TARGET_ID" "$token" -p "$TARGET_PORT" "${JUMP_SIGNIN[@]}" \
+        -o "ProxyCommand=ssh -S $sock -o ControlMaster=no $hop -W %h:%p -p $JUMP_PORT -- $ME@127.0.0.1" \
+        -- "$ME@127.0.0.1" "$cmd"
+}
+
+# End the master at SOCK with -O exit.
+end_master() { # end_master SOCK
+    capture env PATH="$T/shim:$PATH" ssh -S "$1" -O exit -- "$ME@127.0.0.1"
+    [ "$RC" -eq 0 ] || { REASON="-O exit exited $RC: $(err_summary)"; return 1; }
+}
+
+# Stop every master a check left. They are not our children: -O exit through
+# the socket this script made, and then the recorded id and start time (stop_pid)
+# for one that did not answer. Never a process found by name.
+jump_stop_all() {
+    local sock pid
+    for sock in "${JUMP_SOCKETS[@]}"; do
+        [ -S "$sock" ] && timeout 5 env PATH="$T/shim:$PATH" ssh -S "$sock" -O exit -- "$ME@127.0.0.1" </dev/null >/dev/null 2>&1
+    done
+    for pid in "${JUMP_MASTERS[@]}"; do stop_pid "$pid"; done
+    JUMP_SOCKETS=() JUMP_MASTERS=()
+}
+
+run_jump_check() { # run_jump_check NAME FUNCTION: run_check, then end any master the check left
+    run_check "$1" "$2"
+    jump_stop_all
+}
+
+check_jump_master_signs_in() {
+    local sock token parent launcher
+    jump_setup || return 1
+    sock=$(jump_socket)
+    token=$(new_token)
+    start_master "$sock" "$token" || return 1
+    [ -S "$sock" ] || { REASON="no socket at $sock"; return 1; }
+    learn_master "$sock" || return 1
+    grep -qx "Master running (pid=$MASTER_PID)" <(tr -d '\r' <"$ERR") ||
+        { REASON="-O check did not say 'Master running (pid=$MASTER_PID)': $(err_summary)"; return 1; }
+    parent=$(proc_ppid "$MASTER_PID") launcher=$(cat "$T/launcher.pid")
+    [ "$parent" != "$launcher" ] || { REASON="the master's parent is still the launching shell ($launcher)"; return 1; }
+    end_master "$sock"
+}
+
+check_target_through_the_socket() {
+    local sock token
+    jump_setup || return 1
+    sock=$(jump_socket)
+    start_master "$sock" "$(new_token)" && learn_master "$sock" || return 1
+    token=$(new_token)
+    run_target "$sock" "$token" true
+    [ "$RC" -eq 0 ] || { REASON="the target command exited $RC, expected 0: $(err_summary)"; return 1; }
+    [ -e "$(marker_of "$token")" ] || { REASON="the helper did not answer the target's prompt"; return 1; }
+    [ "$(prompts_asked)" -eq 1 ] ||
+        { REASON="expected the target's prompt only, got $(prompts_asked) prompts (log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
+    end_master "$sock"
+}
+
+check_hop_without_master() {
+    local sock token
+    jump_setup || return 1
+    sock=$(jump_socket)
+    start_master "$sock" "$(new_token)" && learn_master "$sock" || return 1
+    end_master "$sock" || return 1
+    wait_gone "$MASTER_PID" "${PID_START[$MASTER_PID]}" "$sock" 3000 >/dev/null ||
+        { REASON="the master did not end after -O exit"; return 1; }
+    # The hop in BatchMode: it finds no master, would have to sign in itself,
+    # and may not ask.
+    token=$(new_token)
+    run_target "$sock" "$token" true
+    [ "$RC" -ne 0 ] || { REASON="the target command exited 0 without a master"; return 1; }
+    [ ! -e "$(marker_of "$token")" ] || { REASON="the stored password was sent without a master"; return 1; }
+    [ "$(prompts_asked)" -eq 0 ] || { REASON="a prompt was asked without a master (log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
+    # The hop that may ask: its prompt names the target's user@host, and it is
+    # not the ssh Moniker started, so the helper gives it nothing.
+    token=$(new_token)
+    run_target "$sock" "$token" true -o BatchMode=no
+    [ "$RC" -ne 0 ] || { REASON="the target command exited 0 without a master (hop may ask)"; return 1; }
+    [ "$(prompts_asked)" -ge 1 ] || { REASON="the hop that may ask did not ask, so nothing was tested"; return 1; }
+    [ ! -e "$(marker_of "$token")" ] || { REASON="the stored password was sent to the hop"; return 1; }
+}
+
+check_master_ends_at_once() {
+    local sock pid start took
+    jump_setup || return 1
+    # -O exit
+    sock=$(jump_socket)
+    start_master "$sock" "$(new_token)" && learn_master "$sock" || return 1
+    pid=$MASTER_PID start=${PID_START[$MASTER_PID]}
+    end_master "$sock" || return 1
+    took=$(wait_gone "$pid" "$start" "$sock" 1000) || { REASON="after -O exit (process ms, socket ms): $took"; return 1; }
+    # SIGTERM to the id this script recorded
+    sock=$(jump_socket)
+    start_master "$sock" "$(new_token)" && learn_master "$sock" || return 1
+    pid=$MASTER_PID start=${PID_START[$MASTER_PID]}
+    proc_alive "$pid" "$start" || { REASON="the master is not running before SIGTERM"; return 1; }
+    kill -TERM "$pid"
+    took=$(wait_gone "$pid" "$start" "$sock" 1000) || { REASON="after SIGTERM (process ms, socket ms): $took"; return 1; }
+}
+
+check_master_backstop() {
+    local sock pid start took p
+    jump_setup || return 1
+    # ControlPersist=10 ends a master 9.3 to 9.8 s after its last client closed
+    # (measured; the clock evidently counts whole seconds), so 8 s is the least
+    # it may take, allowing for the time the client needed to exit.
+    # No client at all: the clock restarts when -O check closes.
+    sock=$(jump_socket)
+    start_master "$sock" "$(new_token)" && learn_master "$sock" || return 1
+    pid=$MASTER_PID start=${PID_START[$MASTER_PID]}
+    took=$(wait_gone "$pid" "$start" "$sock" 13000) || { REASON="a master with no client after 13 s (process ms, socket ms): $took"; return 1; }
+    p=${took%% *}
+    [ "$p" -ge 8000 ] || { REASON="a master with no client ended after only $p ms"; return 1; }
+    # One session, which ends.
+    sock=$(jump_socket)
+    start_master "$sock" "$(new_token)" && learn_master "$sock" || return 1
+    pid=$MASTER_PID start=${PID_START[$MASTER_PID]}
+    run_target "$sock" "$(new_token)" true
+    [ "$RC" -eq 0 ] || { REASON="the target command exited $RC: $(err_summary)"; return 1; }
+    took=$(wait_gone "$pid" "$start" "$sock" 13000) || { REASON="a master whose session ended, after 13 s (process ms, socket ms): $took"; return 1; }
+    p=${took%% *}
+    [ "$p" -ge 8000 ] || { REASON="a master whose session ended went after only $p ms"; return 1; }
+}
+
+check_no_listening_port() {
+    local sock new
+    jump_setup || return 1
+    ss -lntH | awk '{print $4}' | sort -u >"$T/ss.before"
+    sock=$(jump_socket)
+    start_master "$sock" "$(new_token)" && learn_master "$sock" || return 1
+    # The command runs on the target while the session is open.
+    run_target "$sock" "$(new_token)" "$(command -v ss) -lntH >$T/ss.during"
+    [ "$RC" -eq 0 ] || { REASON="the target command exited $RC: $(err_summary)"; return 1; }
+    [ -s "$T/ss.during" ] || { REASON="the listing taken during the session is empty"; return 1; }
+    awk '{print $4}' "$T/ss.during" | sort -u >"$T/ss.during.sorted"
+    new=$(comm -13 "$T/ss.before" "$T/ss.during.sorted" | tr '\n' ' ')
+    [ -z "$new" ] || { REASON="new listening sockets: $new"; return 1; }
+    end_master "$sock"
+}
+
 # ---------- inner main ----------
 
 inner_main() {
@@ -784,6 +1058,12 @@ inner_main() {
     run_check "askpass prompt format with real OpenSSH" check_askpass_prompts
     run_check "askpass follows the ssh config and skips ProxyJump hops" check_askpass_follows_ssh_config
     run_check "host key confirmation is never auto-answered" check_host_key_not_auto_answered
+    run_jump_check "jump connection: the master signs in as Moniker's child and leaves a socket" check_jump_master_signs_in
+    run_jump_check "jump connection: the target is reached through the socket" check_target_through_the_socket
+    run_jump_check "jump connection: a hop without the master never gets the stored password" check_hop_without_master
+    run_jump_check "jump connection: the master ends at once on -O exit and on SIGTERM" check_master_ends_at_once
+    run_jump_check "jump connection: a master nobody uses ends by itself" check_master_backstop
+    run_jump_check "jump connection: no listening port" check_no_listening_port
 
     say "== summary: $PASSED passed, $FAILED failed"
     [ "$FAILED" -eq 0 ]
