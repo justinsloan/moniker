@@ -16,6 +16,15 @@
 //! switch and reads as on. The switch lives in this file so that one atomic
 //! write under the store's lock changes it together with the profiles.
 //!
+//! Version 3, `{"version":3,"sync_off":<bool>,"profiles":[...]}`, is written
+//! exactly while a live profile has a jump host (`jump_host`, the profile it
+//! connects through), with `sync_off` and `local_only` carried as in version 2.
+//! The reason is the same too: an older version would read the file, drop the
+//! field it does not know and connect the profile straight to its host, so it
+//! must refuse the file instead. Version 3 wins over 2 when both hold. A
+//! tombstone never has a jump host, so deleting the last profile that has one
+//! takes the file back to 1 or 2.
+//!
 //! Passwords are not stored here; they live in the system keyring.
 //!
 //! The file can change under an open store: `moniker-server sync-serve` run over ssh
@@ -54,6 +63,8 @@ use crate::profile::{Profile, ProfileError, now_ms};
 const FORMAT_V1: u64 = 1;
 /// The format that carries `sync_off`. Written only when it matters (module docs).
 const FORMAT_V2: u64 = 2;
+/// The same as version 2 while a live profile has a jump host (module docs).
+const FORMAT_V3: u64 = 3;
 
 /// Whether this machine syncs, as `profiles.json` records it.
 ///
@@ -96,7 +107,7 @@ pub enum StoreError {
     /// The file is not valid JSON, or not shaped like a profile store.
     #[error("profile store file is corrupt (not a valid profile list)")]
     Corrupt,
-    #[error("unsupported profile store version {0} (this build reads versions 1 and 2)")]
+    #[error("unsupported profile store version {0} (this build reads versions 1, 2 and 3)")]
     UnsupportedVersion(u64),
     #[error("profile store contains the same profile id twice")]
     DuplicateId,
@@ -382,7 +393,7 @@ fn index(
 
 /// Parse the file. The version is checked before anything else is looked at,
 /// so a newer format reports as unsupported rather than corrupt, and `sync_off`
-/// is read in version 2 only (version 1 has no switch and reads as on).
+/// is read in versions 2 and 3 (version 1 has no switch and reads as on).
 fn parse(bytes: &[u8]) -> Result<(Vec<Profile>, SyncSwitch), StoreError> {
     // Error values from serde_json are dropped on purpose: they can quote file contents.
     let value: serde_json::Value =
@@ -392,7 +403,7 @@ fn parse(bytes: &[u8]) -> Result<(Vec<Profile>, SyncSwitch), StoreError> {
     };
     let sync = match file.get("version").and_then(serde_json::Value::as_u64) {
         Some(FORMAT_V1) => SyncSwitch::On,
-        Some(FORMAT_V2) => match file.get("sync_off") {
+        Some(FORMAT_V2 | FORMAT_V3) => match file.get("sync_off") {
             Some(serde_json::Value::Bool(true)) => SyncSwitch::Off,
             Some(serde_json::Value::Bool(false)) => SyncSwitch::On,
             // Missing or not a boolean: not understood, not guessed at.
@@ -408,10 +419,10 @@ fn parse(bytes: &[u8]) -> Result<(Vec<Profile>, SyncSwitch), StoreError> {
 
 /// The file's bytes: pretty-printed, profiles in id order, trailing newline.
 ///
-/// Version 2 exactly when the switch is not on or a profile is kept on this
-/// machine, else version 1 (module docs). An `Unreadable` switch is written as
-/// off: whatever rewrites the file must not turn a switch nobody could read into
-/// on.
+/// Version 3 exactly while a live profile has a jump host; else version 2
+/// exactly when the switch is not on or a profile is kept on this machine; else
+/// version 1 (module docs). An `Unreadable` switch is written as off: whatever
+/// rewrites the file must not turn a switch nobody could read into on.
 fn encode(contents: &Contents) -> Result<Vec<u8>, StoreError> {
     #[derive(Serialize)]
     struct File<'a> {
@@ -420,9 +431,19 @@ fn encode(contents: &Contents) -> Result<Vec<u8>, StoreError> {
         sync_off: Option<bool>,
         profiles: Vec<&'a Profile>,
     }
-    let v2 = !contents.sync.is_on() || contents.profiles.values().any(|p| p.local_only);
+    let v3 = contents
+        .profiles
+        .values()
+        .any(|p| !p.deleted && p.jump_host.is_some());
+    let v2 = v3 || !contents.sync.is_on() || contents.profiles.values().any(|p| p.local_only);
     let file = File {
-        version: if v2 { FORMAT_V2 } else { FORMAT_V1 },
+        version: if v3 {
+            FORMAT_V3
+        } else if v2 {
+            FORMAT_V2
+        } else {
+            FORMAT_V1
+        },
         sync_off: v2.then_some(!contents.sync.is_on()),
         profiles: contents.profiles.values().collect(),
     };
@@ -764,7 +785,7 @@ mod tests {
     #[test]
     fn open_rejects_wrong_version() {
         for (text, want) in [
-            (r#"{"version":3,"profiles":[]}"#, 3),
+            (r#"{"version":4,"profiles":[]}"#, 4),
             (r#"{"version":0,"profiles":[]}"#, 0),
             // A future format need not even have a compatible profile list.
             (r#"{"version":7,"profiles":"whatever"}"#, 7),
@@ -777,7 +798,7 @@ mod tests {
                 "input {text:?} gave {err:?}"
             );
             assert!(
-                err.to_string().contains("versions 1 and 2"),
+                err.to_string().contains("versions 1, 2 and 3"),
                 "the message names what this build reads: {err}"
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), text);
@@ -875,6 +896,208 @@ mod tests {
         let text = file_text(&path);
         assert!(text.contains("\"version\": 1"), "{text}");
         assert!(!text.contains("sync_off") && !text.contains("local_only"));
+    }
+
+    // ----- format version 3: a profile that goes through a jump host -----
+    //
+    // Same idea as version 2: an older Moniker refuses a file of another version
+    // and leaves it alone, so none can read a profile that has a jump host and
+    // connect it straight to its host. The switch is carried as in version 2.
+
+    #[test]
+    fn a_jump_host_makes_version_3() {
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(1, "bastion")).unwrap();
+        let through = Profile {
+            jump_host: Some(pid(1)),
+            ..profile(2, "db")
+        };
+        s.upsert(through.clone()).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(text.contains("\"sync_off\": false"), "{text}");
+        assert!(
+            text.contains(&format!("\"jump_host\": \"{}\"", pid(1))),
+            "{text}"
+        );
+        let value = file_json(&path);
+        assert!(
+            value["profiles"][0].get("jump_host").is_none(),
+            "only the profile that has one"
+        );
+
+        let reopened = ProfileStore::open(&path).unwrap();
+        assert_eq!(reopened.get(&pid(2)).unwrap().jump_host, Some(pid(1)));
+        assert_eq!(reopened.get(&pid(1)).unwrap().jump_host, None);
+        assert_eq!(reopened.sync_switch(), SyncSwitch::On);
+
+        // Sync off is carried in version 3 as in 2, and turning it back on
+        // changes nothing else about the file.
+        s.set_sync(false).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(text.contains("\"sync_off\": true"), "{text}");
+        let reopened = ProfileStore::open(&path).unwrap();
+        assert_eq!(reopened.sync_switch(), SyncSwitch::Off);
+        assert_eq!(reopened.get(&pid(2)).unwrap().jump_host, Some(pid(1)));
+        s.set_sync(true).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(text.contains("\"sync_off\": false"), "{text}");
+
+        // The jump host cleared: back to version 1, or 2 with sync off.
+        s.upsert(Profile {
+            jump_host: None,
+            ..through.clone()
+        })
+        .unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("sync_off") && !text.contains("jump_host"));
+        s.set_sync(false).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(text.contains("\"sync_off\": true"), "{text}");
+        s.upsert(through).unwrap();
+        assert!(file_text(&path).contains("\"version\": 3"));
+        s.upsert(Profile {
+            jump_host: None,
+            ..profile(2, "db")
+        })
+        .unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 2"), "{text}");
+        assert!(!text.contains("jump_host"), "{text}");
+    }
+
+    #[test]
+    fn a_kept_profile_with_a_jump_host_is_version_3() {
+        // A kept profile is a live profile in the file: it can have a jump host
+        // and the file is version 3, which still carries `local_only`.
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(1, "bastion")).unwrap();
+        s.upsert(Profile {
+            local_only: true,
+            jump_host: Some(pid(1)),
+            ..profile(2, "stays")
+        })
+        .unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 3"), "{text}");
+        assert!(text.contains("\"local_only\": true"), "{text}");
+        assert!(text.contains("\"jump_host\""), "{text}");
+        let reopened = ProfileStore::open(&path).unwrap();
+        let kept = reopened.get(&pid(2)).unwrap();
+        assert!(kept.local_only);
+        assert_eq!(kept.jump_host, Some(pid(1)));
+
+        // Without the jump host it is version 2 again, because it is kept here.
+        s.upsert(Profile {
+            local_only: true,
+            ..profile(2, "stays")
+        })
+        .unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 2"), "{text}");
+    }
+
+    #[test]
+    fn a_tombstone_never_makes_version_3() {
+        let (_d, path) = setup();
+        let mut s = ProfileStore::open(&path).unwrap();
+        // Deleting the only profile that has a jump host takes the file back.
+        s.upsert(profile(1, "bastion")).unwrap();
+        s.upsert(Profile {
+            jump_host: Some(pid(1)),
+            ..profile(2, "db")
+        })
+        .unwrap();
+        assert!(file_text(&path).contains("\"version\": 3"));
+        s.delete(&pid(2)).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("jump_host"), "{text}");
+
+        // A deleted profile handed in with a jump host is stored as the
+        // canonical tombstone, which has none.
+        s.upsert(Profile {
+            jump_host: Some(pid(1)),
+            deleted: true,
+            ..profile(3, "gone")
+        })
+        .unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("jump_host"), "{text}");
+
+        // A tombstone that already carries one in a file (written by hand, or
+        // by something else) does not count either.
+        let hand = format!(
+            r#"{{"version":1,"profiles":[{{"id":"{}","name":"","host":"","port":0,"username":"","key_file":null,"sequences":[],"transcript":false,"updated_at":1,"jump_host":"{}","deleted":true}}]}}"#,
+            pid(4),
+            pid(1)
+        );
+        fs::write(&path, hand).unwrap();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(5, "other")).unwrap();
+        let text = file_text(&path);
+        assert!(text.contains("\"version\": 1"), "{text}");
+        assert!(!text.contains("sync_off"), "{text}");
+    }
+
+    #[test]
+    fn version_3_is_read() {
+        let one = format!(
+            r#"{{"id":"{}","name":"db","host":"example.com","port":22,"username":"alice","key_file":null,"sequences":[],"transcript":false,"updated_at":1,"jump_host":"{}","deleted":false}}"#,
+            pid(2),
+            pid(1)
+        );
+        for (switch, want) in [
+            (r#""sync_off":true,"#, SyncSwitch::Off),
+            (r#""sync_off":false,"#, SyncSwitch::On),
+            // Missing or not a boolean: not understood, as for version 2.
+            ("", SyncSwitch::Unreadable),
+            (r#""sync_off":"no","#, SyncSwitch::Unreadable),
+            (r#""sync_off":null,"#, SyncSwitch::Unreadable),
+        ] {
+            let (_d, path) = setup();
+            let text = format!(r#"{{"version":3,{switch}"profiles":[{one}]}}"#);
+            fs::write(&path, &text).unwrap();
+            let s = ProfileStore::open(&path).expect(&text);
+            assert_eq!(s.sync_switch(), want, "{text}");
+            assert_eq!(s.get(&pid(2)).unwrap().jump_host, Some(pid(1)), "{text}");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                text,
+                "open writes nothing"
+            );
+        }
+
+        // A version-3 file without any jump host reads too, and the next write
+        // puts it back where it belongs.
+        let (_d, path) = setup();
+        fs::write(&path, r#"{"version":3,"sync_off":false,"profiles":[]}"#).unwrap();
+        let mut s = ProfileStore::open(&path).unwrap();
+        assert_eq!(s.sync_switch(), SyncSwitch::On);
+        s.upsert(profile(1, "A")).unwrap();
+        assert!(file_text(&path).contains("\"version\": 1"));
+
+        // An unreadable switch in version 3 is written as off, with the version
+        // the profiles call for.
+        let (_d, path) = setup();
+        fs::write(
+            &path,
+            format!(r#"{{"version":3,"sync_off":"no","profiles":[{one}]}}"#),
+        )
+        .unwrap();
+        let mut s = ProfileStore::open(&path).unwrap();
+        s.upsert(profile(1, "bastion")).unwrap();
+        let value = file_json(&path);
+        assert_eq!(value["version"], 3);
+        assert_eq!(value["sync_off"], true);
+        assert_eq!(s.sync_switch(), SyncSwitch::Off);
     }
 
     #[test]
@@ -1175,6 +1398,7 @@ mod tests {
             local_only: false,
             updated_at: 1_700_000_000_000,
             startup_sequence: None,
+            jump_host: None,
             deleted: false,
         };
         s.replace_all(vec![p]).unwrap();
@@ -1682,6 +1906,7 @@ mod tests {
             local_only: true,
             updated_at: 42,
             startup_sequence: Some(7),
+            jump_host: Some(pid(2)),
             deleted: true,
         };
         s.replace_all(vec![junk]).unwrap();
@@ -1836,7 +2061,7 @@ mod tests {
         );
         for (bad, want) in [
             ("not json".to_string(), "corrupt"),
-            (r#"{"version":3,"profiles":[]}"#.to_string(), "version"),
+            (r#"{"version":4,"profiles":[]}"#.to_string(), "version"),
             (valid_but_invalid_host, "invalid"),
         ] {
             let (_d, path) = setup();
@@ -1854,7 +2079,7 @@ mod tests {
                 let err = r.unwrap_err();
                 let ok = match want {
                     "corrupt" => matches!(err, StoreError::Corrupt),
-                    "version" => matches!(err, StoreError::UnsupportedVersion(3)),
+                    "version" => matches!(err, StoreError::UnsupportedVersion(4)),
                     _ => matches!(err, StoreError::Invalid(ProfileError::Host)),
                 };
                 assert!(ok, "{want}: got {err:?}");

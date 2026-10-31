@@ -423,6 +423,71 @@ mod tests {
         }
     }
 
+    /// `entry` as a peer that does not know `jump_host` sends it back: it drops
+    /// the field when it reads the entry and writes the entry without it.
+    fn without_the_jump_host(entry: &BundleEntry) -> BundleEntry {
+        let mut value = serde_json::to_value(entry).unwrap();
+        value["profile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("jump_host")
+            .expect("the entry has a jump host to drop");
+        let back: BundleEntry = serde_json::from_value(value).unwrap();
+        assert!(!wire(&back).contains("jump_host"));
+        back
+    }
+
+    #[test]
+    fn an_entry_with_a_jump_host_wins_a_tie_with_the_same_entry_without() {
+        // The same version of the profile, on equal `updated_at`, once as this
+        // machine has it and once as a peer that drops the jump host sends it
+        // back: the entry that has the jump host must be the greater, whichever
+        // side it comes from, or the peer would erase the jump host and send the
+        // profile on to connect straight to its host.
+        for with_default_too in [false, true] {
+            let mut a = if with_default_too {
+                with_default(ID_A, 5)
+            } else {
+                live(ID_A, "behind a bastion", 5, Some("pw"))
+            };
+            a.profile.jump_host = Some(ID_B.to_string());
+            let b = without_the_jump_host(&a);
+            assert_ne!(a, b);
+            assert!(
+                wire(&a) > wire(&b),
+                "the field's place in the struct (with a default: {with_default_too})"
+            );
+
+            for merged in [
+                merge(vec![a.clone()], vec![b.clone()]),
+                merge(vec![b.clone()], vec![a.clone()]),
+            ] {
+                assert_eq!(merged.len(), 1);
+                assert_eq!(merged[0].profile.jump_host.as_deref(), Some(ID_B));
+                assert_eq!(merged[0], a);
+            }
+        }
+    }
+
+    #[test]
+    fn an_edit_elsewhere_still_wins_over_the_jump_host() {
+        // The peer edited the profile after this machine chose the jump host:
+        // its newer version wins, and with it the absence of a jump host.
+        let mut a = live(ID_A, "behind a bastion", 5, None);
+        a.profile.jump_host = Some(ID_B.to_string());
+        let mut b = without_the_jump_host(&a);
+        b.profile.updated_at = 6;
+
+        for merged in [
+            merge(vec![a.clone()], vec![b.clone()]),
+            merge(vec![b.clone()], vec![a.clone()]),
+        ] {
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged[0].profile.updated_at, 6);
+            assert_eq!(merged[0].profile.jump_host, None);
+        }
+    }
+
     #[test]
     fn entry_serde_round_trip() {
         for entry in [

@@ -70,7 +70,7 @@ pub struct Profile {
     /// Kept on this machine only: sync never sends it, password included. Left
     /// out of the JSON when false, so a bundle or a version-1 profile file stays
     /// byte for byte what it was; a profile file that holds one with it set is
-    /// written as format version 2 (see `store`).
+    /// written as format version 2 at least (see `store`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_only: bool,
     /// Last edit time, Unix milliseconds UTC. Newest edit wins when merging.
@@ -84,6 +84,20 @@ pub struct Profile {
     /// after that peer's `"deleted"`, so the entry that has it wins the tie.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_sequence: Option<usize>,
+    /// The id of the profile this one connects through (its jump host), left
+    /// out of the JSON when `None`. Validation checks only the shape of the id:
+    /// whether a profile with that id is saved is a state, not a mistake (the
+    /// jump host can be deleted on another machine), and [`crate::jump::route`]
+    /// says which.
+    ///
+    /// Keep it after `startup_sequence` and before `deleted`, for the reason
+    /// `startup_sequence` is where it is: a peer that does not know this field
+    /// drops it, and on equal `updated_at` the merge compares the entries' JSON
+    /// text (`bundle::tie_key`). Only here does `"jump_host"` sort after that
+    /// peer's `"deleted"`, so the entry that has it wins the tie, with a
+    /// `"startup_sequence"` before it or without.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<String>,
     /// Tombstone marker so deletions propagate through sync.
     pub deleted: bool,
 }
@@ -114,6 +128,8 @@ pub enum ProfileError {
     Command,
     #[error("key file path must not contain a NUL character")]
     KeyFile,
+    #[error("jump host must be another profile's id (a lowercase hyphenated UUID)")]
+    JumpHost,
 }
 
 /// Current time as Unix milliseconds UTC.
@@ -141,6 +157,7 @@ impl Profile {
             local_only: false,
             updated_at: now_ms(),
             startup_sequence: None,
+            jump_host: None,
             deleted: false,
         }
     }
@@ -185,6 +202,14 @@ impl Profile {
         for seq in &self.sequences {
             seq.check()?;
         }
+        // It names another profile and arrives from other machines, so it is
+        // held to the shape of an id like `id` is, and a profile cannot be its
+        // own jump host.
+        if let Some(jump) = &self.jump_host
+            && (!is_canonical_uuid(jump) || *jump == self.id)
+        {
+            return Err(ProfileError::JumpHost);
+        }
         Ok(())
     }
 
@@ -204,6 +229,7 @@ impl Profile {
             local_only: false,
             updated_at: now_ms,
             startup_sequence: None,
+            jump_host: None,
             deleted: true,
         }
     }
@@ -487,6 +513,92 @@ mod tests {
         assert_eq!(p.startup_choice(), None);
         // An index past the end is not an error: it only runs nothing.
         assert_eq!(p.validate(), Ok(()));
+    }
+
+    const OTHER_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn a_jump_host_must_be_a_canonical_uuid() {
+        for bad in [
+            "x",
+            "",
+            "550E8400-E29B-41D4-A716-446655440000",
+            "{550e8400-e29b-41d4-a716-446655440000}",
+            "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+            "550e8400e29b41d4a716446655440000",
+            "550e8400-e29b-41d4-a716-446655440000\n",
+            " 550e8400-e29b-41d4-a716-446655440000",
+        ] {
+            let mut p = valid();
+            p.jump_host = Some(bad.to_string());
+            assert_eq!(
+                p.validate(),
+                Err(ProfileError::JumpHost),
+                "jump host {bad:?} should be rejected"
+            );
+        }
+        // Another profile's id passes, and so does an id no profile has: the
+        // profile alone cannot tell, and a jump host that is not saved (here) is
+        // a state the person can be in, not a mistake (see `jump::route`).
+        let mut p = valid();
+        p.jump_host = Some(OTHER_ID.to_string());
+        assert_eq!(p.validate(), Ok(()));
+        p.jump_host = Some(valid().id);
+        assert_eq!(p.validate(), Ok(()));
+        p.jump_host = None;
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_jump_host_cannot_be_the_profile_itself() {
+        let mut p = valid();
+        p.jump_host = Some(p.id.clone());
+        assert_eq!(p.validate(), Err(ProfileError::JumpHost));
+    }
+
+    #[test]
+    fn a_tombstone_has_no_jump_host() {
+        let mut p = valid();
+        p.jump_host = Some(OTHER_ID.to_string());
+        let t = p.tombstone(9);
+        assert_eq!(t.jump_host, None);
+        assert_eq!(t.validate(), Ok(()));
+        // A tombstone is not field-validated, so one that carries a jump host
+        // is harmless here (the store rewrites it as the canonical tombstone
+        // when it writes).
+        let mut junk = t;
+        junk.jump_host = Some("x".to_string());
+        assert_eq!(junk.validate(), Ok(()));
+    }
+
+    #[test]
+    fn no_jump_host_is_written_as_before() {
+        let none = valid();
+        assert_eq!(none.jump_host, None);
+        assert!(!serde_json::to_string(&none).unwrap().contains("jump_host"));
+        let some = Profile {
+            jump_host: Some(OTHER_ID.to_string()),
+            ..valid()
+        };
+        assert!(
+            serde_json::to_string(&some)
+                .unwrap()
+                .contains(&format!("\"jump_host\":\"{OTHER_ID}\""))
+        );
+        // An entry from a peer that does not know the field reads as none.
+        let back: Profile = serde_json::from_str(&serde_json::to_string(&none).unwrap()).unwrap();
+        assert_eq!(back.jump_host, None);
+        let back: Profile = serde_json::from_str(&serde_json::to_string(&some).unwrap()).unwrap();
+        assert_eq!(back.jump_host.as_deref(), Some(OTHER_ID));
+    }
+
+    #[test]
+    fn the_jump_host_error_has_a_readable_message() {
+        let text = ProfileError::JumpHost.to_string();
+        assert_eq!(
+            text,
+            "jump host must be another profile's id (a lowercase hyphenated UUID)"
+        );
     }
 
     #[test]

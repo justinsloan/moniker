@@ -3,6 +3,7 @@
 pub mod askpass;
 pub mod bundle;
 pub mod crypto;
+pub mod jump;
 pub mod ping;
 pub mod profile;
 pub mod secrets;

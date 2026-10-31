@@ -100,6 +100,7 @@ pub(crate) fn describe(err: ProfileError) -> String {
         }
         ProfileError::Command => "Startup commands must not contain a NUL character.",
         ProfileError::KeyFile => "The key file path must not contain a NUL character.",
+        ProfileError::JumpHost => "Internal error: the jump host is not valid.",
     }
     .to_owned()
 }
@@ -822,6 +823,7 @@ mod tests {
             ProfileError::SequenceName,
             ProfileError::Command,
             ProfileError::KeyFile,
+            ProfileError::JumpHost,
         ] {
             let text = describe(err);
             assert!(text.ends_with('.'), "{text}");
