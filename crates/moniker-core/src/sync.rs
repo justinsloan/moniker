@@ -10,11 +10,13 @@
 //!
 //! | kind | name   | payload                                          |
 //! |------|--------|--------------------------------------------------|
-//! | 1    | HELLO  | `[protocol version]` (currently 1), from the client optionally followed by a flags byte |
+//! | 1    | HELLO  | `[protocol version]` (1, or 2 while a profile sent has a jump host), from the client optionally followed by a flags byte |
 //! | 2    | BUNDLE | a sealed bundle (see [`crate::crypto`])          |
 //! | 3    | ERROR  | `[code u8]` then a UTF-8 message                 |
 //!
-//! Error codes: 1 wrong sync key, 2 version mismatch, 3 no secret store,
+//! Error codes: 1 wrong sync key, 2 version mismatch (a Moniker older than jump
+//! hosts answers a HELLO of 2 this way, and the sender reports
+//! [`SyncError::PeerTooOld`] for it), 3 no secret store,
 //! 4 the server has been away ([`SyncError::Stale`] there,
 //! [`SyncError::PeerStale`] here), 5 sync is turned off on the server
 //! ([`SyncError::SyncOff`] there, [`SyncError::PeerSyncOff`] here), 255
@@ -30,8 +32,10 @@
 //!
 //! ```text
 //! client                                  server
-//!   HELLO [1]  ───────────────────────▶   sync on? passphrase set? ready()? version 1?
-//!              ◀───────────────────────   HELLO [1]            (or ERROR, stop)
+//!   export (once)
+//!   HELLO [1 or 2]  ──────────────────▶   sync on? passphrase set? ready()?
+//!                                         version 1 or 2? not away? export (once)
+//!              ◀───────────────────────   HELLO [1 or 2]        (or ERROR, stop)
 //!   BUNDLE(seal(export))  ────────────▶   open, validate, merge with export,
 //!                                         seal the merged set, apply
 //!              ◀───────────────────────   BUNDLE(seal(merged)) (or ERROR, stop)
@@ -117,6 +121,42 @@
 //! cleared on everything received. The HELLO and the bundle format are
 //! unchanged.
 //!
+//! # Jump hosts (issue #9)
+//!
+//! A profile can go through another profile, its jump host
+//! ([`Profile::jump_host`]). A Moniker older than that knows nothing of the
+//! field, drops it when it writes the profile, and would connect the profile
+//! straight to its host, so it must not take part in a sync that carries one.
+//! The HELLO's version says so: a machine announces [`PROTOCOL_JUMP_HOSTS`]
+//! (2) exactly when a live profile it sends has a jump host
+//! ([`holds_jump_host`]), and [`PROTOCOL_VERSION`] (1) otherwise, so two
+//! machines with no jump host say byte for byte what machines said before.
+//! A profile kept on this machine goes as its tombstone, which has none, so it
+//! does not count.
+//!
+//! * A client says 2 or 1 as above. A server accepts 1 or 2 and answers 2 if
+//!   the client said it or if its own export needs it, else 1. A client that
+//!   said 2 accepts only a 2 back; one that said 1 accepts either, since this
+//!   build can read what a server with jump hosts sends it.
+//! * An older server turns a 2 away with error 2 before reading any bundle, and
+//!   the client reports [`SyncError::PeerTooOld`] (it sent nothing but the
+//!   HELLO). An older client turns a server's 2 away the same way, with its
+//!   "incompatible versions" text, and the server (which answered 2) reports
+//!   [`SyncError::PeerTooOld`] and applies nothing. Either way both machines are
+//!   left as they were, and syncing works again as soon as no live profile has
+//!   a jump host, or the older machine is updated.
+//! * The export a side's HELLO is decided from is the one it sends or merges:
+//!   each side reads it once per sync ([`SyncTarget::export`]; the file is read
+//!   afresh at each call, so a second read could differ). A client reads it
+//!   after its own checks and before the HELLO; a server after the checks that
+//!   come before the answer (sync on, key, secret store, version, away), which
+//!   keep their order from issues #8 and #10.
+//! * A profile that arrives with a jump host this machine does not have (it is
+//!   kept on the other machine only, or was deleted) is accepted like any
+//!   other: it waits, and the GUI says so. A jump host that is not a canonical
+//!   id, or is the profile's own id, makes the entry invalid
+//!   ([`Profile::validate`]) and rejects the whole sync.
+//!
 //! # Passwords: set and changed travel, removal does not
 //!
 //! A password reaches the other machine by being set or changed. Clearing one
@@ -137,6 +177,7 @@ use zeroize::Zeroizing;
 
 use crate::bundle::{BundleEntry, merge};
 use crate::crypto::{self, CryptoError};
+use crate::jump::holds_jump_host;
 use crate::profile::{Profile, now_ms};
 use crate::secrets::{SecretError, SecretStore, password_key};
 use crate::ssh::SshCommand;
@@ -147,6 +188,11 @@ use crate::sync_state;
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// The protocol version carried in HELLO.
 pub const PROTOCOL_VERSION: u8 = 1;
+/// The protocol version a machine announces while a live profile it sends has
+/// a jump host (issue #9). An older Moniker knows nothing of jump hosts and
+/// would connect such a profile straight to its host, so it refuses this
+/// version (error 2) and the sync stops before any profile data is sent.
+pub const PROTOCOL_JUMP_HOSTS: u8 = 2;
 /// Frame kind: HELLO `[version]`.
 pub const KIND_HELLO: u8 = 1;
 /// Frame kind: BUNDLE (sealed bytes).
@@ -250,6 +296,12 @@ pub enum SyncError {
     /// HELLO.
     #[error("sync is turned off on the other machine")]
     PeerSyncOff,
+    /// The other machine runs a Moniker older than jump hosts (issue #9) while
+    /// a profile has one; nothing was sent but the HELLO.
+    #[error(
+        "the other machine runs an older Moniker, which does not know jump hosts; update it to sync while a profile has a jump host"
+    )]
+    PeerTooOld,
     /// The peer broke the frame protocol (bad length, unexpected frame).
     #[error("sync protocol error: {0}")]
     Protocol(String),
@@ -830,13 +882,24 @@ fn stale_from_hello(hello: &[u8]) -> StaleSync {
     }
 }
 
-/// The client's HELLO: the protocol version, then the flags byte only when
-/// there is a flag to send, so a client that accepts nothing sends exactly
-/// what clients before issue #8 sent.
-fn client_hello(stale: StaleSync) -> Vec<u8> {
+/// The client's HELLO: the protocol version `said`, then the flags byte only
+/// when there is a flag to send, so a client that accepts nothing and has no
+/// jump host sends exactly what clients before issues #8 and #9 sent.
+fn client_hello(said: u8, stale: StaleSync) -> Vec<u8> {
     match stale {
-        StaleSync::Refuse => vec![PROTOCOL_VERSION],
-        StaleSync::Allow => vec![PROTOCOL_VERSION, HELLO_ALLOW_STALE],
+        StaleSync::Refuse => vec![said],
+        StaleSync::Allow => vec![said, HELLO_ALLOW_STALE],
+    }
+}
+
+/// The version `entries` need (issue #9): [`PROTOCOL_JUMP_HOSTS`] while a live
+/// profile among them has a jump host, else [`PROTOCOL_VERSION`]. Decided from
+/// the very entries that are then sent, never from a second read.
+fn version_for(entries: &[BundleEntry]) -> u8 {
+    if holds_jump_host(entries.iter().map(|e| &e.profile)) {
+        PROTOCOL_JUMP_HOSTS
+    } else {
+        PROTOCOL_VERSION
     }
 }
 
@@ -848,11 +911,35 @@ fn check_passphrase(passphrase: &str) -> Result<(), SyncError> {
     }
 }
 
-fn check_version(hello: &[u8]) -> Result<(), SyncError> {
+/// The version in a peer's HELLO, if this build speaks it (1 or 2).
+fn peer_version(hello: &[u8]) -> Result<u8, SyncError> {
     match hello.first() {
-        Some(&PROTOCOL_VERSION) => Ok(()),
+        Some(&version @ (PROTOCOL_VERSION | PROTOCOL_JUMP_HOSTS)) => Ok(version),
         Some(_) => Err(SyncError::VersionMismatch),
         None => Err(SyncError::Protocol("empty HELLO".to_string())),
+    }
+}
+
+/// Whether the server's HELLO answers a client that said `said`: a client with
+/// no jump host takes either version, and a client that said 2 takes only 2,
+/// because a server that answers 1 to it has not understood it, and a profile
+/// with a jump host must not be sent to one that does not know jump hosts.
+fn check_reply(hello: &[u8], said: u8) -> Result<(), SyncError> {
+    if peer_version(hello)? >= said {
+        Ok(())
+    } else {
+        Err(SyncError::VersionMismatch)
+    }
+}
+
+/// What an ERROR frame the peer sent in answer to our HELLO of version `said`
+/// means. Error 2 in answer to version 2 is a Moniker that predates jump hosts
+/// ([`SyncError::PeerTooOld`], which says what to do), not some other
+/// incompatibility.
+fn refused_version(err: SyncError, said: u8) -> SyncError {
+    match err {
+        SyncError::VersionMismatch if said == PROTOCOL_JUMP_HOSTS => SyncError::PeerTooOld,
+        other => other,
     }
 }
 
@@ -899,23 +986,38 @@ pub fn serve(
     passphrase: &str,
 ) -> Result<SyncOutcome, SyncError> {
     let hello = read_expected(&mut r, KIND_HELLO)?;
-    tell(
-        &mut w,
-        local
-            .sync_on()
-            .and_then(|()| check_passphrase(passphrase))
-            .and_then(|()| local.ready())
-            .and_then(|()| check_version(&hello))
-            .and_then(|()| check_not_away(&*local, stale_from_hello(&hello))),
-    )?;
-    write_frame(&mut w, KIND_HELLO, &[PROTOCOL_VERSION])?;
+    let (said, entries) = tell(&mut w, accept_hello(&*local, passphrase, &hello))?;
+    // Version 2 if the client said it or if what this server sends needs it
+    // (issue #9). A client of an older Moniker turns 2 away, and nothing more
+    // is sent or applied.
+    let answer = said.max(version_for(&entries));
+    write_frame(&mut w, KIND_HELLO, &[answer])?;
 
-    let sealed = read_expected(&mut r, KIND_BUNDLE)?;
-    let (merged, reply) = tell(&mut w, server_merge(&*local, passphrase, &sealed))?;
+    let sealed = read_expected(&mut r, KIND_BUNDLE).map_err(|e| refused_version(e, answer))?;
+    let (merged, reply) = tell(&mut w, server_merge(entries, passphrase, &sealed))?;
     let outcome = tell(&mut w, local.apply(merged))?;
     write_frame(&mut w, KIND_BUNDLE, &reply)?;
     local.record_sync();
     Ok(outcome)
+}
+
+/// What a server checks before it answers a HELLO, in this order (the first
+/// failure is the answer): sync is on (issue #10), a sync key is set, the secret
+/// store works, the version is one this build speaks, this machine has not been
+/// away (issue #8). Only then is its export read, once: the HELLO's version and
+/// the merge are both made from that one read (issue #9). Returns the client's
+/// version and the export.
+fn accept_hello(
+    local: &dyn SyncTarget,
+    passphrase: &str,
+    hello: &[u8],
+) -> Result<(u8, Vec<BundleEntry>), SyncError> {
+    local.sync_on()?;
+    check_passphrase(passphrase)?;
+    local.ready()?;
+    let said = peer_version(hello)?;
+    check_not_away(local, stale_from_hello(hello))?;
+    Ok((said, local.export()?))
 }
 
 /// Answer the client's HELLO with `err` and do nothing else, for a server that
@@ -929,16 +1031,17 @@ pub fn refuse(mut r: impl Read, mut w: impl Write, err: SyncError) -> Result<(),
     tell(&mut w, Err(err))
 }
 
-/// Open and check the client's bundle, merge it with the local export, and
-/// seal the result. Nothing is changed yet.
+/// Open and check the client's bundle, merge it with the local export
+/// (`exported`, read once in [`accept_hello`]), and seal the result. Nothing is
+/// changed yet.
 fn server_merge(
-    local: &dyn SyncTarget,
+    exported: Vec<BundleEntry>,
     passphrase: &str,
     sealed: &[u8],
 ) -> Result<(Vec<BundleEntry>, Vec<u8>), SyncError> {
     let incoming = open_bundle(passphrase, sealed)?;
     validate_entries(&incoming)?;
-    let merged = merge(local.export()?, incoming);
+    let merged = merge(exported, incoming);
     let reply = seal_bundle(passphrase, &merged)?;
     Ok((merged, reply))
 }
@@ -956,13 +1059,16 @@ pub fn run_client(
     check_passphrase(passphrase)?;
     local.ready()?;
     check_not_away(&*local, stale)?;
-    write_frame(&mut w, KIND_HELLO, &client_hello(stale))?;
-    let hello = read_expected(&mut r, KIND_HELLO)?;
+    // Read once, before the HELLO: the version it says is decided from the
+    // entries that are sealed below, whatever is edited meanwhile (issue #9).
+    // Nothing of them is sent before the server has answered.
+    let entries = local.export()?;
+    let said = version_for(&entries);
+    write_frame(&mut w, KIND_HELLO, &client_hello(said, stale))?;
+    let hello = read_expected(&mut r, KIND_HELLO).map_err(|e| refused_version(e, said))?;
     let sealed = tell(
         &mut w,
-        check_version(&hello)
-            .and_then(|()| local.export())
-            .and_then(|entries| seal_bundle(passphrase, &entries)),
+        check_reply(&hello, said).and_then(|()| seal_bundle(passphrase, &entries)),
     )?;
     write_frame(&mut w, KIND_BUNDLE, &sealed)?;
 
@@ -3437,7 +3543,10 @@ mod tests {
         let mut b = Machine::new(&clock, &[]);
         b.sync_off();
         let b_file = file_of(&b.path);
-        for hello in [vec![PROTOCOL_VERSION], client_hello(StaleSync::Allow)] {
+        for hello in [
+            vec![PROTOCOL_VERSION],
+            client_hello(PROTOCOL_VERSION, StaleSync::Allow),
+        ] {
             let (cs, ss) = pair();
             let served = spawn_server(ss, b.state.take().unwrap(), PASS);
             write_frame(&mut &cs, KIND_HELLO, &hello).unwrap();
@@ -4068,6 +4177,602 @@ mod tests {
             assert_eq!(b.secrets.password(&x.id), None, "day {day}");
             assert_kept(&a, &kept, "pw");
             assert_eq!(file_of(&a.path), a_file, "day {day}");
+        }
+    }
+
+    // ----- jump hosts (issue #9) -----
+
+    /// `p`, going through `jump`.
+    fn via(mut p: Profile, jump: &Profile) -> Profile {
+        p.jump_host = Some(jump.id.clone());
+        p
+    }
+
+    /// The frames of one sync in order, each with whether the client sent it.
+    type Seen = Vec<(bool, u8, Vec<u8>)>;
+
+    /// Sync `client` with `server` through a relay that copies every frame
+    /// across and keeps a copy: the two results, and what was said.
+    fn sync_seen(
+        client: &mut Machine,
+        server: &mut Machine,
+        stale: StaleSync,
+    ) -> (
+        Result<SyncOutcome, SyncError>,
+        Result<SyncOutcome, SyncError>,
+        Seen,
+    ) {
+        let (cs, c_side) = pair();
+        let (s_side, ss) = pair();
+        for side in [&c_side, &s_side] {
+            side.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+        }
+        let served = spawn_server(ss, server.state.take().unwrap(), PASS);
+        let relay = thread::spawn(move || {
+            let mut seen = Seen::new();
+            // The exchange alternates: client, server, client, server.
+            for from_client in [true, false, true, false] {
+                let (from, to) = if from_client {
+                    (&c_side, &s_side)
+                } else {
+                    (&s_side, &c_side)
+                };
+                let Ok((kind, payload)) = read_frame(&mut &*from) else {
+                    break;
+                };
+                seen.push((from_client, kind, payload.clone()));
+                if write_frame(&mut &*to, kind, &payload).is_err() || kind == KIND_ERROR {
+                    break;
+                }
+            }
+            seen
+        });
+        let out = run_client(&cs, &cs, client.state.as_mut().unwrap(), PASS, stale);
+        drop(cs);
+        let (served, back) = served.join().unwrap();
+        server.state = Some(back);
+        (out, served, relay.join().unwrap())
+    }
+
+    /// The payload of the HELLO the client (`true`) or the server (`false`)
+    /// sent.
+    fn hello_from(seen: &Seen, client: bool) -> Vec<u8> {
+        seen.iter()
+            .find(|(from_client, kind, _)| *from_client == client && *kind == KIND_HELLO)
+            .map(|(_, _, payload)| payload.clone())
+            .expect("a HELLO was sent")
+    }
+
+    /// What a Moniker that predates jump hosts answers to a HELLO of version 2
+    /// (or sends back when it is answered with one): error 2, with its text.
+    const OLD_VERSION_ERROR: &[u8] =
+        b"\x02the two machines run incompatible Moniker sync versions; update both";
+
+    /// A bastion, a profile `db` that goes through it, and both with a
+    /// password.
+    fn bastion_and_db() -> (Profile, Profile, Vec<(Profile, Option<&'static str>)>) {
+        let bastion = prof("bastion");
+        let db = via(prof("db"), &bastion);
+        let both = vec![
+            (bastion.clone(), Some("pw-bastion")),
+            (db.clone(), Some("pw-db")),
+        ];
+        (bastion, db, both)
+    }
+
+    #[test]
+    fn two_new_machines_without_jump_hosts_say_version_1() {
+        // Byte for byte what machines said before jump hosts, the stale flag
+        // included: the literals are the point.
+        for (stale, client_hello) in [
+            (StaleSync::Refuse, vec![1u8]),
+            (StaleSync::Allow, vec![1u8, 1u8]),
+        ] {
+            let clock = Clock::starting_now();
+            let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+            let mut b = Machine::new(&clock, &[(prof("two"), Some("pw-two"))]);
+            let (out, served, seen) = sync_seen(&mut a, &mut b, stale);
+            out.unwrap();
+            served.unwrap();
+            assert_eq!(hello_from(&seen, true), client_hello);
+            assert_eq!(hello_from(&seen, false), vec![1u8]);
+        }
+    }
+
+    #[test]
+    fn a_jump_host_on_the_client_says_version_2() {
+        for (stale, client_hello) in [
+            (StaleSync::Refuse, vec![2u8]),
+            (StaleSync::Allow, vec![2u8, 1u8]),
+        ] {
+            let clock = Clock::starting_now();
+            let (bastion, db, both) = bastion_and_db();
+            let mut a = Machine::new(&clock, &both);
+            let mut b = Machine::new(&clock, &[(prof("other"), Some("pw-other"))]);
+
+            let (out, served, seen) = sync_seen(&mut a, &mut b, stale);
+
+            assert_eq!(out.unwrap().added, 1);
+            assert_eq!(served.unwrap().added, 2);
+            assert_eq!(hello_from(&seen, true), client_hello);
+            assert_eq!(hello_from(&seen, false), vec![2u8]);
+            let arrived = b.profile(&db.id).unwrap();
+            assert_eq!(arrived.jump_host.as_deref(), Some(bastion.id.as_str()));
+            assert_eq!(b.secrets.password(&db.id).as_deref(), Some("pw-db"));
+            assert!(b.profile(&bastion.id).is_some());
+        }
+    }
+
+    #[test]
+    fn a_jump_host_on_the_server_answers_version_2() {
+        let clock = Clock::starting_now();
+        let (bastion, db, both) = bastion_and_db();
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+        let mut b = Machine::new(&clock, &both);
+
+        let (out, served, seen) = sync_seen(&mut a, &mut b, StaleSync::Refuse);
+
+        // This client has none, so it says 1, and accepts the 2 it is answered.
+        assert_eq!(out.unwrap().added, 2);
+        assert_eq!(served.unwrap().added, 1);
+        assert_eq!(hello_from(&seen, true), vec![1u8]);
+        assert_eq!(hello_from(&seen, false), vec![2u8]);
+        let arrived = a.profile(&db.id).unwrap();
+        assert_eq!(arrived.jump_host.as_deref(), Some(bastion.id.as_str()));
+        assert_eq!(a.secrets.password(&db.id).as_deref(), Some("pw-db"));
+    }
+
+    #[test]
+    fn an_old_server_keeps_a_jump_host_out() {
+        let clock = Clock::starting_now();
+        let (_, _, both) = bastion_and_db();
+        let mut a = Machine::new(&clock, &both);
+        let a_file = file_of(&a.path);
+
+        let (cs, ss) = pair();
+        let old_server = thread::spawn(move || {
+            let hello = read_frame(&mut &ss).unwrap();
+            write_frame(&mut &ss, KIND_ERROR, OLD_VERSION_ERROR).unwrap();
+            let mut rest = Vec::new();
+            (&ss).read_to_end(&mut rest).unwrap();
+            (hello, rest)
+        });
+        let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+        drop(cs);
+        let (hello, rest) = old_server.join().unwrap();
+
+        let err = out.unwrap_err();
+        assert!(matches!(err, SyncError::PeerTooOld), "got {err:?}");
+        assert_eq!(
+            err.to_string(),
+            "the other machine runs an older Moniker, which does not know jump hosts; \
+             update it to sync while a profile has a jump host"
+        );
+        assert_eq!(hello, (KIND_HELLO, vec![2u8]));
+        assert!(rest.is_empty(), "nothing at all after the HELLO: {rest:?}");
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(a.secrets.writes(), 0);
+        assert_eq!(a.last_sync(), None);
+    }
+
+    #[test]
+    fn an_old_client_is_answered_version_2_and_sends_nothing() {
+        let clock = Clock::starting_now();
+        let (_, _, both) = bastion_and_db();
+        let mut b = Machine::new(&clock, &both);
+        let b_file = file_of(&b.path);
+
+        let (cs, ss) = pair();
+        cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let server = spawn_server(ss, b.state.take().unwrap(), PASS);
+        // What a client that predates jump hosts does: a HELLO of 1, and on a
+        // HELLO of 2 an error 2 (its check_version) and nothing else.
+        write_frame(&mut &cs, KIND_HELLO, &[1]).unwrap();
+        assert_eq!(read_frame(&mut &cs).unwrap(), (KIND_HELLO, vec![2u8]));
+        write_frame(&mut &cs, KIND_ERROR, OLD_VERSION_ERROR).unwrap();
+        let mut rest = Vec::new();
+        (&cs).read_to_end(&mut rest).unwrap();
+        let (served, back) = server.join().unwrap();
+        b.state = Some(back);
+
+        // The server knows why the other side turned away.
+        assert!(
+            matches!(served, Err(SyncError::PeerTooOld)),
+            "got {served:?}"
+        );
+        assert!(rest.is_empty(), "nothing after the HELLO: {rest:?}");
+        assert_eq!(file_of(&b.path), b_file);
+        assert_eq!(b.secrets.writes(), 0);
+        assert_eq!(b.last_sync(), None);
+    }
+
+    #[test]
+    fn an_old_server_still_syncs_without_jump_hosts() {
+        let clock = Clock::starting_now();
+        let two = prof("two");
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+
+        let (cs, ss) = pair();
+        let reply = crate::crypto::seal(PASS, &[entry(&two, Some("pw-two"))]).unwrap();
+        let old_server = thread::spawn(move || {
+            let hello = read_frame(&mut &ss).unwrap();
+            write_frame(&mut &ss, KIND_HELLO, &[1]).unwrap();
+            let (kind, _) = read_frame(&mut &ss).unwrap();
+            assert_eq!(kind, KIND_BUNDLE);
+            write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
+            hello
+        });
+        let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+        drop(cs);
+
+        assert_eq!(out.unwrap().added, 1);
+        assert_eq!(old_server.join().unwrap(), (KIND_HELLO, vec![1u8]));
+        assert!(a.profile(&two.id).is_some());
+        assert_eq!(a.secrets.password(&two.id).as_deref(), Some("pw-two"));
+    }
+
+    #[test]
+    fn a_client_that_said_2_accepts_only_a_reply_of_2() {
+        let clock = Clock::starting_now();
+        let (_, _, both) = bastion_and_db();
+        let mut a = Machine::new(&clock, &both);
+        let a_file = file_of(&a.path);
+
+        // A server that answers a HELLO of 2 with 1 has not understood it;
+        // no profile may go to it.
+        let (cs, ss) = pair();
+        cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let server = thread::spawn(move || {
+            read_frame(&mut &ss).unwrap();
+            write_frame(&mut &ss, KIND_HELLO, &[1]).unwrap();
+            let mut rest = Vec::new();
+            (&ss).read_to_end(&mut rest).unwrap();
+            rest
+        });
+        let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+        drop(cs);
+
+        let err = out.unwrap_err();
+        assert!(matches!(err, SyncError::VersionMismatch), "got {err:?}");
+        let rest = frames(&server.join().unwrap());
+        assert_eq!(rest.len(), 1, "only the error: {rest:?}");
+        assert_eq!((rest[0].0, rest[0].1[0]), (KIND_ERROR, 2));
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(a.secrets.writes(), 0);
+    }
+
+    #[test]
+    fn a_kept_profile_s_jump_host_does_not_count() {
+        let clock = Clock::starting_now();
+        let (_, db, both) = bastion_and_db();
+        let mut a = Machine::new(&clock, &both);
+        // Control: as it is, the jump host is sent.
+        assert!(holds_jump_host(a.export().iter().map(|e| &e.profile)));
+
+        // Kept on this machine, `db` leaves as its bare tombstone, and with it
+        // goes the only jump host.
+        a.keep_here(&db.id, true);
+        let sent = a.export();
+        assert!(sent.iter().all(|e| e.profile.jump_host.is_none()));
+        assert!(!holds_jump_host(sent.iter().map(|e| &e.profile)));
+        let mut b = Machine::new(&clock, &[(prof("two"), Some("pw-two"))]);
+
+        let (out, served, seen) = sync_seen(&mut a, &mut b, StaleSync::Refuse);
+
+        out.unwrap();
+        served.unwrap();
+        assert_eq!(hello_from(&seen, true), vec![1u8]);
+        assert_eq!(hello_from(&seen, false), vec![1u8]);
+        assert!(a.profile(&db.id).unwrap().local_only);
+        assert_eq!(b.profile(&db.id).and_then(|p| p.jump_host), None);
+    }
+
+    #[test]
+    fn a_jump_host_to_a_missing_profile_is_accepted() {
+        let clock = Clock::starting_now();
+
+        // The jump host is kept on the sending machine only, so the other
+        // never gets it: db arrives and waits, and nothing is refused.
+        let (bastion, db, both) = bastion_and_db();
+        let mut a = Machine::new(&clock, &both);
+        a.keep_here(&bastion.id, true);
+        let mut b = Machine::new(&clock, &[]);
+        let (out, served, seen) = sync_seen(&mut a, &mut b, StaleSync::Refuse);
+        out.unwrap();
+        served.unwrap();
+        assert_eq!(hello_from(&seen, true), vec![2u8]);
+        let arrived = b.profile(&db.id).unwrap();
+        assert!(!arrived.deleted);
+        assert_eq!(arrived.jump_host.as_deref(), Some(bastion.id.as_str()));
+        assert!(b.profile(&bastion.id).is_none_or(|p| p.deleted));
+        assert_eq!(b.secrets.password(&db.id).as_deref(), Some("pw-db"));
+
+        // And one whose jump host nobody ever had.
+        let ghost = prof("ghost");
+        let lonely = via(prof("lonely"), &ghost);
+        let mut a = Machine::new(&clock, &[(lonely.clone(), Some("pw-lonely"))]);
+        let mut b = Machine::new(&clock, &[]);
+        let (out, served, _) = sync_seen(&mut a, &mut b, StaleSync::Refuse);
+        out.unwrap();
+        served.unwrap();
+        let arrived = b.profile(&lonely.id).unwrap();
+        assert_eq!(arrived.jump_host.as_deref(), Some(ghost.id.as_str()));
+        assert!(b.profile(&ghost.id).is_none());
+
+        // The same, arriving at a client from a server.
+        let mut a = Machine::new(&clock, &[]);
+        let mut b = Machine::new(&clock, &[(lonely.clone(), Some("pw-lonely"))]);
+        let (out, served, _) = sync_seen(&mut a, &mut b, StaleSync::Refuse);
+        out.unwrap();
+        served.unwrap();
+        assert_eq!(
+            a.profile(&lonely.id).unwrap().jump_host.as_deref(),
+            Some(ghost.id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_self_reference_rejects_the_sync() {
+        let mut looped = prof("looped");
+        looped.jump_host = Some(looped.id.clone());
+        let good = prof("good");
+        let clock = Clock::starting_now();
+
+        // A hostile client: the server rejects everything it sent.
+        let mut b = Machine::new(&clock, &[(prof("two"), Some("pw-two"))]);
+        let b_file = file_of(&b.path);
+        let (cs, ss) = pair();
+        cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let server = spawn_server(ss, b.state.take().unwrap(), PASS);
+        write_frame(&mut &cs, KIND_HELLO, &[2]).unwrap();
+        assert_eq!(read_frame(&mut &cs).unwrap(), (KIND_HELLO, vec![2u8]));
+        let sealed =
+            crate::crypto::seal(PASS, &[entry(&good, Some("g")), entry(&looped, Some("l"))])
+                .unwrap();
+        write_frame(&mut &cs, KIND_BUNDLE, &sealed).unwrap();
+        let (kind, _) = read_frame(&mut &cs).unwrap();
+        drop(cs);
+        let (served, back) = server.join().unwrap();
+        b.state = Some(back);
+        assert_eq!(kind, KIND_ERROR);
+        assert!(matches!(served, Err(SyncError::Store(_))), "{served:?}");
+        assert_eq!(file_of(&b.path), b_file);
+        assert_eq!(b.secrets.writes(), 0);
+
+        // A hostile server: the client rejects its reply.
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+        let a_file = file_of(&a.path);
+        let reply = crate::crypto::seal(PASS, &[entry(&looped, Some("l"))]).unwrap();
+        let (cs, ss) = pair();
+        let server = thread::spawn(move || {
+            read_frame(&mut &ss).unwrap();
+            write_frame(&mut &ss, KIND_HELLO, &[2]).unwrap();
+            read_frame(&mut &ss).unwrap();
+            write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
+        });
+        let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+        drop(cs);
+        server.join().unwrap();
+        let err = out.unwrap_err();
+        assert!(matches!(err, SyncError::Store(_)), "client got {err:?}");
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(a.secrets.writes(), 0);
+
+        // And apply itself refuses it.
+        let err = a
+            .state
+            .as_mut()
+            .unwrap()
+            .apply(vec![entry(&looped, None)])
+            .unwrap_err();
+        assert!(matches!(err, SyncError::Store(_)), "{err:?}");
+        assert_eq!(file_of(&a.path), a_file);
+    }
+
+    /// A target that counts how often it is asked to export.
+    struct CountedExports {
+        inner: LocalState,
+        exports: Cell<usize>,
+    }
+
+    impl CountedExports {
+        fn new(inner: LocalState) -> Self {
+            CountedExports {
+                inner,
+                exports: Cell::new(0),
+            }
+        }
+    }
+
+    impl SyncTarget for CountedExports {
+        fn sync_on(&self) -> Result<(), SyncError> {
+            self.inner.sync_on()
+        }
+        fn ready(&self) -> Result<(), SyncError> {
+            self.inner.ready()
+        }
+        fn export(&self) -> Result<Vec<BundleEntry>, SyncError> {
+            self.exports.set(self.exports.get() + 1);
+            self.inner.export()
+        }
+        fn apply(&mut self, merged: Vec<BundleEntry>) -> Result<SyncOutcome, SyncError> {
+            self.inner.apply(merged)
+        }
+        fn last_sync(&self) -> Option<i64> {
+            self.inner.last_sync()
+        }
+        fn record_sync(&mut self) {
+            self.inner.record_sync();
+        }
+        fn now(&self) -> i64 {
+            self.inner.now()
+        }
+    }
+
+    #[test]
+    fn the_export_is_read_once_per_sync() {
+        for with_jump_host in [false, true] {
+            let clock = Clock::starting_now();
+            let (_, _, both) = bastion_and_db();
+            let kept = if with_jump_host { 2 } else { 1 };
+            let mut a = Machine::new(&clock, &both[..kept]);
+            let mut b = Machine::new(&clock, &[(prof("two"), Some("pw-two"))]);
+            let mut client = CountedExports::new(a.state.take().unwrap());
+            let (cs, ss) = pair();
+            let server = spawn_server(ss, CountedExports::new(b.state.take().unwrap()), PASS);
+
+            run_client(&cs, &cs, &mut client, PASS, StaleSync::Refuse).unwrap();
+            drop(cs);
+            let (served, server) = server.join().unwrap();
+            served.unwrap();
+
+            assert_eq!(
+                client.exports.get(),
+                1,
+                "client, jump host: {with_jump_host}"
+            );
+            assert_eq!(
+                server.exports.get(),
+                1,
+                "server, jump host: {with_jump_host}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_exported_before_the_checks_pass() {
+        let clock = Clock::starting_now();
+        let start = clock.now();
+        let one = || (prof("one"), Some("pw-one"));
+
+        // A client with sync off: no export, and nothing sent.
+        let a = Machine::new(&clock, &[one()]);
+        a.sync_off();
+        let mut client = CountedExports::new(a.state.unwrap());
+        let (cs, _ss) = pair();
+        let out = run_client(&cs, &cs, &mut client, PASS, StaleSync::Refuse);
+        assert!(matches!(out, Err(SyncError::SyncOff)), "{out:?}");
+        assert_eq!(client.exports.get(), 0);
+
+        // A server with sync off, a version it does not know, or away: the
+        // HELLO is refused before it reads anything.
+        for case in ["sync off", "version 9", "away"] {
+            let b = Machine::new(&clock, &[one()]);
+            match case {
+                "sync off" => b.sync_off(),
+                "away" => crate::sync_state::record_sync(&b.path, start - 200 * DAY_MS).unwrap(),
+                _ => {}
+            }
+            let (cs, ss) = pair();
+            cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let server = spawn_server(ss, CountedExports::new(b.state.unwrap()), PASS);
+            let hello: &[u8] = if case == "version 9" { &[9] } else { &[1] };
+            write_frame(&mut &cs, KIND_HELLO, hello).unwrap();
+            assert_eq!(read_frame(&mut &cs).unwrap().0, KIND_ERROR, "{case}");
+            drop(cs);
+            let (served, server) = server.join().unwrap();
+            assert!(served.is_err(), "{case}");
+            assert_eq!(server.exports.get(), 0, "{case}");
+        }
+    }
+
+    /// A target whose profiles change between the first time it is asked and
+    /// every time after: an edit made while a sync runs.
+    struct Changing {
+        reads: Cell<usize>,
+        first: Vec<BundleEntry>,
+        later: Vec<BundleEntry>,
+        applied: Option<Vec<BundleEntry>>,
+    }
+
+    impl SyncTarget for Changing {
+        fn ready(&self) -> Result<(), SyncError> {
+            Ok(())
+        }
+        fn export(&self) -> Result<Vec<BundleEntry>, SyncError> {
+            let n = self.reads.get();
+            self.reads.set(n + 1);
+            Ok(if n == 0 {
+                self.first.clone()
+            } else {
+                self.later.clone()
+            })
+        }
+        fn apply(&mut self, merged: Vec<BundleEntry>) -> Result<SyncOutcome, SyncError> {
+            self.applied = Some(merged);
+            Ok(SyncOutcome::default())
+        }
+    }
+
+    /// `entries` in the order of their ids (`merge` sorts that way).
+    fn by_id(mut entries: Vec<BundleEntry>) -> Vec<BundleEntry> {
+        entries.sort_by(|a, b| a.profile.id.cmp(&b.profile.id));
+        entries
+    }
+
+    #[test]
+    fn the_hello_and_the_bundle_come_from_the_same_read() {
+        let (_, _, both) = bastion_and_db();
+        let plain = vec![entry(&prof("plain"), Some("pw"))];
+        let jumped: Vec<BundleEntry> = both.iter().map(|(p, pw)| entry(p, *pw)).collect();
+        for (first, later) in [(&plain, &jumped), (&jumped, &plain)] {
+            let said = if holds_jump_host(first.iter().map(|e| &e.profile)) {
+                2u8
+            } else {
+                1u8
+            };
+            let target = || Changing {
+                reads: Cell::new(0),
+                first: first.clone(),
+                later: later.clone(),
+                applied: None,
+            };
+            let nothing = crate::crypto::seal(PASS, &[]).unwrap();
+
+            // As a client: the bundle is what the HELLO's version was decided
+            // from, and the target was read once.
+            let mut client = target();
+            let (cs, ss) = pair();
+            let reply = nothing.clone();
+            let raw_server = thread::spawn(move || {
+                let hello = read_frame(&mut &ss).unwrap();
+                write_frame(&mut &ss, KIND_HELLO, &[2]).unwrap();
+                let (kind, sealed) = read_frame(&mut &ss).unwrap();
+                assert_eq!(kind, KIND_BUNDLE);
+                write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
+                (hello, open_bundle(PASS, &sealed).unwrap())
+            });
+            run_client(&cs, &cs, &mut client, PASS, StaleSync::Refuse).unwrap();
+            drop(cs);
+            let (hello, sent) = raw_server.join().unwrap();
+            assert_eq!(hello, (KIND_HELLO, vec![said]));
+            assert!(
+                by_id(sent) == by_id(first.clone()),
+                "client: not what was read"
+            );
+            assert_eq!(client.reads.get(), 1);
+
+            // As a server: the same.
+            let (cs, ss) = pair();
+            cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let server = spawn_server(ss, target(), PASS);
+            write_frame(&mut &cs, KIND_HELLO, &[1]).unwrap();
+            let answer = read_frame(&mut &cs).unwrap();
+            write_frame(&mut &cs, KIND_BUNDLE, &nothing).unwrap();
+            let (kind, sealed) = read_frame(&mut &cs).unwrap();
+            drop(cs);
+            let (served, server) = server.join().unwrap();
+            served.unwrap();
+            assert_eq!(answer, (KIND_HELLO, vec![said]));
+            assert_eq!(kind, KIND_BUNDLE);
+            let replied = by_id(open_bundle(PASS, &sealed).unwrap());
+            assert!(replied == by_id(first.clone()), "server: not what was read");
+            assert!(
+                by_id(server.applied.clone().unwrap()) == replied,
+                "server: applied what it replied"
+            );
+            assert_eq!(server.reads.get(), 1);
         }
     }
 }
