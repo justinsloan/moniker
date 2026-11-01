@@ -18,7 +18,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -32,23 +32,25 @@ use moniker_core::store::ProfileStore;
 use vte4::Terminal;
 use vte4::prelude::*;
 
-use super::main_window::test_app;
+use super::hosts::{mark_in, showing, shown as mark_shown};
+use super::main_window::{ctx_with, test_app};
 use super::profiles::{Setup, items_of, saved, shown_item};
-use super::windows::main_window;
+use super::windows::{list_in, main_window, row};
 use super::{
-    HeldKeyring, HeldProfileFile, all_widgets, button_labeled, files_in, make_helper, pane,
-    pump_for, pump_until, shown, wait_for_session, wait_for_text,
+    HeldKeyring, HeldProfileFile, all_widgets, button_labeled, files_in, find_widget, make_helper,
+    pane, pump_for, pump_until, shown, wait_for_session, wait_for_text,
 };
 use crate::context::AppContext;
+use crate::hosts::{Check, Reach};
 use crate::jump_link::JumpLink;
 use crate::panes::{self, REC_PREFIX};
-use crate::profiles::jump_row::ROW_TITLE;
+use crate::profiles::jump_row::{ROW_TITLE, answers_taken};
 use crate::session_file::{Kind, Node, PaneRecord, TabRecord};
 use crate::terminal_tab::{
     ASKPASS_MISSING_NOTICE, PaneHolder, close_pane, open_profile, set_test_ssh_program,
     start_profile, terminal_in, terminal_text,
 };
-use crate::{form, keyring, session_layout, settings};
+use crate::{form, keyring, new_tab, preferences, profiles, session_layout, settings, window};
 
 /// The fake `ssh` of one scenario and the folder where it writes down what it
 /// did:
@@ -1755,6 +1757,9 @@ pub(super) fn the_row_shows_one_note_most_urgent_first(dir: &Path) {
     let routes = Arc::clone(&s.ctx.config_routes);
     // ~/.ssh/config sends web's host through another host too.
     set_host(&routes.through, &web.host, true);
+    // The check counts its answers on its worker thread; the row counts those
+    // it has dealt with on the main thread, which is what is waited for.
+    let taken = answers_taken();
     s.select(&web.id);
     let row = jump_row(&s.window);
 
@@ -1762,8 +1767,9 @@ pub(super) fn the_row_shows_one_note_most_urgent_first(dir: &Path) {
     assert_eq!(items_of(&row), ["None", "k", form::JUMP_NO_LONGER_SAVED]);
     assert_eq!(shown_item(&row), form::JUMP_NO_LONGER_SAVED);
     assert_eq!(note(&row), form::JUMP_CHOOSE_ANOTHER);
-    pump_until("the config check", || routes.answered() == 1);
-    pump_for(Duration::from_millis(100));
+    pump_until("the config check's answer to be taken in", || {
+        answers_taken() == taken + 1
+    });
     assert_eq!(
         note(&row),
         form::JUMP_CHOOSE_ANOTHER,
@@ -1788,17 +1794,18 @@ pub(super) fn the_row_shows_one_note_most_urgent_first(dir: &Path) {
     s.elsewhere(&bastion.id, |p| p.local_only = false);
     s.ctx.profiles_changed();
     assert_eq!(note(&row), form::config_route_note("bastion"));
+    pump_for(Duration::from_millis(100));
     assert_eq!(routes.answered(), 1, "asked once for the same connection");
+    assert_eq!(answers_taken(), taken + 1);
 
     // 5. web's host changes: asked again, for that connection, which goes
     // straight there. No note, no subtitle.
     s.elsewhere(&web.id, |p| p.host = "direct.example.test".to_owned());
     s.ctx.profiles_changed();
     assert_eq!(note(&row), "", "not before it says so");
-    pump_until("the config check of the new host", || {
-        routes.answered() == 2
+    pump_until("the answer about the new host to be taken in", || {
+        answers_taken() == taken + 2
     });
-    pump_for(Duration::from_millis(100));
     assert_eq!(note(&row), "");
 
     // 6. An answer about a connection the profile no longer has is not used:
@@ -1810,10 +1817,13 @@ pub(super) fn the_row_shows_one_note_most_urgent_first(dir: &Path) {
     s.ctx.profiles_changed();
     s.elsewhere(&web.id, |p| p.host = "direct.example.test".to_owned());
     s.ctx.profiles_changed();
-    pump_until("the check of direct again", || routes.answered() == 3);
+    pump_until("the answer about direct to be taken in", || {
+        answers_taken() == taken + 3
+    });
     set_host(&routes.held, "slow.example.test", false);
-    pump_until("the check of slow", || routes.answered() == 4);
-    pump_for(Duration::from_millis(200));
+    pump_until("the answer about slow to be taken in", || {
+        answers_taken() == taken + 4
+    });
     assert_eq!(note(&row), "", "the answer about slow came too late");
     // Asked anew once the profile is there again, it is used.
     s.elsewhere(&web.id, |p| p.host = "slow.example.test".to_owned());
@@ -1822,6 +1832,56 @@ pub(super) fn the_row_shows_one_note_most_urgent_first(dir: &Path) {
         note(&row) == form::config_route_note("bastion")
     });
     assert_eq!(routes.on_main(), 0, "no ssh -G on the main thread");
+    s.close();
+}
+
+/// The notes follow a pick at once, not when its save is back: the profile
+/// file is held (as a sync that waits for the keyring holds it), and the row
+/// shows the pick's note while the save waits. The same goes for the note on
+/// `~/.ssh/config`, whose check is asked at the pick.
+pub(super) fn a_pick_shows_its_notes_before_its_save_is_back(dir: &Path) {
+    let mut bastion = Profile::new("bastion", "bastion.example.test", "bob");
+    bastion.local_only = true;
+    let gate = Profile::new("gate", "gate.example.test", "gus");
+    let web = Profile::new("web", "web.example.test", "alice");
+    let s = Setup::open(dir, &[bastion.clone(), gate.clone(), web.clone()]);
+    let routes = Arc::clone(&s.ctx.config_routes);
+    // ~/.ssh/config sends web's host through another host.
+    set_host(&routes.through, &web.host, true);
+    let taken = answers_taken();
+    s.select(&web.id);
+    let row = jump_row(&s.window);
+    assert_eq!(note(&row), "", "no jump host: no note");
+    pump_for(Duration::from_millis(100));
+    assert_eq!(routes.answered(), 0, "not asked without a jump host");
+
+    let held = HeldProfileFile::hold(&s.dir);
+    let written = s.file_bytes();
+    choose(&row, "bastion");
+    pump_until("the note of the pick", || {
+        note(&row) == form::kept_here_note("bastion")
+    });
+    assert_eq!(keyring::pending(), 1, "the save is still waiting");
+    assert_eq!(s.file_bytes(), written, "and has written nothing");
+
+    // Another pick, with the save of the first still waiting: its note, and
+    // once the check has answered, the one about ~/.ssh/config.
+    choose(&row, "gate");
+    pump_until("the note of the second pick", || {
+        note(&row) == form::config_route_note("gate")
+    });
+    assert_eq!(answers_taken(), taken + 1, "the check has answered");
+    assert_eq!(keyring::pending(), 2, "both saves are waiting");
+    assert_eq!(s.file_bytes(), written, "and have written nothing");
+
+    held.release();
+    saved();
+    assert_eq!(
+        s.on_disk(&web.id).expect("web").jump_host.as_deref(),
+        Some(gate.id.as_str())
+    );
+    assert_eq!(shown_item(&row), "gate");
+    assert_eq!(note(&row), form::config_route_note("gate"));
     s.close();
 }
 
@@ -2053,4 +2113,294 @@ pub(super) fn deleting_a_jump_host_names_who_goes_through_it(dir: &Path) {
         );
     }
     s.close();
+}
+
+// ----- the lists and the host marks -----
+
+/// The sidebar list of the Connection Profiles window `window`.
+fn sidebar_of(window: &adw::Window) -> gtk::ListBox {
+    all_widgets::<gtk::ListBox>(window)
+        .into_iter()
+        .find(|list| list.widget_name() == profiles::SIDEBAR_NAME)
+        .expect("the sidebar")
+}
+
+/// The line under each profile's name in `list`, for the profiles `ids` in
+/// that order.
+fn lines(list: &gtk::ListBox, ids: &[&str]) -> Vec<String> {
+    ids.iter()
+        .map(|id| {
+            row(list, id)
+                .subtitle()
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// The ones of `ids` whose row in `list` the search leaves.
+fn left_by_search<'a>(list: &gtk::ListBox, ids: &[&'a str]) -> Vec<&'a str> {
+    ids.iter()
+        .copied()
+        .filter(|id| row(list, id).is_child_visible())
+        .collect()
+}
+
+/// Both lists, the Connection Profiles sidebar and the new-tab list, name the
+/// jump host under a profile's name (`alice@db:22 via bastion`), also one that
+/// goes through a jump host of its own, and say when it is not saved. A jump
+/// host renamed or deleted later is followed after the next profile change.
+/// The search matches what it matched before: the name, host and user name,
+/// not these words.
+pub(super) fn both_lists_say_which_jump_host(dir: &Path) {
+    let bastion = Profile::new("bastion", "bastion.example.test", "bob");
+    let mut mid = Profile::new("mid", "mid.example.test", "mia");
+    mid.jump_host = Some(bastion.id.clone());
+    let db = going_through("db", &bastion);
+    // Through a profile that has a jump host of its own: refused at connect,
+    // but the line still says where it goes.
+    let far = going_through("far", &mid);
+    // Its jump host is not saved here.
+    let lost = going_through("lost", &Profile::new("gone", "gone.example.test", "gus"));
+    let plain = Profile::new("plain", "plain.example.test", "pat");
+    let mut v6 = Profile::new("v6", "fe80::5", "val");
+    v6.port = 2222;
+    v6.jump_host = Some(bastion.id.clone());
+    let ctx = ctx_with(
+        dir,
+        &[
+            bastion.clone(),
+            mid.clone(),
+            db.clone(),
+            far.clone(),
+            lost.clone(),
+            plain.clone(),
+            v6.clone(),
+        ],
+    );
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = new_tab::open(&main.view, &ctx);
+    let tab_list = list_in(&page).expect("the new-tab list");
+    let profiles_window = window::open_profiles(&app, &ctx);
+    pump_for(Duration::from_millis(300));
+    let sidebar = sidebar_of(&profiles_window);
+    let ids = [
+        bastion.id.as_str(),
+        mid.id.as_str(),
+        db.id.as_str(),
+        far.id.as_str(),
+        lost.id.as_str(),
+        plain.id.as_str(),
+        v6.id.as_str(),
+    ];
+    let said = |via: &str| {
+        vec![
+            "bob@bastion.example.test:22".to_owned(),
+            format!("mia@mid.example.test:22 via {via}"),
+            format!("alice@db.example.test:22 via {via}"),
+            "alice@far.example.test:22 via mid".to_owned(),
+            "alice@lost.example.test:22, jump host no longer saved".to_owned(),
+            "pat@plain.example.test:22".to_owned(),
+            format!("val@[fe80::5]:2222 via {via}"),
+        ]
+    };
+    assert_eq!(lines(&sidebar, &ids), said("bastion"), "the sidebar");
+    assert_eq!(lines(&tab_list, &ids), said("bastion"), "the new-tab list");
+
+    // The search matches the name, host and user name, as it always did: not
+    // the words the line adds.
+    let tab_search: gtk::SearchEntry = find_widget(&page.child()).expect("the search entry");
+    let side_search: gtk::SearchEntry = find_widget(&profiles_window).expect("the search entry");
+    for (query, matching) in [
+        ("bastion", vec![bastion.id.as_str()]),
+        ("via", vec![]),
+        ("saved", vec![]),
+        ("jump", vec![]),
+        ("mia", vec![mid.id.as_str()]),
+    ] {
+        tab_search.set_text(query);
+        side_search.set_text(query);
+        pump_until(&format!("the search for {query:?} to apply"), || {
+            left_by_search(&tab_list, &ids) == matching
+                && left_by_search(&sidebar, &ids) == matching
+        });
+    }
+    tab_search.set_text("");
+    side_search.set_text("");
+    pump_until("the search to clear", || {
+        left_by_search(&tab_list, &ids) == ids && left_by_search(&sidebar, &ids) == ids
+    });
+
+    // A jump host renamed elsewhere is followed after the next profile change.
+    edit(dir, &ctx, &bastion.id, |p| p.name = "gate".to_owned());
+    assert_eq!(lines(&sidebar, &ids), said("gate"), "the sidebar");
+    assert_eq!(lines(&tab_list, &ids), said("gate"), "the new-tab list");
+
+    // Deleted elsewhere: the profiles that went through it wait for another.
+    ProfileStore::open(&dir.join("profiles.json"))
+        .expect("the store")
+        .delete(&bastion.id)
+        .expect("delete it elsewhere");
+    ctx.profiles_changed();
+    let waiting = |line: &str| format!("{line}, jump host no longer saved");
+    let after = [
+        waiting("mia@mid.example.test:22"),
+        waiting("alice@db.example.test:22"),
+        "alice@far.example.test:22 via mid".to_owned(),
+        waiting("alice@lost.example.test:22"),
+        "pat@plain.example.test:22".to_owned(),
+        waiting("val@[fe80::5]:2222"),
+    ];
+    let ids = &ids[1..];
+    assert_eq!(lines(&sidebar, ids), after, "the sidebar");
+    assert_eq!(lines(&tab_list, ids), after, "the new-tab list");
+    profiles_window.destroy();
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A profile that goes through a jump host is never pinged: its mark is the
+/// dimmed dash with a text that names the jump host (or says it is no longer
+/// saved), in both lists, and it does not take part in the one status per host:
+/// the same host saved directly keeps its own mark, and the jump host's own row
+/// its own. The Preferences switch hides these marks and shows them again.
+pub(super) fn a_profile_behind_a_jump_host_is_never_pinged(dir: &Path) {
+    let bastion = Profile::new("bastion", "bastion.example.test", "bob");
+    let db = going_through("db", &bastion);
+    // The same host as db's, saved directly.
+    let direct = Profile::new("direct", &db.host, "dan");
+    let lost = going_through("lost", &Profile::new("gone", "gone.example.test", "gus"));
+    let ctx = ctx_with(
+        dir,
+        &[bastion.clone(), db.clone(), direct.clone(), lost.clone()],
+    );
+    // Every host answers, and the hosts asked about are written down.
+    let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let record = Arc::clone(&asked);
+    ctx.hosts
+        .set_check(Check::new(move |p: &Profile, _: &dyn Fn() -> bool| {
+            record.lock().unwrap().push(p.host.clone());
+            Reach::Answers
+        }));
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = new_tab::open(&main.view, &ctx);
+    let list = list_in(&page).expect("the new-tab list");
+    let mark = |list: &gtk::ListBox, p: &Profile| mark_in(&row(list, &p.id)).expect("a mark");
+    let dash = |text: &str| showing("unknown", "dim-label", text);
+    let answers = || showing("answers", "success", "Answers ping");
+    let through_bastion = "Not checked: reached through bastion";
+    let gone = "Not checked: its jump host is no longer saved";
+
+    pump_until("the direct profile's mark", || {
+        mark_shown(&mark(&list, &direct)) == answers()
+    });
+    pump_until("the jump host's own mark", || {
+        mark_shown(&mark(&list, &bastion)) == answers()
+    });
+    pump_for(Duration::from_millis(200));
+    assert_eq!(mark_shown(&mark(&list, &db)), dash(through_bastion));
+    assert_eq!(mark_shown(&mark(&list, &lost)), dash(gone));
+    for p in [&db, &lost] {
+        assert_eq!(
+            mark(&list, p).accessible_role(),
+            gtk::AccessibleRole::Img,
+            "{}",
+            p.name
+        );
+    }
+    let mut now = asked.lock().unwrap().clone();
+    now.sort();
+    assert_eq!(
+        now,
+        ["bastion.example.test", "db.example.test"],
+        "only the direct profile's host, and the jump host's own: db.example.test \
+         once, for direct; nothing for a profile behind a jump host"
+    );
+    assert_eq!(
+        ctx.hosts.reach(&db.host),
+        Reach::Answers,
+        "the host's status is the direct profile's"
+    );
+
+    // The sidebar says the same.
+    let profiles_window = window::open_profiles(&app, &ctx);
+    pump_for(Duration::from_millis(300));
+    let sidebar = sidebar_of(&profiles_window);
+    assert_eq!(mark_shown(&mark(&sidebar, &db)), dash(through_bastion));
+    assert_eq!(mark_shown(&mark(&sidebar, &lost)), dash(gone));
+    assert_eq!(mark_shown(&mark(&sidebar, &direct)), answers());
+    assert_eq!(mark_shown(&mark(&sidebar, &bastion)), answers());
+
+    // A jump host renamed or deleted later is followed after the next profile
+    // change, in the marks as in the lines.
+    edit(dir, &ctx, &bastion.id, |p| p.name = "gate".to_owned());
+    assert_eq!(
+        mark_shown(&mark(&list, &db)),
+        dash("Not checked: reached through gate")
+    );
+    assert_eq!(
+        mark_shown(&mark(&sidebar, &db)),
+        dash("Not checked: reached through gate")
+    );
+    edit(dir, &ctx, &bastion.id, |p| p.name = "bastion".to_owned());
+    assert_eq!(mark_shown(&mark(&list, &db)), dash(through_bastion));
+
+    // The Preferences switch hides every mark, these too, and shows them again
+    // as they were; a list made while it is off has them hidden.
+    let preferences = preferences::present(&main.window, &app, &ctx);
+    pump_until("the Preferences dialog", || {
+        main.window.visible_dialog().is_some()
+    });
+    let switch = all_widgets::<adw::SwitchRow>(&preferences)
+        .into_iter()
+        .find(|r| r.title() == "Show whether hosts are reachable")
+        .expect("the switch");
+    switch.set_active(false);
+    for p in [&db, &lost, &direct, &bastion] {
+        assert!(!mark(&list, p).is_visible(), "{}", p.name);
+        assert!(!mark(&sidebar, p).is_visible(), "{} in the sidebar", p.name);
+    }
+    preferences.force_close();
+    pump_until("the dialog to close", || {
+        main.window.visible_dialog().is_none()
+    });
+    let second = new_tab::open(&main.view, &ctx);
+    let second_list = list_in(&second).expect("the second list");
+    assert!(!mark(&second_list, &db).is_visible(), "made while off");
+    assert!(!mark(&second_list, &lost).is_visible(), "made while off");
+
+    let preferences = preferences::present(&main.window, &app, &ctx);
+    pump_until("the Preferences dialog", || {
+        main.window.visible_dialog().is_some()
+    });
+    let switch = all_widgets::<adw::SwitchRow>(&preferences)
+        .into_iter()
+        .find(|r| r.title() == "Show whether hosts are reachable")
+        .expect("the switch");
+    switch.set_active(true);
+    preferences.force_close();
+    pump_until("the dialog to close", || {
+        main.window.visible_dialog().is_none()
+    });
+    for l in [&list, &second_list, &sidebar] {
+        assert!(mark(l, &db).is_visible());
+        assert_eq!(mark_shown(&mark(l, &db)), dash(through_bastion));
+        assert_eq!(mark_shown(&mark(l, &lost)), dash(gone));
+    }
+    pump_until("the direct profile to be checked anew", || {
+        mark_shown(&mark(&second_list, &direct)) == answers()
+    });
+    pump_for(Duration::from_millis(200));
+    let asked = asked.lock().unwrap().clone();
+    assert!(
+        asked
+            .iter()
+            .all(|host| host == "db.example.test" || host == "bastion.example.test"),
+        "{asked:?}"
+    );
+    profiles_window.destroy();
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
 }

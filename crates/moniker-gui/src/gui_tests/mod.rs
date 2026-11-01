@@ -451,9 +451,12 @@ fn gui_integration() {
     jump_hosts::the_jump_host_row_offers_usable_profiles(&tmp.path().join("jr-offers"));
     jump_hosts::picking_a_jump_host_saves_it(&tmp.path().join("jr-pick"));
     jump_hosts::the_row_shows_one_note_most_urgent_first(&tmp.path().join("jr-notes"));
+    jump_hosts::a_pick_shows_its_notes_before_its_save_is_back(&tmp.path().join("jr-early"));
     jump_hosts::the_row_is_grayed_on_a_profile_others_go_through(&tmp.path().join("jr-grayed"));
     jump_hosts::new_profile_has_the_jump_host_row(&tmp.path().join("jr-new"));
     jump_hosts::deleting_a_jump_host_names_who_goes_through_it(&tmp.path().join("jr-delete"));
+    jump_hosts::both_lists_say_which_jump_host(&tmp.path().join("jl-lists"));
+    jump_hosts::a_profile_behind_a_jump_host_is_never_pinged(&tmp.path().join("jl-marks"));
     // Issue #9, a pane connecting through its profile's jump host.
     jump_hosts::a_profile_connects_through_its_jump_host(&bin, &tmp.path().join("jh-connect"));
     jump_hosts::closing_the_pane_ends_its_shared_connection(&bin, &tmp.path().join("jh-close"));
@@ -879,7 +882,9 @@ fn close_popover(popover: &gtk::Popover) {
 /// title, the key-file row, the sequence row, the Default sequence row (as chosen
 /// and in its open list), the delete confirmation, and Local terminal's page
 /// (its sequence row, its Default sequence row's list and the sequence's
-/// sub-page). The session runs a fake `ssh`.
+/// sub-page). A Jump Host row's choices and notes, and a profile that goes
+/// through the profile (issue #9): its line under the name and its mark's
+/// tooltip, in the sidebar and the new-tab list. The session runs a fake `ssh`.
 fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     const KEY_FILE: &str = "/tmp/<i>k</i>";
     let mut p = Profile::new(MARKUP_NAME, "h", "u");
@@ -1331,6 +1336,56 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     });
     note_is("grayed line", &form::going_through_line(&[MARKUP_NAME]));
     assert!(!jump_row.is_sensitive());
+
+    // Both lists name the jump host in the line under the profile, and the mark
+    // of a profile that goes through one says so in its tooltip: plain text,
+    // the tooltip (markup for GTK) escaped. (`through_p` goes through `p`.)
+    let through_subtitle = format!("{} via {MARKUP_NAME}", form::subtitle(&through_p));
+    let through_mark = format!("Not checked: reached through {MARKUP_NAME}");
+    let assert_mark = |what: &str, row: &adw::ActionRow| {
+        let mark = hosts::mark_in(row).expect("the mark");
+        assert_eq!(
+            mark.tooltip_text().as_deref(),
+            Some(through_mark.as_str()),
+            "{what}"
+        );
+        assert_eq!(
+            mark.tooltip_markup().as_deref(),
+            Some(glib::markup_escape_text(&through_mark).as_str()),
+            "{what}: the tooltip is markup for GTK"
+        );
+    };
+    let side_row = row_for(&sidebar, &through_p.id);
+    assert_plain_row(
+        "sidebar row through a jump host",
+        &side_row,
+        MARKUP_NAME,
+        Some(&through_subtitle),
+    );
+    assert_mark("sidebar mark", &side_row);
+    plus.emit_clicked();
+    pump_until("the new tab", || {
+        main.view
+            .selected_page()
+            .is_some_and(|page| find_widget::<gtk::ListBox>(&page.child()).is_some())
+    });
+    let list_page = main.view.selected_page().expect("the new tab");
+    let list = all_widgets::<gtk::ListBox>(&list_page.child())
+        .into_iter()
+        .find(|l| l.widget_name() == new_tab::LIST_NAME)
+        .expect("the new-tab list");
+    let tab_row = row_for(&list, &through_p.id);
+    assert_plain_row(
+        "new-tab row through a jump host",
+        &tab_row,
+        MARKUP_NAME,
+        Some(&through_subtitle),
+    );
+    assert_mark("new-tab mark", &tab_row);
+    main.view.close_page(&list_page);
+    pump_until("the new tab to close", || {
+        main.view.selected_page().as_ref() != Some(&list_page)
+    });
 
     // The delete confirmation names the profile as it is, and the profile that
     // goes through it. Cancel leaves it be.

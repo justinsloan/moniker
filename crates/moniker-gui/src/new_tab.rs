@@ -7,7 +7,9 @@
 //! The tab, called "New Tab" (a new pane: "New Pane"), holds a search entry
 //! over a list. The first row
 //! is always "Local terminal"; below it come the live profiles in the store's
-//! order, each with its name and `user@host:port` and, for a profile kept on
+//! order, each with its name and `user@host:port` (and `via` the jump host it
+//! goes through, [`form::list_subtitle`]; its host mark is the dimmed dash,
+//! never pinged, [`crate::hosts::Hosts::mark_for`]) and, for a profile kept on
 //! this machine only, a mark before its "›" ([`local_only::mark`]). "Local
 //! terminal" starts out selected and with the focus, so Enter gives a local shell
 //! at once.
@@ -59,6 +61,7 @@ use adw::prelude::*;
 use gtk::{gdk, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
+use moniker_core::jump::{self, Route};
 use moniker_core::profile::{Profile, StartupSequence};
 
 use crate::context::AppContext;
@@ -401,7 +404,10 @@ fn refresh(chooser: &Rc<Chooser>, list: &gtk::ListBox) {
 fn append_profile_rows(chooser: &Rc<Chooser>, list: &gtk::ListBox) {
     let profiles = chooser.profiles.borrow().clone();
     for profile in &profiles {
-        list.append(&profile_row(chooser, list, profile));
+        // Where its connection goes (issue #9): the line under the name and
+        // the mark say so.
+        let route = jump::route(profile, |id| profiles.iter().find(|p| p.id == id));
+        list.append(&profile_row(chooser, list, profile, &route));
     }
 }
 
@@ -485,9 +491,15 @@ fn local_choices_now(
     )
 }
 
-/// One profile: its name and `user@host:port`, plain text, and a "›" whose
+/// One profile: its name and `user@host:port` (and the jump host it goes
+/// through, if any, [`form::list_subtitle`]), plain text, and a "›" whose
 /// popover holds its connect choices.
-fn profile_row(chooser: &Rc<Chooser>, list: &gtk::ListBox, profile: &Profile) -> adw::ActionRow {
+fn profile_row(
+    chooser: &Rc<Chooser>,
+    list: &gtk::ListBox,
+    profile: &Profile,
+    route: &Route,
+) -> adw::ActionRow {
     let popover = gtk::Popover::new();
     let chosen = profile.clone();
     let choices = connect_menu::choices(
@@ -520,14 +532,14 @@ fn profile_row(chooser: &Rc<Chooser>, list: &gtk::ListBox, profile: &Profile) ->
     let row = adw::ActionRow::builder()
         .name(profile.id.as_str())
         .title(profile.name.as_str())
-        .subtitle(form::subtitle(profile))
+        .subtitle(form::list_subtitle(profile, route))
         .use_markup(false)
         .title_lines(1)
         .subtitle_lines(1)
         .activatable(true)
         .build();
     // Whether the host answers a ping (`crate::hosts`), before the name.
-    row.add_prefix(&chooser.ctx.hosts.mark(profile));
+    row.add_prefix(&chooser.ctx.hosts.mark_for(profile, route));
     // That it stays on this machine, before the › button.
     if let Some(kept) = local_only::mark(profile) {
         row.add_suffix(&kept);

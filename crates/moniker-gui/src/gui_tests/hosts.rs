@@ -19,14 +19,14 @@ use crate::hosts::{Check, MARK_CLASS, Reach};
 use crate::{new_tab, preferences, profiles, window};
 
 /// The host mark in `root` (a row), if it has one.
-fn mark_in(root: &impl IsA<gtk::Widget>) -> Option<gtk::Box> {
+pub(super) fn mark_in(root: &impl IsA<gtk::Widget>) -> Option<gtk::Box> {
     all_widgets::<gtk::Box>(root)
         .into_iter()
         .find(|b| b.has_css_class(MARK_CLASS))
 }
 
 /// What `mark` shows: its shape and color classes and its tooltip.
-fn shown(mark: &gtk::Box) -> (String, String, String) {
+pub(super) fn shown(mark: &gtk::Box) -> (String, String, String) {
     let shape = ["answers", "no-reply", "unknown"]
         .into_iter()
         .find(|c| mark.has_css_class(c))
@@ -44,7 +44,7 @@ fn shown(mark: &gtk::Box) -> (String, String, String) {
     )
 }
 
-fn showing(shape: &str, color: &str, text: &str) -> (String, String, String) {
+pub(super) fn showing(shape: &str, color: &str, text: &str) -> (String, String, String) {
     (shape.to_owned(), color.to_owned(), text.to_owned())
 }
 

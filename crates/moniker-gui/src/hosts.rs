@@ -17,6 +17,14 @@
 //!   animation; its tooltip and accessible name say what it means
 //!   ([`Reach::text`]), and the row's accessible description says it too.
 //!   Drawn with CSS only.
+//! * **A profile behind a jump host** (issue #9, [`Hosts::mark_for`]) is never
+//!   pinged and takes no part in the status of its host: its mark is the dimmed
+//!   dash with a text of its own, "Not checked: reached through {jump host}"
+//!   (or "Not checked: its jump host is no longer saved"), so the same host
+//!   saved directly keeps its own mark. These marks are kept apart from the
+//!   others, hidden and shown again by the same switch, and are rebuilt with
+//!   the rows when the profiles change, which follows a jump host renamed
+//!   meanwhile.
 //! * **A check** ([`real_check`]): nothing at all where pings are not allowed;
 //!   otherwise where the connection really goes, from `ssh -G`
 //!   (`moniker_core::ssh_config`, asked again at most every [`TARGET_FRESH`]
@@ -51,6 +59,7 @@ use adw::prelude::*;
 use gtk::{gdk, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
+use moniker_core::jump::Route;
 use moniker_core::ping::{self, Ping};
 use moniker_core::profile::Profile;
 use moniker_core::ssh_config::{self, PingTarget};
@@ -267,6 +276,10 @@ pub(crate) struct Hosts {
     hosts: RefCell<HashMap<String, Host>>,
     /// Every mark made, with its host. Dead ones are dropped as they are found.
     marks: RefCell<Vec<(String, glib::WeakRef<gtk::Widget>)>>,
+    /// The marks of profiles behind a jump host ([`Hosts::mark_for`]), with
+    /// their text. They have no host of their own: nothing is checked for
+    /// them, and they are not in view for the re-check timer.
+    route_marks: RefCell<Vec<(String, glib::WeakRef<gtk::Widget>)>>,
     /// Hosts waiting for a check, in order.
     queue: RefCell<VecDeque<String>>,
     /// Checks running now.
@@ -289,6 +302,7 @@ impl Hosts {
             check: RefCell::new(check),
             hosts: RefCell::new(HashMap::new()),
             marks: RefCell::new(Vec::new()),
+            route_marks: RefCell::new(Vec::new()),
             queue: RefCell::new(VecDeque::new()),
             running: Cell::new(0),
             shown: Cell::new(0),
@@ -318,6 +332,9 @@ impl Hosts {
         for (key, mark) in self.live_marks() {
             self.style(&mark, &key);
         }
+        for (text, mark) in self.live_route_marks() {
+            self.paint_route(&mark, &text);
+        }
     }
 
     /// What is known about `host` now.
@@ -343,14 +360,7 @@ impl Hosts {
                 checking: false,
                 profile: profile.clone(),
             });
-        let mark: gtk::Widget = gtk::Box::builder()
-            .accessible_role(gtk::AccessibleRole::Img)
-            .valign(gtk::Align::Center)
-            .halign(gtk::Align::Center)
-            .css_classes([MARK_CLASS])
-            .margin_end(2)
-            .build()
-            .upcast();
+        let mark = new_mark();
         self.style(&mark, &key);
         {
             let mut marks = self.marks.borrow_mut();
@@ -374,9 +384,59 @@ impl Hosts {
         mark
     }
 
+    /// A new mark for a profile that may go through a jump host (issue #9),
+    /// to go before the profile's name in a list. A profile with no jump host
+    /// gets [`mark`](Self::mark). Any other, whether its jump host is saved,
+    /// chained or not there, gets the dimmed dash with the route's text: it is
+    /// never pinged (a check through the jump host would be a sign-in nobody
+    /// asked for, and a ping from here says nothing of a host reached through
+    /// another), and it is not in the table of hosts, so the host saved
+    /// directly keeps its own status. The jump host's own row has its own
+    /// mark as any profile's.
+    pub(crate) fn mark_for(self: &Rc<Self>, profile: &Profile, route: &Route) -> gtk::Widget {
+        let text = match route {
+            Route::Direct => return self.mark(profile),
+            Route::Through(jump) | Route::Chained(jump) => {
+                format!("Not checked: reached through {}", jump.name)
+            }
+            Route::Missing => "Not checked: its jump host is no longer saved".to_owned(),
+        };
+        add_css();
+        let mark = new_mark();
+        self.paint_route(&mark, &text);
+        {
+            let mut marks = self.route_marks.borrow_mut();
+            marks.retain(|(_, mark)| mark.upgrade().is_some());
+            marks.push((text.clone(), mark.downgrade()));
+        }
+        let weak = Rc::downgrade(self);
+        mark.connect_map(move |mark| {
+            // In its row now: say it in the row's description too. (Nothing
+            // to check: it does not ask for a check, nor count as in view.)
+            if let Some(hosts) = weak.upgrade() {
+                hosts.paint_route(mark, &text);
+            }
+        });
+        mark
+    }
+
     /// Show on `mark` what is known about its host `key`, or nothing while off.
     fn style(&self, mark: &gtk::Widget, key: &str) {
         let reach = self.reach(key);
+        self.paint(mark, reach.shape(), reach.color(), reach.text());
+    }
+
+    /// Show on a mark of a profile behind a jump host (`text`: why it is not
+    /// checked), or nothing while off: the dimmed dash that [`Reach::Proxied`]
+    /// also has, with a text of its own.
+    fn paint_route(&self, mark: &gtk::Widget, text: &str) {
+        self.paint(mark, Reach::Proxied.shape(), Reach::Proxied.color(), text);
+    }
+
+    /// Give `mark` the `shape` and `color` classes, `text` as its tooltip and
+    /// accessible name, and say it in its row's accessible description, or
+    /// hide it while the marks are off.
+    fn paint(&self, mark: &gtk::Widget, shape: &str, color: &str, text: &str) {
         let on = self.enabled.get();
         mark.set_visible(on);
         for class in [
@@ -389,10 +449,10 @@ impl Hosts {
         ] {
             mark.remove_css_class(class);
         }
-        mark.add_css_class(reach.shape());
-        mark.add_css_class(reach.color());
-        mark.set_tooltip_text(Some(reach.text()));
-        mark.update_property(&[gtk::accessible::Property::Label(reach.text())]);
+        mark.add_css_class(shape);
+        mark.add_css_class(color);
+        mark.set_tooltip_text(Some(text));
+        mark.update_property(&[gtk::accessible::Property::Label(text)]);
         // A screen reader reads a row's title and description, not what is in
         // its prefix: the status goes after the subtitle there.
         if let Some(row) = mark
@@ -401,7 +461,7 @@ impl Hosts {
         {
             let subtitle = row.subtitle().unwrap_or_default();
             let description = if on {
-                format!("{subtitle}. {}", reach.text())
+                format!("{subtitle}. {text}")
             } else {
                 subtitle.to_string()
             };
@@ -417,6 +477,17 @@ impl Hosts {
         marks
             .iter()
             .filter_map(|(key, mark)| mark.upgrade().map(|mark| (key.clone(), mark)))
+            .collect()
+    }
+
+    /// The route marks still alive, with their texts; the dead ones are
+    /// forgotten.
+    fn live_route_marks(&self) -> Vec<(String, gtk::Widget)> {
+        let mut marks = self.route_marks.borrow_mut();
+        marks.retain(|(_, mark)| mark.upgrade().is_some());
+        marks
+            .iter()
+            .filter_map(|(text, mark)| mark.upgrade().map(|mark| (text.clone(), mark)))
             .collect()
     }
 
@@ -564,6 +635,18 @@ impl Hosts {
     pub(crate) fn running(&self) -> usize {
         self.running.get()
     }
+}
+
+/// A mark with no state yet: the widget every mark is.
+fn new_mark() -> gtk::Widget {
+    gtk::Box::builder()
+        .accessible_role(gtk::AccessibleRole::Img)
+        .valign(gtk::Align::Center)
+        .halign(gtk::Align::Center)
+        .css_classes([MARK_CLASS])
+        .margin_end(2)
+        .build()
+        .upcast()
 }
 
 /// Load the marks' CSS on the default display, once.

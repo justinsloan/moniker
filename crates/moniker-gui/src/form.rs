@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use moniker_core::jump;
+use moniker_core::jump::{self, Route};
 use moniker_core::profile::{Profile, ProfileError, StartupSequence, now_ms};
 use moniker_core::secrets::{SecretStore, password_key};
 use moniker_core::store::ProfileStore;
@@ -135,6 +135,22 @@ pub fn subtitle(profile: &Profile) -> String {
         profile.host.clone()
     };
     format!("{}@{}:{}", profile.username, host, profile.port)
+}
+
+/// The line under a profile's name in the two lists (issue #9): [`subtitle`],
+/// then ` via {jump host}` for a profile whose connection goes through a jump
+/// host, also one that goes through a jump host of its own (it is refused at
+/// connect, but the line still says where it goes), and `, jump host no longer
+/// saved` for one whose jump host is not there. Plain text, the jump host's
+/// name as it is. The search does not look at it: it matches the name, the
+/// host and the user name ([`matches_query`]).
+pub fn list_subtitle(profile: &Profile, route: &Route) -> String {
+    let line = subtitle(profile);
+    match route {
+        Route::Direct => line,
+        Route::Through(jump) | Route::Chained(jump) => format!("{line} via {}", jump.name),
+        Route::Missing => format!("{line}, jump host no longer saved"),
+    }
 }
 
 /// Save a whole profile at once (the New Profile dialog), with no GTK in it.
@@ -1090,6 +1106,45 @@ mod tests {
         assert_eq!(subtitle(&p), "alice@example.com:2222");
         p.host = "fe80::1%eth0".to_owned();
         assert_eq!(subtitle(&p), "alice@[fe80::1%eth0]:2222");
+    }
+
+    #[test]
+    fn list_subtitles() {
+        use moniker_core::jump::Route;
+        let db = Profile::new("db", "db.example.com", "alice");
+        let bastion = Profile::new("bastion", "bastion.example.com", "bob");
+        // Direct: the line as it always was.
+        assert_eq!(
+            list_subtitle(&db, &Route::Direct),
+            "alice@db.example.com:22"
+        );
+        // Through a jump host, named, and the same for one that goes through a
+        // jump host of its own (it is refused at connect, but still named).
+        assert_eq!(
+            list_subtitle(&db, &Route::Through(&bastion)),
+            "alice@db.example.com:22 via bastion"
+        );
+        assert_eq!(
+            list_subtitle(&db, &Route::Chained(&bastion)),
+            "alice@db.example.com:22 via bastion"
+        );
+        // A jump host that is not saved.
+        assert_eq!(
+            list_subtitle(&db, &Route::Missing),
+            "alice@db.example.com:22, jump host no longer saved"
+        );
+        // An IPv6 host stays in brackets, and the name is plain text.
+        let mut v6 = Profile::new("v6", "fe80::1", "alice");
+        v6.port = 2222;
+        let odd = Profile::new("<b>j</b> &amp;", "j.example.com", "bob");
+        assert_eq!(
+            list_subtitle(&v6, &Route::Through(&odd)),
+            "alice@[fe80::1]:2222 via <b>j</b> &amp;"
+        );
+        assert_eq!(
+            list_subtitle(&v6, &Route::Missing),
+            "alice@[fe80::1]:2222, jump host no longer saved"
+        );
     }
 
     // ---- per-field saving (the Connection Profiles window) ----

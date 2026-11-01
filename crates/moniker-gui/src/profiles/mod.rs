@@ -1,7 +1,10 @@
 //! The Connection Profiles window, laid out like GNOME Settings: a sidebar
 //! listing the saved profiles (with ＋ and search; a profile kept on this
-//! machine only has a mark, [`local_only::mark`]) and, beside it, the page of
-//! the selected profile ([`page`]), where each field saves on its own. ＋ opens
+//! machine only has a mark, [`local_only::mark`]; one that goes through a jump
+//! host says which under its name, [`form::list_subtitle`], and its host mark
+//! says it is not checked, [`crate::hosts::Hosts::mark_for`]) and, beside it,
+//! the page of the selected profile ([`page`]), where each field saves on its
+//! own. ＋ opens
 //! the New Profile dialog ([`new_profile`]). A startup sequence opens as a
 //! sub-page ([`sequence_page`]) pushed over the page in the content pane;
 //! Cancel (or Escape) returns to it. The rows that list the sequences, with
@@ -57,6 +60,7 @@ use adw::prelude::*;
 use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
+use moniker_core::jump;
 use moniker_core::profile::{Profile, StartupSequence};
 
 use crate::context::AppContext;
@@ -776,20 +780,23 @@ impl State {
         }
         let mut listed = HashMap::new();
         let mut reselected = None;
-        for profile in profiles {
+        for profile in &profiles {
+            // Where its connection goes (issue #9): the line under the name
+            // and the mark say so.
+            let route = jump::route(profile, |id| profiles.iter().find(|p| p.id == id));
             let row = adw::ActionRow::builder()
                 .name(profile.id.as_str())
                 .title(profile.name.as_str())
-                .subtitle(form::subtitle(&profile))
+                .subtitle(form::list_subtitle(profile, &route))
                 .use_markup(false)
                 .title_lines(1)
                 .subtitle_lines(1)
                 .activatable(true)
                 .build();
             // Whether the host answers a ping (`crate::hosts`), before the name.
-            row.add_prefix(&self.ctx.hosts.mark(&profile));
+            row.add_prefix(&self.ctx.hosts.mark_for(profile, &route));
             // That it stays on this machine, after the name.
-            if let Some(kept) = local_only::mark(&profile) {
+            if let Some(kept) = local_only::mark(profile) {
                 row.add_suffix(&kept);
             }
             self.list.append(&row);
@@ -797,7 +804,7 @@ impl State {
                 self.list.select_row(Some(&row));
                 reselected = Some(row);
             }
-            listed.insert(profile.id.clone(), profile);
+            listed.insert(profile.id.clone(), profile.clone());
         }
         self.listed.replace(listed);
         if focus_in_list && let Some(row) = reselected {

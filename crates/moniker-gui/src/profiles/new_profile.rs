@@ -17,7 +17,7 @@
 //! which stays open so they can be fixed, and never contain the password.
 
 use std::cell::Cell;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -91,7 +91,7 @@ pub(super) fn show(
             .use_markup(false)
             .build()
     };
-    let fields = Rc::new_cyclic(|weak: &Weak<Fields>| Fields {
+    let fields = Rc::new(Fields {
         name: entry("Name"),
         host: entry("Host"),
         username: entry("Username"),
@@ -100,19 +100,9 @@ pub(super) fn show(
             .adjustment(&gtk::Adjustment::new(22.0, 1.0, 65535.0, 1.0, 10.0, 0.0))
             .numeric(true)
             .build(),
-        // A pick only changes the notes: shown again from the main loop, as
-        // the row asks (it is still telling of the pick).
-        jump: JumpRow::new(ctx, None, {
-            let weak = weak.clone();
-            move |_| {
-                let weak = weak.clone();
-                glib::idle_add_local_once(move || {
-                    if let Some(fields) = weak.upgrade() {
-                        fields.show_jump();
-                    }
-                });
-            }
-        }),
+        // The pick is kept until Create ([`JumpRow::choice`]); the row shows
+        // its notes by itself.
+        jump: JumpRow::new(ctx, None, |_| {}),
         password: adw::PasswordEntryRow::builder()
             .title("Password (optional)")
             .use_markup(false)

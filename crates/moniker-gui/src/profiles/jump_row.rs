@@ -22,6 +22,10 @@
 //! showing it, and once it is back the next
 //! [`show_profile`](JumpRow::show_profile) shows the file's choice, which puts
 //! a refused or failed pick back. In New Profile the pick is kept until Create.
+//! The notes follow a pick at once, whichever owns the row, not when its save is
+//! back (which waits as long as a sync holds the profile file): the row shows
+//! itself again from the main loop after the pick, with what it was last given
+//! to show and the pick as the choice.
 //!
 //! Its subtitle carries one note at a time, the most urgent first:
 //! 1. the jump host is not saved here: [`form::JUMP_CHOOSE_ANOTHER`];
@@ -66,6 +70,21 @@ use crate::form;
 /// The row's title.
 pub(crate) const ROW_TITLE: &str = "Jump Host";
 
+#[cfg(test)]
+thread_local! {
+    static ANSWERS_TAKEN: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Tests: how many answers of the `~/.ssh/config` check the rows have taken in
+/// on the main thread so far, those they did not use included. The check
+/// counts its answers on its worker thread ([`crate::context::ConfigRoutes`]),
+/// before the main loop has applied them, so only this tells a test that an
+/// answer has been dealt with.
+#[cfg(test)]
+pub(crate) fn answers_taken() -> usize {
+    ANSWERS_TAKEN.get()
+}
+
 /// The first entry of the row: no jump host.
 const NONE: &str = "None";
 
@@ -94,6 +113,11 @@ pub(super) struct JumpRow {
     on_pick: Box<dyn Fn(Option<String>)>,
     /// The notes, as the last show worked them out.
     notes: RefCell<Notes>,
+    /// What the last show was given, for the show a pick asks for: the
+    /// profile the page showed (`None` in New Profile) and whether the profile
+    /// is kept on this machine only.
+    shown_for: RefCell<Option<Profile>>,
+    local_only: Cell<bool>,
     /// The connection the config check was last asked about (`ssh -G`'s
     /// arguments), and its answer once it is back.
     config: RefCell<Option<(Vec<String>, Option<bool>)>>,
@@ -120,8 +144,8 @@ impl JumpRow {
     /// the row again synchronously: a show whose entries changed gives the row
     /// a new list, which the combo row does not survive while it is still
     /// telling of the pick (as for the Default sequence row,
-    /// `sequence_rows`). The page's save is back later anyway; New Profile
-    /// shows it again from the main loop.
+    /// `sequence_rows`). The row shows itself again from the main loop (module
+    /// docs); the owner has nothing to do for the notes.
     pub(super) fn new(
         ctx: &Rc<AppContext>,
         for_id: Option<&str>,
@@ -155,6 +179,8 @@ impl JumpRow {
                 loading: Cell::new(false),
                 on_pick: Box::new(on_pick),
                 notes: RefCell::new(Notes::default()),
+                shown_for: RefCell::new(None),
+                local_only: Cell::new(false),
                 config: RefCell::new(None),
             }
         })
@@ -180,6 +206,7 @@ impl JumpRow {
     /// now) among the profiles as the window last read them. While a pick is
     /// being saved the row keeps showing the pick.
     pub(super) fn show_profile(&self, profile: &Profile) {
+        self.shown_for.replace(Some(profile.clone()));
         if !self.saving.busy() {
             self.stored.replace(profile.jump_host.clone());
         }
@@ -199,6 +226,7 @@ impl JumpRow {
     /// Make the list (if what it shows changed), select the choice, and work
     /// out the notes (module docs).
     fn show(&self, local_only: bool) {
+        self.local_only.set(local_only);
         // Bind first so the store borrow ends here.
         let all = self.ctx.store.borrow().all();
         let for_id = self.for_id.as_deref();
@@ -348,6 +376,8 @@ impl JumpRow {
     /// The config check about the connection `asked` answered `through`
     /// (`None`: it never answered, and is asked again at the next show).
     fn config_answered(&self, asked: &[String], through: Option<bool>) {
+        #[cfg(test)]
+        ANSWERS_TAKEN.set(ANSWERS_TAKEN.get() + 1);
         {
             let mut config = self.config.borrow_mut();
             let Some((current, answer)) = config.as_mut() else {
@@ -388,5 +418,25 @@ impl JumpRow {
         }
         self.stored.replace(choice.clone());
         (self.on_pick)(choice);
+        // The notes follow the pick now, from the main loop (see `new`).
+        let me = self.me.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(row) = me.upgrade() {
+                row.show_again();
+            }
+        });
+    }
+
+    /// Show the row again as the last show did, with the choice as it is now
+    /// (the pick, while its save waits), and ask `~/.ssh/config` about the
+    /// profile's connection if that was not asked yet.
+    fn show_again(&self) {
+        let profile = self.shown_for.borrow().clone();
+        if let Some(profile) = &profile
+            && self.stored.borrow().is_some()
+        {
+            self.ask_config(profile);
+        }
+        self.show(self.local_only.get());
     }
 }
