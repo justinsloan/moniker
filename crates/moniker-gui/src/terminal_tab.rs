@@ -2242,30 +2242,68 @@ fn jump_failed_note(name: &str) -> String {
     format!("Could not connect to the jump host {name}.")
 }
 
+/// What the keyring worker found stored for one connection
+/// ([`has_stored_password`]): whether a password is stored for the profile,
+/// and the jump host its route named when it was asked, by id, if a password
+/// is stored for that one. The id says which jump host the answer is for: the
+/// profile may go through another one by the time the answer is used (plan
+/// Ruling R4, [`launch`]).
+#[derive(Debug, Default)]
+pub(crate) struct StoredPasswords {
+    pub(crate) target: bool,
+    pub(crate) jump: Option<String>,
+}
+
+/// Where `profile` connects as the window's profiles are now
+/// (`moniker_core::jump::route`): `Ok` with the jump host it goes through, if
+/// it has one, or `Err` with why it must not connect at all (its jump host is
+/// not saved here, or goes through a jump host of its own). Never a direct
+/// connection in place of a refused one.
+fn jump_host_now(ctx: &AppContext, profile: &Profile) -> Result<Option<Profile>, String> {
+    let store = ctx.store.borrow();
+    let route = route(profile, |id| store.get(id));
+    match route.refusal() {
+        Some(refusal) => Err(refusal),
+        None => Ok(route.jump().cloned()),
+    }
+}
+
+/// Why a connection through the jump host `name` found no private folder for
+/// its shared connection's socket, as a line for standard error (the pane says
+/// it in its own words). `reason` is plain text from the system, made one line
+/// as [`start_failure_log`] makes its own.
+fn socket_failure_log(name: &str, reason: &str) -> String {
+    format!(
+        "moniker: no private runtime folder for the shared connection through {}: {}",
+        one_line(name),
+        one_line(reason)
+    )
+}
+
 /// Work out the pane for connecting to `profile` with its startup sequence
 /// number `sequence`: its title, the `ssh` command and the transcript settings.
 /// `record` says whether the session is recorded (see [`transcript_spec`]), and
-/// `has_password` whether a password is stored for it (the keyring worker's
-/// answer, [`has_stored_password`]). Shows a note as a notification if the
-/// stored password cannot be used, in the window of `holder`, the pane being
-/// opened: a connection started from the Connection Profiles window opens its
-/// tab in a main window, and that is where the note belongs.
+/// `stored` what the keyring worker found stored ([`StoredPasswords`]). Shows a
+/// note as a notification if a stored password cannot be used, in the window of
+/// `holder`, the pane being opened: a connection started from the Connection
+/// Profiles window opens its tab in a main window, and that is where the note
+/// belongs.
 ///
 /// A profile with a jump host (issue #9) goes where `moniker_core::jump::route`
-/// says with the window's profiles as they are now: through the jump host, with
-/// a [`JumpStage`] that signs in to it first (`moniker_core::jump::pane_commands`
-/// builds the commands of both). `jump_with_password` is the id of the jump host
-/// the keyring found a stored password for: any other one (the profile was given
-/// another jump host since the keyring was asked) counts as having none, and ssh
-/// asks for its password in the terminal (plan Ruling R4). The jump host's
-/// stored password needs the askpass helper, as the profile's does.
+/// says with the window's profiles as they are now ([`jump_host_now`]): through
+/// the jump host, with a [`JumpStage`] that signs in to it first
+/// (`moniker_core::jump::pane_commands` builds the commands of both). The jump
+/// host's password counts as stored only when `stored.jump` names that very
+/// jump host: any other one (the profile was given another jump host since the
+/// keyring was asked) counts as having none, and ssh asks for its password in
+/// the terminal (plan Ruling R4). The jump host's stored password needs the
+/// askpass helper, as the profile's does.
 ///
 /// `Err` is the note of a connection that must not start at all, never a direct
-/// connection in its place: the route's refusal (the jump host is not saved
-/// here, or goes through a jump host of its own), no private runtime folder for
-/// the shared connection's socket (`moniker_core::jump::JumpSocket`), or a jump
-/// host whose user name or host cannot go in the hop's command.
-#[allow(clippy::too_many_arguments)]
+/// connection in its place: the route's refusal, no private runtime folder for
+/// the shared connection's socket (`moniker_core::jump::JumpSocket`; why goes
+/// to standard error, [`socket_failure_log`]), or a jump host whose user name
+/// or host cannot go in the hop's command.
 pub(crate) fn launch(
     holder: &PaneHolder,
     profile: &Profile,
@@ -2273,18 +2311,10 @@ pub(crate) fn launch(
     record: bool,
     ctx: &AppContext,
     transcript_dir: &Path,
-    has_password: bool,
-    jump_with_password: Option<&str>,
+    stored: &StoredPasswords,
 ) -> Result<Launch, String> {
-    // Bind first so the store borrow ends here.
-    let jump = {
-        let store = ctx.store.borrow();
-        let route = route(profile, |id| store.get(id));
-        match route.refusal() {
-            Some(refusal) => Err(refusal),
-            None => Ok(route.jump().cloned()),
-        }
-    }?;
+    let has_password = stored.target;
+    let jump = jump_host_now(ctx, profile)?;
     let transcript = transcript_spec(profile, record, transcript_dir, &ctx.notice);
     let Some(jump) = jump else {
         if let Some(note) = askpass_notice(has_password, &ctx.askpass_path) {
@@ -2300,18 +2330,22 @@ pub(crate) fn launch(
             jump: None,
         });
     };
-    let socket = ctx
-        .runtime_dir
-        .as_deref()
-        .and_then(|dir| JumpSocket::new(dir).ok())
-        .ok_or_else(|| {
-            format!(
+    let socket = match ctx.runtime_dir.as_deref().map(JumpSocket::new) {
+        Some(Ok(socket)) => socket,
+        unusable => {
+            let reason = match unusable {
+                Some(Err(err)) => err.to_string(),
+                _ => "XDG_RUNTIME_DIR is not set to an absolute path".to_owned(),
+            };
+            eprintln!("{}", socket_failure_log(&jump.name, &reason));
+            return Err(format!(
                 "Could not connect through the jump host {}: there is no private runtime \
                  folder for its shared connection.",
                 jump.name
-            )
-        })?;
-    let jump_has_password = jump_with_password == Some(jump.id.as_str());
+            ));
+        }
+    };
+    let jump_has_password = stored.jump.as_deref() == Some(jump.id.as_str());
     if let Some(note) = askpass_notice(has_password || jump_has_password, &ctx.askpass_path) {
         ctx.notice.show_near(holder, note);
     }
@@ -2418,16 +2452,7 @@ pub(crate) fn start_profile(
         .borrow_mut()
         .adopt(TabTitle::remote(tab_title(profile)));
     refresh_title(holder);
-    // Bind first so the store borrow ends here.
-    let picked = {
-        let store = ctx.store.borrow();
-        let route = route(profile, |id| store.get(id));
-        match route.refusal() {
-            Some(refusal) => Err(refusal),
-            None => Ok(route.jump().cloned()),
-        }
-    };
-    let asked_jump = match picked {
+    let asked_jump = match jump_host_now(ctx, profile) {
         Ok(jump) => jump,
         Err(refusal) => {
             refuse(holder, &tab_title(profile), &refusal);
@@ -2441,12 +2466,11 @@ pub(crate) fn start_profile(
     let ctx_done = Rc::clone(ctx);
     crate::keyring::read(
         ctx,
-        move |secrets| {
-            let has_password = has_stored_password(&asked, secrets);
-            let jump_with_password = asked_jump
+        move |secrets| StoredPasswords {
+            target: has_stored_password(&asked, secrets),
+            jump: asked_jump
                 .filter(|jump| has_stored_password(jump, secrets))
-                .map(|jump| jump.id);
-            (has_password, jump_with_password)
+                .map(|jump| jump.id),
         },
         move |answer| {
             let ctx = ctx_done;
@@ -2467,7 +2491,6 @@ pub(crate) fn start_profile(
                 }
                 None => profile,
             };
-            let (has_password, jump_with_password) = answer.unwrap_or((false, None));
             let launched = launch(
                 &holder,
                 &profile,
@@ -2475,8 +2498,8 @@ pub(crate) fn start_profile(
                 record,
                 &ctx,
                 &ctx.transcripts_dir(),
-                has_password,
-                jump_with_password.as_deref(),
+                // A worker that stopped: no stored password for either.
+                &answer.unwrap_or_default(),
             );
             match launched {
                 Ok(launched) => start_launch(&holder, launched),
@@ -2713,9 +2736,10 @@ fn shows(holder: &PaneHolder, terminal: &Terminal) -> bool {
 ///   without a jump host does ([`connection_ended`]), and ends the shared
 ///   connection with it;
 /// * with any other end (a wrong password, an unreachable host, a refused host
-///   key), the target is never tried: the shared connection is ended, the
-///   transcript is written, and the pane keeps ssh's message with a note of
-///   Moniker's below it ([`jump_failed_note`]).
+///   key), the target is never tried: the link is let go
+///   ([`JumpLink::forget`]: a master that did not sign in left nothing in the
+///   background to end), the transcript is written, and the pane keeps ssh's
+///   message with a note of Moniker's below it ([`jump_failed_note`]).
 ///
 /// The transcript and REC cover both: one recording from the jump host's
 /// sign-in to the target's end. Closing the pane while the master signs in
@@ -2766,8 +2790,10 @@ fn start_through_jump(
             marker.release();
         }
         if status != 0 {
+            // It did not sign in, so it never went to the background: there
+            // is no master to end, and no `ssh -O exit` to run.
             holder.jump().take();
-            link.close();
+            link.forget();
             if let Some(session) = &session {
                 session.write_transcript_once();
             }
@@ -3007,6 +3033,23 @@ mod tests {
         assert_eq!(
             start_failure_log("\x1b]0;pwned\x07\nx", "a\x1b[2Jb\r\nc"),
             "moniker: failed to start  ]0;pwned  x: a [2Jb  c"
+        );
+    }
+
+    #[test]
+    fn a_runtime_folder_refused_for_a_jump_host_is_one_line_on_standard_error() {
+        assert_eq!(
+            socket_failure_log(
+                "bastion",
+                "the runtime directory is not this user's, or others may write in it"
+            ),
+            "moniker: no private runtime folder for the shared connection through \
+             bastion: the runtime directory is not this user's, or others may write in it"
+        );
+        assert_eq!(
+            socket_failure_log("b\x1b[2Jx", "a\nb"),
+            "moniker: no private runtime folder for the shared connection through \
+             b [2Jx: a b"
         );
     }
 

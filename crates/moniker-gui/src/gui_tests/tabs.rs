@@ -30,7 +30,7 @@ use crate::context::{AppContext, Notice};
 use crate::launch_args::{Run, Start};
 use crate::notify::NotificationArea;
 use crate::terminal_tab::{
-    ASKPASS_MISSING_NOTICE, TranscriptSpec, after_the_menu_lets_go, ask_rename,
+    ASKPASS_MISSING_NOTICE, StoredPasswords, TranscriptSpec, after_the_menu_lets_go, ask_rename,
     end_sessions_on_close, launch, new_holder_page, new_holder_page_at, open_command, open_local,
     open_local_shell, rename_page, scale_of, set_test_ssh_program, start_command, start_profile,
     start_shell_in, terminal_of, terminal_text, write_transcripts,
@@ -383,8 +383,10 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
         false,
         &ctx,
         &transcripts,
-        true,
-        None,
+        &StoredPasswords {
+            target: true,
+            jump: None,
+        },
     )
     .expect("a direct connection");
     assert!(
@@ -406,8 +408,10 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
         false,
         &ctx,
         &transcripts,
-        true,
-        None,
+        &StoredPasswords {
+            target: true,
+            jump: None,
+        },
     )
     .expect("a direct connection");
     let names: Vec<&str> = launched
@@ -441,8 +445,7 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
         false,
         &ctx,
         &transcripts,
-        false,
-        None,
+        &StoredPasswords::default(),
     )
     .expect("a direct connection");
     assert!(launched.command.env.is_empty());
@@ -496,8 +499,10 @@ pub(super) fn the_marker_is_released_when_the_session_ends(bin: &Path, dir: &Pat
             false,
             &ctx,
             &dir.join("transcripts"),
-            true,
-            None,
+            &StoredPasswords {
+                target: true,
+                jump: None,
+            },
         )
         .expect("a direct connection");
         launched.command.program = fake;

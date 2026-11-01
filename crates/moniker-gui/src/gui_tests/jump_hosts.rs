@@ -38,6 +38,7 @@ use super::{
     wait_for_text,
 };
 use crate::context::AppContext;
+use crate::jump_link::JumpLink;
 use crate::panes::{self, REC_PREFIX};
 use crate::session_file::{Kind, Node, PaneRecord, TabRecord};
 use crate::terminal_tab::{
@@ -59,7 +60,11 @@ use crate::{keyring, session_layout, settings};
 /// `master-status` (how a master ends: 0, the default, signs in and leaves its
 /// `sleep`; anything else is a failed sign-in), `master-deaf` (a master
 /// ignores the hang-up of a closed pane and signs in all the same),
-/// `check-fails` (every `-O check` fails).
+/// `check-fails` (every `-O check` fails), `hold-check` (while it exists an
+/// `-O check` waits before it answers). `-O check` answers, and `-O exit` ends
+/// the recorded `sleep`, only while that `sleep` is still this fake's own
+/// (started with `MONIKER_FAKE_MASTER` set to its folder), as a real master
+/// answers only while it runs.
 ///
 /// A master or a target prints each argument after `ARG:` and the variables
 /// Moniker sets for the askpass helper, as `super::fake_ssh` does, then
@@ -88,17 +93,29 @@ for a in "$@"; do
     prev=$a
 done
 name=${{socket##*/}}
+# Whether $1 is this fake's own sleep, still running: a pid recorded earlier
+# may belong to another process by now. The master answers and ends only
+# while it runs, as a real one does.
+own_sleep() {{
+    [ -n "$1" ] \
+        && [ "$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null)" = 'sleep 600 ' ] \
+        && tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null \
+            | grep -qxF "MONIKER_FAKE_MASTER=$state"
+}}
 if [ -n "$op" ]; then
     printf '%s %s\n' "$op" "$*" >> "$state/log"
+    pid=$(cat "$state/$name.pid" 2>/dev/null)
     case $op in
         check)
+            while [ -e "$state/hold-check" ]; do sleep 0.05; done
             [ -e "$state/check-fails" ] && exit 255
-            [ -s "$state/$name.pid" ] || exit 255
-            printf 'Master running (pid=%s)\r\n' "$(cat "$state/$name.pid")" >&2
+            own_sleep "$pid" || exit 255
+            printf 'Master running (pid=%s)\r\n' "$pid" >&2
             exit 0 ;;
         exit)
+            own_sleep "$pid" && kill "$pid" 2>/dev/null
+            # Written last: once the line is there, this exit is done.
             printf '%s\n' "$socket" >> "$state/exits"
-            [ -s "$state/$name.pid" ] && kill "$(cat "$state/$name.pid")" 2>/dev/null
             printf 'Exit request sent.\r\n' >&2
             exit 0 ;;
     esac
@@ -117,7 +134,8 @@ if [ -n "$master" ]; then
     while [ -e "$state/hold-master" ]; do sleep 0.05; done
     status=$(cat "$state/master-status" 2>/dev/null || echo 0)
     if [ "$status" = 0 ]; then
-        (trap '' HUP; exec sleep 600) </dev/null >/dev/null 2>&1 &
+        (trap '' HUP; export MONIKER_FAKE_MASTER="$state"; exec sleep 600) \
+            </dev/null >/dev/null 2>&1 &
         echo "$!" > "$state/$name.pid.new"
         mv "$state/$name.pid.new" "$state/$name.pid"
         echo "$!" >> "$state/sleeps"
@@ -210,18 +228,37 @@ exit "$status"
     }
 
     /// Kill every `sleep` this fake started that still sleeps (the scenario
-    /// started them: nothing else is touched).
+    /// started them: nothing else is touched, [`sleeping`](Self::sleeping)).
     fn end(&self) {
         for pid in self.lines("sleeps") {
             let Ok(pid) = pid.trim().parse::<i32>() else {
                 continue;
             };
-            if sleeping(pid)
+            if self.sleeping(pid)
                 && let Some(pid) = rustix::process::Pid::from_raw(pid)
             {
                 let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
             }
         }
+    }
+
+    /// Whether `pid` is a `sleep 600` this fake started that still runs: not a
+    /// zombie, and not another process that took the id since (another
+    /// scenario's `sleep 600` included). The fake starts each with
+    /// `MONIKER_FAKE_MASTER` set to its folder, and only such a process counts.
+    fn sleeping(&self, pid: i32) -> bool {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next());
+        let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let environ = fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        let marker = format!("MONIKER_FAKE_MASTER={}", self.state.display());
+        cmdline == b"sleep\x00600\x00"
+            && !matches!(state, Some('Z' | 'X'))
+            && environ.split(|&b| b == 0).any(|v| v == marker.as_bytes())
     }
 }
 
@@ -230,19 +267,6 @@ impl Drop for Fake {
     fn drop(&mut self) {
         self.end();
     }
-}
-
-/// Whether `pid` is a `sleep 600` that still runs (not a zombie, and not
-/// another process that took the id since).
-fn sleeping(pid: i32) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
-    let state = stat
-        .rsplit_once(')')
-        .and_then(|(_, rest)| rest.trim_start().chars().next());
-    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    cmdline == b"sleep\x00600\x00" && !matches!(state, Some('Z' | 'X'))
 }
 
 /// The jump host of these scenarios.
@@ -361,6 +385,8 @@ struct Connected {
     terminal: Terminal,
     /// The master's socket.
     socket: String,
+    /// The pane's shared connection, as it had it once the target was up.
+    link: Rc<JumpLink>,
 }
 
 /// Connect to `p` in a new tab of `view` as a click does, and wait until its
@@ -369,27 +395,49 @@ fn connect(view: &adw::TabView, ctx: &Rc<AppContext>, p: &Profile) -> Connected 
     open_profile(view, ctx, p, None, false);
     let page = view.selected_page().expect("the new tab");
     let holder = pane(&page);
-    let terminal = wait_for_session(&page);
+    connected(page, holder)
+}
+
+/// The connection through its jump host in the pane of `holder` (in `page`),
+/// once its target's `ssh` runs.
+fn connected(page: adw::TabPage, holder: PaneHolder) -> Connected {
+    pump_until("the session", || terminal_in(&holder).is_some());
+    let terminal = terminal_in(&holder).expect("the session");
     wait_for_text(&terminal, "TARGET-UP");
     let (master, _) = stages(&terminal);
     let socket = arg_after(&master, "-S").expect("the master's socket");
+    let link = holder
+        .jump()
+        .borrow()
+        .clone()
+        .expect("its shared connection");
     Connected {
         page,
         holder,
         terminal,
         socket,
+        link,
     }
 }
 
 /// Wait until the pane of `c` has learned its master's process.
 fn learned(c: &Connected) {
-    let link = c
-        .holder
-        .jump()
-        .borrow()
-        .clone()
-        .expect("its shared connection");
-    pump_until("the master's process to be learned", || link.knows_master());
+    pump_until("the master's process to be learned", || {
+        c.link.knows_master()
+    });
+}
+
+/// Wait until `link` is closed and none of its commands is still running, so
+/// that nothing of it runs after the scenario.
+fn settled(link: &JumpLink) {
+    pump_until("the shared connection to settle", || {
+        link.is_closed() && link.idle()
+    });
+}
+
+/// How many `-O exit` named `socket`.
+fn exits_for(fake: &Fake, socket: &str) -> usize {
+    fake.exits().iter().filter(|s| *s == socket).count()
 }
 
 /// A click on a profile whose jump host is a saved profile connects through
@@ -524,14 +572,15 @@ pub(super) fn a_profile_connects_through_its_jump_host(bin: &Path, dir: &Path) {
     assert_eq!(link.socket(), Path::new(&socket));
     pump_until("the master's process to be learned", || link.knows_master());
     let master_pid = fake.pid_of(&socket);
-    assert!(sleeping(master_pid));
+    assert!(fake.sleeping(master_pid));
     assert!(target_marker.exists(), "kept while the target runs");
 
     // Closing the tab hangs up the target and ends the master, through its
     // pidfd: no `-O exit` was needed.
     main.view.close_page(&page);
-    pump_until("the master to end", || !sleeping(master_pid));
+    pump_until("the master to end", || !fake.sleeping(master_pid));
     pump_until("the target's marker to go", || !target_marker.exists());
+    settled(&link);
     assert!(holder.jump().borrow().is_none(), "the pane let go of it");
     assert_eq!(
         fake.exits(),
@@ -541,7 +590,7 @@ pub(super) fn a_profile_connects_through_its_jump_host(bin: &Path, dir: &Path) {
 
     fake.end();
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }
 
@@ -568,11 +617,14 @@ pub(super) fn closing_the_pane_ends_its_shared_connection(bin: &Path, dir: &Path
     learned(&c);
     let pid = fake.pid_of(&c.socket);
     main.view.close_page(&c.page);
-    pump_until("the master to end", || !sleeping(pid));
-    assert!(!fake.exits().contains(&c.socket), "no -O exit was needed");
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
+    assert_eq!(exits_for(&fake, &c.socket), 0, "no -O exit was needed");
 
-    // `-O check` fails: the pane closed tells the master with `-O exit`.
+    // `-O check` fails: the pane closed tells the master with `-O exit`, and
+    // only once, also when the failed check comes back after it.
     fake.set("check-fails", true);
+    fake.set("hold-check", true);
     let c = connect(&main.view, &ctx, &web);
     pump_until("the master to be asked for its process", || {
         fake.checked(&c.socket)
@@ -580,9 +632,13 @@ pub(super) fn closing_the_pane_ends_its_shared_connection(bin: &Path, dir: &Path
     let pid = fake.pid_of(&c.socket);
     main.view.close_page(&c.page);
     pump_until("-O exit for its socket", || {
-        fake.exits().contains(&c.socket)
+        exits_for(&fake, &c.socket) == 1
     });
-    pump_until("the master to end", || !sleeping(pid));
+    pump_until("the master to end", || !fake.sleeping(pid));
+    assert!(!c.link.idle(), "the check is still out");
+    fake.set("hold-check", false);
+    settled(&c.link);
+    assert_eq!(exits_for(&fake, &c.socket), 1, "told once");
     fake.set("check-fails", false);
 
     // The target exits with success: its pane closes and the master ends.
@@ -592,7 +648,8 @@ pub(super) fn closing_the_pane_ends_its_shared_connection(bin: &Path, dir: &Path
     let tabs = main.view.n_pages();
     c.terminal.feed_child(b"0\n");
     pump_until("the pane to close", || main.view.n_pages() == tabs - 1);
-    pump_until("the master to end", || !sleeping(pid));
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
 
     // The target fails: its pane stays with the note, and the master ends.
     let c = connect(&main.view, &ctx, &web);
@@ -600,21 +657,25 @@ pub(super) fn closing_the_pane_ends_its_shared_connection(bin: &Path, dir: &Path
     let pid = fake.pid_of(&c.socket);
     c.terminal.feed_child(b"7\n");
     wait_for_text(&c.terminal, "[session ended: status 7]");
-    pump_until("the master to end", || !sleeping(pid));
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
     assert!(c.holder.jump().borrow().is_none(), "its connection is over");
     assert_eq!(terminal_in(&c.holder).as_ref(), Some(&c.terminal), "kept");
     main.view.close_page(&c.page);
 
-    // The pane closed while the jump host signs in: the master is hung up.
-    // One that signs in all the same (it ignores the hang-up) is ended once
-    // its process is known, and its target is never started.
+    // The pane closed while the jump host signs in: the master is hung up,
+    // and `-O exit` goes to a socket that is not there yet. One that signs in
+    // all the same (it ignores the hang-up) is ended through its pidfd once
+    // its process is known (the late answer, plan Ruling R2), with no second
+    // `-O exit`, and its target is never started.
     fake.set("master-deaf", true);
     fake.set("hold-master", true);
     let targets = fake.targets();
     open_profile(&main.view, &ctx, &web, None, false);
     let page = main.view.selected_page().expect("the new tab");
     let holder = pane(&page);
-    let terminal = wait_for_session(&page);
+    pump_until("the session", || terminal_in(&holder).is_some());
+    let terminal = terminal_in(&holder).expect("the session");
     wait_for_text(&terminal, "PARENT=");
     let socket = arg_after(&stages(&terminal).0, "-S").expect("its socket");
     let link = holder
@@ -627,21 +688,31 @@ pub(super) fn closing_the_pane_ends_its_shared_connection(bin: &Path, dir: &Path
         link.is_closed(),
         "closing the pane ends its shared connection"
     );
+    // Done before the master signs in: it ended nothing.
+    pump_until("-O exit for its socket", || exits_for(&fake, &socket) == 1);
+    assert!(link.told_to_exit());
     fake.set("hold-master", false);
     let pid = fake.pid_of(&socket);
-    pump_until("the master that signed in late to end", || !sleeping(pid));
-    pump_for(Duration::from_millis(300));
+    pump_until("the master that signed in late to end", || {
+        !fake.sleeping(pid)
+    });
+    settled(&link);
+    assert_eq!(exits_for(&fake, &socket), 1, "ended through its pidfd");
     assert_eq!(fake.targets(), targets, "a closed pane reaches no target");
     fake.set("master-deaf", false);
 
     // The target's `ssh` cannot be started: the shared connection is ended
-    // with it. (The fake is away meanwhile, so it is not asked for anything.)
+    // with it. The fake is away meanwhile, and stays away until the link's
+    // commands have all come back, so neither `-O check` nor `-O exit` could
+    // reach the master: the scenario ends it itself.
     fake.set("hold-master", true);
     open_profile(&main.view, &ctx, &web, None, false);
     let page = main.view.selected_page().expect("the new tab");
     let holder = pane(&page);
-    let terminal = wait_for_session(&page);
+    pump_until("the session", || terminal_in(&holder).is_some());
+    let terminal = terminal_in(&holder).expect("the session");
     wait_for_text(&terminal, "PARENT=");
+    let socket = arg_after(&stages(&terminal).0, "-S").expect("its socket");
     let link = holder
         .jump()
         .borrow()
@@ -651,9 +722,13 @@ pub(super) fn closing_the_pane_ends_its_shared_connection(bin: &Path, dir: &Path
     fs::rename(&fake.program, &away).expect("take the fake away");
     fake.set("hold-master", false);
     wait_for_text(&terminal, "[could not start");
+    settled(&link);
     fs::rename(&away, &fake.program).expect("put the fake back");
     assert!(holder.jump().borrow().is_none(), "the pane let go of it");
-    assert!(link.is_closed(), "and ended it");
+    assert!(link.told_to_exit(), "and told its master to end");
+    let pid = fake.pid_of(&socket);
+    fake.end();
+    pump_until("the master to end", || !fake.sleeping(pid));
     main.view.close_page(&page);
 
     // A window closed ends the master of its pane.
@@ -662,11 +737,12 @@ pub(super) fn closing_the_pane_ends_its_shared_connection(bin: &Path, dir: &Path
     learned(&c);
     let pid = fake.pid_of(&c.socket);
     second.window.close();
-    pump_until("the master to end", || !sleeping(pid));
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
 
     fake.end();
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }
 
@@ -696,28 +772,21 @@ pub(super) fn two_panes_keep_their_own_shared_connections(bin: &Path, dir: &Path
     let holder = layout.focused_holder().expect("the new pane");
     assert_ne!(holder, first.holder, "a pane of its own");
     start_profile(&holder, &ctx, &web, None, false);
-    pump_until("the second pane's session", || {
-        terminal_in(&holder).is_some()
-    });
-    let terminal = terminal_in(&holder).expect("its terminal");
-    wait_for_text(&terminal, "TARGET-UP");
-    let (master, _) = stages(&terminal);
-    let socket = arg_after(&master, "-S").expect("its socket");
-    let second = Connected {
-        page: first.page.clone(),
-        holder,
-        terminal,
-        socket,
-    };
+    let second = connected(first.page.clone(), holder);
     learned(&second);
     assert_ne!(first.socket, second.socket, "a socket each");
     let (one, two) = (fake.pid_of(&first.socket), fake.pid_of(&second.socket));
     assert_ne!(one, two, "a master each");
 
     close_pane(&first.holder);
-    pump_until("the first master to end", || !sleeping(one));
+    pump_until("the first master to end", || !fake.sleeping(one));
+    settled(&first.link);
     pump_for(Duration::from_millis(300));
-    assert!(sleeping(two), "the other pane's master runs on");
+    assert!(fake.sleeping(two), "the other pane's master runs on");
+    assert!(
+        !second.link.is_closed(),
+        "and its shared connection is open"
+    );
     assert!(
         !terminal_text(&second.terminal).contains("[session ended"),
         "the other pane's session runs on"
@@ -725,11 +794,84 @@ pub(super) fn two_panes_keep_their_own_shared_connections(bin: &Path, dir: &Path
     assert!(fake.exits().is_empty(), "nothing told to exit");
 
     main.view.close_page(&second.page);
-    pump_until("the second master to end", || !sleeping(two));
+    pump_until("the second master to end", || !fake.sleeping(two));
+    settled(&second.link);
 
     fake.end();
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A pane moved to a window of its own (its header's Move to New Window) takes
+/// its shared connection along: closing the window it left ends nothing of it,
+/// and closing the moved pane ends its master.
+pub(super) fn a_moved_pane_takes_its_shared_connection_along(bin: &Path, dir: &Path) {
+    let fake = Fake::new(bin, "jh-moved", &dir.join("fake"));
+    let bastion = bastion();
+    let web = through(&bastion);
+    let run = runtime(dir);
+    let ctx = ctx_for(
+        dir,
+        &[bastion.clone(), web.clone()],
+        Arc::new(MemorySecretStore::default()),
+        Some(&run),
+    );
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    set_test_ssh_program(Some(fake.program.clone()));
+
+    let c = connect(&main.view, &ctx, &web);
+    learned(&c);
+    let pid = fake.pid_of(&c.socket);
+    // Split, so that the pane has its header, then out to a window of its own.
+    gtk::prelude::WidgetExt::activate_action(&main.window, "win.split-right", None)
+        .expect("win.split-right");
+    let pane_widget = panes::pane_of(&c.holder).expect("its pane");
+    let header = pane_widget.header();
+    pump_until("the pane's header", || header.is_visible());
+    let windows = app.windows().len();
+    gtk::prelude::WidgetExt::activate_action(header, "pane.pane-to-window", None)
+        .expect("pane.pane-to-window");
+    pump_until("a window of its own", || app.windows().len() == windows + 1);
+    let moved = c
+        .holder
+        .root()
+        .and_downcast::<gtk::Window>()
+        .expect("the pane's window");
+    assert_ne!(
+        &moved,
+        main.window.upcast_ref::<gtk::Window>(),
+        "the pane left"
+    );
+    assert!(
+        c.holder
+            .jump()
+            .borrow()
+            .as_ref()
+            .is_some_and(|link| Rc::ptr_eq(link, &c.link)),
+        "its shared connection went with it"
+    );
+
+    // The window it left closes: the moved pane's connection runs on.
+    main.window.close();
+    pump_for(Duration::from_millis(300));
+    assert!(fake.sleeping(pid), "its master runs on");
+    assert!(!c.link.is_closed(), "its shared connection is open");
+    assert!(
+        !terminal_text(&c.terminal).contains("[session ended"),
+        "its session runs on"
+    );
+    assert!(fake.exits().is_empty(), "nothing told to exit");
+
+    // Closed where it is now, it ends its master.
+    close_pane(&c.holder);
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
+    pump_until("its window to close with it", || !moved.is_visible());
+
+    fake.end();
+    set_test_ssh_program(None);
     pump_for(Duration::from_millis(200));
 }
 
@@ -766,7 +908,9 @@ pub(super) fn an_edited_jump_host_still_ends_the_master_it_started(bin: &Path, d
     pump_until("-O exit for its socket", || {
         fake.exits().contains(&c.socket)
     });
-    pump_until("the master to end", || !sleeping(pid));
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
+    assert_eq!(exits_for(&fake, &c.socket), 1, "told once");
     let exit = fake
         .log()
         .into_iter()
@@ -788,18 +932,20 @@ pub(super) fn an_edited_jump_host_still_ends_the_master_it_started(bin: &Path, d
         p.host = "elsewhere.example.test".to_owned();
     });
     main.view.close_page(&c.page);
-    pump_until("the master to end", || !sleeping(pid));
-    assert!(!fake.exits().contains(&c.socket), "through its pidfd");
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
+    assert_eq!(exits_for(&fake, &c.socket), 0, "through its pidfd");
 
     fake.end();
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }
 
 /// A jump connection that fails (ssh exits with 255, a wrong password say)
 /// leaves ssh's message and Moniker's note in the pane, and the target is never
-/// tried. The pane stays; its transcript is written once.
+/// tried. Nothing went to the background, so no `-O exit` is run. The pane
+/// stays; its transcript is written once.
 pub(super) fn a_failed_jump_connection_never_tries_the_target(bin: &Path, dir: &Path) {
     let fake = Fake::new(bin, "jh-failed", &dir.join("fake"));
     let bastion = bastion();
@@ -817,12 +963,26 @@ pub(super) fn a_failed_jump_connection_never_tries_the_target(bin: &Path, dir: &
     let transcripts = dir.join("transcripts");
 
     fake.master_status(255);
+    fake.set("hold-master", true);
     open_profile(&main.view, &ctx, &web, None, true);
     let page = main.view.selected_page().expect("the new tab");
     let holder = pane(&page);
     let terminal = wait_for_session(&page);
+    wait_for_text(&terminal, "PARENT=");
+    let link = holder
+        .jump()
+        .borrow()
+        .clone()
+        .expect("its shared connection");
+    fake.set("hold-master", false);
     wait_for_text(&terminal, "Could not connect to the jump host bastion.");
+    settled(&link);
     pump_for(Duration::from_millis(300));
+    assert!(
+        !link.told_to_exit(),
+        "no -O exit for a master that did not sign in"
+    );
+    assert!(fake.exits().is_empty() && !fake.log().iter().any(|l| l.starts_with("exit ")));
     assert!(!fake.ran_a_target(), "the target is never tried");
     assert!(!terminal_text(&terminal).contains("TARGET-UP"));
     let lines = shown(&terminal);
@@ -850,7 +1010,7 @@ pub(super) fn a_failed_jump_connection_never_tries_the_target(bin: &Path, dir: &
 
     fake.end();
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }
 
@@ -925,7 +1085,7 @@ pub(super) fn a_waiting_profile_connects_nowhere(bin: &Path, dir: &Path) {
     );
 
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }
 
@@ -1029,10 +1189,21 @@ pub(super) fn a_jump_host_gone_while_the_keyring_waits_connects_nowhere(bin: &Pa
         calls,
         "the keyring was called on the main thread"
     );
+    // Closed, it ends its master: nothing of it runs after the scenario.
+    let link = holder
+        .jump()
+        .borrow()
+        .clone()
+        .expect("its shared connection");
+    pump_until("the master's process to be learned", || link.knows_master());
+    let pid = fake.pid_of(&arg_after(&master, "-S").expect("its socket"));
+    close_pane(&holder);
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&link);
 
     fake.end();
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }
 
@@ -1066,7 +1237,7 @@ pub(super) fn no_private_runtime_folder_connects_nowhere(bin: &Path, dir: &Path)
         pump_for(Duration::from_millis(300));
         assert!(!fake.ran(), "{case}: nothing ran: {:?}", fake.log());
         set_test_ssh_program(None);
-        main.window.destroy();
+        main.window.close();
         pump_for(Duration::from_millis(200));
     }
     assert!(!open.join("moniker").exists(), "nothing made in it");
@@ -1108,11 +1279,12 @@ pub(super) fn the_jump_host_s_password_needs_the_helper_too(bin: &Path, dir: &Pa
     }
     let pid = fake.pid_of(&c.socket);
     main.view.close_page(&c.page);
-    pump_until("the master to end", || !sleeping(pid));
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
 
     fake.end();
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }
 
@@ -1172,9 +1344,15 @@ pub(super) fn a_restored_layout_pane_goes_through_its_jump_host(bin: &Path, dir:
         1
     );
 
+    let link = holder
+        .jump()
+        .borrow()
+        .clone()
+        .expect("its shared connection");
     let pid = fake.pid_of(&arg_after(&master, "-S").expect("the socket"));
     main.window.close();
-    pump_until("the master to end", || !sleeping(pid));
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&link);
     fake.end();
     set_test_ssh_program(None);
     pump_for(Duration::from_millis(200));
@@ -1209,13 +1387,16 @@ pub(super) fn rec_lasts_from_the_jump_host_to_the_target_s_end(bin: &Path, dir: 
     assert_eq!(page.title(), format!("{REC_PREFIX}web"));
 
     fake.set("hold-master", false);
-    wait_for_text(&terminal, "TARGET-UP");
+    let c = connected(page.clone(), holder.clone());
     assert!(holder.recording().get(), "REC while the target runs");
     assert_eq!(page.title(), format!("{REC_PREFIX}web"));
     assert_eq!(files_in(&transcripts), Vec::<PathBuf>::new(), "not yet");
+    let pid = fake.pid_of(&c.socket);
 
     terminal.feed_child(b"3\n");
     wait_for_text(&terminal, "[session ended: status 3]");
+    pump_until("the master to end", || !fake.sleeping(pid));
+    settled(&c.link);
     assert!(!holder.recording().get(), "REC goes with the transcript");
     assert_eq!(page.title(), "web");
     let files = files_in(&transcripts);
@@ -1234,6 +1415,6 @@ pub(super) fn rec_lasts_from_the_jump_host_to_the_target_s_end(bin: &Path, dir: 
 
     fake.end();
     set_test_ssh_program(None);
-    main.window.destroy();
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }

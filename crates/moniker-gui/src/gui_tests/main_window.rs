@@ -36,7 +36,7 @@ use crate::context::AppContext;
 use crate::launch_args::{Refused, Run, Start, decode, encode};
 use crate::profiles::Pick;
 use crate::terminal_tab::{
-    launch, new_holder_page, rename_page, start_command, tab_title, terminal_of,
+    StoredPasswords, launch, new_holder_page, rename_page, start_command, tab_title, terminal_of,
 };
 use crate::{ABOUT_COPYRIGHT, REPOSITORY_URL, preferences, profiles, sessions_menu, window};
 
@@ -441,8 +441,16 @@ fn the_connect_time_choice_decides_whether_a_transcript_is_written(bin: &Path, d
 
         let fx = fixture();
         let page = new_holder_page(&fx.view, "x");
-        let mut launched = launch(&pane(&page), &p, sequence, record, &ctx, &case, false, None)
-            .expect("a direct connection");
+        let mut launched = launch(
+            &pane(&page),
+            &p,
+            sequence,
+            record,
+            &ctx,
+            &case,
+            &StoredPasswords::default(),
+        )
+        .expect("a direct connection");
         launched.command.program = fake.clone();
         assert_eq!(launched.transcript.is_some(), expect_file);
 

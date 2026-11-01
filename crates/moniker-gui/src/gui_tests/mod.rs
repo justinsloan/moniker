@@ -451,6 +451,7 @@ fn gui_integration() {
     jump_hosts::a_profile_connects_through_its_jump_host(&bin, &tmp.path().join("jh-connect"));
     jump_hosts::closing_the_pane_ends_its_shared_connection(&bin, &tmp.path().join("jh-close"));
     jump_hosts::two_panes_keep_their_own_shared_connections(&bin, &tmp.path().join("jh-two"));
+    jump_hosts::a_moved_pane_takes_its_shared_connection_along(&bin, &tmp.path().join("jh-moved"));
     jump_hosts::an_edited_jump_host_still_ends_the_master_it_started(
         &bin,
         &tmp.path().join("jh-edited"),

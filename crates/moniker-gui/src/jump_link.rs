@@ -23,7 +23,11 @@
 //!   application quits, else `ssh -O exit` through the socket, on a worker
 //!   thread, with the application held until it is done. An answer of
 //!   `learn_pid` that comes back after the link was closed ends the master
-//!   then: the master that signed in while its pane was closing is ended too.
+//!   then: the master that signed in while its pane was closing is ended too,
+//!   through its pidfd. A link sends `-O exit` once at most, since every `ssh
+//!   -O` reads the person's `~/.ssh/config` (a `Match exec` runs its command),
+//!   and none for a master that did not sign in ([`JumpLink::forget`]), which
+//!   never went to the background.
 //! * Should neither reach it (Moniker was killed), the master ends by itself
 //!   `moniker_core::jump::PERSIST_SECS` after its last channel closed.
 //!
@@ -63,8 +67,15 @@ pub(crate) struct JumpLink {
     /// The master, once [`learn_pid`](Self::learn_pid) has learned it, until it
     /// is ended.
     pidfd: RefCell<Option<OwnedFd>>,
-    /// The pane's connection has ended: the master is, or is being, ended.
+    /// The pane's connection has ended: the master is, or is being, ended (or
+    /// there is none, [`forget`](Self::forget)).
     closed: Cell<bool>,
+    /// `-O exit` was sent once already. Never twice: each `ssh -O` reads the
+    /// person's `~/.ssh/config` (a `Match exec` runs its command), so a link
+    /// runs no more of them than it must.
+    told: Cell<bool>,
+    /// Commands of this link on a worker thread whose answer is not back yet.
+    running: Rc<Cell<u32>>,
 }
 
 impl JumpLink {
@@ -77,15 +88,18 @@ impl JumpLink {
             exit,
             pidfd: RefCell::new(None),
             closed: Cell::new(false),
+            told: Cell::new(false),
+            running: Rc::new(Cell::new(0)),
         }
     }
 
     /// Learn the master's process id, now that it has signed in, on a worker
     /// thread (`moniker_core::jump::learn_master`), and back on the main loop
     /// keep its pidfd for [`close`](Self::close). If the link was closed
-    /// meanwhile, end the master then instead: through the pidfd, or with `ssh
-    /// -O exit` when it could not be learned (the link may have been closed
-    /// before the master's socket existed, while it signed in).
+    /// meanwhile, end the master then instead: through the pidfd (a signal,
+    /// which reads no configuration), or, when it could not be learned, with
+    /// `ssh -O exit` unless `close` already sent one (the link may have been
+    /// closed before the master's socket existed, while it signed in).
     ///
     /// A master that cannot be learned while the link is open is ended with
     /// `-O exit` when the link closes.
@@ -93,6 +107,7 @@ impl JumpLink {
         let check = test_hook::command(self.check.clone());
         let link = Rc::clone(self);
         on_a_worker(
+            &self.running,
             move || learn_master(&check),
             move |pidfd| {
                 let pidfd = pidfd.flatten();
@@ -105,7 +120,8 @@ impl JumpLink {
                         // An error: it is gone already.
                         let _ = end_master(&pidfd);
                     }
-                    None => link.tell_exit(),
+                    None if !link.told.get() => link.tell_exit(),
+                    None => {}
                 }
             },
         );
@@ -127,14 +143,26 @@ impl JumpLink {
         }
     }
 
-    /// Run `-O exit` on a worker thread, with the application held until it is
-    /// done, so that closing the last window does not quit before the master
-    /// was told. It answers in milliseconds, and within
-    /// `moniker_core::jump::CONTROL_LIMIT` in any case.
+    /// Close the link without ending anything: its master did not sign in, so
+    /// it never went to the background and there is nothing to end (no `ssh
+    /// -O exit` is run for it).
+    pub(crate) fn forget(&self) {
+        self.closed.set(true);
+        self.pidfd.take();
+    }
+
+    /// Run `-O exit` on a worker thread, once (`told`), with the
+    /// application held until it is done, so that closing the last window does
+    /// not quit before the master was told. It answers in milliseconds, and
+    /// within `moniker_core::jump::CONTROL_LIMIT` in any case.
     fn tell_exit(&self) {
+        if self.told.replace(true) {
+            return;
+        }
         let exit = test_hook::command(self.exit.clone());
         let hold = gio::Application::default().map(|app| app.hold());
         on_a_worker(
+            &self.running,
             move || {
                 let _ = run_control(&exit, CONTROL_LIMIT);
             },
@@ -148,10 +176,23 @@ impl JumpLink {
         self.pidfd.borrow().is_some()
     }
 
-    /// Whether [`close`](Self::close) was called (tests).
+    /// Whether [`close`](Self::close) (or [`forget`](Self::forget)) was called
+    /// (tests).
     #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
         self.closed.get()
+    }
+
+    /// Whether `-O exit` was sent (tests).
+    #[cfg(test)]
+    pub(crate) fn told_to_exit(&self) -> bool {
+        self.told.get()
+    }
+
+    /// Whether no command of the link waits on a worker thread (tests).
+    #[cfg(test)]
+    pub(crate) fn idle(&self) -> bool {
+        self.running.get() == 0
     }
 
     /// The master's socket (tests).
@@ -172,8 +213,9 @@ impl Drop for JumpLink {
 
 /// Run `work` on a thread of its own and `done` on the main loop with what it
 /// returned, or with `None` when the thread could not be started or `work`
-/// panicked.
+/// panicked; `running` counts it from now until `done` has run.
 fn on_a_worker<R: Send + 'static>(
+    running: &Rc<Cell<u32>>,
     work: impl FnOnce() -> R + Send + 'static,
     done: impl FnOnce(Option<R>) + 'static,
 ) {
@@ -185,7 +227,10 @@ fn on_a_worker<R: Send + 'static>(
         .spawn(move || {
             let _ = sender.send_blocking(work());
         });
+    running.set(running.get() + 1);
+    let running = Rc::clone(running);
     glib::MainContext::default().spawn_local(async move {
         done(received.recv().await.ok());
+        running.set(running.get() - 1);
     });
 }
