@@ -8,7 +8,10 @@
 //!   every open terminal and by new ones (`terminal_tab::apply_font`); and the
 //!   scrollback of ordinary tabs, 1,000 to 1,000,000 lines, for tabs opened
 //!   after the change (`terminal_tab::set_scrollback`). Tabs that save a
-//!   transcript keep unlimited scrollback whatever it says.
+//!   transcript keep unlimited scrollback whatever it says. Last, "Show when a
+//!   session runs as root" (on by default): the red top bar, pane header and
+//!   tab of a session that runs as root (`crate::root`), turned off or on in
+//!   every window at once; off, nothing is checked.
 //! * **Layouts**: "Show the Layouts menu" (on by default), the Layouts
 //!   button beside ＋ in every main window, hidden or shown at once
 //!   (`sessions_menu::show_buttons`). Off, the saved layouts are kept.
@@ -51,7 +54,7 @@ use moniker_core::transcript::{MoveReport, move_transcripts, prepare_folder};
 use crate::context::AppContext;
 use crate::notify;
 use crate::settings::{self, GuiSettings};
-use crate::{profiles, recordings, sessions_menu, terminal_tab, window};
+use crate::{profiles, recordings, root, sessions_menu, terminal_tab, window};
 
 /// Widget name of the dialog, how [`present`] finds an open one.
 const DIALOG_NAME: &str = "moniker-preferences";
@@ -67,6 +70,9 @@ const FONT_RESET_NAME: &str = "preferences-font-reset";
 const FONT_SUBTITLE: &str = "Used by every terminal; changes apply at once";
 const FONT_RESET_TOOLTIP: &str = "Use the System Font";
 const SCROLLBACK_SUBTITLE: &str = "Lines kept for scrolling back in ordinary tabs";
+pub(crate) const ROOT_TITLE: &str = "Show when a session runs as root";
+pub(crate) const ROOT_SUBTITLE: &str =
+    "Turns the top bar red while the program in front runs as root.";
 const SAVE_ALL_TITLE: &str = "Save transcripts of all sessions";
 const SAVE_ALL_SUBTITLE: &str = "Every new tab, including the first at launch. Tabs that save a \
 transcript keep all their scrollback.";
@@ -306,6 +312,13 @@ fn terminal_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGr
     let group = adw::PreferencesGroup::builder().title("Terminal").build();
     group.add(&font_row(ctx, now));
     group.add(&scrollback_row(ctx, now));
+    group.add(&switch_row(
+        ctx,
+        (ROOT_TITLE, ROOT_SUBTITLE),
+        now.mark_root,
+        |s| &mut s.mark_root,
+        root::set_enabled,
+    ));
     group
 }
 

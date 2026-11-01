@@ -3,7 +3,8 @@
 //! shows a warning icon before the title; a root pane's header in a split is
 //! red with the icon, focused or not; a tab with a root pane has the icon and a
 //! last line in its tooltip. The marks move with the pane, sit before REC, and
-//! all go while the switch is off.
+//! all go while the switch is off. The Preferences switch that turns them off
+//! is saved, and a launch applies it ([`the_preferences_switch_turns_the_mark_off`]).
 //!
 //! The first scenarios set what the watch would decide directly
 //! ([`root::show_root`]), with a check hook that keeps what is set
@@ -15,11 +16,13 @@
 //! checked. Local tabs run `/bin/sh`, connections a fake `ssh`.
 
 use std::cell::{Cell, RefCell};
+use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use adw::prelude::*;
 use gtk::glib::translate::IntoGlib;
 use gtk::{gdk, gio};
 use gtk4 as gtk;
@@ -43,7 +46,7 @@ use crate::root::{self, Backoff, PANE_CLASS, ROOT_ICON, ROOT_TOOLTIP, WINDOW_CLA
 use crate::terminal_tab::{
     self, PaneHolder, WAITING_TEXT, set_test_ssh_program, shown_title, terminal_in, terminal_of,
 };
-use crate::window;
+use crate::{preferences, settings, window};
 
 /// Run the window action `name` of `main`, as its accelerator does.
 fn act(main: &window::MainWindow, name: &str) {
@@ -54,7 +57,10 @@ fn act(main: &window::MainWindow, name: &str) {
 /// The warning icon before the header bar's title of `main`, which shows while
 /// its top bar is red.
 fn header_root_image(main: &window::MainWindow) -> gtk::Image {
-    let header: adw::HeaderBar = find_widget(&main.window).expect("the header bar");
+    // Looked for in the window's content, not in the window: a dialog over the
+    // window (the Preferences) has a header bar of its own, which may come first.
+    let content = main.window.content().expect("the window's content");
+    let header: adw::HeaderBar = find_widget(&content).expect("the header bar");
     all_widgets::<gtk::Image>(&header)
         .into_iter()
         .find(|image| image.widget_name() == window::ROOT_IMAGE_NAME)
@@ -982,5 +988,114 @@ pub(super) fn the_switch_stops_the_checks(dir: &Path) {
     assert_root_tab(&page);
 
     main.window.close();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The Preferences switch "Show when a session runs as root", the last row of
+/// the Terminal group, on to start with: off, it removes the marks of every
+/// window at once and is saved; on, they come back after the first checks. A
+/// change that cannot be saved (a damaged settings file) is not used: the row
+/// goes back, the windows stay red and the file is left byte for byte. A
+/// launch takes the setting from the file (`terminal_tab::use_preferences`).
+pub(super) fn the_preferences_switch_turns_the_mark_off(dir: &Path) {
+    let _hook = Hook::answering(|_| true);
+    let _on = SwitchBackOn;
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let one = main_window(&app, &ctx);
+    let two = main_window(&app, &ctx);
+    for main in [&one, &two] {
+        let page = main.view.selected_page().expect("the launch tab");
+        root::show_root(&pane(&page), true);
+    }
+    pump_until("both top bars red", || is_red(&one) && is_red(&two));
+
+    let dialog = preferences::present(&one.window, &app, &ctx);
+    pump_until("the Preferences dialog", || {
+        one.window.visible_dialog().as_ref() == Some(dialog.upcast_ref())
+    });
+    let terminal = all_widgets::<adw::PreferencesGroup>(&dialog)
+        .into_iter()
+        .find(|group| group.title() == "Terminal")
+        .expect("the Terminal group");
+    let switch = all_widgets::<adw::PreferencesRow>(&terminal)
+        .pop()
+        .and_then(|row| row.downcast::<adw::SwitchRow>().ok())
+        .expect("the Terminal group's last row is a switch");
+    assert_eq!(switch.title(), "Show when a session runs as root");
+    assert_eq!(
+        switch.subtitle().as_deref(),
+        Some("Turns the top bar red while the program in front runs as root.")
+    );
+    assert!(!switch.uses_markup());
+    assert!(switch.is_active(), "on to start with");
+    assert!(ctx.settings().mark_root);
+
+    // Off: both windows lose the marks at once, and the file says so.
+    switch.set_active(false);
+    assert!(!root::enabled());
+    assert!(!ctx.settings().mark_root, "saved");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&ctx.settings_path).expect("the settings file"))
+            .expect("JSON");
+    assert_eq!(saved["mark_root"], serde_json::Value::Bool(false));
+    assert_red(&one, false);
+    assert_red(&two, false);
+
+    // On again: the checks start and both are red after the first ones.
+    switch.set_active(true);
+    assert!(root::enabled());
+    assert!(ctx.settings().mark_root, "saved");
+    pump_until("both top bars red again", || is_red(&one) && is_red(&two));
+
+    // A change that cannot be saved is not used.
+    let damaged = "{ not json";
+    fs::write(&ctx.settings_path, damaged).expect("damage the settings file");
+    switch.set_active(false);
+    pump_until("the row to go back", || switch.is_active());
+    pump_for(Duration::from_millis(200));
+    assert!(switch.is_active(), "it stays back");
+    assert!(root::enabled(), "the marks stay on");
+    assert!(is_red(&one) && is_red(&two), "the windows stay red");
+    assert_eq!(
+        fs::read_to_string(&ctx.settings_path).expect("the settings file"),
+        damaged,
+        "the damaged file is left byte for byte"
+    );
+    fs::remove_file(&ctx.settings_path).expect("remove the damaged file");
+
+    dialog.force_close();
+    pump_until("the dialog to close", || {
+        one.window.visible_dialog().is_none()
+    });
+
+    // A launch takes the setting from the file: off, the marks are off; on,
+    // they come back.
+    let off = settings::GuiSettings {
+        mark_root: false,
+        ..ctx.settings()
+    };
+    terminal_tab::use_preferences(&off);
+    assert!(!root::enabled(), "a launch with the setting off");
+    assert_red(&one, false);
+    assert_red(&two, false);
+    terminal_tab::use_preferences(&ctx.settings());
+    assert!(root::enabled(), "a launch with the setting on");
+    pump_until("both top bars red once more", || {
+        is_red(&one) && is_red(&two)
+    });
+
+    // A launch that finds the marks as the file says leaves the checks of the
+    // open windows alone (every command line launch comes through here).
+    let holder = pane(&one.view.selected_page().expect("the launch tab"));
+    pump_until("the first window's watch to back off", || {
+        root::delay_of(&holder) > Some(Backoff::FIRST)
+    });
+    let delay = root::delay_of(&holder);
+    terminal_tab::use_preferences(&ctx.settings());
+    assert_eq!(root::delay_of(&holder), delay, "the schedule is not reset");
+
+    one.window.destroy();
+    two.window.destroy();
     pump_for(Duration::from_millis(200));
 }

@@ -89,6 +89,10 @@ pub struct GuiSettings {
     /// (`crate::sessions_menu`; the Preferences switch, on by default). Off,
     /// the saved layouts are kept and only the button is hidden.
     pub show_sessions: bool,
+    /// Mark a session that runs as root: the top bar, a pane's header and the
+    /// tab turn red (`crate::root`; the Preferences switch, on by default).
+    /// Off, nothing is checked and nothing is marked.
+    pub mark_root: bool,
     /// The size of the main window that closed last, which new main windows
     /// open at (issue #14); `None` is the built-in size.
     pub main_window: Option<WindowSize>,
@@ -198,6 +202,10 @@ impl GuiSettings {
                 .get("show_sessions")
                 .and_then(Value::as_bool)
                 .unwrap_or(defaults.show_sessions),
+            mark_root: fields
+                .get("mark_root")
+                .and_then(Value::as_bool)
+                .unwrap_or(defaults.mark_root),
             main_window: fields.get("main_window").and_then(WindowSize::from_json),
             profiles_window: fields
                 .get("profiles_window")
@@ -240,6 +248,7 @@ impl Default for GuiSettings {
             transcripts_dir: None,
             ping_hosts: true,
             show_sessions: true,
+            mark_root: true,
             main_window: None,
             profiles_window: None,
             transcripts_window: None,
@@ -398,6 +407,7 @@ mod tests {
             transcripts_dir: Some(PathBuf::from("/srv/transcripts")),
             ping_hosts: false,
             show_sessions: false,
+            mark_root: false,
             main_window: Some(WindowSize {
                 width: 1200,
                 height: 800,
@@ -582,6 +592,7 @@ mod tests {
             transcripts_dir: Some(PathBuf::from("/srv/transcripts")),
             ping_hosts: false,
             show_sessions: false,
+            mark_root: false,
             main_window: Some(WindowSize {
                 width: 1000,
                 height: 600,
@@ -731,6 +742,7 @@ mod tests {
             assert_eq!(loaded.transcripts_dir, None, "{text}");
             assert!(loaded.ping_hosts, "{text}: on unless turned off");
             assert!(loaded.show_sessions, "{text}: shown unless turned off");
+            assert!(loaded.mark_root, "{text}: marked unless turned off");
             assert_eq!(loaded.main_window, None, "{text}");
             assert_eq!(loaded.profiles_window, None, "{text}");
             assert_eq!(loaded.transcripts_window, None, "{text}");
@@ -738,6 +750,7 @@ mod tests {
         let default = GuiSettings::default();
         assert!(default.ping_hosts);
         assert!(default.show_sessions);
+        assert!(default.mark_root);
         assert!(!default.save_all_transcripts);
         assert_eq!(default.scrollback_lines, 10_000);
         assert_eq!(default.font, None);
@@ -831,6 +844,54 @@ mod tests {
             fs::write(&path, text).unwrap();
             assert_eq!(load(&path).show_sessions, want, "{text}");
         }
+    }
+
+    #[test]
+    fn root_sessions_are_marked_unless_the_file_says_not_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        for (text, want) in [
+            (r#"{"mark_root": false}"#, false),
+            (r#"{"mark_root": true}"#, true),
+            (r#"{"mark_root": "no"}"#, true),
+            (r#"{"mark_root": null}"#, true),
+            (r#"{"mark_root": 0}"#, true),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(load(&path).mark_root, want, "{text}");
+        }
+    }
+
+    #[test]
+    fn turning_the_root_mark_off_writes_only_that_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let before = GuiSettings {
+            sync_partner: Some(ID.to_owned()),
+            auto_sync: false,
+            font: Some("Monospace 11".to_owned()),
+            ..GuiSettings::default()
+        };
+        save(&path, &before).unwrap();
+        let mut fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        update(&path, |s| s.mark_root = false).unwrap();
+        fields.insert("mark_root".to_owned(), serde_json::Value::Bool(false));
+        let after: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, fields, "only mark_root differs from the file before");
+        assert_eq!(
+            load(&path),
+            GuiSettings {
+                mark_root: false,
+                ..before.clone()
+            }
+        );
+        assert_eq!(mode(&path), 0o600);
+
+        update(&path, |s| s.mark_root = true).unwrap();
+        assert_eq!(load(&path), before);
     }
 
     #[test]
@@ -982,6 +1043,7 @@ mod tests {
             transcripts_dir: Some(PathBuf::from("/srv/t")),
             ping_hosts: false,
             show_sessions: false,
+            mark_root: false,
             main_window: Some(WindowSize {
                 width: 1000,
                 height: 600,

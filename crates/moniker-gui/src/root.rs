@@ -125,7 +125,6 @@ pub(crate) fn enabled() -> bool {
 /// nothing looks again), and [`shown`] hides it. On, every watch checks again
 /// [`Backoff::FIRST`] from now, and a local pane shows its state after that
 /// first check.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn set_enabled(on: bool) {
     ENABLED.set(on);
     // Collected first: a check scheduled or cancelled borrows nothing of it.

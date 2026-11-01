@@ -462,6 +462,7 @@ fn gui_integration() {
     root_indicator::a_closed_pane_stops_its_watch(&tmp.path().join("root-closed"));
     root_indicator::a_root_profile_is_red_while_connected(&bin, &tmp.path().join("root-profile"));
     root_indicator::the_switch_stops_the_checks(&tmp.path().join("root-switch"));
+    root_indicator::the_preferences_switch_turns_the_mark_off(&tmp.path().join("root-prefs"));
     // Issue #9, the Jump Host row on the profile page and in New Profile.
     jump_hosts::the_jump_host_row_offers_usable_profiles(&tmp.path().join("jr-offers"));
     jump_hosts::picking_a_jump_host_saves_it(&tmp.path().join("jr-pick"));

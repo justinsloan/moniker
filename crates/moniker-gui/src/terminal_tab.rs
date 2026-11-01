@@ -1228,11 +1228,20 @@ thread_local! {
     static SCROLLBACK: Cell<c_long> = const { Cell::new(settings::SCROLLBACK_DEFAULT as c_long) };
 }
 
-/// Take the terminal font and the scrollback from `settings` (the settings file
-/// read at launch): the open terminals get the font, new tabs both.
+/// Take the terminal font, the scrollback and whether root sessions are marked
+/// from `settings` (the settings file read at launch): the open terminals get
+/// the font, new tabs the scrollback, and the open windows the marks.
+///
+/// The marks are touched only if the setting differs from what they are now:
+/// every command-line launch comes through here, and one that finds the marks
+/// as the file says must not start the checks of the windows already open over
+/// again.
 pub(crate) fn use_preferences(settings: &GuiSettings) {
     apply_font(font_description(settings.font.as_deref()).as_ref());
     set_scrollback(settings.scrollback_lines);
+    if root::enabled() != settings.mark_root {
+        root::set_enabled(settings.mark_root);
+    }
 }
 
 /// The font a font setting (a Pango font description string) stands for; `None`
