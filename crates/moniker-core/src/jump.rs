@@ -9,24 +9,27 @@
 //! has a jump host of its own is refused, with a text that says why.
 //!
 //! The second part is the shared connection (the commands are in
-//! `crate::ssh`: `jump_master_command`, `hop_command`, `jump_control_command`).
-//! Each connection through a jump host has a master of its own, an `ssh` that
-//! signed in to the jump host and went to the background, listening on a
-//! socket nobody else can reach: [`JumpSocket`], a random name in
-//! `<runtime>/moniker/jump/`, a folder private to this user (checked like the
-//! askpass markers' folder). The socket's path goes into the hop's shell
-//! string, so it is made only of `[A-Za-z0-9/._-]` and is at most
+//! `crate::ssh`: `jump_master_command`, `hop_command`, `jump_control_command`;
+//! [`pane_commands`] builds a terminal pane's together, for the GUI and the
+//! end-to-end check alike). Each connection through a jump host has a master
+//! of its own, an `ssh` that signed in to the jump host and went to the
+//! background, listening on a socket nobody else can reach: [`JumpSocket`], a
+//! new random name in `<runtime>/moniker/jump/`, a folder private to this user
+//! (checked like the askpass markers' folder) in a runtime folder that is this
+//! user's and that nobody else may write in. The socket's path goes into the
+//! hop's shell string, so it is made only of `[A-Za-z0-9/._-]` and is at most
 //! [`MAX_SOCKET_PATH`] bytes long; a runtime folder that does not allow that is
 //! refused rather than quoted. No TCP port is opened.
 //!
 //! The master is no child of Moniker once it went to the background (`-f`), so
 //! its process id is asked of it: `ssh -O check` prints it ([`master_pid`],
-//! through [`run_control`]). With it, [`open_master`] holds the process by a
-//! pidfd, and [`end_master`] ends it at once with `SIGTERM` (which also removes
-//! the socket), a system call that reads no configuration and so works as the
-//! application quits. Without it, `ssh -O exit` does the same through the
-//! socket. Should neither happen, the master ends by itself [`PERSIST_SECS`]
-//! after its last channel closed (`ControlPersist`).
+//! through [`run_control`]). [`learn_master`] asks, holds the process by a
+//! pidfd ([`open_master`]) and asks again, and [`end_master`] ends it at once
+//! with `SIGTERM` (which also removes the socket), a system call that reads no
+//! configuration and so works as the application quits. Without the pidfd,
+//! `ssh -O exit` does the same through the socket. Should neither happen, the
+//! master ends by itself [`PERSIST_SECS`] after its last channel closed
+//! (`ControlPersist`).
 
 use std::io::{self, Read};
 use std::os::fd::OwnedFd;
@@ -37,12 +40,17 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
+use rustix::fs::{AtFlags, fstat, statat};
+use rustix::io::Errno;
+use rustix::process::{Pid, PidfdFlags, Signal, geteuid, pidfd_open, pidfd_send_signal};
 use uuid::Uuid;
 
-use crate::askpass::{RUNTIME_SUBDIR, runtime_subdir};
-use crate::profile::Profile;
-use crate::ssh::SshCommand;
+use crate::askpass::{AskpassToken, RUNTIME_SUBDIR, moniker_subdir, open_runtime_dir};
+use crate::profile::{Profile, StartupSequence};
+use crate::ssh::{
+    JumpControl, SshCommand, hop_command, jump_control_command, jump_master_command,
+    terminal_command,
+};
 use crate::ssh_config::HELPER_ENV;
 
 /// How long a master stays after its last channel closed (`ControlPersist`): a
@@ -165,7 +173,11 @@ fn in_name_order<'a>(ps: impl Iterator<Item = &'a Profile>) -> Vec<&'a Profile> 
 /// connection uses, in a folder private to this user (module docs). ssh makes
 /// the socket itself when the master signs in, and removes it when the master
 /// ends, unless it is killed outright.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// One socket per master, never reused: a new connection makes a new one
+/// ([`JumpSocket::new`]), and there is no way to copy one (no `Clone`), so two
+/// masters can never be given the same path.
+#[derive(Debug, PartialEq, Eq)]
 pub struct JumpSocket {
     path: PathBuf,
 }
@@ -174,23 +186,35 @@ impl JumpSocket {
     /// A new socket path in `<runtime_dir>/moniker/jump/`, named by 32
     /// lowercase hexadecimal characters (a random UUID), with the folder opened
     /// or made private (mode 0700) on the way, following no symlink below
-    /// `runtime_dir` (`crate::askpass::runtime_subdir`, as for the askpass
-    /// markers).
+    /// `runtime_dir` (as for the askpass markers).
     ///
-    /// Refused, with nothing made, when `runtime_dir` is not an absolute path,
-    /// or when the socket's path would hold a character other than
-    /// `[A-Za-z0-9/._-]` or be longer than [`MAX_SOCKET_PATH`] bytes: the path
-    /// goes into the hop's shell string unquoted (`crate::ssh::hop_command`).
+    /// Refused, with nothing made:
+    /// - when `runtime_dir` is not an absolute path, or the socket's path would
+    ///   hold a character other than `[A-Za-z0-9/._-]` or be longer than
+    ///   [`MAX_SOCKET_PATH`] bytes: the path goes into the hop's shell string
+    ///   unquoted (`crate::ssh::hop_command`);
+    /// - when `runtime_dir` is not this user's, or the group or others may
+    ///   write in it: someone else could then move `moniker` aside and put a
+    ///   folder of theirs in its place between this check and ssh's use of the
+    ///   path.
+    ///
     /// Refused too when a folder on the way is not private (a symlink, someone
-    /// else's, open to others, not a folder).
+    /// else's, open to others, not a folder), and when something is already at
+    /// the socket's path: a master started there would not listen, run on as no
+    /// master at all, and be out of reach of both `ControlPersist` and `-O`.
     pub fn new(runtime_dir: &Path) -> io::Result<JumpSocket> {
+        Self::named(runtime_dir, &Uuid::new_v4().simple().to_string())
+    }
+
+    /// [`new`](JumpSocket::new) with the socket's name given (tests).
+    fn named(runtime_dir: &Path, name: &str) -> io::Result<JumpSocket> {
         if !runtime_dir.is_absolute() {
             return Err(refused("the runtime directory is not an absolute path"));
         }
         let path = runtime_dir
             .join(RUNTIME_SUBDIR)
             .join(SOCKET_SUBDIR)
-            .join(Uuid::new_v4().simple().to_string());
+            .join(name);
         let bytes = path.as_os_str().as_bytes();
         if !bytes.iter().all(|&b| is_socket_byte(b)) {
             return Err(refused(
@@ -202,8 +226,23 @@ impl JumpSocket {
                 "the runtime directory's path is too long for a shared connection's socket",
             ));
         }
-        runtime_subdir(runtime_dir, SOCKET_SUBDIR, true)?;
-        Ok(JumpSocket { path })
+        let runtime = open_runtime_dir(runtime_dir)?;
+        let stat = fstat(&runtime)?;
+        if stat.st_uid != geteuid().as_raw() || stat.st_mode & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the runtime directory is not this user's, or others may write in it",
+            ));
+        }
+        let dir = moniker_subdir(&runtime, SOCKET_SUBDIR, true)?;
+        match statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Err(Errno::NOENT) => Ok(JumpSocket { path }),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "something is already at the shared connection's socket path",
+            )),
+            Err(err) => Err(err.into()),
+        }
     }
 
     /// The socket's path.
@@ -218,25 +257,30 @@ fn refused(why: &str) -> io::Error {
 }
 
 /// Whether `byte` may be in a socket's path: `[A-Za-z0-9/._-]`, nothing a
-/// shell or ssh's `%` and `~` expansion reads.
-fn is_socket_byte(byte: u8) -> bool {
+/// shell or ssh's `%` and `~` expansion reads. The hop's shell string checks
+/// its socket with it too (`crate::ssh::hop_command`).
+pub(crate) fn is_socket_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
 }
 
 /// The master's process id in what `ssh -O check` wrote on stderr: the number
-/// in a line `Master running (pid=N)` (OpenSSH ends it with CR LF). `None`
-/// when no line says that, or the number is not plain digits, is 0, or does not
-/// fit.
+/// in its last line that begins `Master running (`, which must be exactly
+/// `Master running (pid=N)` (OpenSSH ends it with CR LF). ssh writes its answer
+/// last; what comes before it (a `Match exec` command's own output) is not the
+/// master's. `None` when no line says that, or the last one does not read: the
+/// number not plain digits, 0, or too large.
 pub fn master_pid(stderr: &str) -> Option<u32> {
-    stderr.lines().find_map(|line| {
-        let digits = line
-            .strip_prefix("Master running (pid=")?
-            .strip_suffix(')')?;
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        digits.parse().ok().filter(|&pid| pid > 0)
-    })
+    let line = stderr
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("Master running ("))?;
+    let digits = line
+        .strip_prefix("Master running (pid=")?
+        .strip_suffix(')')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|&pid| pid > 0)
 }
 
 /// Run a control command (`crate::ssh::jump_control_command`) and give what it
@@ -248,7 +292,7 @@ pub fn master_pid(stderr: &str) -> Option<u32> {
 /// that lead `ssh` to the askpass helper (only those `cmd` itself adds), with
 /// no input and its standard output thrown away. Stderr is read to its end on
 /// a thread of its own, so the command can never block on a full pipe, and its
-/// last [`CONTROL_MAX_BYTES`] are kept (ssh writes its answer last), as text
+/// last 4 KiB are kept (ssh writes its answer last), as text
 /// with anything that is not UTF-8 replaced. A command still running at
 /// `limit` is killed and reaped; one that exits but leaves a process holding
 /// its stderr open is given up on at `limit` too.
@@ -335,6 +379,62 @@ pub fn open_master(pid: u32) -> Option<OwnedFd> {
 /// already gone.
 pub fn end_master(pidfd: &OwnedFd) -> io::Result<()> {
     pidfd_send_signal(pidfd, Signal::TERM).map_err(io::Error::from)
+}
+
+/// The master `check` (`crate::ssh::jump_control_command` with
+/// `JumpControl::Check`) answers for, held by a pidfd ([`open_master`]), or
+/// `None`. It asks twice, each within [`CONTROL_LIMIT`]: the id, then the
+/// pidfd, then the id again, which must be the same. The master then held that
+/// id at both answers, and the process the pidfd holds, opened between them,
+/// is the master and no process that took its id afterwards. This is the way
+/// to learn a master; nothing else composes these steps.
+pub fn learn_master(check: &SshCommand) -> Option<OwnedFd> {
+    let pid = master_pid(&run_control(check, CONTROL_LIMIT)?)?;
+    let pidfd = open_master(pid)?;
+    let again = master_pid(&run_control(check, CONTROL_LIMIT)?)?;
+    (again == pid).then_some(pidfd)
+}
+
+/// The commands of one terminal pane's connection through a jump host, built
+/// together ([`pane_commands`]): the GUI and the end-to-end check's helper run
+/// exactly these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneCommands {
+    /// Signs in to the jump host and serves the shared connection
+    /// (`crate::ssh::jump_master_command`).
+    pub master: SshCommand,
+    /// The target's `ssh`, its `ProxyCommand` going through the master
+    /// (`crate::ssh::terminal_command` with `crate::ssh::hop_command`).
+    pub target: SshCommand,
+    /// `-O check`, for [`learn_master`].
+    pub check: SshCommand,
+    /// `-O exit`, to end the master when its pid is not known.
+    pub exit: SshCommand,
+}
+
+/// The commands of a pane's connection to `target`, running its startup
+/// sequence `seq` if any, through `jump` at `socket`: the master with the jump
+/// host's one-time token `jump_token`, the target with its own `target_token`
+/// (each `None` when no password is stored for it, or the askpass helper is
+/// missing), and the control commands. `None` when the hop refuses the jump
+/// host's user name or host (`crate::ssh::hop_command`): the pane must then not
+/// connect at all.
+pub fn pane_commands(
+    target: &Profile,
+    seq: Option<&StartupSequence>,
+    jump: &Profile,
+    socket: &JumpSocket,
+    askpass: &Path,
+    target_token: Option<&AskpassToken>,
+    jump_token: Option<&AskpassToken>,
+) -> Option<PaneCommands> {
+    let hop = hop_command(jump, socket.path())?;
+    Some(PaneCommands {
+        master: jump_master_command(jump, socket.path(), askpass, jump_token),
+        target: terminal_command(target, seq, askpass, target_token, Some(&hop)),
+        check: jump_control_command(jump, socket.path(), JumpControl::Check),
+        exit: jump_control_command(jump, socket.path(), JumpControl::Exit),
+    })
 }
 
 #[cfg(test)]
@@ -548,6 +648,56 @@ mod tests {
         assert!(names_in(&over).is_empty());
     }
 
+    #[test]
+    fn a_socket_refuses_a_runtime_folder_others_can_change() {
+        // Writable by the group or by others: someone else could move
+        // `moniker` aside and put a folder of their own in its place between
+        // the check and ssh's use of the path.
+        for mode in [0o770, 0o730, 0o707, 0o702, 0o777, 0o1777] {
+            let rt = runtime();
+            set_mode(rt.path(), mode);
+            let err = JumpSocket::new(rt.path()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{mode:o}");
+            assert!(names_in(rt.path()).is_empty(), "nothing made at {mode:o}");
+        }
+        // Readable by others is no matter.
+        for mode in [0o700, 0o750, 0o755] {
+            let rt = runtime();
+            set_mode(rt.path(), mode);
+            assert!(JumpSocket::new(rt.path()).is_ok(), "{mode:o}");
+        }
+        // Not this user's: `/proc` is root's. The refusal is this check's own,
+        // not the failure to make a folder there (as root, mkdir there fails
+        // anyway).
+        if !rustix::process::geteuid().is_root() {
+            let err = JumpSocket::new(Path::new("/proc")).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains("not this user's"), "{err}");
+        }
+        assert!(!Path::new("/proc/moniker").exists());
+    }
+
+    #[test]
+    fn a_socket_is_never_a_path_that_exists() {
+        // A master started on a path that is taken runs on as no master at
+        // all, which neither ControlPersist nor `-O` could ever end.
+        const NAME: &str = "0123456789abcdef0123456789abcdef";
+        let rt = runtime();
+        let socket = JumpSocket::named(rt.path(), NAME).unwrap();
+        let path = socket.path().to_path_buf();
+        assert_eq!(path, rt.path().join("moniker/jump").join(NAME));
+        std::fs::write(&path, "").unwrap();
+        let err = JumpSocket::named(rt.path(), NAME).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // A link, even one to nothing, is a path that is taken too.
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(rt.path().join("nowhere"), &path).unwrap();
+        let err = JumpSocket::named(rt.path(), NAME).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        std::fs::remove_file(&path).unwrap();
+        assert!(JumpSocket::named(rt.path(), NAME).is_ok());
+    }
+
     // ----- the master -----
 
     #[test]
@@ -562,6 +712,22 @@ mod tests {
                 "debug1: Reading configuration data /etc/ssh/ssh_config\r\nMaster running (pid=77)\r\n"
             ),
             Some(77)
+        );
+        // ssh writes its answer last: a line before it (a `Match exec`
+        // command's own output, say) is not the master's.
+        assert_eq!(
+            master_pid("Master running (pid=11)\r\nMaster running (pid=22)\r\n"),
+            Some(22)
+        );
+        assert_eq!(
+            master_pid("Master running (pid=11)\nsomething else\r\nMaster running (pid=22)\r\n"),
+            Some(22)
+        );
+        // The last such line decides: one that does not read leaves no id,
+        // never an earlier line's.
+        assert_eq!(
+            master_pid("Master running (pid=11)\r\nMaster running (pid=x)\r\n"),
+            None
         );
         for text in [
             "",
@@ -669,6 +835,141 @@ mod tests {
         for pid in [0, 1, std::process::id(), u32::MAX, i32::MAX as u32 + 1] {
             assert!(open_master(pid).is_none(), "{pid}");
         }
+    }
+
+    /// A process that stands for a master, ended when the test is over.
+    struct Stand(std::process::Child);
+
+    impl Stand {
+        fn new() -> Stand {
+            Stand(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// The signal that ended it, once it has ended.
+        fn ended_by(&mut self) -> Option<i32> {
+            use std::os::unix::process::ExitStatusExt;
+            self.0
+                .try_wait()
+                .unwrap()
+                .and_then(|status| status.signal())
+        }
+    }
+
+    impl Drop for Stand {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A `-O check` that answers with `first` the first time it runs and with
+    /// `then` after that (a file in `dir` tells), or fails with `then: None`.
+    fn check_answering(dir: &Path, first: u32, then: Option<u32>) -> SshCommand {
+        let asked = dir.join("asked");
+        let second = match then {
+            Some(pid) => format!("printf 'Master running (pid={pid})\\r\\n' >&2"),
+            None => "exit 255".to_string(),
+        };
+        sh(&format!(
+            "if [ -e '{asked}' ]; then {second}; else : >'{asked}'; \
+             printf 'Master running (pid={first})\\r\\n' >&2; fi",
+            asked = asked.display(),
+        ))
+    }
+
+    #[test]
+    fn learn_master_holds_the_pid_both_checks_named() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The same pid twice: the pidfd is that process's.
+        let mut master = Stand::new();
+        let check = check_answering(dir.path(), master.pid(), Some(master.pid()));
+        let pidfd = learn_master(&check).unwrap();
+        assert_eq!(master.ended_by(), None, "learning ends nothing");
+        end_master(&pidfd).unwrap();
+        let start = Instant::now();
+        while master.ended_by().is_none() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(master.ended_by(), Some(15));
+
+        // Another pid the second time: the first may no longer be the
+        // master's, so nothing is held, and neither process is touched.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut one, mut other) = (Stand::new(), Stand::new());
+        let check = check_answering(dir.path(), one.pid(), Some(other.pid()));
+        assert!(learn_master(&check).is_none());
+        assert_eq!((one.ended_by(), other.ended_by()), (None, None));
+
+        // The second check fails, or the first one does.
+        let dir = tempfile::tempdir().unwrap();
+        let check = check_answering(dir.path(), one.pid(), None);
+        assert!(learn_master(&check).is_none());
+        assert!(learn_master(&sh("echo 'Master running (pid=1)' >&2; exit 255")).is_none());
+        // A pid that is no process, or this one's.
+        let me = std::process::id();
+        assert!(learn_master(&sh(&format!("echo 'Master running (pid={me})' >&2"))).is_none());
+        assert_eq!(one.ended_by(), None);
+    }
+
+    #[test]
+    fn a_pane_s_commands_are_the_builders_together() {
+        let rt = runtime();
+        let socket = JumpSocket::new(rt.path()).unwrap();
+        let askpass = Path::new("/usr/lib/moniker/moniker-askpass");
+        let jump = profile(1, "bastion");
+        let target = via(profile(2, "db"), &jump);
+        let seq = StartupSequence {
+            name: "u".to_string(),
+            commands: vec!["uptime".to_string()],
+        };
+        let (t, j) = (AskpassToken::new(), AskpassToken::new());
+        let cmds = pane_commands(
+            &target,
+            Some(&seq),
+            &jump,
+            &socket,
+            askpass,
+            Some(&t),
+            Some(&j),
+        )
+        .unwrap();
+        let hop = hop_command(&jump, socket.path()).unwrap();
+        assert_eq!(
+            cmds,
+            PaneCommands {
+                master: jump_master_command(&jump, socket.path(), askpass, Some(&j)),
+                target: terminal_command(&target, Some(&seq), askpass, Some(&t), Some(&hop)),
+                check: jump_control_command(&jump, socket.path(), JumpControl::Check),
+                exit: jump_control_command(&jump, socket.path(), JumpControl::Exit),
+            }
+        );
+        // The master carries the jump host's token, the target its own.
+        let token_of = |cmd: &SshCommand| {
+            cmd.env
+                .iter()
+                .find(|(name, _)| name == "MONIKER_ASKPASS_TOKEN")
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(token_of(&cmds.master).as_deref(), Some(j.as_str()));
+        assert_eq!(token_of(&cmds.target).as_deref(), Some(t.as_str()));
+
+        // A jump host whose user or host a shell would read: no commands.
+        let mut odd = jump.clone();
+        odd.host = "bastion;id".to_string();
+        assert_eq!(
+            pane_commands(&target, None, &odd, &socket, askpass, None, None),
+            None
+        );
     }
 
     #[test]

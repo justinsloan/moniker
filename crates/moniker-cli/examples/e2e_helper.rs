@@ -29,10 +29,7 @@ use moniker_core::askpass::AskpassToken;
 use moniker_core::jump;
 use moniker_core::profile::Profile;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore, password_key};
-use moniker_core::ssh::{
-    JumpControl, SshCommand, hop_command, jump_control_command, jump_master_command,
-    terminal_command,
-};
+use moniker_core::ssh::SshCommand;
 use moniker_core::store::ProfileStore;
 use zeroize::Zeroizing;
 
@@ -71,14 +68,12 @@ enum Command {
         jump_host: Option<String>,
     },
     /// Print the commands of a connection through the profile's jump host, one
-    /// item per line: `master`, `target`, `check` and `exit`, each followed by
-    /// `arg <argument>` lines (the program first) and `env <NAME>=<value>` lines
+    /// item per line: `socket <path>` (a new one in $XDG_RUNTIME_DIR), then
+    /// `master`, `target`, `check` and `exit`, each followed by `arg <argument>`
+    /// lines (the program first) and `env <NAME>=<value>` lines
     ConnectionArgv {
         #[arg(long)]
         profile: String,
-        /// The shared connection's socket
-        #[arg(long)]
-        socket: PathBuf,
         /// The askpass helper the commands point ssh at
         #[arg(long)]
         askpass: PathBuf,
@@ -127,12 +122,10 @@ fn run(command: Command) -> Result<ExitCode, String> {
             .map(|()| ExitCode::SUCCESS),
         Command::ConnectionArgv {
             profile,
-            socket,
             askpass,
             token,
             jump_token,
-        } => connection_argv(&profile, &socket, &askpass, token, jump_token)
-            .map(|()| ExitCode::SUCCESS),
+        } => connection_argv(&profile, &askpass, token, jump_token).map(|()| ExitCode::SUCCESS),
         Command::SetSecret { profile } => set_secret(&profile).map(|()| ExitCode::SUCCESS),
         Command::GetSecret { profile } => get_secret(&profile),
         Command::DeleteProfile { name } => delete_profile(&name).map(|()| ExitCode::SUCCESS),
@@ -194,14 +187,13 @@ fn seed_profile(
 }
 
 /// Print the commands of a connection to the live profile `name` through its
-/// jump host, built as the GUI builds them: the master that signs in to the
-/// jump host, the target's `ssh` with the hop as its `ProxyCommand` (no
-/// startup sequence), and the control commands. A token is given only when a
-/// password is stored, as in the GUI; `MONIKER_PID` is this helper's id, and the
-/// script puts the id of the process that starts `ssh` in its place.
+/// jump host, as the GUI builds them: a new socket in `$XDG_RUNTIME_DIR`
+/// (`JumpSocket::new`), then exactly what `jump::pane_commands` gives for it
+/// (no startup sequence). A token is given only when a password is stored, as
+/// in the GUI; `MONIKER_PID` is this helper's id, and the script puts the id of
+/// the process that starts `ssh` in its place.
 fn connection_argv(
     name: &str,
-    socket: &Path,
     askpass: &Path,
     token: Option<String>,
     jump_token: Option<String>,
@@ -220,26 +212,32 @@ fn connection_argv(
         .ok_or_else(|| format!("{name:?} has no jump host"))?;
     let token = parse_token(token)?;
     let jump_token = parse_token(jump_token)?;
-    let hop = hop_command(jump, socket);
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or("XDG_RUNTIME_DIR is not set")?;
+    let socket = jump::JumpSocket::new(Path::new(&runtime))
+        .map_err(|e| format!("cannot make the socket: {e}"))?;
+    let cmds = jump::pane_commands(
+        profile,
+        None,
+        jump,
+        &socket,
+        askpass,
+        token.as_ref(),
+        jump_token.as_ref(),
+    )
+    .ok_or("the hop refuses the jump host's user name or host")?;
+    let jump::PaneCommands {
+        master,
+        target,
+        check,
+        exit,
+    } = &cmds;
     let commands = [
-        (
-            "master",
-            jump_master_command(jump, socket, askpass, jump_token.as_ref()),
-        ),
-        (
-            "target",
-            terminal_command(profile, None, askpass, token.as_ref(), Some(&hop)),
-        ),
-        (
-            "check",
-            jump_control_command(jump, socket, JumpControl::Check),
-        ),
-        (
-            "exit",
-            jump_control_command(jump, socket, JumpControl::Exit),
-        ),
+        ("master", master),
+        ("target", target),
+        ("check", check),
+        ("exit", exit),
     ];
-    let mut text = String::new();
+    let mut text = format!("socket {}\n", socket.path().display());
     for (stage, cmd) in &commands {
         text.push_str(&format!("{stage}\n"));
         push_items(&mut text, cmd)?;

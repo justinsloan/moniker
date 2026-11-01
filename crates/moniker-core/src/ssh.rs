@@ -36,8 +36,8 @@
 use std::path::Path;
 
 use crate::askpass::{AskpassToken, PID_ENV, TOKEN_ENV};
-use crate::jump::PERSIST_SECS;
-use crate::profile::{Profile, StartupSequence};
+use crate::jump::{PERSIST_SECS, is_socket_byte};
+use crate::profile::{Profile, StartupSequence, is_host_char, is_username_char};
 
 /// The system `ssh` binary, found on `PATH` so ssh-agent, `known_hosts` and
 /// `~/.ssh/config` keep working.
@@ -107,16 +107,23 @@ fn commands(seq: &StartupSequence) -> Option<String> {
 /// `ssh` invocation for an interactive terminal tab.
 ///
 /// Arguments, in order: `-p <port>`, `-i <key>` if the profile has a key file,
-/// `-o ProxyCommand=<proxy>` if the connection goes through a jump host
-/// (`proxy` is [`hop_command`]'s, one argv entry), `-t` only if there is a
-/// remote command (so the startup sequence gets a tty), `--`,
-/// `<username>@<host>`, then the remote command as a single argument if any.
+/// `-o ProxyCommand=<proxy>` and `-o ControlPath=none` if the connection goes
+/// through a jump host (`proxy` is [`hop_command`]'s, one argv entry), `-t`
+/// only if there is a remote command (so the startup sequence gets a tty),
+/// `--`, `<username>@<host>`, then the remote command as a single argument if
+/// any.
 ///
 /// A `ProxyCommand` on the command line comes before anything in
 /// `~/.ssh/config`, so a `ProxyJump` or `ProxyCommand` the configuration sets
-/// for this host is not used: the profile's route wins. It changes no `user`,
-/// `hostname` or `hostkeyalias` (no `Match` criterion reads it), so the
-/// identity the askpass helper expects ([`resolve_command`]) is the same.
+/// for this host is not used: the profile's route wins. `ControlPath=none`
+/// keeps a `ControlMaster auto` in the configuration from sending the
+/// connection over a master that was opened another way, past the route. A
+/// proxy changes no `user`, `hostname` or `hostkeyalias` the configuration
+/// gives (no `Match` criterion reads it), but ssh canonicalizes the host name
+/// (`CanonicalizeHostname yes`) only for a connection without one; so the
+/// askpass helper looks up the identity the prompt names with
+/// [`login_resolve_command`], which carries a stand-in `ProxyCommand` exactly
+/// when the profile has a jump host.
 ///
 /// There is no limit on password prompts: `ssh` allows its usual three. The
 /// askpass helper answers at most one of them with the stored password (the
@@ -157,8 +164,9 @@ pub fn terminal_command(
 /// host with no tty.
 ///
 /// Arguments, in order: `-p <port>`, `-i <key>` if the profile has a key file,
-/// `-o ProxyCommand=<proxy>` if the connection goes through a jump host (as for
-/// [`terminal_command`]), `-T`, `-o StrictHostKeyChecking=yes`,
+/// `-o ProxyCommand=<proxy>` and `-o ControlPath=none` if the connection goes
+/// through a jump host (as for [`terminal_command`]), `-T`,
+/// `-o StrictHostKeyChecking=yes`,
 /// `-o NumberOfPasswordPrompts=1`, `--`, `<username>@<host>`,
 /// `<remote_server>`, `sync-serve`. With no tty, an unknown host key fails
 /// instead of prompting.
@@ -199,48 +207,50 @@ pub fn sync_command(
 
 /// The `ProxyCommand` that takes a connection to its target through the jump
 /// host's shared connection at `socket`: exactly
-/// `ssh -S <socket> -o ControlMaster=no -o BatchMode=yes -W %h:%p -p <port> -- <username>@<host>`
+/// `ssh -S <socket> -o ControlMaster=no -o BatchMode=yes -W '[%h]:%p' -p <port> -- <username>@<host>`
 /// with every `%` of the host doubled, given to [`terminal_command`] or
-/// [`sync_command`] as their `proxy`.
+/// [`sync_command`] as their `proxy`. `None` when the socket's path, the jump
+/// host's user name or its host is empty or has a character outside its own
+/// set (below): the caller then refuses to connect.
 ///
 /// It is the one shell string Moniker makes: `ssh` expands its `%` tokens and
-/// runs it with `$SHELL -c`. So nothing in it is quoted text: the socket's path
-/// is `[A-Za-z0-9/._-]` (`crate::jump::JumpSocket` makes no other), the user
-/// name `[A-Za-z0-9._@-]` and the host `[A-Za-z0-9._:%-]`
-/// (`Profile::validate`), none of them special to a shell, and the port is
-/// digits. A host's `%` (an IPv6 zone, `fe80::1%eth0`) is doubled so that the
-/// expansion gives it back instead of reading a token (`%e` is none, and ssh
-/// would refuse the command).
+/// runs it with `$SHELL -c`. So nothing in it is quoted text from a profile:
+/// the socket's path is `[A-Za-z0-9/._-]` (`crate::jump::JumpSocket` makes no
+/// other), the user name `[A-Za-z0-9._@-]` and the host `[A-Za-z0-9._:%-]`
+/// (what `Profile::validate` allows), none of them special to a shell, and the
+/// port is digits. Each is checked here as well, not assumed. A host's `%` (an
+/// IPv6 zone, `fe80::1%eth0`) is doubled so that the expansion gives it back
+/// instead of reading a token (`%e` is none, and ssh would refuse the command).
 ///
-/// `-W %h:%p` asks the master for a channel to the target's host and port as
-/// the target's `ssh` sees them (after `~/.ssh/config`). `ControlMaster=no`
+/// `-W '[%h]:%p'` asks the master for a channel to the target's host and port
+/// as the target's `ssh` sees them (after `~/.ssh/config`). The brackets are
+/// what lets the host be an IPv6 address (`-W ::1:22` is refused, `-W [::1]:22`
+/// is not), as in OpenSSH's own `ProxyJump`; the quotes are fixed text, so the
+/// shell never takes the brackets for a pattern of file names. `ControlMaster=no`
 /// keeps this `ssh` from becoming a master itself. `BatchMode=yes` and no `-i`:
 /// should the shared connection be gone, this `ssh`, a child of the target's
 /// and not of Moniker, would have to sign in to the jump host itself; it then
 /// fails (or uses ssh-agent) and never asks for anything, and no key-file path
 /// enters the shell string.
-pub fn hop_command(jump: &Profile, socket: &Path) -> String {
+pub fn hop_command(jump: &Profile, socket: &Path) -> Option<String> {
     debug_assert!(!jump.deleted, "ssh command requested for a tombstone");
-    let socket = socket.to_string_lossy();
-    debug_assert!(
-        [&*socket, &jump.username, &jump.host]
-            .iter()
-            .all(|word| word.bytes().all(is_hop_byte)),
-        "a value of the hop's shell string has an unsafe character"
-    );
-    format!(
-        "{SSH_PROGRAM} -S {socket} -o ControlMaster=no -o BatchMode=yes -W %h:%p -p {port} \
-         -- {user}@{host}",
+    let socket = socket.to_str()?;
+    let safe =
+        |word: &str, allowed: fn(char) -> bool| !word.is_empty() && word.chars().all(allowed);
+    let socket_char = |c: char| u8::try_from(c).is_ok_and(is_socket_byte);
+    if !(safe(socket, socket_char)
+        && safe(&jump.username, is_username_char)
+        && safe(&jump.host, is_host_char))
+    {
+        return None;
+    }
+    Some(format!(
+        "{SSH_PROGRAM} -S {socket} -o ControlMaster=no -o BatchMode=yes -W '[%h]:%p' \
+         -p {port} -- {user}@{host}",
         port = jump.port,
         user = jump.username,
         host = jump.host.replace('%', "%%"),
-    )
-}
-
-/// Whether `byte` may be in a value of [`hop_command`]'s shell string: the
-/// characters of the socket's path, the user name and the host, together.
-fn is_hop_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':' | b'%' | b'@')
+    ))
 }
 
 /// `ssh` invocation that signs in to the jump host `jump` in a terminal tab
@@ -355,11 +365,12 @@ pub fn jump_control_command(jump: &Profile, socket: &Path, op: JumpControl) -> S
     }
 }
 
-/// `ssh -G` for the connection [`terminal_command`] and [`sync_command`] make
-/// to the profile: `ssh` prints the configuration it would use, after
-/// `~/.ssh/config`, and exits without connecting. The askpass helper reads from
-/// it the user and host that the password prompt will name
-/// (`crate::askpass::effective_identity`).
+/// `ssh -G` for the profile as `~/.ssh/config` has it: `ssh` prints the
+/// configuration it would use for a plain connection to the profile, after
+/// `~/.ssh/config`, and exits without connecting. The host marks read from it
+/// where the host really is and whether the configuration sends it through
+/// another host (`crate::ssh_config::ping_target`), so it carries nothing of
+/// Moniker's own route. The askpass helper uses [`login_resolve_command`].
 ///
 /// Arguments, in order: `-G`, `-p <port>`, `-i <key>` if the profile has a key
 /// file, `--`, `<username>@<host>`. No environment.
@@ -373,6 +384,33 @@ pub fn resolve_command(p: &Profile) -> SshCommand {
         args,
         env: Vec::new(),
     }
+}
+
+/// The `ProxyCommand` [`login_resolve_command`] gives `ssh -G` for a profile
+/// with a jump host. Any text but `none` would do: `-G` never runs it.
+pub const PROXY_STAND_IN: &str = "moniker-jump-host";
+
+/// `ssh -G` for the connection [`terminal_command`] and [`sync_command`] make
+/// to the profile, for the askpass helper, which reads from it the user and
+/// host the password prompt will name (`crate::askpass::effective_identity`).
+///
+/// It is [`resolve_command`], with `-o ProxyCommand=<PROXY_STAND_IN>` before
+/// `--` exactly when the profile has a jump host, the connection then having a
+/// `ProxyCommand` of its own: ssh canonicalizes a host name
+/// (`CanonicalizeHostname yes`) only for a connection without a proxy, and
+/// the stand-in, like the real one, also puts aside a `ProxyJump` the
+/// configuration sets. The identity the lookup gives is then the one the
+/// prompt names. No environment.
+pub fn login_resolve_command(p: &Profile) -> SshCommand {
+    let mut cmd = resolve_command(p);
+    if p.jump_host.is_some() {
+        let at = cmd.args.len() - 2;
+        cmd.args.splice(
+            at..at,
+            ["-o".to_string(), format!("ProxyCommand={PROXY_STAND_IN}")],
+        );
+    }
+    cmd
 }
 
 /// `-p <port>` and, if the profile has one, `-i <key>`. Each flag and its value
@@ -392,10 +430,12 @@ fn push_option(args: &mut Vec<String>, option: &str) {
     args.push(option.to_string());
 }
 
-/// `-o ProxyCommand=<proxy>`, if there is a `proxy`.
+/// `-o ProxyCommand=<proxy>` and `-o ControlPath=none`, if there is a `proxy`
+/// (see [`terminal_command`]).
 fn push_proxy(args: &mut Vec<String>, proxy: Option<&str>) {
     if let Some(proxy) = proxy {
         push_option(args, &format!("ProxyCommand={proxy}"));
+        push_option(args, "ControlPath=none");
     }
 }
 
@@ -970,18 +1010,23 @@ mod tests {
         );
     }
 
+    /// [`hop_command`] for `jump` at [`SOCKET`], which must not be refused.
+    fn hop(jump: &Profile) -> String {
+        hop_command(jump, socket()).expect("a hop of the safe characters")
+    }
+
     #[test]
     fn the_hop_reaches_the_target_through_the_socket() {
         let expected = format!(
-            "ssh -S {SOCKET} -o ControlMaster=no -o BatchMode=yes -W %h:%p -p 2201 \
+            "ssh -S {SOCKET} -o ControlMaster=no -o BatchMode=yes -W '[%h]:%p' -p 2201 \
              -- bob@bastion.example.com"
         );
-        assert_eq!(hop_command(&bastion(), socket()), expected);
+        assert_eq!(hop(&bastion()), expected);
         // A key file never enters the shell string, and the hop needs none: it
         // goes through the shared connection (or fails, never asking).
         let mut keyed = bastion();
         keyed.key_file = Some("/home/bob/.ssh/id_ed25519".into());
-        assert_eq!(hop_command(&keyed, socket()), expected);
+        assert_eq!(hop(&keyed), expected);
     }
 
     #[test]
@@ -990,25 +1035,85 @@ mod tests {
         let mut jump = bastion();
         jump.host = "fe80::1%eth0".to_string();
         assert_eq!(
-            hop_command(&jump, socket()),
+            hop(&jump),
             format!(
-                "ssh -S {SOCKET} -o ControlMaster=no -o BatchMode=yes -W %h:%p -p 2201 \
+                "ssh -S {SOCKET} -o ControlMaster=no -o BatchMode=yes -W '[%h]:%p' -p 2201 \
                  -- bob@fe80::1%%eth0"
             )
         );
         // Every `%` of the host, and only those.
         jump.host = "a%b%%c".to_string();
-        assert!(hop_command(&jump, socket()).ends_with(" -W %h:%p -p 2201 -- bob@a%%b%%%%c"));
+        assert!(hop(&jump).ends_with(" -W '[%h]:%p' -p 2201 -- bob@a%%b%%%%c"));
+    }
+
+    #[test]
+    fn an_ipv6_target_goes_through_a_bracketed_forward() {
+        // `-W %h:%p` would give ssh `::1:22`, which it refuses ("Bad stdio
+        // forwarding specification"); `[::1]:22` it takes, as it takes
+        // `[db.example.com]:22`. The form is OpenSSH's own ProxyJump's, the
+        // quotes fixed text so the brackets are never a shell pattern. The
+        // hop is the same for every target: ssh fills in `%h` itself.
+        let hop = hop(&bastion());
+        for host in ["::1", "fe80::1%eth0", "db.example.com"] {
+            let mut target = profile();
+            target.host = host.to_string();
+            let cmd = terminal_command(&target, None, askpass(), None, Some(&hop));
+            let proxy = cmd
+                .args
+                .iter()
+                .find_map(|a| a.strip_prefix("ProxyCommand="))
+                .unwrap();
+            assert_eq!(proxy, hop, "{host}");
+            assert!(proxy.contains(" -W '[%h]:%p' "), "{proxy}");
+            assert!(!proxy.contains(" -W %h:%p "), "{proxy}");
+            assert_eq!(cmd.args.last().unwrap(), &format!("alice@{host}"));
+        }
+    }
+
+    #[test]
+    fn the_hop_refuses_a_value_outside_its_characters() {
+        // The hop is a shell string: anything a shell or ssh's expansion reads
+        // means no hop at all (the caller refuses to connect), never a quoted
+        // one.
+        assert!(hop_command(&bastion(), socket()).is_some());
+        for bad in [
+            "/run/user/1000/a b/s",
+            "/run/user/1000/it's",
+            "/run/user/1000/50%",
+            "/run/user/1000/$HOME",
+            "/run/user/1000/@x",
+            "/run/user/1000/a:b",
+            "",
+        ] {
+            assert_eq!(hop_command(&bastion(), Path::new(bad)), None, "{bad:?}");
+        }
+        for user in ["bo b", "bob;id", "bob%x", "bob:x", "$(id)", "b'b", ""] {
+            let mut jump = bastion();
+            jump.username = user.to_string();
+            assert_eq!(hop_command(&jump, socket()), None, "{user:?}");
+        }
+        for host in ["a b", "a;b", "a@b", "a/b", "`id`", "a'b", "a\nb", ""] {
+            let mut jump = bastion();
+            jump.host = host.to_string();
+            assert_eq!(hop_command(&jump, socket()), None, "{host:?}");
+        }
+        // Each charset as it is: `@` in a user name, `:` and `%` in a host.
+        let mut jump = bastion();
+        jump.username = "bob@corp.example".to_string();
+        jump.host = "fe80::1%eth0".to_string();
+        assert!(hop_command(&jump, socket()).is_some());
     }
 
     #[test]
     fn the_target_goes_through_the_proxy_before_its_tty_and_sequence() {
-        let hop = hop_command(&bastion(), socket());
+        let hop = hop(&bastion());
         let proxy = format!("ProxyCommand={hop}");
         let p = profile();
         let s = seq(&["uptime"]);
         let t = token();
         let cmd = terminal_command(&p, Some(&s), askpass(), Some(&t), Some(&hop));
+        // `ControlPath=none`: a `ControlMaster auto` in `~/.ssh/config` cannot
+        // send the target over a master opened another way, past the route.
         assert_eq!(
             cmd.args,
             strs(&[
@@ -1016,6 +1121,8 @@ mod tests {
                 "22",
                 "-o",
                 &proxy,
+                "-o",
+                "ControlPath=none",
                 "-t",
                 "--",
                 "alice@example.com",
@@ -1038,6 +1145,8 @@ mod tests {
                 "/k/id",
                 "-o",
                 &proxy,
+                "-o",
+                "ControlPath=none",
                 "--",
                 "alice@example.com"
             ])
@@ -1052,11 +1161,15 @@ mod tests {
                 .count(),
             1
         );
+        // Without a jump host, nothing of the kind: the person's own
+        // `ControlMaster` settings apply as before.
+        let direct = terminal_command(&p, Some(&s), askpass(), Some(&t), None);
+        assert!(direct.args.iter().all(|a| !a.starts_with("Control")));
     }
 
     #[test]
     fn a_sync_through_a_jump_host() {
-        let hop = hop_command(&bastion(), socket());
+        let hop = hop(&bastion());
         let p = profile();
         let cmd = sync_command(&p, askpass(), true, "moniker-server", Some(&hop));
         assert_eq!(
@@ -1066,6 +1179,8 @@ mod tests {
                 "22",
                 "-o",
                 &format!("ProxyCommand={hop}"),
+                "-o",
+                "ControlPath=none",
                 "-T",
                 "-o",
                 "StrictHostKeyChecking=yes",
@@ -1121,11 +1236,16 @@ mod tests {
         let (p, jump) = (named(profile()), named(bastion()));
         let s = seq(&["uptime"]);
         let t = token();
-        let hop = hop_command(&jump, socket());
+        let hop = hop(&jump);
+        let jumped = Profile {
+            jump_host: Some(jump.id.clone()),
+            ..p.clone()
+        };
         let commands = [
             terminal_command(&p, Some(&s), askpass(), Some(&t), Some(&hop)),
             sync_command(&p, askpass(), true, "moniker-server", Some(&hop)),
             resolve_command(&p),
+            login_resolve_command(&jumped),
             jump_master_command(&jump, socket(), askpass(), Some(&t)),
             jump_sync_master_command(&jump, socket(), askpass(), true),
             jump_control_command(&jump, socket(), JumpControl::Check),
@@ -1150,6 +1270,44 @@ mod tests {
                 assert!(!value.contains(SECRET), "{name}");
             }
         }
+    }
+
+    #[test]
+    fn the_login_lookup_sees_the_route_the_connection_takes() {
+        // ssh canonicalizes a host name (`CanonicalizeHostname yes`) only for
+        // a connection without a proxy, so the askpass helper's `ssh -G` must
+        // carry one exactly when the connection does: a stand-in, never run.
+        let mut p = profile();
+        p.port = 2222;
+        p.key_file = Some("/k/id".into());
+        assert_eq!(login_resolve_command(&p), resolve_command(&p));
+
+        p.jump_host = Some(bastion().id);
+        let cmd = login_resolve_command(&p);
+        assert_eq!(
+            cmd.args,
+            strs(&[
+                "-G",
+                "-p",
+                "2222",
+                "-i",
+                "/k/id",
+                "-o",
+                &format!("ProxyCommand={PROXY_STAND_IN}"),
+                "--",
+                "alice@example.com",
+            ])
+        );
+        assert_ne!(PROXY_STAND_IN, "none");
+        assert!(cmd.env.is_empty(), "{:?}", cmd.env);
+        // The configuration's own view (the host marks, the route note) has
+        // no stand-in, whether the profile has a jump host or not.
+        assert!(
+            resolve_command(&p)
+                .args
+                .iter()
+                .all(|a| !a.contains("ProxyCommand"))
+        );
     }
 
     #[test]

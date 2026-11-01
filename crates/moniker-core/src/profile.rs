@@ -263,12 +263,14 @@ fn valid_token(s: &str, allowed: fn(char) -> bool) -> bool {
 }
 
 /// Host charset `[A-Za-z0-9._:%-]`: hostnames, IPv4, IPv6 (with `%zone`).
-fn is_host_char(c: char) -> bool {
+/// Also what a jump host's host may hold in the hop's shell string
+/// (`crate::ssh::hop_command`).
+pub(crate) fn is_host_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '%' | '-')
 }
 
-/// Username charset `[A-Za-z0-9._@-]`.
-fn is_username_char(c: char) -> bool {
+/// Username charset `[A-Za-z0-9._@-]`, also for the hop's shell string.
+pub(crate) fn is_username_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-')
 }
 

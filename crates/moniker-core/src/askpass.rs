@@ -183,28 +183,33 @@ fn open_marker_dir(runtime_dir: &Path, token: &str, create: bool) -> io::Result<
             "the askpass token is not a canonical UUID",
         ));
     }
-    runtime_subdir(runtime_dir, MARKER_SUBDIR, create)
+    let runtime = open_runtime_dir(runtime_dir)?;
+    moniker_subdir(&runtime, MARKER_SUBDIR, create)
 }
 
-/// The directory `<runtime_dir>/moniker/<name>`, opened, if `runtime_dir` is an
-/// absolute path and both directories are private ([`private_dir`]); with
-/// `create`, missing ones are made. No symlink below `runtime_dir` is followed.
-/// The markers are in one (`askpass`), the sockets of the jump hosts' shared
-/// connections in another (`crate::jump::JumpSocket`).
-pub(crate) fn runtime_subdir(runtime_dir: &Path, name: &str, create: bool) -> io::Result<OwnedFd> {
+/// The runtime directory `runtime_dir`, opened, if it is an absolute path.
+pub(crate) fn open_runtime_dir(runtime_dir: &Path) -> io::Result<OwnedFd> {
     if !runtime_dir.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "the runtime directory is not an absolute path",
         ));
     }
-    let runtime = openat(
+    Ok(openat(
         CWD,
         runtime_dir,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
-    let moniker = private_dir(&runtime, RUNTIME_SUBDIR, create)?;
+    )?)
+}
+
+/// The directory `moniker/<name>` in the opened runtime directory `runtime`
+/// ([`open_runtime_dir`]), opened, if both directories are private
+/// ([`private_dir`]); with `create`, missing ones are made. No symlink is
+/// followed. The markers are in one (`askpass`), the sockets of the jump hosts'
+/// shared connections in another (`crate::jump::JumpSocket`).
+pub(crate) fn moniker_subdir(runtime: impl AsFd, name: &str, create: bool) -> io::Result<OwnedFd> {
+    let moniker = private_dir(runtime, RUNTIME_SUBDIR, create)?;
     private_dir(&moniker, name, create)
 }
 
@@ -367,7 +372,7 @@ fn has_word(lower: &str, word: &str) -> bool {
 }
 
 /// The `(user, host)` that `ssh`'s password prompt names for a connection,
-/// read from what `ssh -G` printed for it (`crate::ssh::resolve_command`):
+/// read from what `ssh -G` printed for it (`crate::ssh::login_resolve_command`):
 /// the `user`, and the `hostkeyalias` if there is one (the prompt names it),
 /// else the `hostname`, as `ssh` prints them (it lowercases both host names).
 /// This is the identity after `~/.ssh/config` is applied, so a profile whose

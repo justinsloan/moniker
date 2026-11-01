@@ -369,17 +369,19 @@ free_port() {
 # sshd_config for one throwaway server. B's environment is set with SetEnv, so
 # `moniker-server sync-serve` in the session is instance B on the private bus.
 write_sshd_config() { # write_sshd_config FILE PORT NAME REMOTE_PATH key|password|both
-    local auth="PasswordAuthentication no" pubkey="PubkeyAuthentication yes" penalties=""
+    local auth="PasswordAuthentication no" pubkey="PubkeyAuthentication yes" penalties="" listen6=""
     # A user-level sshd cannot check passwords, so every password login fails;
     # OpenSSH 9.8 and later then penalize the source address, 127.0.0.1, and
     # drop the next checks' connections. The password servers have none. "both"
     # offers the key as well, so that a login which tried the password first
-    # (the askpass helper answered it) can still succeed with the key.
+    # (the askpass helper answered it) can still succeed with the key; it also
+    # listens on ::1, for a target that is an IPv6 address.
     [ "$5" = password ] && { auth="PasswordAuthentication yes"; pubkey="PubkeyAuthentication no"; penalties="PerSourcePenalties no"; }
-    [ "$5" = both ] && { auth="PasswordAuthentication yes"; penalties="PerSourcePenalties no"; }
+    [ "$5" = both ] && { auth="PasswordAuthentication yes"; penalties="PerSourcePenalties no"; listen6="ListenAddress ::1"; }
     cat >"$1" <<EOF
 Port $2
 ListenAddress 127.0.0.1
+$listen6
 HostKey $T/hostkey
 AuthorizedKeysFile $T/authorized_keys
 PidFile $T/sshd_$3.pid
@@ -395,9 +397,9 @@ SetEnv XDG_CONFIG_HOME=$T/B/cfg MONIKER_KEYRING_SERVICE=moniker-e2e-b DBUS_SESSI
 EOF
 }
 
-port_speaks_ssh() { # the port answers with an SSH banner
+port_speaks_ssh() { # port_speaks_ssh PORT [ADDRESS]: it answers with an SSH banner (on 127.0.0.1)
     local banner
-    banner=$( (exec 3<>"/dev/tcp/127.0.0.1/$1" && read -r -t 2 line <&3 && printf '%s' "$line") 2>/dev/null)
+    banner=$( (exec 3<>"/dev/tcp/${2:-127.0.0.1}/$1" && read -r -t 2 line <&3 && printf '%s' "$line") 2>/dev/null)
     case $banner in SSH-2.0-*) return 0 ;; *) return 1 ;; esac
 }
 
@@ -640,12 +642,14 @@ EOF
 # `hopped` is reached through a ProxyJump hop whose prompt names the same
 # user@host as the target's: the target's prompt names its HostKeyAlias,
 # 127.0.0.1, the hop's its host, also 127.0.0.1 (OpenSSH refuses a jump to the
-# very host, port and user it connects to, hence the alias). $VIA_JUMP_HOST and
-# $VIA_TARGET_HOST are the jump host and the target of
-# check_connection_through_a_jump_host: each signs in with the key after the
-# password (see "jump connections" below), and the target's entry has a
-# ProxyJump of its own, to a host that does not exist, and names its host key
-# 127.0.0.1 while its host name is localhost.
+# very host, port and user it connects to, hence the alias). $VIA_JUMP_HOST is
+# the jump host of the checks of connections through one, and
+# $VIA_TARGET_HOST, $VIA_CANON_HOST and ::1 their targets: each signs in with
+# the key after the password (see "jump connections" below). The first
+# target's entry has a ProxyJump of its own, to a host that does not exist, and
+# names its host key 127.0.0.1 while its host name is localhost; the second's
+# has no route and canonicalizes its host name, localhost, to
+# localhost.localhost (which ssh does only for a connection without a proxy).
 write_ssh_shim() {
     local real
     real=$(command -v ssh) || return 1
@@ -668,7 +672,11 @@ Host $VIA_TARGET_HOST
   HostName localhost
   HostKeyAlias 127.0.0.1
   ProxyJump nowhere.invalid
-Host $VIA_JUMP_HOST $VIA_TARGET_HOST
+Host $VIA_CANON_HOST
+  HostName localhost
+  CanonicalizeHostname yes
+  CanonicalDomains localhost
+Host $VIA_JUMP_HOST $VIA_TARGET_HOST $VIA_CANON_HOST ::1
   PubkeyAuthentication yes
   IdentitiesOnly yes
   IdentityFile $T/client_key
@@ -799,8 +807,14 @@ JUMP_SIGNIN=()  # ssh options: the password first, then the key
 JUMP_SOCKETS=() # sockets of the masters a check started
 JUMP_MASTERS=() # ids of those masters, once known (learn_master)
 MASTER_PID=     # set by learn_master
-VIA_JUMP_HOST=bastion-e2e # hosts of check_connection_through_a_jump_host's profiles
+VIA_JUMP_HOST=bastion-e2e # hosts of the profiles of the connections through a jump host
 VIA_TARGET_HOST=db-e2e    # (their entries in $T/ssh_config: write_ssh_shim)
+VIA_CANON_HOST=canon-e2e
+VIA_READY=      # set once via_setup has seeded them
+VIA_JUMP_ID=    # their ids
+VIA_DB_ID=
+VIA_CANON_ID=
+VIA_V6_ID=
 CMD_ARGS=()     # a command the product built (built_command): the program, then its arguments
 CMD_ENV=()      # and the variables it adds, NAME=value
 
@@ -1088,32 +1102,40 @@ run_built_control() {
     capture env PATH="$T/shim:$PATH" timeout 5 "${CMD_ARGS[@]}"
 }
 
-# A connection through a jump host with exactly the commands the product
-# builds (e2e_helper connection-argv). Both profiles have a stored password and
-# an entry in $T/ssh_config (write_ssh_shim) that signs in with the key once
-# the password was answered and refused, so nothing is added to the command
-# line. The target's entry sends it through a ProxyJump of its own, to
-# nowhere.invalid, and names its host key 127.0.0.1 while its host name is
-# localhost: the connection works only if the profile's route (the
-# ProxyCommand on the command line) wins over the configuration, and the
-# target's password is answered only if the helper's `ssh -G`, which sees no
-# ProxyCommand, still gives the identity the prompt names (plan Ruling R1).
-check_connection_through_a_jump_host() {
-    local out sock jump_id target_id jump_token token accepted took
+# The profiles of the connections through a jump host, once: the jump host
+# and three targets through it, each with a stored password and an entry in
+# $T/ssh_config (write_ssh_shim) that signs in with the key once the password
+# was answered and refused, so nothing is added to the command line.
+via_setup() {
+    [ -z "$VIA_READY" ] || return 0
     jump_setup || return 1
-    jump_id=$(seed_password_profile via-bastion "$VIA_JUMP_HOST" "$JUMP_PORT") &&
-        target_id=$(seed_password_profile via-db "$VIA_TARGET_HOST" "$TARGET_PORT" via-bastion) ||
+    VIA_JUMP_ID=$(seed_password_profile via-bastion "$VIA_JUMP_HOST" "$JUMP_PORT") &&
+        VIA_DB_ID=$(seed_password_profile via-db "$VIA_TARGET_HOST" "$TARGET_PORT" via-bastion) &&
+        VIA_CANON_ID=$(seed_password_profile via-canon "$VIA_CANON_HOST" "$TARGET_PORT" via-bastion) &&
+        VIA_V6_ID=$(seed_password_profile via-v6 ::1 "$TARGET_PORT" via-bastion) ||
         { REASON="cannot seed the profiles"; return 1; }
-    capture env PATH="$T/shim:$PATH" ssh -G -p "$TARGET_PORT" -- "$ME@$VIA_TARGET_HOST"
-    grep -qx 'proxyjump nowhere.invalid' "$OUT" && grep -qx 'hostkeyalias 127.0.0.1' "$OUT" ||
-        { REASON="precondition: the configuration does not send the target through nowhere.invalid"; return 1; }
-    sock=$(jump_socket) jump_token=$(new_token) token=$(new_token) out=$T/connection-argv
-    A "$HELPER" connection-argv --profile via-db --socket "$sock" --askpass "$T/askpass-exec.sh" \
+    VIA_READY=1
+}
+
+# Connect to the profile NAME (id ID) through its jump host with exactly the
+# commands the product builds (e2e_helper connection-argv: a socket made by
+# JumpSocket::new in $XDG_RUNTIME_DIR, then jump::pane_commands), run as
+# Moniker runs them: the master signs in, its prompt answered by the helper;
+# -O check names it; the target's ssh goes through it, its own prompt (naming
+# PROMPT_HOST) answered, none from the hop, and the target's sshd lets it in;
+# -O exit ends the master at once.
+connect_through_jump_host() { # connect_through_jump_host NAME ID PROMPT_HOST
+    local out=$T/connection-argv sock jump_token token accepted took
+    jump_token=$(new_token) token=$(new_token)
+    A "$HELPER" connection-argv --profile "$1" --askpass "$T/askpass-exec.sh" \
         --token "$token" --jump-token "$jump_token" >"$out" 2>"$ERR" ||
         { REASON="connection-argv failed: $(err_summary)"; return 1; }
+    sock=$(sed -n 's/^socket //p' "$out")
+    case $sock in "$JUMP_DIR"/*) ;; *) REASON="the socket is not in $JUMP_DIR: $sock"; return 1 ;; esac
+    [ ! -e "$sock" ] || { REASON="something is already at the socket's path $sock"; return 1; }
 
     # The master signs in to the jump host: its prompt answered by the helper.
-    built_command "$out" master && expect_built_env master "$jump_id" "$jump_token" || return 1
+    built_command "$out" master && expect_built_env master "$VIA_JUMP_ID" "$jump_token" || return 1
     JUMP_SOCKETS+=("$sock")
     run_built
     [ "$RC" -eq 0 ] || { REASON="the master exited $RC, expected 0: $(err_summary)"; return 1; }
@@ -1133,14 +1155,14 @@ check_connection_through_a_jump_host() {
 
     # The target, through the master: its own prompt answered, none from the
     # hop, and the target's sshd let it in.
-    built_command "$out" target && expect_built_env target "$target_id" "$token" || return 1
+    built_command "$out" target && expect_built_env target "$2" "$token" || return 1
     accepted=$(grep -c "Accepted publickey for $ME " "$T/sshd_pwtarget.log")
     run_built
     [ "$RC" -eq 0 ] || { REASON="the target exited $RC, expected 0: $(err_summary)"; return 1; }
     [ -e "$(marker_of "$token")" ] ||
         { REASON="the helper did not answer the target's prompt (askpass log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
-    [ "$(prompts_asked)" -eq 1 ] && grep -qxF "prompt=$ME@127.0.0.1's password: " "$T/askpass.log" ||
-        { REASON="expected the target's prompt only (log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
+    [ "$(prompts_asked)" -eq 1 ] && grep -qxF "prompt=$ME@$3's password: " "$T/askpass.log" ||
+        { REASON="expected the target's prompt only, naming $ME@$3 (log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
     [ "$(grep -c "Accepted publickey for $ME " "$T/sshd_pwtarget.log")" -eq $((accepted + 1)) ] ||
         { REASON="the target's sshd did not let the connection in"; return 1; }
 
@@ -1151,6 +1173,42 @@ check_connection_through_a_jump_host() {
     grep -qx 'Exit request sent.' <(tr -d '\r' <"$ERR") || { REASON="-O exit said: $(err_summary)"; return 1; }
     took=$(wait_gone "$MASTER_PID" "${PID_START[$MASTER_PID]}" "$sock" 1000) ||
         { REASON="after -O exit (process ms, socket ms): $took"; return 1; }
+}
+
+# The target's entry sends it through a ProxyJump of its own, to
+# nowhere.invalid, and names its host key 127.0.0.1 while its host name is
+# localhost: the connection works only if the profile's route (the
+# ProxyCommand on the command line) wins over the configuration, and the
+# prompt names the host key's alias.
+check_connection_through_a_jump_host() {
+    via_setup || return 1
+    capture env PATH="$T/shim:$PATH" ssh -G -p "$TARGET_PORT" -- "$ME@$VIA_TARGET_HOST"
+    grep -qx 'proxyjump nowhere.invalid' "$OUT" && grep -qx 'hostkeyalias 127.0.0.1' "$OUT" ||
+        { REASON="precondition: the configuration does not send the target through nowhere.invalid"; return 1; }
+    connect_through_jump_host via-db "$VIA_DB_ID" 127.0.0.1
+}
+
+# The target's entry has no route of its own and canonicalizes its host name:
+# `ssh -G` for the profile as the configuration alone has it says
+# localhost.localhost, but ssh canonicalizes only a connection without a proxy,
+# so the connection through the jump host names localhost in its prompt. The
+# helper answers that only if its own `ssh -G` carries a ProxyCommand as the
+# connection does (Ruling T3-b).
+check_jump_host_target_named_as_connected() {
+    via_setup || return 1
+    capture env PATH="$T/shim:$PATH" ssh -G -p "$TARGET_PORT" -- "$ME@$VIA_CANON_HOST"
+    grep -qx 'hostname localhost.localhost' "$OUT" ||
+        { REASON="precondition: ssh -G does not canonicalize $VIA_CANON_HOST to localhost.localhost (does this machine resolve *.localhost?): $(grep '^hostname ' "$OUT")"; return 1; }
+    connect_through_jump_host via-canon "$VIA_CANON_ID" localhost
+}
+
+# A target that is an IPv6 address: the hop asks the master for `[::1]:PORT`
+# (`-W ::1:PORT` would be refused by ssh; Ruling T3-a).
+check_jump_host_ipv6_target() {
+    via_setup || return 1
+    port_speaks_ssh "$TARGET_PORT" ::1 ||
+        { REASON="precondition: the target's sshd does not answer on [::1]:$TARGET_PORT"; return 1; }
+    connect_through_jump_host via-v6 "$VIA_V6_ID" ::1
 }
 
 # ---------- inner main ----------
@@ -1193,6 +1251,8 @@ inner_main() {
     run_jump_check "jump connection: a master nobody uses ends by itself" check_master_backstop
     run_jump_check "jump connection: no listening port" check_no_listening_port
     run_jump_check "jump connection: the product's commands reach the target through its jump host" check_connection_through_a_jump_host
+    run_jump_check "jump connection: the helper names the target as the connection does, not canonicalized" check_jump_host_target_named_as_connected
+    run_jump_check "jump connection: an IPv6 target is reached through the jump host" check_jump_host_ipv6_target
 
     say "== summary: $PASSED passed, $FAILED failed"
     [ "$FAILED" -eq 0 ]

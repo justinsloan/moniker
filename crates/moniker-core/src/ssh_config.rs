@@ -3,12 +3,16 @@
 //! `ssh -G` prints the configuration `ssh` would use for a connection, after
 //! `~/.ssh/config` and `/etc/ssh/ssh_config` are applied, and exits without
 //! connecting. Moniker reads two things from it: the user and host a password
-//! prompt will name (the askpass helper, `crate::askpass::effective_identity`)
-//! and the host a connection really goes to, to ping it ([`ping_target`]).
+//! prompt will name (the askpass helper, `crate::askpass::effective_identity`,
+//! from [`login_config`]: the connection as Moniker makes it, through its jump
+//! host if it has one) and the host a connection really goes to, to ping it
+//! ([`ping_target`], from [`effective_config`]: the profile as the
+//! configuration has it).
 //!
-//! [`effective_config`] runs it like every `ssh` Moniker starts: the system
-//! `ssh` from `PATH`, from argv (`crate::ssh::resolve_command`, with `--`
-//! before the destination), never through a shell. It gets no input, its
+//! Both run it like every `ssh` Moniker starts: the system `ssh` from `PATH`,
+//! from argv (`crate::ssh::resolve_command` or
+//! `crate::ssh::login_resolve_command`, with `--` before the destination),
+//! never through a shell. It gets no input, its
 //! errors are discarded, it has [`CONFIG_LIMIT`] to answer, and it runs
 //! without the variables that lead `ssh` to the askpass helper: it never
 //! prompts, and if it ever did, that must not come back to the helper.
@@ -23,7 +27,7 @@ use std::time::{Duration, Instant};
 use crate::askpass::{PID_ENV, TOKEN_ENV};
 use crate::ping::Family;
 use crate::profile::Profile;
-use crate::ssh::resolve_command;
+use crate::ssh::{SshCommand, login_resolve_command, resolve_command};
 
 /// How long `ssh -G` may take. It normally answers in milliseconds; only a
 /// `Match exec` or host name canonicalization in `~/.ssh/config` can make it
@@ -43,15 +47,35 @@ pub(crate) const HELPER_ENV: [&str; 5] = [
     TOKEN_ENV,
 ];
 
-/// What `ssh -G` prints for the connection to `profile`, if it answers within
-/// [`CONFIG_LIMIT`] (module docs).
+/// What `ssh -G` prints for `profile` as `~/.ssh/config` has it
+/// (`crate::ssh::resolve_command`: nothing of Moniker's own route, so a route
+/// the configuration sets shows), if it answers within [`CONFIG_LIMIT`]
+/// (module docs). For the host marks.
 pub fn effective_config(profile: &Profile) -> Option<String> {
-    output_within(config_process(profile), CONFIG_LIMIT)
+    output_within(effective_process(profile), CONFIG_LIMIT)
 }
 
-/// `ssh -G` for the connection to `p`, without the askpass helper's variables.
-fn config_process(p: &Profile) -> Command {
-    let ssh = resolve_command(p);
+/// What `ssh -G` prints for the connection Moniker makes to `profile`
+/// (`crate::ssh::login_resolve_command`: through a jump host, with a stand-in
+/// `ProxyCommand`, as ssh then canonicalizes no host name), if it answers
+/// within [`CONFIG_LIMIT`]. For the askpass helper, which reads from it the
+/// identity the password prompt names.
+pub fn login_config(profile: &Profile) -> Option<String> {
+    output_within(login_process(profile), CONFIG_LIMIT)
+}
+
+/// The process of [`effective_config`].
+fn effective_process(p: &Profile) -> Command {
+    config_process(resolve_command(p))
+}
+
+/// The process of [`login_config`].
+fn login_process(p: &Profile) -> Command {
+    config_process(login_resolve_command(p))
+}
+
+/// `ssh` running `ssh -G` from argv, without the askpass helper's variables.
+fn config_process(ssh: SshCommand) -> Command {
     let mut command = Command::new(&ssh.program);
     command.args(&ssh.args);
     for name in HELPER_ENV {
@@ -251,25 +275,57 @@ mod tests {
     fn ssh_g_runs_from_argv_without_the_helpers_variables() {
         let mut p = Profile::new("web1", "web", "admin");
         p.port = 2222;
-        let command = config_process(&p);
-        assert_eq!(command.get_program(), "ssh");
-        let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
-        assert_eq!(args, ["-G", "-p", "2222", "--", "admin@web"]);
-        let removed: Vec<&std::ffi::OsStr> = command
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(name, _)| name)
-            .collect();
-        for name in [
-            "SSH_ASKPASS",
-            "SSH_ASKPASS_REQUIRE",
-            "MONIKER_PROFILE_ID",
-            "MONIKER_PID",
-            "MONIKER_ASKPASS_TOKEN",
-        ] {
-            assert!(removed.contains(&std::ffi::OsStr::new(name)), "{name}");
+        for command in [effective_process(&p), login_process(&p)] {
+            assert_eq!(command.get_program(), "ssh");
+            let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+            assert_eq!(args, ["-G", "-p", "2222", "--", "admin@web"]);
+            let removed: Vec<&std::ffi::OsStr> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| name)
+                .collect();
+            for name in [
+                "SSH_ASKPASS",
+                "SSH_ASKPASS_REQUIRE",
+                "MONIKER_PROFILE_ID",
+                "MONIKER_PID",
+                "MONIKER_ASKPASS_TOKEN",
+            ] {
+                assert!(removed.contains(&std::ffi::OsStr::new(name)), "{name}");
+            }
+            assert!(command.get_envs().all(|(_, value)| value.is_none()));
         }
-        assert!(command.get_envs().all(|(_, value)| value.is_none()));
+    }
+
+    #[test]
+    fn only_the_login_lookup_goes_through_the_stand_in() {
+        // A profile with a jump host: the askpass helper's lookup sees the
+        // route the connection takes; the host marks see the configuration's
+        // own (a ProxyJump it sets must show there).
+        let mut p = Profile::new("db", "db.internal", "alice");
+        p.jump_host = Some("00000000-0000-4000-8000-000000000001".to_owned());
+        let args = |command: Command| -> Vec<String> {
+            command
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(
+            args(effective_process(&p)),
+            ["-G", "-p", "22", "--", "alice@db.internal"]
+        );
+        assert_eq!(
+            args(login_process(&p)),
+            [
+                "-G",
+                "-p",
+                "22",
+                "-o",
+                "ProxyCommand=moniker-jump-host",
+                "--",
+                "alice@db.internal"
+            ]
+        );
     }
 
     // ----- where a ping goes -----

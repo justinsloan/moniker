@@ -39,7 +39,7 @@ use moniker_core::askpass::{
 };
 use moniker_core::profile::Profile;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore};
-use moniker_core::ssh_config::effective_config;
+use moniker_core::ssh_config::login_config;
 use moniker_core::store::ProfileStore;
 
 /// Why no answer was given. Deliberately generic: the prompt can name a key
@@ -174,10 +174,13 @@ fn respond(
 
 /// The `(username, host)` of the profile `profile_id` names, read from the
 /// profile file. Any failure (no config directory, unreadable store, no such
-/// profile) is `None`, which makes the helper ask the user instead.
+/// profile) is `None`, which makes the helper ask the user instead. `ssh -G`
+/// is asked about the connection as Moniker makes it (`login_config`: through
+/// the profile's jump host if it has one, where ssh canonicalizes no host
+/// name), not about the profile as `~/.ssh/config` alone has it.
 fn identity_from_store(profile_id: &str, prompt: &str) -> Option<(String, String)> {
     let store = ProfileStore::open(&store_path().ok()?).ok()?;
-    identity_of(&store, profile_id, prompt, effective_config)
+    identity_of(&store, profile_id, prompt, login_config)
 }
 
 /// What decides whether the stored password may be looked for at all.
