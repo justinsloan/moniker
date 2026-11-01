@@ -253,8 +253,12 @@ fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
     let current = std::env::current_exe()
         .map_err(|e| format!("cannot locate the moniker-server executable: {e}"))?;
     let askpass = current.with_file_name("moniker-askpass");
-    check_askpass(has_password, &askpass)?;
-    check_askpass(jump_has_password, &askpass)?;
+    check_sync_askpass(
+        &askpass,
+        &profile,
+        has_password,
+        jump.as_ref().map(|jump| (jump, jump_has_password)),
+    )?;
     let leg = jump
         .as_ref()
         .map(|jump| jump_leg(jump, runtime_dir().as_deref(), &askpass, jump_has_password))
@@ -366,7 +370,8 @@ fn sync_status(path: &Path) -> Result<String, String> {
 // ----- helpers -----
 
 /// What `moniker-server sync` says about a failed sync: the error, and for a
-/// machine that has been away or has sync turned off, how to go ahead anyway.
+/// machine that has been away or has sync turned off, how to go ahead anyway;
+/// for a jump host whose key is not known yet, what to do about it here.
 fn sync_error_text(err: &SyncError) -> String {
     match err {
         SyncError::Stale { .. } | SyncError::PeerStale => {
@@ -374,6 +379,11 @@ fn sync_error_text(err: &SyncError) -> String {
         }
         SyncError::SyncOff => {
             format!("{err}; turn it on with `moniker-server sync-switch on` or on the Sync page")
+        }
+        // The core's text sends the person to a tab of the app, as the GUI
+        // words it; a command line has none.
+        SyncError::JumpHostKeyUnknown { name } => {
+            format!("connect to {name} once with ssh first, so its host key is known")
         }
         _ => err.to_string(),
     }
@@ -446,17 +456,35 @@ fn jump_leg(
 /// A sync runs with no terminal, so a stored password reaches ssh only through
 /// the `moniker-askpass` helper. If one is stored and the helper is not an
 /// existing file, say so now, before connecting, instead of failing later with
-/// an authentication error.
-fn check_askpass(has_password: bool, askpass: &Path) -> Result<(), String> {
+/// an authentication error. `whose` says which stored password it is.
+fn check_askpass(has_password: bool, askpass: &Path, whose: &str) -> Result<(), String> {
     if has_password && !askpass.is_file() {
         Err(format!(
-            "moniker-askpass not found next to moniker-server (looked for {}), so the stored \
-             password cannot be used for the sync (build with `cargo build --workspace`)",
+            "moniker-askpass not found next to moniker-server (looked for {}), so {whose} \
+             cannot be used for the sync (build with `cargo build --workspace`)",
             askpass.display()
         ))
     } else {
         Ok(())
     }
+}
+
+/// [`check_askpass`] for a sync's two logins: the partner's, then the jump
+/// host's, each as `(profile, whether a password is stored)`. The error names
+/// the profile whose stored password cannot be used.
+fn check_sync_askpass(
+    askpass: &Path,
+    partner: &Profile,
+    partner_has_password: bool,
+    jump: Option<(&Profile, bool)>,
+) -> Result<(), String> {
+    let whose = format!("the stored password of {}", partner.name);
+    check_askpass(partner_has_password, askpass, &whose)?;
+    if let Some((jump, has_password)) = jump {
+        let whose = format!("the stored password of the jump host {}", jump.name);
+        check_askpass(has_password, askpass, &whose)?;
+    }
+    Ok(())
 }
 
 /// Write `text` to stdout. A closed stdout is an error, not a panic.
@@ -820,7 +848,7 @@ mod tests {
     #[test]
     fn a_stored_password_without_the_helper_is_an_error_before_connecting() {
         let missing = Path::new("/nonexistent/moniker/moniker-askpass");
-        let err = check_askpass(true, missing).unwrap_err();
+        let err = check_askpass(true, missing, "the stored password of Db").unwrap_err();
         assert!(
             err.contains("moniker-askpass not found next to moniker-server"),
             "{err}"
@@ -829,10 +857,14 @@ mod tests {
             err.contains("/nonexistent/moniker/moniker-askpass"),
             "{err}"
         );
+        assert!(
+            err.contains("so the stored password of Db cannot be used for the sync"),
+            "{err}"
+        );
         assert!(err.contains("cargo build --workspace"), "{err}");
         // A directory is not a helper either.
         let dir = tempfile::tempdir().unwrap();
-        assert!(check_askpass(true, dir.path()).is_err());
+        assert!(check_askpass(true, dir.path(), "x").is_err());
     }
 
     #[test]
@@ -840,9 +872,47 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("moniker-askpass");
         std::fs::write(&helper, "#!/bin/sh\n").unwrap();
-        assert_eq!(check_askpass(true, &helper), Ok(()));
-        assert_eq!(check_askpass(false, &helper), Ok(()));
-        assert_eq!(check_askpass(false, Path::new("/nonexistent/x")), Ok(()));
+        assert_eq!(check_askpass(true, &helper, "x"), Ok(()));
+        assert_eq!(check_askpass(false, &helper, "x"), Ok(()));
+        assert_eq!(
+            check_askpass(false, Path::new("/nonexistent/x"), "x"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_missing_helper_names_whose_stored_password_cannot_be_used() {
+        let missing = Path::new("/nonexistent/moniker/moniker-askpass");
+        let db = Profile::new("Db", "db", "alice");
+        let bastion = Profile::new("Bastion", "bastion", "admin");
+
+        // The partner's, when it has one (the jump host's is not reached).
+        let err = check_sync_askpass(missing, &db, true, Some((&bastion, true))).unwrap_err();
+        assert!(err.contains("so the stored password of Db cannot"), "{err}");
+        assert!(!err.contains("Bastion"), "{err}");
+
+        // The jump host's, when only it has one.
+        let err = check_sync_askpass(missing, &db, false, Some((&bastion, true))).unwrap_err();
+        assert!(
+            err.contains("so the stored password of the jump host Bastion cannot"),
+            "{err}"
+        );
+        assert!(!err.contains("Db"), "{err}");
+
+        // No stored password, no helper needed.
+        assert_eq!(
+            check_sync_askpass(missing, &db, false, Some((&bastion, false))),
+            Ok(())
+        );
+        assert_eq!(check_sync_askpass(missing, &db, false, None), Ok(()));
+        // And with the helper there, any combination.
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("moniker-askpass");
+        std::fs::write(&helper, "#!/bin/sh\n").unwrap();
+        assert_eq!(
+            check_sync_askpass(&helper, &db, true, Some((&bastion, true))),
+            Ok(())
+        );
     }
 
     // ----- the sync key minimum (set time only) -----
@@ -1565,6 +1635,25 @@ mod tests {
             sync_error_text(&SyncError::PeerSyncOff),
             SyncError::PeerSyncOff.to_string()
         );
+    }
+
+    #[test]
+    fn an_unknown_jump_host_key_says_to_connect_with_ssh() {
+        // The core's text is the GUI's ("in a tab"); a command line has no tab.
+        let err = SyncError::JumpHostKeyUnknown {
+            name: "Bastion".to_owned(),
+        };
+        assert_eq!(
+            sync_error_text(&err),
+            "connect to Bastion once with ssh first, so its host key is known"
+        );
+        assert!(err.to_string().contains("in a tab"));
+        // Another jump failure is the core's text as it is.
+        let other = SyncError::JumpFailed {
+            name: "Bastion".to_owned(),
+            detail: "ssh exited with status 255".to_owned(),
+        };
+        assert_eq!(sync_error_text(&other), other.to_string());
     }
 
     #[test]

@@ -1230,16 +1230,19 @@ check_jump_host_ipv6_target() {
 # `moniker-server sync` opens the jump host's shared connection itself, goes
 # through it to the partner and ends it. A sync has no one-time token, so there
 # is no marker that shows the helper answered a prompt. What shows it here:
-#   * the askpass helper `moniker-server` uses is a copy that logs each prompt
-#     and the profile it was asked for, then becomes the real helper
-#     (make_sync_tools), so the log has the master's prompt and the partner's,
-#     in that order, and nothing else;
+#   * the askpass helper `moniker-server` uses is a wrapper that runs the real
+#     helper as its child, hands its answer on to ssh and logs the profile, the
+#     prompt and the helper's exit status (make_sync_tools), so the log has the
+#     master's prompt and the partner's, in that order, each answered (exit 0)
+#     and nothing else asked. A helper that refused would log exit 1, though
+#     ssh would still go on with an empty password;
 #   * the throwaway sshds refuse every password, as a user-level sshd must, and
-#     log it ("Failed password"): a password was sent, which only the helper can
-#     have done (no terminal, and ssh is told to ask the helper), and the key
-#     then signs in ("Accepted publickey"). The jump host's sshd sees exactly
-#     one of each: the master's. The hop goes through that connection, so it
-#     signs in to nothing, and the partner's sshd sees exactly one: the sync's.
+#     log it ("Failed password"), and the key then signs in ("Accepted
+#     publickey"). The jump host's sshd sees exactly one of each: the master's.
+#     The hop goes through that connection, so it signs in to nothing, and the
+#     partner's sshd sees exactly one: the sync's. That says how many logins
+#     there were, not that a password was right (no user-level sshd can check
+#     one); the helper's exit status says it answered.
 
 SYNC_TOOLS=    # $T/synctools: a moniker-server whose askpass helper logs the prompts
 PARTNER_ID=    # the sync partner's profile id on A
@@ -1252,16 +1255,35 @@ trust_in_shim_kh() { # trust_in_shim_kh PORT
 }
 
 # A copy of moniker-server in $SYNC_TOOLS, with a moniker-askpass beside it (the
-# product looks for the helper next to its own executable) that logs the
-# profile and the prompt to $T/sync-askpass.log and then execs the real helper:
-# its parent is still the ssh that asked, as the helper requires.
+# product looks for the helper next to its own executable). It runs the real
+# helper as its child, so that the helper's exit status can be logged, leaves
+# the helper's stdout (the answer) to ssh, and logs one line to
+# $T/sync-askpass.log: the profile the helper was asked for, its exit status and
+# the prompt (never the answer).
+#
+# The helper answers only an ssh whose parent is MONIKER_PID, read as the
+# parent of its own parent, and with this wrapper between, its parent is the
+# wrapper and the ssh is the grandparent (as in askpass-wrap.sh). So the
+# wrapper makes the same decision one level down: only if the ssh's parent
+# really is the MONIKER_PID the product set, the helper is told the ssh's id as
+# MONIKER_PID; otherwise it keeps the product's value and refuses. What the
+# helper decides after that (the profile, the identity ssh -G gives, the
+# keyring) is its own.
 make_sync_tools() {
     SYNC_TOOLS=$T/synctools
     mkdir -p "$SYNC_TOOLS" && cp -- "$BIN/moniker-server" "$SYNC_TOOLS/moniker-server" || return 1
     cat >"$SYNC_TOOLS/moniker-askpass" <<EOF
 #!/bin/sh
-printf 'profile=%s prompt=%s\n' "\${MONIKER_PROFILE_ID-}" "\$1" >>"$T/sync-askpass.log"
-exec "$BIN/moniker-askpass" "\$1"
+prompt=\$1
+stat=\$(cat "/proc/\$PPID/stat" 2>/dev/null)
+stat=\${stat##*) }
+set -- \$stat
+if [ -n "\${MONIKER_PID-}" ] && [ "\${2-}" = "\$MONIKER_PID" ]; then MONIKER_PID=\$PPID; fi
+export MONIKER_PID
+"$BIN/moniker-askpass" "\$prompt"
+code=\$?
+printf 'profile=%s exit=%s prompt=%s\n' "\${MONIKER_PROFILE_ID-}" "\$code" "\$prompt" >>"$T/sync-askpass.log"
+exit "\$code"
 EOF
     chmod 700 "$SYNC_TOOLS/moniker-askpass"
 }
@@ -1316,11 +1338,12 @@ check_sync_through_a_jump_host() {
     [ "$(secret_of A "$carried_b")" = "$pw_b" ] || { REASON="carried-b's password did not arrive on A"; return 1; }
 
     # The helper answered the master (the jump host's profile), then the
-    # partner's ssh (the partner's profile), and nothing else asked.
-    [ "$(grep -c '^profile=' "$T/sync-askpass.log")" -eq 2 ] &&
-        [ "$(sed -n 1p "$T/sync-askpass.log")" = "profile=$VIA_JUMP_ID prompt=$ME@127.0.0.1's password: " ] &&
-        [ "$(sed -n 2p "$T/sync-askpass.log")" = "profile=$PARTNER_ID prompt=$ME@127.0.0.1's password: " ] ||
-        { REASON="the prompts asked were not the master's and the partner's (log: $(tr '\n' '~' <"$T/sync-askpass.log"))"; return 1; }
+    # partner's ssh (the partner's profile), each with exit status 0, and
+    # nothing else asked. A helper that refused would have logged exit=1.
+    [ "$(wc -l <"$T/sync-askpass.log")" -eq 2 ] &&
+        [ "$(sed -n 1p "$T/sync-askpass.log")" = "profile=$VIA_JUMP_ID exit=0 prompt=$ME@127.0.0.1's password: " ] &&
+        [ "$(sed -n 2p "$T/sync-askpass.log")" = "profile=$PARTNER_ID exit=0 prompt=$ME@127.0.0.1's password: " ] ||
+        { REASON="the helper did not answer exactly the master's prompt and then the partner's (log: $(tr '\n' '~' <"$T/sync-askpass.log"))"; return 1; }
     # One password sent and one key login at each sshd: the master's at the
     # jump host's, the sync's at the partner's. A hop that signed in by itself,
     # or a partner reached directly after the master, would show as another.
@@ -1332,6 +1355,46 @@ check_sync_through_a_jump_host() {
         { REASON="the partner's sshd did not see exactly one password and one key login"; return 1; }
     # The master was ended with the sync (it is signaled, not waited for).
     wait_for 5 jump_folder_empty || { REASON="a socket is left in $JUMP_DIR: $(ls -A "$JUMP_DIR" | tr '\n' ' ')"; return 1; }
+}
+
+# A sync whose connection to the jump host cannot be made fails: it never
+# syncs with the partner directly instead. The partner's profile goes through
+# a jump host, but its host name here is a plain alias of 127.0.0.1 that the
+# partner's sshd answers directly, so a sync that skipped the jump host would
+# succeed; and the sshds' logs show no login at all, at the jump host's or the
+# partner's. The runtime folder (where the socket would go) is missing from the
+# environment, not absolute, or open to others.
+check_sync_without_a_runtime_folder_never_goes_direct() {
+    local port before logs_before logs_after run why
+    local msg="cannot connect through the jump host via-bastion: no private runtime folder for its shared connection"
+    via_setup || return 1
+    start_sshd pwnorun "$BIN:$SYSTEM_PATH" both || { REASON="cannot start the partner's sshd"; return 1; }
+    port=$SSHD_PORT
+    trust_in_shim_kh "$JUMP_PORT" && trust_in_shim_kh "$port" || { REASON="cannot trust the host keys"; return 1; }
+    seed_password_profile no-runtime-partner "$OLD_HOST" "$port" via-bastion >/dev/null ||
+        { REASON="cannot seed the partner's profile"; return 1; }
+    mkdir -m 0777 "$T/open-run" && chmod 0777 "$T/open-run" || { REASON="cannot make a runtime folder open to others"; return 1; }
+    # The partner can be reached directly (this also starts its first login).
+    capture env PATH="$T/shim:$PATH" ssh -p "$port" -o StrictHostKeyChecking=yes -o BatchMode=yes -- "$ME@$OLD_HOST" true
+    [ "$RC" -eq 0 ] || { REASON="precondition: the partner's sshd cannot be reached directly: $(err_summary)"; return 1; }
+    before=$(state_snapshot) || { REASON="cannot read the state before the sync"; return 1; }
+    logs_before=$(sshd_log_count pwjump 'Connection from\|Accepted\|Failed password')/$(sshd_log_count pwnorun 'Connection from\|Accepted\|Failed password')
+    for run in unset relative open; do
+        case $run in
+        unset) capture A env -u XDG_RUNTIME_DIR PATH="$T/shim:$PATH" "${MONX[@]}" sync no-runtime-partner ;;
+        relative) capture A env XDG_RUNTIME_DIR=run PATH="$T/shim:$PATH" "${MONX[@]}" sync no-runtime-partner ;;
+        open) capture A env XDG_RUNTIME_DIR="$T/open-run" PATH="$T/shim:$PATH" "${MONX[@]}" sync no-runtime-partner ;;
+        esac
+        why="with XDG_RUNTIME_DIR $run"
+        [ "$RC" -ne 0 ] || { REASON="exit status 0 $why, expected a failure"; return 1; }
+        grep -qxF "moniker-server: $msg" "$ERR" || { REASON="unexpected message $why: $(err_summary)"; return 1; }
+        [ ! -s "$OUT" ] || { REASON="a sync reported a result $why: $(tr '\n' ' ' <"$OUT")"; return 1; }
+    done
+    logs_after=$(sshd_log_count pwjump 'Connection from\|Accepted\|Failed password')/$(sshd_log_count pwnorun 'Connection from\|Accepted\|Failed password')
+    [ "$logs_before" = "$logs_after" ] ||
+        { REASON="a login reached an sshd (connections, jump host/partner, before $logs_before, after $logs_after)"; return 1; }
+    jump_folder_empty || { REASON="a socket was made in $JUMP_DIR"; return 1; }
+    unchanged_since "$before"
 }
 
 # A machine older than jump hosts turns a sync away while A holds a profile
@@ -1400,6 +1463,7 @@ inner_main() {
     run_jump_check "jump connection: the helper names the target as the connection does, not canonicalized" check_jump_host_target_named_as_connected
     run_jump_check "jump connection: an IPv6 target is reached through the jump host" check_jump_host_ipv6_target
     run_jump_check "sync through a partner's jump host: converges, the helper answers both, no master is left" check_sync_through_a_jump_host
+    run_jump_check "sync through a partner's jump host: no usable runtime folder fails and never syncs direct" check_sync_without_a_runtime_folder_never_goes_direct
     run_jump_check "sync: a machine older than jump hosts is kept out while a profile has one" check_jump_hosts_keep_an_old_machine_out
 
     say "== summary: $PASSED passed, $FAILED failed"

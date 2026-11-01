@@ -1124,9 +1124,10 @@ pub fn run_client(
 /// A completed exchange is `Ok` whatever the exit status.
 ///
 /// With `jump`, whose [`hop`](JumpLeg::hop) `cmd` is to carry as its
-/// `ProxyCommand` (`-o ProxyCommand=<hop>` among its options; a `cmd` that does
-/// not is an [`io::ErrorKind::InvalidInput`] error, and nothing starts, so a
-/// caller cannot sign in to the jump host and reach the partner directly), the
+/// `ProxyCommand` (`-o ProxyCommand=<hop>`, the first `ProxyCommand` or
+/// `ProxyJump` option among its options, which is the one ssh uses; a `cmd` that
+/// does not is an [`io::ErrorKind::InvalidInput`] error, and nothing starts, so
+/// a caller cannot sign in to the jump host and reach the partner directly), the
 /// leg's master signs in to the jump host before `cmd` starts, within the same
 /// limit, and is ended when this returns, whatever happens after it signed in,
 /// a panic included (see `sign_in_to_jump_host`).
@@ -1248,16 +1249,39 @@ fn sync_over_ssh_with_timeout(
     }
 }
 
-/// Whether `cmd` takes `leg`'s hop as the `ProxyCommand` option of its `ssh`
-/// (`-o ProxyCommand=<hop>` before the `--` that ends the options), as
-/// `crate::ssh::sync_command` builds it for its `proxy`.
+/// Whether `cmd` takes `leg`'s hop as the `ProxyCommand` of its `ssh`, as
+/// `crate::ssh::sync_command` builds it for its `proxy`: `-o ProxyCommand=<hop>`
+/// before the `--` that ends the options, and the first proxy option there.
+/// ssh uses the first `ProxyCommand` or `ProxyJump` it is given (from `-o` or
+/// `-J`) and ignores the rest, so any such option before the hop's, in any
+/// spelling, sends the sync somewhere else.
 fn goes_through(cmd: &SshCommand, leg: &JumpLeg) -> bool {
-    let option = format!("ProxyCommand={}", leg.hop);
+    let hop = format!("ProxyCommand={}", leg.hop);
     let end = cmd.args.iter().position(|arg| arg == "--");
-    let options = &cmd.args[..end.unwrap_or(cmd.args.len())];
-    options
-        .windows(2)
-        .any(|pair| pair[0] == "-o" && pair[1] == option)
+    let mut options = cmd.args[..end.unwrap_or(cmd.args.len())].iter();
+    while let Some(arg) = options.next() {
+        if arg == "-o" {
+            match options.next() {
+                Some(value) if is_proxy_option(value) => return *value == hop,
+                _ => {}
+            }
+        } else if arg.starts_with("-J") || arg.strip_prefix("-o").is_some_and(is_proxy_option) {
+            // `-J host`, or `-oProxyCommand=...` in one word: not the hop's form.
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether the `-o` option `value` sets `ProxyCommand` or `ProxyJump` (ssh reads
+/// the keyword without regard to case, then `=` or white space).
+fn is_proxy_option(value: &str) -> bool {
+    let keyword = value
+        .trim_start()
+        .split(|c: char| c == '=' || c.is_whitespace())
+        .next()
+        .unwrap_or_default();
+    keyword.eq_ignore_ascii_case("ProxyCommand") || keyword.eq_ignore_ascii_case("ProxyJump")
 }
 
 /// Make `command` start its process where `terminal` says: in a session of its
@@ -5501,6 +5525,39 @@ exec sleep 30"#,
     }
 
     #[test]
+    fn the_hop_must_be_the_first_proxy_option_ssh_sees() {
+        // ssh takes the first ProxyCommand or ProxyJump it is given, from
+        // `-o` or `-J`; a later one changes nothing. So a command carries the
+        // hop only if nothing of the kind comes before it.
+        let fake = FakeJump::new();
+        let hop = format!("ProxyCommand={}", fake.leg.hop);
+        let command = |args: &[&str]| SshCommand {
+            program: "ssh".to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            env: Vec::new(),
+        };
+        let goes = |args: &[&str]| goes_through(&command(args), &fake.leg);
+
+        assert!(goes(&["-p", "22", "-o", &hop, "-T", "--", "alice@db"]));
+        // Another after it is ssh's second, which it ignores.
+        assert!(goes(&["-o", &hop, "-o", "ProxyCommand=other", "--", "x"]));
+        assert!(goes(&["-o", &hop, "-J", "elsewhere", "--", "x"]));
+
+        // Another before it is the one ssh uses.
+        assert!(!goes(&["-o", "ProxyCommand=other", "-o", &hop, "--", "x"]));
+        assert!(!goes(&["-o", "ProxyJump=elsewhere", "-o", &hop, "--", "x"]));
+        assert!(!goes(&["-o", "proxycommand=other", "-o", &hop, "--", "x"]));
+        assert!(!goes(&["-o", "ProxyJump elsewhere", "-o", &hop, "--", "x"]));
+        assert!(!goes(&["-J", "elsewhere", "-o", &hop, "--", "x"]));
+        assert!(!goes(&["-Jelsewhere", "-o", &hop, "--", "x"]));
+        assert!(!goes(&["-oProxyCommand=other", "-o", &hop, "--", "x"]));
+        // The hop's text is no option of another kind, nor one after the `--`.
+        assert!(!goes(&["-o", "ProxyCommand=other", "--", "-o", &hop]));
+        assert!(!goes(&["-o", &format!("{hop} extra"), "--", "x"]));
+        assert!(!goes(&["--", "x"]));
+    }
+
+    #[test]
     fn a_command_that_does_not_go_through_the_hop_is_refused_before_the_master() {
         // A caller that signed in to the jump host and then reached the
         // partner directly would defeat the person's choice of route: fail
@@ -5522,6 +5579,13 @@ exec sleep 30"#,
             ),
             // The hop's text where it is no option: as the remote command.
             sync_command(&db, askpass, false, &format!("ProxyCommand={hop}"), None),
+            // The hop, but another route first: ssh would use that one.
+            {
+                let mut cmd = sync_command(&db, askpass, false, SERVER_PROGRAM, Some(&hop));
+                cmd.args
+                    .splice(0..0, ["-o", "ProxyCommand=other"].map(String::from));
+                cmd
+            },
         ];
         let mut a = side(&[(prof("one"), Some("pw-one"))]);
         let a_file = file_of(&a.path);
