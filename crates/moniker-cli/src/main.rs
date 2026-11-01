@@ -256,8 +256,15 @@ fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
     } else {
         StaleSync::Refuse
     };
-    let outcome = sync_over_ssh(&mut local, &cmd, &passphrase, SshTerminal::Inherit, stale)
-        .map_err(|e| sync_error_text(&e))?;
+    let outcome = sync_over_ssh(
+        &mut local,
+        &cmd,
+        None,
+        &passphrase,
+        SshTerminal::Inherit,
+        stale,
+    )
+    .map_err(|e| sync_error_text(&e))?;
     print_stdout(&format!(
         "added {}, updated {}, removed {}\n",
         outcome.added, outcome.updated, outcome.removed

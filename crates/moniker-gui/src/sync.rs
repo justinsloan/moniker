@@ -419,6 +419,7 @@ pub(crate) fn run_with(
     sync_over_ssh(
         &mut local,
         &cmd,
+        None,
         &inputs.passphrase,
         SshTerminal::Detached,
         inputs.stale,

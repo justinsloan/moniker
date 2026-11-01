@@ -10,7 +10,7 @@
 //!
 //! | kind | name   | payload                                          |
 //! |------|--------|--------------------------------------------------|
-//! | 1    | HELLO  | `[protocol version]` (1, or 2 while a profile sent has a jump host), from the client optionally followed by a flags byte |
+//! | 1    | HELLO  | `[protocol version]` (1, or 2 while a profile sent has a jump host or in answer to a 2), from the client optionally followed by a flags byte |
 //! | 2    | BUNDLE | a sealed bundle (see [`crate::crypto`])          |
 //! | 3    | ERROR  | `[code u8]` then a UTF-8 message                 |
 //!
@@ -156,6 +156,12 @@
 //!   other: it waits, and the GUI says so. A jump host that is not a canonical
 //!   id, or is the profile's own id, makes the entry invalid
 //!   ([`Profile::validate`]) and rejects the whole sync.
+//! * A sync with a partner that goes through a jump host goes through it too
+//!   ([`sync_over_ssh`] with a [`JumpLeg`]): a master `ssh` signs in to the
+//!   jump host first, the sync's own `ssh` reaches the partner through the
+//!   master's shared connection, and the master is ended when the sync
+//!   returns, however it returns. A jump host whose key is not known yet, or
+//!   that refuses the login, stops the sync before the partner is tried.
 //!
 //! # Passwords: set and changed travel, removal does not
 //!
@@ -166,6 +172,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -177,7 +184,7 @@ use zeroize::Zeroizing;
 
 use crate::bundle::{BundleEntry, merge};
 use crate::crypto::{self, CryptoError};
-use crate::jump::holds_jump_host;
+use crate::jump::{CONTROL_LIMIT, JumpLeg, end_master, holds_jump_host, learn_master, run_control};
 use crate::profile::{Profile, now_ms};
 use crate::secrets::{SecretError, SecretStore, password_key};
 use crate::ssh::SshCommand;
@@ -186,7 +193,8 @@ use crate::sync_state;
 
 /// Largest frame accepted or sent, kind byte included (16 MiB).
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
-/// The protocol version carried in HELLO.
+/// The protocol version carried in HELLO while no profile sent has a jump host
+/// ([`PROTOCOL_JUMP_HOSTS`] otherwise, and in a server's answer to a 2).
 pub const PROTOCOL_VERSION: u8 = 1;
 /// The protocol version a machine announces while a live profile it sends has
 /// a jump host (issue #9). An older Moniker knows nothing of jump hosts and
@@ -302,6 +310,18 @@ pub enum SyncError {
         "the other machine runs an older Moniker, which does not know jump hosts; update it to sync while a profile has a jump host"
     )]
     PeerTooOld,
+    /// The sync goes through a jump host (issue #9) whose host key is not
+    /// known yet: its connection, which has no terminal to ask in and checks
+    /// host keys strictly, stopped there. Nothing was sent. `name` is the jump
+    /// host's profile name.
+    #[error("connect to {name} once in a tab first, so its host key is known")]
+    JumpHostKeyUnknown { name: String },
+    /// The connection to the jump host `name` failed (a refused login, an
+    /// unreachable host, too slow) or could not start; the target was not
+    /// tried and nothing was sent. `detail` says how ssh ended, with the last
+    /// lines it wrote, sanitized.
+    #[error("could not connect to the jump host {name}: {detail}")]
+    JumpFailed { name: String, detail: String },
     /// The peer broke the frame protocol (bad length, unexpected frame).
     #[error("sync protocol error: {0}")]
     Protocol(String),
@@ -1061,16 +1081,21 @@ pub fn run_client(
     check_not_away(&*local, stale)?;
     // Read once, before the HELLO: the version it says is decided from the
     // entries that are sealed below, whatever is edited meanwhile (issue #9).
-    // Nothing of them is sent before the server has answered.
-    let entries = local.export()?;
+    // Nothing of them is sent before the server has answered. A read that
+    // fails is told to the server in place of the HELLO (every server reads an
+    // ERROR there), so it reports why instead of a connection that closed.
+    let entries = tell(&mut w, local.export())?;
     let said = version_for(&entries);
     write_frame(&mut w, KIND_HELLO, &client_hello(said, stale))?;
     let hello = read_expected(&mut r, KIND_HELLO).map_err(|e| refused_version(e, said))?;
     let sealed = tell(
         &mut w,
         check_reply(&hello, said).and_then(|()| seal_bundle(passphrase, &entries)),
-    )?;
-    write_frame(&mut w, KIND_BUNDLE, &sealed)?;
+    );
+    // The export holds every password in plain text (zeroized when dropped):
+    // gone now that it is sealed, not once the server has answered.
+    drop(entries);
+    write_frame(&mut w, KIND_BUNDLE, &sealed?)?;
 
     let reply = read_expected(&mut r, KIND_BUNDLE)?;
     let merged = open_bundle(passphrase, &reply)?;
@@ -1083,7 +1108,8 @@ pub fn run_client(
 // ----- ssh transport -----
 
 /// Run `cmd` (normally [`crate::ssh::sync_command`]) and sync with the
-/// `moniker-server sync-serve` at the other end of its stdin/stdout.
+/// `moniker-server sync-serve` at the other end of its stdin/stdout, through
+/// `jump` when the partner goes through a jump host (issue #9).
 ///
 /// The command is spawned directly from its argv, never through a shell, with
 /// `cmd.env` added to the environment. Its stderr is drained (the last few KiB
@@ -1096,17 +1122,31 @@ pub fn run_client(
 /// [`SyncError::Remote`] with the last stderr lines (sanitized). An error the
 /// server reported itself, or any error with exit status 0, is kept as it is.
 /// A completed exchange is `Ok` whatever the exit status.
+///
+/// With `jump`, whose [`hop`](JumpLeg::hop) `cmd` is to carry as its
+/// `ProxyCommand`, the leg's master signs in to the jump host before `cmd`
+/// starts, within the same limit, and is ended when this returns, whatever
+/// happens after it signed in, a panic included (see `sign_in_to_jump_host`).
+/// A master that fails stops the sync before `cmd` starts:
+/// [`SyncError::JumpHostKeyUnknown`] when its stderr says "Host key
+/// verification failed", else [`SyncError::JumpFailed`].
+///
+/// Nothing is started, the master included, when this machine does not take
+/// part (sync turned off, no passphrase, no secret store, or away and not
+/// accepted).
 pub fn sync_over_ssh(
     local: &mut dyn SyncTarget,
     cmd: &SshCommand,
+    jump: Option<&JumpLeg>,
     passphrase: &str,
     terminal: SshTerminal,
     stale: StaleSync,
 ) -> Result<SyncOutcome, SyncError> {
-    sync_over_ssh_with_timeout(local, cmd, passphrase, terminal, stale, SYNC_TIMEOUT)
+    sync_over_ssh_with_timeout(local, cmd, jump, passphrase, terminal, stale, SYNC_TIMEOUT)
 }
 
-/// Whether the `ssh` of a sync keeps the controlling terminal of this process.
+/// Whether the `ssh` of a sync, and the master of its jump connection if it
+/// has one, keep the controlling terminal of this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SshTerminal {
     /// It keeps it, so `ssh` can ask there (a key passphrase, a ProxyJump
@@ -1127,6 +1167,7 @@ pub enum SshTerminal {
 fn sync_over_ssh_with_timeout(
     local: &mut dyn SyncTarget,
     cmd: &SshCommand,
+    jump: Option<&JumpLeg>,
     passphrase: &str,
     terminal: SshTerminal,
     stale: StaleSync,
@@ -1134,12 +1175,17 @@ fn sync_over_ssh_with_timeout(
 ) -> Result<SyncOutcome, SyncError> {
     // No point connecting if sync is turned off, if received passwords could
     // not be stored, or if this machine has been away and the person has not
-    // accepted that.
+    // accepted that: checked before any ssh starts, the jump connection's too.
     local.sync_on()?;
     check_passphrase(passphrase)?;
     local.ready()?;
     check_not_away(&*local, stale)?;
     let deadline = Instant::now() + timeout;
+    // Declared before the child, so it is dropped after it: the master is
+    // ended once the sync's own ssh is gone, on every path, panics included.
+    let _master = jump
+        .map(|leg| sign_in_to_jump_host(leg, terminal, deadline))
+        .transpose()?;
     let mut command = Command::new(&cmd.program);
     command
         .args(&cmd.args)
@@ -1147,18 +1193,7 @@ fn sync_over_ssh_with_timeout(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if terminal == SshTerminal::Detached {
-        // SAFETY: the closure runs in the child between fork and exec, where
-        // only async-signal-safe calls may be made. It makes one system call,
-        // setsid (rustix calls it directly and allocates nothing), and turns a
-        // failure's errno into an `io::Error`, which allocates nothing either.
-        unsafe {
-            command.pre_exec(|| {
-                rustix::process::setsid()?;
-                Ok(())
-            });
-        }
-    }
+    set_terminal(&mut command, terminal);
     let child = command.spawn().map_err(|e| {
         SyncError::Io(io::Error::new(
             e.kind(),
@@ -1202,6 +1237,137 @@ fn sync_over_ssh_with_timeout(
     }
 }
 
+/// Make `command` start its process where `terminal` says: in a session of its
+/// own, with no controlling terminal, for [`SshTerminal::Detached`], else in
+/// this process's. The one place that does so, for the sync's `ssh` and its
+/// jump connection's master alike.
+fn set_terminal(command: &mut Command, terminal: SshTerminal) {
+    if terminal == SshTerminal::Detached {
+        // SAFETY: the closure runs in the child between fork and exec, where
+        // only async-signal-safe calls may be made. It makes one system call,
+        // setsid (rustix calls it directly and allocates nothing), and turns a
+        // failure's errno into an `io::Error`, which allocates nothing either.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::process::setsid()?;
+                Ok(())
+            });
+        }
+    }
+}
+
+/// Start `leg`'s master, the sync's connection to the partner's jump host, and
+/// wait until it has signed in, exiting 0 with its background part serving the
+/// shared connection, or failed, at the latest at `deadline`.
+///
+/// It is started from its argv like the sync's own `ssh`, in the place
+/// `terminal` says ([`set_terminal`]), with `leg.master.env` added; its input
+/// and output are null, and its stderr is drained, the end kept to say why it
+/// failed. Only the part that signs in is waited for: the part that went to the
+/// background lets go of the pipe, but a `ProxyCommand` that `~/.ssh/config`
+/// gives the jump host keeps it open as long as the master runs.
+///
+/// Signed in, it is held by the [`EndsMaster`] returned, which ends it when
+/// dropped, and its pid is asked for at once ([`learn_master`]): the caller is
+/// to start the target's `ssh` right after, since a master nothing uses ends
+/// by itself `crate::jump::PERSIST_SECS` after signing in. A master whose pid
+/// cannot be learned is used all the same and ended with `ssh -O exit`.
+///
+/// Failed, nothing of it runs any more (one still signing in at `deadline` is
+/// killed and reaped), and the error says why:
+/// [`SyncError::JumpHostKeyUnknown`] when it exited saying "Host key
+/// verification failed", else [`SyncError::JumpFailed`] with how it ended and
+/// its last stderr lines, sanitized as for [`explain_exit`].
+fn sign_in_to_jump_host(
+    leg: &JumpLeg,
+    terminal: SshTerminal,
+    deadline: Instant,
+) -> Result<EndsMaster<'_>, SyncError> {
+    let failed = |detail: String| SyncError::JumpFailed {
+        name: leg.name.clone(),
+        detail,
+    };
+    let mut command = Command::new(&leg.master.program);
+    command
+        .args(&leg.master.args)
+        .envs(leg.master.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    set_terminal(&mut command, terminal);
+    let child = command
+        .spawn()
+        .map_err(|e| failed(format!("could not start {}: {e}", leg.master.program)))?;
+    // Killed and reaped on every path from here, panics included.
+    let mut child = Reaped(child);
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| failed("its stderr could not be read".to_string()))?;
+    let (tail, drain) =
+        drain_stderr(stderr).map_err(|e| failed(format!("its stderr could not be read: {e}")))?;
+    let ended = child.wait_until(deadline);
+    if let Ok(Some(status)) = &ended
+        && status.success()
+    {
+        // The drain ends by itself when the pipe closes.
+        drop(drain);
+        let mut master = EndsMaster {
+            pidfd: None,
+            exit: &leg.exit,
+        };
+        master.pidfd = learn_master(&leg.check);
+        return Ok(master);
+    }
+    join_briefly(vec![drain]);
+    let tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
+    let stderr = String::from_utf8_lossy(&tail);
+    Err(match ended {
+        Ok(Some(_)) if stderr.contains(HOST_KEY_FAILED) => SyncError::JumpHostKeyUnknown {
+            name: leg.name.clone(),
+        },
+        Ok(Some(status)) => failed(with_stderr(how_ssh_ended(status), &stderr)),
+        Ok(None) => failed(with_stderr(
+            "ssh did not sign in in time".to_string(),
+            &stderr,
+        )),
+        Err(e) => {
+            // How it ended is not known, so it may have signed in: ended as a
+            // master would be.
+            drop(EndsMaster {
+                pidfd: None,
+                exit: &leg.exit,
+            });
+            failed(format!("its end could not be read: {e}"))
+        }
+    })
+}
+
+/// The master of a sync's jump connection, signed in: ended when this is
+/// dropped, however the sync ends (success, an error, a timeout, a panic),
+/// through its pidfd ([`end_master`]) when [`learn_master`] gave one, else, or
+/// should the pidfd find it gone already, with `ssh -O exit` through its socket
+/// ([`run_control`], within [`CONTROL_LIMIT`]). Either way it closes its
+/// channels and removes its socket at once.
+struct EndsMaster<'a> {
+    pidfd: Option<OwnedFd>,
+    /// `ssh -O exit` for it.
+    exit: &'a SshCommand,
+}
+
+impl Drop for EndsMaster<'_> {
+    fn drop(&mut self) {
+        let ended = self
+            .pidfd
+            .as_ref()
+            .is_some_and(|pidfd| end_master(pidfd).is_ok());
+        if !ended {
+            let _ = run_control(self.exit, CONTROL_LIMIT);
+        }
+    }
+}
+
 /// Failures that say only that the stream broke, so the exit status and
 /// stderr of the transport explain them better.
 fn is_transport_failure(e: &SyncError) -> bool {
@@ -1220,19 +1386,31 @@ fn explain_exit(err: SyncError, status: Option<ExitStatus>, stderr: &str) -> Syn
     match status.code() {
         Some(0) => err,
         Some(127) => SyncError::ServerNotFound,
-        Some(255) if stderr.contains("Host key verification failed") => SyncError::HostKeyUnknown,
-        code => {
-            let what = match code {
-                Some(c) => format!("ssh exited with status {c}"),
-                None => "ssh was terminated by a signal".to_string(),
-            };
-            let text = stderr_summary(stderr);
-            if text.is_empty() {
-                SyncError::Remote(what)
-            } else {
-                SyncError::Remote(format!("{what}: {text}"))
-            }
-        }
+        Some(255) if stderr.contains(HOST_KEY_FAILED) => SyncError::HostKeyUnknown,
+        _ => SyncError::Remote(with_stderr(how_ssh_ended(status), stderr)),
+    }
+}
+
+/// What ssh writes on stderr when it cannot check a host's key: unknown (with
+/// `StrictHostKeyChecking=yes` and nobody to ask) or changed.
+const HOST_KEY_FAILED: &str = "Host key verification failed";
+
+/// How ssh ended, in words: its exit status, or a signal.
+fn how_ssh_ended(status: ExitStatus) -> String {
+    match status.code() {
+        Some(c) => format!("ssh exited with status {c}"),
+        None => "ssh was terminated by a signal".to_string(),
+    }
+}
+
+/// `what` happened to ssh, followed by the last lines it wrote on stderr
+/// ([`stderr_summary`]), if there are any.
+fn with_stderr(what: String, stderr: &str) -> String {
+    let text = stderr_summary(stderr);
+    if text.is_empty() {
+        what
+    } else {
+        format!("{what}: {text}")
     }
 }
 
@@ -1479,8 +1657,10 @@ fn join_briefly(handles: Vec<JoinHandle<()>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jump::{JumpLeg, JumpSocket};
     use crate::profile::Profile;
     use crate::secrets::{MemorySecretStore, SecretError, password_key};
+    use crate::ssh::{SERVER_PROGRAM, sync_command};
     use std::cell::Cell;
     use std::ffi::OsStr;
     use std::fs;
@@ -1924,6 +2104,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh("exit 127"),
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -1934,6 +2115,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh(r#"echo "Host key verification failed." >&2; exit 255"#),
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -1945,6 +2127,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh(r#"printf 'early noise\nssh: connect to host x: \033[31mrefused\a\n' >&2; exit 255"#),
+            None,
             PASS, SshTerminal::Inherit, StaleSync::Refuse
         )
         .unwrap_err();
@@ -1959,6 +2142,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh("i=0; while [ $i -lt 400 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxx' >&2; i=$((i+1)); done; exit 3"),
+            None,
             PASS, SshTerminal::Inherit, StaleSync::Refuse
         )
         .unwrap_err();
@@ -1971,6 +2155,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &sh("exit 0"),
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -1987,6 +2172,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &missing,
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -2018,7 +2204,8 @@ mod tests {
             env: vec![],
         };
         let mut a = side(&[]);
-        let err = sync_over_ssh(&mut a.state, &cmd, PASS, terminal, StaleSync::Refuse).unwrap_err();
+        let err =
+            sync_over_ssh(&mut a.state, &cmd, None, PASS, terminal, StaleSync::Refuse).unwrap_err();
         assert!(matches!(err, SyncError::ServerNotFound), "got {err:?}");
         let ids = fs::read_to_string(&out).unwrap();
         let mut ids = ids.split(' ').map(str::to_owned);
@@ -2079,6 +2266,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &cmd,
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -2109,6 +2297,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut stub,
             &cmd,
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -2161,6 +2350,7 @@ mod tests {
         let out = sync_over_ssh(
             &mut a.state,
             &cmd,
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -2688,6 +2878,7 @@ mod tests {
         let err = sync_over_ssh(
             &mut a.state,
             &cmd,
+            None,
             "",
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -2718,6 +2909,7 @@ mod tests {
         let err = sync_over_ssh_with_timeout(
             &mut a.state,
             &cmd,
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -3393,6 +3585,7 @@ mod tests {
         let err = sync_over_ssh(
             a.state.as_mut().unwrap(),
             &cmd,
+            None,
             PASS,
             SshTerminal::Inherit,
             StaleSync::Refuse,
@@ -3592,6 +3785,7 @@ mod tests {
             let err = sync_over_ssh(
                 a.state.as_mut().unwrap(),
                 &cmd,
+                None,
                 PASS,
                 terminal,
                 StaleSync::Allow,
@@ -4774,5 +4968,579 @@ mod tests {
             );
             assert_eq!(server.reads.get(), 1);
         }
+    }
+
+    #[test]
+    fn a_client_whose_export_fails_tells_the_server_why() {
+        /// A machine whose profiles cannot be read for the sync.
+        struct Unreadable;
+
+        impl SyncTarget for Unreadable {
+            fn ready(&self) -> Result<(), SyncError> {
+                Ok(())
+            }
+            fn export(&self) -> Result<Vec<BundleEntry>, SyncError> {
+                Err(SyncError::Store(
+                    "the profile file could not be read".to_string(),
+                ))
+            }
+            fn apply(&mut self, _: Vec<BundleEntry>) -> Result<SyncOutcome, SyncError> {
+                unreachable!("nothing arrives for a client that sent nothing")
+            }
+        }
+        const SAID: &str = "profile data error: the profile file could not be read";
+
+        // On the wire: an ERROR in place of the HELLO, and nothing else.
+        let (cs, ss) = pair();
+        let err = run_client(&cs, &cs, &mut Unreadable, PASS, StaleSync::Refuse).unwrap_err();
+        drop(cs);
+        assert!(matches!(err, SyncError::Store(_)), "{err:?}");
+        let mut sent = Vec::new();
+        (&ss).read_to_end(&mut sent).unwrap();
+        let mut said = vec![CODE_OTHER];
+        said.extend_from_slice(SAID.as_bytes());
+        assert_eq!(frames(&sent), vec![(KIND_ERROR, said)]);
+
+        // A server reads it where the HELLO would be, says why, and changes
+        // nothing.
+        let clock = Clock::starting_now();
+        let mut b = Machine::new(&clock, &[(prof("two"), Some("pw-two"))]);
+        let b_file = file_of(&b.path);
+        let (cs, ss) = pair();
+        let server = spawn_server(ss, b.state.take().unwrap(), PASS);
+        run_client(&cs, &cs, &mut Unreadable, PASS, StaleSync::Refuse).unwrap_err();
+        drop(cs);
+        let (served, back) = server.join().unwrap();
+        b.state = Some(back);
+        match served {
+            Err(SyncError::Remote(text)) => assert_eq!(text, SAID),
+            other => panic!("the server got {other:?}"),
+        }
+        assert_eq!(file_of(&b.path), b_file);
+        assert_eq!(b.secrets.writes(), 0);
+        assert_eq!(b.last_sync(), None);
+    }
+
+    // ----- a sync through the partner's jump host (issue #9) -----
+
+    /// A sync's connection through a jump host, played by scripts in place of
+    /// `ssh` (no network), in a private folder that is also the runtime folder
+    /// of the socket. The commands are the real ones (`JumpLeg::for_sync`, and
+    /// `sync_command` through its hop) with `sh` reading a script instead of
+    /// running `ssh`: `master`, `check`, `exit` and `target`, each of which
+    /// writes its name to `log` when it runs. (`sh` reads the scripts, which are
+    /// never executed themselves, so one just written can never be busy.)
+    ///
+    /// The master that signs in leaves a process standing for ssh's master gone
+    /// to the background, a `sleep` with its own input and output (so the
+    /// master's stderr ends when the master exits), and writes its pid to
+    /// `pid`. `check` answers with that pid as ssh does, and `exit` ends it. If
+    /// it still runs when the test is over, it is killed.
+    struct FakeJump {
+        dir: TempDir,
+        leg: JumpLeg,
+        target: SshCommand,
+    }
+
+    /// A master that signs in.
+    const SIGNS_IN: &str = r#"echo master >> "$D/log"
+sleep 600 </dev/null >/dev/null 2>&1 &
+echo $! > "$D/pid""#;
+
+    /// `ssh -O check` answering for the master.
+    const ANSWERS: &str = r#"echo check >> "$D/log"
+printf 'Master running (pid=%s)\r\n' "$(cat "$D/pid")" >&2"#;
+
+    /// `ssh -O exit` ending the master.
+    const ENDS: &str = r#"echo exit >> "$D/log"
+kill "$(cat "$D/pid")""#;
+
+    /// The target's `ssh`, finding no moniker-server on the other machine.
+    const NO_SERVER: &str = r#"echo target >> "$D/log"
+exit 127"#;
+
+    impl FakeJump {
+        fn new() -> FakeJump {
+            // Short and plain enough for a socket's path, and private.
+            let dir = tempfile::Builder::new()
+                .prefix("rt")
+                .tempdir_in("/tmp")
+                .unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let socket = JumpSocket::new(dir.path()).unwrap();
+            let bastion = Profile::new("bastion", "bastion.example", "alice");
+            let mut db = prof("db");
+            db.jump_host = Some(bastion.id.clone());
+            let askpass = Path::new("/nonexistent/moniker-askpass");
+            let mut leg = JumpLeg::for_sync(&bastion, &socket, askpass, false).unwrap();
+            let script = |name: &str| dir.path().join(name);
+            leg.master = played_by(leg.master, &script("master"));
+            leg.check = played_by(leg.check, &script("check"));
+            leg.exit = played_by(leg.exit, &script("exit"));
+            let target = played_by(
+                sync_command(&db, askpass, false, SERVER_PROGRAM, Some(&leg.hop)),
+                &script("target"),
+            );
+            let fake = FakeJump { dir, leg, target };
+            fake.script("master", SIGNS_IN);
+            fake.script("check", ANSWERS);
+            fake.script("exit", ENDS);
+            fake.script("target", NO_SERVER);
+            fake
+        }
+
+        /// Make `body` the script `name`, with `$D` its folder.
+        fn script(&self, name: &str, body: &str) {
+            let text = format!("D='{}'\n{body}\n", self.dir.path().display());
+            fs::write(self.path(name), text).unwrap();
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+
+        /// What ran, in order.
+        fn log(&self) -> Vec<String> {
+            fs::read_to_string(self.path("log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The pid of the process standing for the master.
+        fn stand_in(&self) -> u32 {
+            fs::read_to_string(self.path("pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+
+        /// Sync `local` through this jump host within `timeout`.
+        fn sync(
+            &self,
+            local: &mut dyn SyncTarget,
+            timeout: Duration,
+        ) -> Result<SyncOutcome, SyncError> {
+            sync_over_ssh_with_timeout(
+                local,
+                &self.target,
+                Some(&self.leg),
+                PASS,
+                SshTerminal::Inherit,
+                StaleSync::Refuse,
+                timeout,
+            )
+        }
+    }
+
+    impl Drop for FakeJump {
+        fn drop(&mut self) {
+            let Some(pid) = fs::read_to_string(self.path("pid"))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+            else {
+                return;
+            };
+            // Only the stand-in this test started, if it still runs.
+            let ours =
+                fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| c.starts_with(b"sleep\x00"));
+            if ours && !has_ended(pid) {
+                let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+        }
+    }
+
+    /// `cmd` with `sh` reading `script` in place of running `ssh`, given the
+    /// same arguments and environment.
+    fn played_by(mut cmd: SshCommand, script: &Path) -> SshCommand {
+        cmd.args.insert(0, script.to_str().unwrap().to_owned());
+        cmd.program = "sh".to_owned();
+        cmd
+    }
+
+    /// Whether the process `pid` has ended: it is gone, or a zombie. (`kill -0`
+    /// still finds a zombie, and the zombie of a process that lost its parent
+    /// waits for whatever adopted it; a container's first process may never
+    /// reap it.)
+    fn has_ended(pid: u32) -> bool {
+        let state = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, rest) = stat.rsplit_once(')')?;
+                rest.trim_start().chars().next()
+            });
+        matches!(state, None | Some('Z' | 'X'))
+    }
+
+    /// Whether the process `pid` ends within a few seconds: ending it is a
+    /// signal, which takes effect a moment later.
+    fn ends_soon(pid: u32) -> bool {
+        let start = Instant::now();
+        while !has_ended(pid) {
+            if start.elapsed() > Duration::from_secs(5) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[test]
+    fn a_sync_goes_through_its_jump_host() {
+        let fake = FakeJump::new();
+        // The target relays the protocol to a real server, as in
+        // `sync_over_ssh_full_exchange_with_a_child_process`.
+        let (to_server, to_client) = (fake.path("to_server"), fake.path("to_client"));
+        for f in [&to_server, &to_client] {
+            let made = std::process::Command::new("mkfifo").arg(f).status();
+            assert!(made.unwrap().success());
+        }
+        // It also says whether the master still ran when it started and when
+        // it was done.
+        fake.script(
+            "target",
+            r#"up() { s=$(cut -d' ' -f3 "/proc/$(cat "$D/pid")/stat"); [ "${s:-Z}" != Z ]; }
+up && echo target >> "$D/log" || echo 'target, no master' >> "$D/log"
+printf '%s\n' "$@" > "$D/target-args"
+exec 3<&0; cat <&3 > "$D/to_server" & cat < "$D/to_client"; wait
+up && echo 'target, done' >> "$D/log" || echo 'target, done, no master' >> "$D/log""#,
+        );
+        let (p1, p2) = (prof("one"), prof("two"));
+        let mut a = side(&[(p1.clone(), Some("pw-one"))]);
+        let b = side(&[(p2.clone(), Some("pw-two"))]);
+        let server = thread::spawn(move || {
+            let mut b_state = b.state;
+            let r = fs::File::open(&to_server).unwrap();
+            let w = fs::OpenOptions::new().write(true).open(&to_client).unwrap();
+            let res = serve(r, w, &mut b_state, PASS);
+            (res, b.secrets, b._dir)
+        });
+
+        let out = fake.sync(&mut a.state, SYNC_TIMEOUT).unwrap();
+
+        assert_eq!(out.added, 1);
+        let (served, b_secrets, _b_dir) = server.join().unwrap();
+        assert_eq!(served.unwrap().added, 1);
+        assert_eq!(a.secrets.password(&p2.id).as_deref(), Some("pw-two"));
+        assert_eq!(b_secrets.password(&p1.id).as_deref(), Some("pw-one"));
+        // The master signed in first and was asked for its pid twice, then
+        // the target went through it (its ProxyCommand is the hop) while it
+        // ran.
+        assert_eq!(
+            fake.log(),
+            ["master", "check", "check", "target", "target, done"]
+        );
+        let args = fs::read_to_string(fake.path("target-args")).unwrap();
+        let proxy = format!("ProxyCommand={}", fake.leg.hop);
+        assert!(args.lines().any(|arg| arg == proxy), "{args}");
+        // Ended when the sync returned, through its pidfd: no `-O exit`.
+        assert!(ends_soon(fake.stand_in()), "the master was left running");
+        assert!(!fake.log().contains(&"exit".to_string()));
+    }
+
+    #[test]
+    fn a_failed_sync_still_ends_the_master() {
+        // The other machine refuses the login.
+        let fake = FakeJump::new();
+        fake.script(
+            "target",
+            r#"echo target >> "$D/log"
+echo 'alice@db: Permission denied (publickey,password).' >&2
+exit 255"#,
+        );
+        let mut a = side(&[(prof("one"), Some("pw-one"))]);
+        let a_file = file_of(&a.path);
+        let err = fake.sync(&mut a.state, SYNC_TIMEOUT).unwrap_err();
+        assert!(
+            matches!(&err, SyncError::Remote(text) if text.contains("Permission denied")),
+            "{err:?}"
+        );
+        assert_eq!(fake.log(), ["master", "check", "check", "target"]);
+        assert!(ends_soon(fake.stand_in()), "the master was left running");
+
+        // The other machine never answers.
+        let fake = FakeJump::new();
+        fake.script("target", r#"echo target >> "$D/log"; exec sleep 30"#);
+        let err = fake.sync(&mut a.state, Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(err, SyncError::Timeout), "{err:?}");
+        assert_eq!(fake.log(), ["master", "check", "check", "target"]);
+        assert!(ends_soon(fake.stand_in()), "the master was left running");
+
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(a.secrets.writes(), 0);
+    }
+
+    #[test]
+    fn a_panic_still_ends_the_master() {
+        /// A machine whose code panics while the sync runs.
+        struct Panics;
+
+        impl SyncTarget for Panics {
+            fn ready(&self) -> Result<(), SyncError> {
+                Ok(())
+            }
+            fn export(&self) -> Result<Vec<BundleEntry>, SyncError> {
+                panic!("a bug in the middle of a sync")
+            }
+            fn apply(&mut self, _: Vec<BundleEntry>) -> Result<SyncOutcome, SyncError> {
+                unreachable!("the sync panicked before")
+            }
+        }
+
+        let fake = FakeJump::new();
+        fake.script("target", r#"echo target >> "$D/log"; exec sleep 30"#);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fake.sync(&mut Panics, SYNC_TIMEOUT)
+        }));
+        assert!(panicked.is_err());
+        // The target may have been killed by then before it said anything.
+        assert_eq!(fake.log()[..3], ["master", "check", "check"]);
+        assert!(ends_soon(fake.stand_in()), "the master was left running");
+    }
+
+    #[test]
+    fn a_master_whose_stderr_stays_open_does_not_hold_the_sync() {
+        // A ProxyCommand that ~/.ssh/config gives the jump host keeps the
+        // master's stderr open as long as the master runs: here the stand-in
+        // does. (Should the sync wait for that stderr to end, this takes the
+        // stand-in's 20 s.)
+        let fake = FakeJump::new();
+        fake.script(
+            "master",
+            r#"echo master >> "$D/log"
+sleep 20 </dev/null >/dev/null &
+echo $! > "$D/pid""#,
+        );
+        let mut a = side(&[]);
+        let start = Instant::now();
+        let err = fake.sync(&mut a.state, SYNC_TIMEOUT).unwrap_err();
+        assert!(matches!(err, SyncError::ServerNotFound), "{err:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(fake.log(), ["master", "check", "check", "target"]);
+        assert!(ends_soon(fake.stand_in()), "the master was left running");
+    }
+
+    #[test]
+    fn a_master_with_no_pid_is_ended_with_exit() {
+        let fake = FakeJump::new();
+        fake.script(
+            "check",
+            r#"echo check >> "$D/log"
+echo 'Control socket connect(/run/x): No such file or directory' >&2
+exit 255"#,
+        );
+        let mut a = side(&[]);
+        let err = fake.sync(&mut a.state, SYNC_TIMEOUT).unwrap_err();
+        assert!(matches!(err, SyncError::ServerNotFound), "{err:?}");
+        // No pid: the target still goes through it, and the master is then
+        // ended through its socket.
+        assert_eq!(fake.log(), ["master", "check", "target", "exit"]);
+        assert!(ends_soon(fake.stand_in()), "the master was left running");
+    }
+
+    #[test]
+    fn an_unknown_jump_host_key_says_to_connect_in_a_tab() {
+        let fake = FakeJump::new();
+        fake.script(
+            "master",
+            r#"echo master >> "$D/log"
+echo 'Host key verification failed.' >&2
+exit 255"#,
+        );
+        let mut a = side(&[(prof("one"), Some("pw-one"))]);
+        let a_file = file_of(&a.path);
+        let err = fake.sync(&mut a.state, SYNC_TIMEOUT).unwrap_err();
+        let SyncError::JumpHostKeyUnknown { name } = &err else {
+            panic!("expected JumpHostKeyUnknown, got {err:?}");
+        };
+        assert_eq!(name, "bastion");
+        assert_eq!(
+            err.to_string(),
+            "connect to bastion once in a tab first, so its host key is known"
+        );
+        assert_eq!(fake.log(), ["master"], "nothing more was started");
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(a.secrets.writes(), 0);
+    }
+
+    #[test]
+    fn a_failed_jump_connection_names_the_jump_host_and_never_starts_the_target() {
+        let mut a = side(&[(prof("one"), Some("pw-one"))]);
+        let a_file = file_of(&a.path);
+        let failed = |fake: &FakeJump, timeout: Duration, a: &mut Side| {
+            let err = fake.sync(&mut a.state, timeout).unwrap_err();
+            let SyncError::JumpFailed { name, detail } = &err else {
+                panic!("expected JumpFailed, got {err:?}");
+            };
+            assert_eq!(name, "bastion");
+            assert_eq!(
+                err.to_string(),
+                format!("could not connect to the jump host bastion: {detail}")
+            );
+            assert!(!detail.chars().any(char::is_control), "{detail:?}");
+            // Never the target, and no master to end.
+            assert!(
+                fake.log().iter().all(|ran| ran == "master"),
+                "{:?}",
+                fake.log()
+            );
+            detail.clone()
+        };
+
+        // The jump host refuses the login: the last lines ssh wrote, cleaned.
+        let fake = FakeJump::new();
+        fake.script(
+            "master",
+            r#"echo master >> "$D/log"
+printf 'early noise\nalice@bastion.example: Permission denied \033[1m(publickey,password).\r\n' >&2
+exit 255"#,
+        );
+        assert_eq!(
+            failed(&fake, SYNC_TIMEOUT, &mut a),
+            "ssh exited with status 255: early noise | \
+             alice@bastion.example: Permission denied [1m(publickey,password)."
+        );
+
+        // Killed by a signal, saying nothing.
+        let fake = FakeJump::new();
+        fake.script("master", r#"echo master >> "$D/log"; kill -KILL $$"#);
+        assert_eq!(
+            failed(&fake, SYNC_TIMEOUT, &mut a),
+            "ssh was terminated by a signal"
+        );
+
+        // Still signing in when the sync's time is up: killed and reaped.
+        let fake = FakeJump::new();
+        fake.script(
+            "master",
+            r#"echo master >> "$D/log"
+echo $$ > "$D/master"
+echo 'Connecting to bastion.example' >&2
+exec sleep 30"#,
+        );
+        let start = Instant::now();
+        assert_eq!(
+            failed(&fake, Duration::from_secs(1), &mut a),
+            "ssh did not sign in in time: Connecting to bastion.example"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        let master: u32 = fs::read_to_string(fake.path("master"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(has_ended(master), "the master still signs in");
+
+        // No ssh to start.
+        let mut fake = FakeJump::new();
+        fake.leg.master.program = "/nonexistent/moniker-test-ssh".to_string();
+        let detail = failed(&fake, SYNC_TIMEOUT, &mut a);
+        assert!(
+            detail.starts_with("could not start /nonexistent/moniker-test-ssh: "),
+            "{detail}"
+        );
+
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(a.secrets.writes(), 0);
+    }
+
+    #[test]
+    fn sync_off_refuses_before_the_master_starts() {
+        let fake = FakeJump::new();
+        let refused = |local: &mut dyn SyncTarget, passphrase: &str| {
+            sync_over_ssh(
+                local,
+                &fake.target,
+                Some(&fake.leg),
+                passphrase,
+                SshTerminal::Detached,
+                StaleSync::Refuse,
+            )
+            .unwrap_err()
+        };
+        let clock = Clock::starting_now();
+
+        let mut off = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+        off.sync_off();
+        let err = refused(off.state.as_mut().unwrap(), PASS);
+        assert!(matches!(err, SyncError::SyncOff), "{err:?}");
+
+        // So do the sync's other refusals: no sync key, no secret store, a
+        // machine that has been away.
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+        let err = refused(a.state.as_mut().unwrap(), "");
+        assert!(matches!(err, SyncError::EmptyPassphrase), "{err:?}");
+        let mut no_keyring = Stub {
+            no_secret_store: true,
+            ..Stub::default()
+        };
+        let err = refused(&mut no_keyring, PASS);
+        assert!(matches!(err, SyncError::NoSecretStore), "{err:?}");
+        crate::sync_state::record_sync(&a.path, clock.now() - 181 * DAY_MS).unwrap();
+        let err = refused(a.state.as_mut().unwrap(), PASS);
+        assert!(matches!(err, SyncError::Stale { days: 181 }), "{err:?}");
+
+        assert_eq!(fake.log(), Vec::<String>::new(), "no ssh was started");
+    }
+
+    /// `[pid, parent, session, stdin, stdout]` of a jump connection's master,
+    /// as it reads them itself, in a sync run with `terminal`. It then fails,
+    /// as a jump host that refuses the login.
+    fn ids_of_the_master(terminal: SshTerminal) -> [String; 5] {
+        let fake = FakeJump::new();
+        fake.script(
+            "master",
+            r#"fd=/proc/$$/fd
+set -- $(cat /proc/$$/stat)
+printf '%s %s %s %s %s' "$1" "$4" "$6" "$(readlink $fd/0)" "$(readlink $fd/1)" > "$D/ids"
+exit 255"#,
+        );
+        let mut a = side(&[]);
+        let err = sync_over_ssh(
+            &mut a.state,
+            &fake.target,
+            Some(&fake.leg),
+            PASS,
+            terminal,
+            StaleSync::Refuse,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SyncError::JumpFailed { .. }), "{err:?}");
+        let ids = fs::read_to_string(fake.path("ids")).unwrap();
+        let ids: Vec<String> = ids.split(' ').map(str::to_owned).collect();
+        ids.try_into().unwrap()
+    }
+
+    #[test]
+    fn a_jump_connection_may_ask_only_where_the_sync_s_ssh_may() {
+        // Detached, as the GUI's syncs: a session of its own, so a question
+        // fails at once instead of waiting in the terminal Moniker came from.
+        let [pid, parent, session, stdin, stdout] = ids_of_the_master(SshTerminal::Detached);
+        assert_eq!(session, pid, "the session leader");
+        assert_ne!(session, own_session());
+        // Still this process's own child, which the askpass helper checks.
+        assert_eq!(parent, std::process::id().to_string());
+        assert_eq!([stdin, stdout], ["/dev/null", "/dev/null"]);
+
+        // Inherit, as `moniker-server sync`: in this session, so it can ask.
+        let [pid, parent, session, stdin, stdout] = ids_of_the_master(SshTerminal::Inherit);
+        assert_eq!(session, own_session());
+        assert_ne!(session, pid);
+        assert_eq!(parent, std::process::id().to_string());
+        assert_eq!([stdin, stdout], ["/dev/null", "/dev/null"]);
     }
 }

@@ -49,7 +49,7 @@ use crate::askpass::{AskpassToken, RUNTIME_SUBDIR, moniker_subdir, open_runtime_
 use crate::profile::{Profile, StartupSequence};
 use crate::ssh::{
     JumpControl, SshCommand, hop_command, jump_control_command, jump_master_command,
-    terminal_command,
+    jump_sync_master_command, terminal_command,
 };
 use crate::ssh_config::HELPER_ENV;
 
@@ -435,6 +435,53 @@ pub fn pane_commands(
         check: jump_control_command(jump, socket.path(), JumpControl::Check),
         exit: jump_control_command(jump, socket.path(), JumpControl::Exit),
     })
+}
+
+/// The commands of a sync's connection through a jump host, built together
+/// ([`JumpLeg::for_sync`]) and run by `crate::sync::sync_over_ssh`: the master
+/// signs in to the jump host, the sync's own `ssh` goes through it with
+/// [`hop`](JumpLeg::hop) as its `ProxyCommand`, and the master is ended when
+/// the sync returns.
+///
+/// One leg per sync, made from a new [`JumpSocket`]: its commands name that
+/// socket, so a leg is not to be run twice (and cannot be copied).
+#[derive(Debug, PartialEq, Eq)]
+pub struct JumpLeg {
+    /// The jump host's profile name, for what a failure says.
+    pub name: String,
+    /// Signs in to the jump host and serves the shared connection
+    /// (`crate::ssh::jump_sync_master_command`).
+    pub master: SshCommand,
+    /// `-O check`, for [`learn_master`].
+    pub check: SshCommand,
+    /// `-O exit`, to end the master when its pid is not known.
+    pub exit: SshCommand,
+    /// The target's `ProxyCommand` (`crate::ssh::hop_command`), which
+    /// `crate::ssh::sync_command` takes as its `proxy`.
+    pub hop: String,
+}
+
+impl JumpLeg {
+    /// The commands of a sync's connection through `jump` at `socket`, the
+    /// master pointed at the askpass helper `askpass` when `has_password` (a
+    /// sync's master has no one-time token, as a sync's `ssh` has none). `None`
+    /// when the hop refuses the jump host's user name or host
+    /// (`crate::ssh::hop_command`): the sync must then not start.
+    pub fn for_sync(
+        jump: &Profile,
+        socket: &JumpSocket,
+        askpass: &Path,
+        has_password: bool,
+    ) -> Option<JumpLeg> {
+        let hop = hop_command(jump, socket.path())?;
+        Some(JumpLeg {
+            name: jump.name.clone(),
+            master: jump_sync_master_command(jump, socket.path(), askpass, has_password),
+            check: jump_control_command(jump, socket.path(), JumpControl::Check),
+            exit: jump_control_command(jump, socket.path(), JumpControl::Exit),
+            hop,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -970,6 +1017,41 @@ mod tests {
             pane_commands(&target, None, &odd, &socket, askpass, None, None),
             None
         );
+    }
+
+    #[test]
+    fn a_sync_s_jump_leg_is_the_builders_together() {
+        let rt = runtime();
+        let socket = JumpSocket::new(rt.path()).unwrap();
+        let askpass = Path::new("/usr/lib/moniker/moniker-askpass");
+        let jump = profile(1, "bastion");
+        for has_password in [true, false] {
+            let leg = JumpLeg::for_sync(&jump, &socket, askpass, has_password).unwrap();
+            assert_eq!(
+                leg,
+                JumpLeg {
+                    name: "bastion".to_string(),
+                    master: jump_sync_master_command(&jump, socket.path(), askpass, has_password),
+                    check: jump_control_command(&jump, socket.path(), JumpControl::Check),
+                    exit: jump_control_command(&jump, socket.path(), JumpControl::Exit),
+                    hop: hop_command(&jump, socket.path()).unwrap(),
+                }
+            );
+            // A sync has no terminal to fall back to: no one-time token.
+            assert!(
+                leg.master
+                    .env
+                    .iter()
+                    .all(|(name, _)| name != "MONIKER_ASKPASS_TOKEN"),
+                "{:?}",
+                leg.master.env
+            );
+        }
+
+        // A jump host whose user or host a shell would read: no leg.
+        let mut odd = jump.clone();
+        odd.username = "alice$(id)".to_string();
+        assert_eq!(JumpLeg::for_sync(&odd, &socket, askpass, true), None);
     }
 
     #[test]
