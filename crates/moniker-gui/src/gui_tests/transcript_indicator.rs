@@ -83,7 +83,7 @@ fn assert_plain(page: &adw::TabPage) {
 
 /// The record icon in `main`'s header bar, which shows while the tab in front
 /// saves a transcript.
-fn header_icon(main: &window::MainWindow) -> gtk::Image {
+pub(super) fn header_icon(main: &window::MainWindow) -> gtk::Image {
     let header: adw::HeaderBar = find_widget(&main.window).expect("the header bar");
     all_widgets::<gtk::Image>(&header)
         .into_iter()
@@ -91,16 +91,16 @@ fn header_icon(main: &window::MainWindow) -> gtk::Image {
         .expect("the header bar's record icon")
 }
 
-fn layout_of(page: &adw::TabPage) -> TabLayout {
+pub(super) fn layout_of(page: &adw::TabPage) -> TabLayout {
     panes::layout_of_page(page).expect("a tab made by terminal_tab has a layout")
 }
 
-fn pane_of(holder: &PaneHolder) -> Pane {
+pub(super) fn pane_of(holder: &PaneHolder) -> Pane {
     panes::pane_of(holder).expect("a holder is in a pane")
 }
 
 /// The focused pane of `page`.
-fn focused(page: &adw::TabPage) -> PaneHolder {
+pub(super) fn focused(page: &adw::TabPage) -> PaneHolder {
     layout_of(page).focused_holder().expect("a focused pane")
 }
 

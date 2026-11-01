@@ -22,6 +22,17 @@
 //! red mark is a host that does not answer), and changes only when a session
 //! starts or stops recording.
 //!
+//! # Root
+//!
+//! Beside REC, before it, a pane whose session runs as root (`crate::root`,
+//! while its marks are on) has a warning icon on its header, which is red
+//! whether the pane is focused or not and never dimmed; its tab has the icon
+//! as its own (`AdwTabPage:icon`, after REC's indicator) and a last line in
+//! its tooltip, after REC's, while any of its panes runs as root
+//! ([`show_titles`]); and its window's top bar is red while it is the focused
+//! pane of the tab in front (`root::show_in_window`, from [`refresh`]). The
+//! title gets nothing added.
+//!
 //! # Focus
 //!
 //! The pane that had the keyboard focus last is the tab's focused pane
@@ -94,6 +105,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use vte4::Terminal;
 
+use crate::root;
 use crate::terminal_tab::{self, PaneHolder};
 
 /// The signal a [`TabLayout`] emits when its focused pane changes.
@@ -264,6 +276,7 @@ mod pane {
         pub struct Pane {
             pub(super) holder: OnceCell<PaneHolder>,
             pub(super) header: OnceCell<gtk::Box>,
+            pub(super) root_image: OnceCell<gtk::Image>,
             pub(super) badge: OnceCell<gtk::Box>,
             pub(super) title: OnceCell<gtk::Label>,
             pub(super) zone: OnceCell<gtk::Box>,
@@ -295,6 +308,7 @@ mod pane {
         pub(super) fn new(
             holder: &PaneHolder,
             header: &gtk::Box,
+            root_image: &gtk::Image,
             badge: &gtk::Box,
             title: &gtk::Label,
             zone: &gtk::Box,
@@ -303,6 +317,7 @@ mod pane {
             let imp = pane.imp();
             let _ = imp.holder.set(holder.clone());
             let _ = imp.header.set(header.clone());
+            let _ = imp.root_image.set(root_image.clone());
             let _ = imp.badge.set(badge.clone());
             let _ = imp.title.set(title.clone());
             let _ = imp.zone.set(zone.clone());
@@ -317,6 +332,12 @@ mod pane {
         /// The header (title, menu, close button).
         pub(crate) fn header(&self) -> &gtk::Box {
             self.imp().header.get().expect("set when made")
+        }
+
+        /// The header's warning icon, first, shown while the pane runs as
+        /// root (`crate::root`).
+        pub(crate) fn root_image(&self) -> &gtk::Image {
+            self.imp().root_image.get().expect("set when made")
         }
 
         /// The header's REC badge (the record icon and "REC"), before the
@@ -444,9 +465,11 @@ pub(crate) fn new_layout(holder: &PaneHolder) -> TabLayout {
 
 /// Show what the panes of `layout` are called, which one has the focus and
 /// what can be done now: the headers (only with two panes or more, each with
-/// its REC badge while its pane saves a transcript), the title, tooltip and
-/// indicator of the tab ([`show_titles`]) and the window's actions; and tell
-/// those who follow the focused pane ([`FOCUS_CHANGED`]).
+/// its REC badge while its pane saves a transcript, and red with the root icon
+/// while it runs as root), the title, tooltip, indicator and icon of the tab
+/// ([`show_titles`]), the window's actions and whether its top bar is red
+/// (`root::show_in_window`); and tell those who follow the focused pane
+/// ([`FOCUS_CHANGED`]).
 pub(crate) fn refresh(layout: &TabLayout) {
     let panes = layout.panes();
     let several = panes.len() > 1;
@@ -455,16 +478,31 @@ pub(crate) fn refresh(layout: &TabLayout) {
         let header = pane.header();
         header.set_visible(several);
         pane.badge().set_visible(pane.holder().recording().get());
+        let as_root = root::shown(pane.holder());
+        pane.root_image().set_visible(as_root);
+        if as_root {
+            header.add_css_class(root::PANE_CLASS);
+        } else {
+            header.remove_css_class(root::PANE_CLASS);
+        }
         let is_focused = focused.as_ref() == Some(pane.holder());
-        // The badge is dimmed with the title: in the title's own color.
         if is_focused {
             header.add_css_class(FOCUSED_CLASS);
-            pane.title().remove_css_class("dim-label");
-            pane.badge().remove_css_class("dim-label");
         } else {
             header.remove_css_class(FOCUSED_CLASS);
-            pane.title().add_css_class("dim-label");
-            pane.badge().add_css_class("dim-label");
+        }
+        // The badge is dimmed with the title: in the title's own color. A red
+        // header is never dimmed, so that its text keeps its contrast on the
+        // red.
+        for dimmed in [
+            pane.title().upcast_ref::<gtk::Widget>(),
+            pane.badge().upcast_ref(),
+        ] {
+            if is_focused || as_root {
+                dimmed.remove_css_class("dim-label");
+            } else {
+                dimmed.add_css_class("dim-label");
+            }
         }
         pane.title()
             .set_text(&terminal_tab::shown_title(pane.holder()));
@@ -481,6 +519,7 @@ pub(crate) fn refresh(layout: &TabLayout) {
     if let Some((view, page)) = page_of(layout) {
         show_titles(&page, &panes, focused.as_ref());
         terminal_tab::sync_window_actions(&view);
+        root::show_in_window(&view);
     }
     if layout.announced().upgrade() != focused {
         layout.announced().set(focused.as_ref());
@@ -538,6 +577,11 @@ pub(crate) fn tab_page_title(title: &str, recording: bool) -> String {
 /// (a screen reader may read it). The icon is set only when it comes or goes,
 /// so the header bar's icon, which follows it (`crate::window`), hears of it
 /// only then.
+///
+/// While any pane of the tab runs as root (`root::shown`), the tab's own icon
+/// (`AdwTabPage:icon`, after the indicator) is [`root::ROOT_ICON`], set only
+/// when it comes or goes, and the tooltip's last line is
+/// [`root::ROOT_TOOLTIP`], after REC's. The title has nothing added for it.
 fn show_titles(page: &adw::TabPage, panes: &[Pane], focused: Option<&PaneHolder>) {
     let titles: Vec<String> = panes
         .iter()
@@ -548,16 +592,27 @@ fn show_titles(page: &adw::TabPage, panes: &[Pane], focused: Option<&PaneHolder>
         .or_else(|| titles.first().cloned())
         .unwrap_or_default();
     let recording = panes.iter().any(|pane| pane.holder().recording().get());
+    let as_root = panes.iter().any(|pane| root::shown(pane.holder()));
     page.set_title(&tab_page_title(&title, recording));
     let mut tooltip: Vec<String> = titles
         .iter()
         .map(|t| glib::markup_escape_text(t).to_string())
         .collect();
+    // Fixed texts with nothing in them that markup would read.
     if recording {
-        // Fixed text with nothing in it that markup would read.
         tooltip.push(RECORDING_TOOLTIP.to_owned());
     }
+    if as_root {
+        tooltip.push(root::ROOT_TOOLTIP.to_owned());
+    }
     page.set_tooltip(&tooltip.join("\n"));
+    if page.icon().is_some() != as_root {
+        page.set_icon(
+            as_root
+                .then(|| gio::ThemedIcon::new(root::ROOT_ICON))
+                .as_ref(),
+        );
+    }
     if page.indicator_icon().is_some() != recording {
         page.set_indicator_icon(
             recording
@@ -570,13 +625,25 @@ fn show_titles(page: &adw::TabPage, panes: &[Pane], focused: Option<&PaneHolder>
     }
 }
 
-/// The pane widget for `holder`: header (REC badge, title, menu, close button)
-/// over the holder, with the drop highlight over it; its `pane.` actions, the
-/// drag source on the header and the drop target on the pane. The badge shows
-/// while the pane saves a transcript ([`refresh`]); it is fixed text, not
-/// clickable, with the tooltip and accessible label [`RECORDING_TOOLTIP`].
+/// The pane widget for `holder`: header (root icon, REC badge, title, menu,
+/// close button) over the holder, with the drop highlight over it; its `pane.`
+/// actions, the drag source on the header and the drop target on the pane. The
+/// badge shows while the pane saves a transcript ([`refresh`]); it is fixed
+/// text, not clickable, with the tooltip and accessible label
+/// [`RECORDING_TOOLTIP`]. The root icon shows while the pane runs as root,
+/// with the tooltip and accessible label `root::ROOT_TOOLTIP`, not clickable
+/// either.
 fn build_pane(holder: &PaneHolder) -> Pane {
     add_css();
+    let root_image = gtk::Image::builder()
+        .icon_name(root::ROOT_ICON)
+        .tooltip_text(root::ROOT_TOOLTIP)
+        .focusable(false)
+        .margin_end(6)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    root_image.update_property(&[gtk::accessible::Property::Label(root::ROOT_TOOLTIP)]);
     let badge_icon = gtk::Image::from_icon_name(RECORDING_ICON);
     badge_icon.update_property(&[gtk::accessible::Property::Label(RECORDING_TOOLTIP)]);
     let badge_label = gtk::Label::builder()
@@ -619,6 +686,7 @@ fn build_pane(holder: &PaneHolder) -> Pane {
         .css_classes([HEADER_CLASS])
         .visible(false)
         .build();
+    header.append(&root_image);
     header.append(&badge);
     header.append(&title);
     header.append(&menu);
@@ -636,7 +704,7 @@ fn build_pane(holder: &PaneHolder) -> Pane {
         .build();
     overlay.add_overlay(&zone);
 
-    let pane = Pane::new(holder, &header, &badge, &title, &zone);
+    let pane = Pane::new(holder, &header, &root_image, &badge, &title, &zone);
     pane.set_orientation(gtk::Orientation::Vertical);
     pane.set_hexpand(true);
     pane.set_vexpand(true);
@@ -1967,7 +2035,8 @@ fn reveal_tab_bars(show: bool) {
     }
 }
 
-/// Load the panes' CSS on the default display, once.
+/// Load the panes' CSS on the default display, once, and the root tint, which
+/// follows the application's style (`root::follow_style`).
 fn add_css() {
     if CSS_ADDED.get() {
         return;
@@ -1983,6 +2052,7 @@ fn add_css() {
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
     CSS_ADDED.set(true);
+    root::follow_style();
 }
 
 /// A side of a pane: where a pane dropped on it goes.

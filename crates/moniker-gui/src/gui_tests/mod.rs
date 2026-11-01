@@ -14,8 +14,9 @@
 //!
 //! The scenarios live in one file per area ([`tabs`], [`main_window`],
 //! [`windows`], [`save_transcripts`], [`transcript_indicator`],
-//! [`preferences`], [`notifications`], [`sync`], [`profiles`], [`recordings`],
-//! [`sessions`], [`local_terminal`], [`jump_hosts`]);
+//! [`root_indicator`], [`preferences`], [`notifications`], [`sync`],
+//! [`profiles`], [`recordings`], [`sessions`], [`local_terminal`],
+//! [`jump_hosts`]);
 //! this file holds the test function that calls them, the helpers they
 //! share, and [`markup_is_shown_literally_everywhere`], the one scenario that
 //! spans the areas. The transcripts go to a temporary directory the tests pass
@@ -56,6 +57,7 @@ mod panes;
 mod preferences;
 mod profiles;
 mod recordings;
+mod root_indicator;
 mod save_transcripts;
 mod sessions;
 mod sync;
@@ -447,6 +449,12 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #17, the marks of a session that runs as root.
+    root_indicator::the_top_bar_follows_the_focused_pane(&tmp.path().join("root-top"));
+    root_indicator::a_root_pane_moves_with_its_state(&tmp.path().join("root-moves"));
+    root_indicator::rec_and_root_together(&tmp.path().join("root-rec"));
+    root_indicator::turning_the_mark_off_hides_everything(&tmp.path().join("root-off"));
+    root_indicator::the_tint_follows_light_and_dark(&tmp.path().join("root-tint"));
     // Issue #9, the Jump Host row on the profile page and in New Profile.
     jump_hosts::the_jump_host_row_offers_usable_profiles(&tmp.path().join("jr-offers"));
     jump_hosts::picking_a_jump_host_saves_it(&tmp.path().join("jr-pick"));
@@ -873,7 +881,8 @@ fn close_popover(popover: &gtk::Popover) {
 /// Surfaces: the new-tab list (row and the choices behind "›", a profile's and
 /// Local terminal's, whose sequence is named the same way), the tab (title,
 /// tooltip, as the tab bar draws it), the window title, the same two and a
-/// pane's header for a tab that saves a transcript (REC before the name), a
+/// pane's header for a tab that saves a transcript (REC before the name) and
+/// for a tab whose pane runs as root (its tooltip's last line), a
 /// notification (and the toast of the Preferences dialog), the Layouts menu (a
 /// saved session's row, its rename field and the questions of delete and
 /// replace) and, from it, the note over the list of a restored pane whose
@@ -1035,6 +1044,60 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     main.view.close_page(&recording);
     pump_until("the recording tab to close", || {
         main.view.selected_page().as_ref() != Some(&recording)
+    });
+
+    // A tab of the profile whose pane runs as root (issue #17): its title is
+    // the name as it is, with nothing added, in the tab bar and the window
+    // title; in a split its pane's header shows the name as it is after the
+    // root icon; and the tab's tooltip (markup) ends with the fixed line.
+    set_test_ssh_program(Some(fake_ssh(
+        bin,
+        "markup-root",
+        "echo FAKE-END\nexec sleep 600",
+    )));
+    crate::terminal_tab::open_profile(&main.view, &ctx, &p, None, false);
+    let rooted = main.view.selected_page().expect("the root tab");
+    wait_for_text(&wait_for_session(&rooted), "FAKE-END");
+    set_test_ssh_program(None);
+    crate::root::show_root(&pane(&rooted), true);
+    assert_eq!(rooted.title(), MARKUP_NAME);
+    assert_eq!(
+        rooted.tooltip().as_deref(),
+        Some(
+            format!(
+                "{}\n{}",
+                glib::markup_escape_text(MARKUP_NAME),
+                crate::root::ROOT_TOOLTIP
+            )
+            .as_str()
+        ),
+        "the tooltip is markup for GTK"
+    );
+    assert!(main.window.has_css_class(crate::root::WINDOW_CLASS));
+    literal_labels("root tab in the tab bar", &bar, MARKUP_NAME);
+    literal_labels("root window title", &title, MARKUP_NAME);
+    WidgetExt::activate_action(&main.window, "win.split-right", None).expect("win.split-right");
+    let root_layout = crate::panes::layout_of_page(&rooted).expect("its layout");
+    let root_pane = crate::panes::pane_of(&root_layout.holders()[0]).expect("its first pane");
+    assert!(root_pane.header().is_visible());
+    assert!(root_pane.root_image().is_visible());
+    literal_labels("root pane header", root_pane.header(), MARKUP_NAME);
+    assert_eq!(
+        rooted.tooltip().as_deref(),
+        Some(
+            format!(
+                "{}\n{}\n{}",
+                glib::markup_escape_text(MARKUP_NAME),
+                crate::panes::NEW_PANE_TITLE,
+                crate::root::ROOT_TOOLTIP
+            )
+            .as_str()
+        ),
+        "the tooltip is markup for GTK"
+    );
+    main.view.close_page(&rooted);
+    pump_until("the root tab to close", || {
+        main.view.selected_page().as_ref() != Some(&rooted)
     });
 
     // A notification made of this text (an error message built from a name has

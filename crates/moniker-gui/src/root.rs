@@ -1,5 +1,9 @@
-//! Whether a session runs as root (issue #17): what the root indicator decides,
-//! apart from showing it, so that it is testable without a display.
+//! Whether a session runs as root (issue #17), and the marks that say so.
+//!
+//! # Deciding
+//!
+//! What the root indicator decides is kept apart from showing it, so that it is
+//! testable without a display.
 //!
 //! * **A local pane** is root while the process group in the foreground of its
 //!   terminal runs as root, which is Ptyxis's rule ([`foreground_is_root`]). The
@@ -17,21 +21,337 @@
 //! * **When to look** is Ptyxis's poll ([`Backoff`]): soon after output, then
 //!   less and less often while nothing changes.
 //!
+//! # Showing
+//!
+//! What was seen is kept on the pane's holder (`PaneHolder::as_root`, set by
+//! [`show_root`]), so it moves with the pane. While the switch is on
+//! ([`enabled`], [`set_enabled`]) a pane that is root ([`shown`]) is marked
+//! three ways, as Ptyxis marks it:
+//!
+//! * **the top bar** of its window is tinted red, while it is the focused pane
+//!   of the tab in front ([`show_in_window`], the window's [`WINDOW_CLASS`]),
+//!   and the header bar shows [`ROOT_ICON`] before its title (`crate::window`);
+//! * **its header** in a split is tinted the same way, focused or not
+//!   ([`PANE_CLASS`]), with the icon before its title (`crate::panes`);
+//! * **its tab** has the icon, and a last line [`ROOT_TOOLTIP`] in its tooltip,
+//!   while any of its panes is root (`crate::panes`).
+//!
+//! The icon is there as well as the color, for someone who cannot tell red and
+//! for a screen reader. The tint ([`Tint`]) is fixed colors, light or dark,
+//! with a text color of its own, so that the text on it keeps at least 4.5:1
+//! whatever the theme's own header color is; it follows the application's
+//! style ([`follow_style`]). Nothing moves or fades.
+//!
 //! Nothing here is per frame, and nothing here reads a secret.
 
+use std::cell::{Cell, RefCell};
 use std::os::fd::BorrowedFd;
 use std::time::Duration;
 
+use adw::prelude::*;
+use gtk::gdk;
+use gtk4 as gtk;
+use libadwaita as adw;
 use rustix::termios::tcgetpgrp;
 
+use crate::panes;
+use crate::terminal_tab::PaneHolder;
+use crate::window::MainWindow;
+
 /// The tooltip and accessible label of every root mark.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ROOT_TOOLTIP: &str = "Running as root";
 
 /// The icon of the root mark, before the title in the header bar and in a
 /// pane's header, and as the tab's icon.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const ROOT_ICON: &str = "dialog-warning-symbolic";
+
+/// The CSS class of a main window while the focused pane of its tab in front
+/// is root ([`show_in_window`]): it tints the top bar.
+pub(crate) const WINDOW_CLASS: &str = "moniker-root";
+
+/// The CSS class of a pane's header (`panes::HEADER_CLASS`) while its pane is
+/// root: it tints the header.
+pub(crate) const PANE_CLASS: &str = "root";
+
+/// The CSS class of a main window's toolbar view, whose top bar (the header
+/// bar and the tab bar) the tint colors. libadwaita draws a flat top bar with
+/// no background of its own, in the window's, so the header bar's colors have
+/// to be given to the top bar itself; the class keeps the tint off the top
+/// bars of dialogs shown over the window.
+pub(crate) const TOP_BARS_CLASS: &str = "moniker-top-bars";
+
+thread_local! {
+    /// Whether root sessions are marked at all. GTK runs on one thread.
+    static ENABLED: Cell<bool> = const { Cell::new(true) };
+    /// The provider of the tint, once [`follow_style`] has installed it.
+    static PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    /// The style sheet the provider has now.
+    static LOADED: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Whether root sessions are marked: true unless [`set_enabled`] turned it off.
+pub(crate) fn enabled() -> bool {
+    ENABLED.get()
+}
+
+/// Turn the marks on or off, and show every tab of every main window as it now
+/// is. What each pane's session was seen to be (`PaneHolder::as_root`) is kept
+/// either way.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn set_enabled(on: bool) {
+    ENABLED.set(on);
+    for window in gtk::Window::list_toplevels() {
+        let Some(main) = window
+            .downcast_ref::<gtk::Window>()
+            .and_then(MainWindow::of)
+        else {
+            continue;
+        };
+        for index in 0..main.view.n_pages() {
+            if let Some(layout) = panes::layout_of_page(&main.view.nth_page(index)) {
+                panes::refresh(&layout);
+            }
+        }
+    }
+}
+
+/// Whether the pane of `holder` is marked as root now: its session was seen to
+/// run as root, and the marks are on.
+pub(crate) fn shown(holder: &PaneHolder) -> bool {
+    enabled() && holder.as_root().get()
+}
+
+/// Say whether the session in the pane of `holder` runs as root (`on`), and
+/// show its pane, tab and window again if that changed. A holder in no pane
+/// layout only keeps the flag.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn show_root(holder: &PaneHolder, on: bool) {
+    if holder.as_root().replace(on) != on
+        && let Some(layout) = panes::layout_of(holder)
+    {
+        panes::refresh(&layout);
+    }
+}
+
+/// Tint the top bar of the window `view` is in while the focused pane of its
+/// tab in front is marked as root ([`shown`]), and not otherwise. Nothing
+/// happens for a view in no window.
+pub(crate) fn show_in_window(view: &adw::TabView) {
+    let Some(window) = view.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let red = view
+        .selected_page()
+        .and_then(|page| panes::layout_of_page(&page))
+        .and_then(|layout| layout.focused_holder())
+        .is_some_and(|holder| shown(&holder));
+    if red {
+        window.add_css_class(WINDOW_CLASS);
+    } else {
+        window.remove_css_class(WINDOW_CLASS);
+    }
+}
+
+/// A color: sRGB channels from 0 to 255 and an opacity from 0 to 1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rgba {
+    r: f64,
+    g: f64,
+    b: f64,
+    a: f64,
+}
+
+impl Rgba {
+    /// An opaque color from its hex value, `0xrrggbb`.
+    const fn hex(value: u32) -> Rgba {
+        Rgba {
+            r: ((value >> 16) & 0xff) as f64,
+            g: ((value >> 8) & 0xff) as f64,
+            b: (value & 0xff) as f64,
+            a: 1.0,
+        }
+    }
+
+    /// `amount` (0 to 1) of `other` mixed into this opaque color, each channel
+    /// rounded to a whole value, so that what is drawn is what was measured.
+    fn mix(self, other: Rgba, amount: f64) -> Rgba {
+        let channel = |mine: f64, theirs: f64| (mine * (1.0 - amount) + theirs * amount).round();
+        Rgba {
+            r: channel(self.r, other.r),
+            g: channel(self.g, other.g),
+            b: channel(self.b, other.b),
+            a: 1.0,
+        }
+    }
+
+    /// The color in CSS.
+    fn to_css(self) -> String {
+        format!("rgba({}, {}, {}, {})", self.r, self.g, self.b, self.a)
+    }
+}
+
+/// GNOME's red (red 3 of its palette), libadwaita's own: mixed into a header
+/// color, it makes the tint.
+const RED: Rgba = Rgba::hex(0xe01b24);
+
+/// The neutral header colors the red is mixed into, light and dark: Adwaita's,
+/// fixed rather than the theme's own, since a theme (Ubuntu's Yaru, with a
+/// style sheet per accent color) may make its header any color.
+const LIGHT_BASE: Rgba = Rgba::hex(0xebebed);
+const DARK_BASE: Rgba = Rgba::hex(0x2e2e32);
+
+/// The red of a root session's top bar and pane header, and the color of the
+/// text on it, for one style of the application.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Tint {
+    background: Rgba,
+    text: Rgba,
+}
+
+impl Tint {
+    /// The tint for the light or `dark` style, in high contrast or not (`hc`).
+    ///
+    /// The background mixes the red into the neutral header color in Ptyxis's
+    /// proportions, half of it in the light style and a third in the dark one;
+    /// high contrast keeps the same background. The text color is set too, so
+    /// that no theme can lower the contrast: Adwaita's dark text in the light
+    /// style (black in high contrast), white in the dark one.
+    pub(crate) fn for_style(dark: bool, hc: bool) -> Tint {
+        if dark {
+            Tint {
+                background: DARK_BASE.mix(RED, 0.33),
+                text: Rgba::hex(0xffffff),
+            }
+        } else {
+            Tint {
+                background: LIGHT_BASE.mix(RED, 0.5),
+                text: if hc {
+                    Rgba::hex(0x000000)
+                } else {
+                    Rgba {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 6.0,
+                        a: 0.8,
+                    }
+                },
+            }
+        }
+    }
+
+    /// The background in CSS.
+    pub(crate) fn background_css(&self) -> String {
+        self.background.to_css()
+    }
+
+    /// The background's channels, as a texture drawn with it holds them.
+    #[cfg(test)]
+    pub(crate) fn background_rgb(&self) -> [u8; 3] {
+        let b = self.background;
+        // Whole values from 0 to 255: `mix` rounds them.
+        [b.r, b.g, b.b].map(|channel| channel as u8)
+    }
+
+    /// The text as it is drawn on the background: its color, at its opacity,
+    /// over the background.
+    #[cfg(test)]
+    fn text_over_tint(&self) -> Rgba {
+        let (t, b) = (self.text, self.background);
+        let over = |text: f64, back: f64| text * t.a + back * (1.0 - t.a);
+        Rgba {
+            r: over(t.r, b.r),
+            g: over(t.g, b.g),
+            b: over(t.b, b.b),
+            a: 1.0,
+        }
+    }
+}
+
+/// The contrast ratio of two opaque colors, as WCAG 2 measures it: from 1 (the
+/// same) to 21 (black on white).
+#[cfg(test)]
+fn contrast(one: Rgba, other: Rgba) -> f64 {
+    fn luminance(color: Rgba) -> f64 {
+        let linear = |channel: f64| {
+            let c = channel / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
+    }
+    let (a, b) = (luminance(one), luminance(other));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+/// The style sheet of the tint for the light or `dark` style, in high contrast
+/// or not (`hc`).
+///
+/// A window with [`WINDOW_CLASS`] gives libadwaita's header bar variables the
+/// tint, the way GNOME Console does, and its top bar ([`TOP_BARS_CLASS`]) is
+/// drawn in them; a pane header with [`PANE_CLASS`] is drawn in the tint. The
+/// header bar's focused-pane underline is a border and stays.
+pub(crate) fn css(dark: bool, hc: bool) -> String {
+    let tint = Tint::for_style(dark, hc);
+    let background = tint.background_css();
+    let text = tint.text.to_css();
+    format!(
+        "window.{WINDOW_CLASS} {{ \
+           --headerbar-bg-color: {background}; \
+           --headerbar-backdrop-color: {background}; \
+           --headerbar-fg-color: {text}; }}\n\
+         window.{WINDOW_CLASS} toolbarview.{TOP_BARS_CLASS} > .top-bar {{ \
+           background-color: var(--headerbar-bg-color); \
+           color: var(--headerbar-fg-color); }}\n\
+         window.{WINDOW_CLASS} toolbarview.{TOP_BARS_CLASS} > .top-bar:backdrop {{ \
+           background-color: var(--headerbar-backdrop-color); }}\n\
+         .{header}.{PANE_CLASS} {{ background-color: {background}; color: {text}; }}\n",
+        header = panes::HEADER_CLASS,
+    )
+}
+
+/// Load the tint on the default display, once, and load it again whenever the
+/// application's style changes between light and dark, or into or out of high
+/// contrast, for as long as the application runs. Nothing is drawn with it
+/// until a window or a pane header has its class.
+pub(crate) fn follow_style() {
+    if PROVIDER.with_borrow(Option::is_some) {
+        return;
+    }
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+    PROVIDER.set(Some(provider));
+    let manager = adw::StyleManager::default();
+    load_tint(&manager);
+    manager.connect_dark_notify(load_tint);
+    manager.connect_high_contrast_notify(load_tint);
+}
+
+/// Load the tint of `manager`'s style now into the provider.
+fn load_tint(manager: &adw::StyleManager) {
+    let text = css(manager.is_dark(), manager.is_high_contrast());
+    // Taken out first, so that no borrow is held while GTK restyles.
+    if let Some(provider) = PROVIDER.with_borrow(Clone::clone) {
+        provider.load_from_string(&text);
+    }
+    LOADED.set(text);
+}
+
+/// The style sheet the tint's provider has now (empty before
+/// [`follow_style`]).
+#[cfg(test)]
+pub(crate) fn current_css() -> String {
+    LOADED.with_borrow(Clone::clone)
+}
 
 /// Whether the text of a `/proc/<pid>/status` file says the process runs as
 /// root: the second number (the effective uid) of the first `Uid:` line is 0.
@@ -206,6 +526,32 @@ mod tests {
         for user in ["Root", "ROOT", "rootx", " root", "root ", "", "toor"] {
             assert!(!logs_in_as_root(user), "{user:?}");
         }
+    }
+
+    #[test]
+    fn the_tint_keeps_its_text_readable() {
+        for (dark, hc) in [(false, false), (false, true), (true, false), (true, true)] {
+            let t = Tint::for_style(dark, hc);
+            assert!(
+                contrast(t.text_over_tint(), t.background) >= 4.5,
+                "dark={dark} hc={hc}: {t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_css_tints_the_window_and_the_pane_header() {
+        for (dark, hc) in [(false, false), (true, false), (false, true), (true, true)] {
+            let css = css(dark, hc);
+            let t = Tint::for_style(dark, hc);
+            assert!(css.contains("window.moniker-root"));
+            assert!(css.contains("--headerbar-bg-color"));
+            assert!(css.contains("--headerbar-backdrop-color"));
+            assert!(css.contains("--headerbar-fg-color"));
+            assert!(css.contains(".moniker-pane-header.root"));
+            assert!(css.contains(&t.background_css()));
+        }
+        assert_ne!(css(false, false), css(true, false));
     }
 
     #[test]

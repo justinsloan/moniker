@@ -5,15 +5,18 @@
 //! tab), Layouts (the saved layouts of windows, each opened in a new window by
 //! [`open_layout`], and saving this one: [`crate::sessions_menu`]; the
 //! Preferences can hide it), the selected tab's title (after a record icon
-//! while that tab saves a transcript, `crate::panes`), and ☰ (the app's
-//! actions, which `main.rs` defines, under a zoom row for the selected tab's
-//! text size). There is no Connect button: connections come from the new-tab
-//! list and the Connection Profiles window. Below it the tab bar, which hides
-//! itself while there is one tab, so a fresh window looks like a plain
-//! terminal; then the tabs ([`crate::terminal_tab`]) inside a notification
-//! area ([`crate::notify`]) attached to the context's
+//! while that tab saves a transcript, `crate::panes`, and before that a
+//! warning icon while its focused pane runs as root, `crate::root`), and ☰
+//! (the app's actions, which `main.rs` defines, under a zoom row for the
+//! selected tab's text size). There is no Connect button: connections come
+//! from the new-tab list and the Connection Profiles window. Below it the tab
+//! bar, which hides itself while there is one tab, so a fresh window looks like
+//! a plain terminal; then the tabs ([`crate::terminal_tab`]) inside a
+//! notification area ([`crate::notify`]) attached to the context's
 //! [`crate::context::Notice`], so messages appear at the top center of the
-//! terminal, below the bars.
+//! terminal, below the bars. While the focused pane of the tab in front runs
+//! as root, the bars (the header bar and the tab bar) are red as well as
+//! showing the warning icon (`crate::root`).
 //!
 //! Each main window has the actions of its tabs: `win.new-tab` (as ＋ does),
 //! `win.next-tab` and `win.previous-tab`; of the panes of a tab
@@ -70,7 +73,7 @@ use crate::session_file::TabRecord;
 use crate::session_layout;
 use crate::sessions_menu;
 use crate::window_size::{self, Kind};
-use crate::{new_tab, panes, profiles, recordings, settings, terminal_tab, zoom};
+use crate::{new_tab, panes, profiles, recordings, root, settings, terminal_tab, zoom};
 
 /// Widget name of a main window, how [`last_active`] tells it from the
 /// Connection Profiles window and dialogs.
@@ -87,6 +90,11 @@ const ZOOM_ITEM: &str = "zoom";
 /// Widget name of the record icon before the header bar's title, shown while
 /// the selected tab saves a transcript.
 pub(crate) const RECORDING_IMAGE_NAME: &str = "recording-indicator";
+
+/// Widget name of the warning icon first in the header bar's title, shown
+/// while the top bar is red: the focused pane of the selected tab runs as root
+/// (`crate::root`).
+pub(crate) const ROOT_IMAGE_NAME: &str = "root-indicator";
 
 /// A main window and the parts of it others work with.
 #[derive(Clone)]
@@ -283,8 +291,17 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
 
     // The title, after the record icon while the tab in front saves a
     // transcript (the tab bar, which shows it on the tab, is hidden while there
-    // is one tab).
+    // is one tab), and first the warning icon while the top bar is red: the
+    // focused pane of the tab in front runs as root (`crate::root`).
     let title = adw::WindowTitle::new("Moniker", "");
+    let as_root = gtk::Image::builder()
+        .name(ROOT_IMAGE_NAME)
+        .icon_name(root::ROOT_ICON)
+        .tooltip_text(root::ROOT_TOOLTIP)
+        .focusable(false)
+        .visible(false)
+        .build();
+    as_root.update_property(&[gtk::accessible::Property::Label(root::ROOT_TOOLTIP)]);
     let recording = gtk::Image::builder()
         .name(RECORDING_IMAGE_NAME)
         .icon_name(panes::RECORDING_ICON)
@@ -296,6 +313,7 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
+    title_box.append(&as_root);
     title_box.append(&recording);
     title_box.append(&title);
     let header = adw::HeaderBar::builder().title_widget(&title_box).build();
@@ -303,6 +321,8 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
     header.pack_end(&main_menu);
 
     let toolbar = adw::ToolbarView::new();
+    // The bars the root tint colors (`root::css`), and no dialog's.
+    toolbar.add_css_class(root::TOP_BARS_CLASS);
     toolbar.add_top_bar(&header);
     toolbar.add_top_bar(&tab_bar);
     toolbar.set_content(Some(&notifications));
@@ -331,6 +351,19 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
             |_: Option<glib::Object>, icon: Option<gio::Icon>| icon.is_some()
         ))
         .bind(&recording, "visible", gtk::Widget::NONE);
+    // The warning icon shows exactly while the top bar is red: while the
+    // window has the class that tints it (`root::show_in_window`). The window
+    // is held weakly too.
+    window
+        .property_expression_weak("css-classes")
+        .chain_closure::<bool>(glib::closure!(
+            |_: Option<glib::Object>, classes: glib::StrV| {
+                classes
+                    .iter()
+                    .any(|class| class.as_str() == root::WINDOW_CLASS)
+            }
+        ))
+        .bind(&as_root, "visible", gtk::Widget::NONE);
 
     // The size of the selected tab, as the zoom row shows it, and as the last
     // window to close saves it. Kept as it changes because a window whose last
@@ -348,6 +381,9 @@ fn build_empty(app: &adw::Application, ctx: &Rc<AppContext>) -> MainWindow {
     // included, so with the actions enabled Ctrl+Shift+V would paste into the
     // terminal behind the Rename dialog.
     view.connect_selected_page_notify(terminal_tab::sync_window_actions);
+    // The top bar is red while the focused pane of the tab in front runs as
+    // root; `panes::refresh` follows the panes, this the tab in front.
+    view.connect_selected_page_notify(root::show_in_window);
     window.connect_visible_dialog_notify(glib::clone!(
         #[weak]
         view,

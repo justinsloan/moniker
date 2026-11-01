@@ -460,6 +460,8 @@ mod holder {
             pub(super) kind: RefCell<PaneKind>,
             /// The pane's session saves a transcript that is not written yet.
             pub(super) recording: Cell<bool>,
+            /// The pane's session runs as root, as last seen (issue #17).
+            pub(super) as_root: Cell<bool>,
             /// The shared connection of a session through a jump host, until
             /// its connection ends (issue #9).
             pub(super) jump: RefCell<Option<Rc<JumpLink>>>,
@@ -474,6 +476,7 @@ mod holder {
                     scale: Cell::new(zoom::DEFAULT),
                     kind: RefCell::new(PaneKind::Empty),
                     recording: Cell::new(false),
+                    as_root: Cell::new(false),
                     jump: RefCell::new(None),
                 }
             }
@@ -540,6 +543,15 @@ mod holder {
         /// REC meanwhile (`crate::panes`).
         pub(crate) fn recording(&self) -> &Cell<bool> {
             &self.imp().recording
+        }
+
+        /// Whether the pane's session runs as root, as last seen
+        /// (`crate::root::show_root`), whatever the switch of the root marks
+        /// says; its header, tab and window show it while the marks are on
+        /// (`crate::root::shown`). (Not `root`: that is GTK's, the window a
+        /// widget is in.)
+        pub(crate) fn as_root(&self) -> &Cell<bool> {
+            &self.imp().as_root
         }
 
         /// The shared connection to the jump host of the pane's session
