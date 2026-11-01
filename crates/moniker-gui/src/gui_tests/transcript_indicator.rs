@@ -107,7 +107,7 @@ pub(super) fn focused(page: &adw::TabPage) -> PaneHolder {
 /// Split the selected tab of `main` to the right and open a local terminal in
 /// the new pane from its list (saving a transcript when "Save transcripts of
 /// all sessions" is on, as a plain click does). Returns the new pane.
-fn split_with_local(main: &window::MainWindow, page: &adw::TabPage) -> PaneHolder {
+pub(super) fn split_with_local(main: &window::MainWindow, page: &adw::TabPage) -> PaneHolder {
     WidgetExt::activate_action(&main.window, "win.split-right", None).expect("win.split-right");
     let holder = focused(page);
     let list = find_widget::<gtk::ListBox>(&holder)

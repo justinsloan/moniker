@@ -5,25 +5,44 @@
 //! last line in its tooltip. The marks move with the pane, sit before REC, and
 //! all go while the switch is off.
 //!
-//! What the watch would decide is set here directly ([`root::show_root`]): the
-//! watching itself is not what these check. Local tabs run `/bin/sh`.
+//! The first scenarios set what the watch would decide directly
+//! ([`root::show_root`]), with a check hook that keeps what is set
+//! ([`keep_as_set`]): the watching itself is not what they check. The others
+//! check the watching: a local pane is checked on Ptyxis's schedule
+//! ([`Backoff`]) through a check hook that answers as the scenario says
+//! ([`Hook`]), and once without a hook, for real; a profile pane is red while
+//! its profile signs in as `root` and its connection runs, and is never
+//! checked. Local tabs run `/bin/sh`, connections a fake `ssh`.
 
+use std::cell::{Cell, RefCell};
 use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use adw::prelude::*;
+use gtk::glib::translate::IntoGlib;
 use gtk::{gdk, gio};
 use gtk4 as gtk;
 use libadwaita as adw;
+use moniker_core::profile::Profile;
+use moniker_core::secrets::MemorySecretStore;
+use vte4::Terminal;
+use vte4::prelude::*;
 
-use super::main_window::{ctx_with, main_windows, test_app};
-use super::save_transcripts::{configure, new_list, say};
-use super::transcript_indicator::{focused, header_icon, layout_of, pane_of};
+use super::main_window::{ctx_with, ctx_with_secrets, main_windows, test_app};
+use super::save_transcripts::{click, configure, new_list, say};
+use super::transcript_indicator::{focused, header_icon, layout_of, pane_of, split_with_local};
 use super::windows::main_window;
-use super::{all_widgets, find_widget, pane, pump_for, pump_until};
+use super::{
+    HeldKeyring, all_widgets, fake_ssh, find_widget, labels_in, pane, pump_for, pump_until,
+    wait_for_session, wait_for_text,
+};
+use crate::launch_args::{Run, Start};
 use crate::panes::RECORDING_TOOLTIP;
-use crate::root::{self, PANE_CLASS, ROOT_ICON, ROOT_TOOLTIP, WINDOW_CLASS};
-use crate::terminal_tab::{PaneHolder, shown_title, terminal_of};
+use crate::root::{self, Backoff, PANE_CLASS, ROOT_ICON, ROOT_TOOLTIP, WINDOW_CLASS};
+use crate::terminal_tab::{
+    self, PaneHolder, WAITING_TEXT, set_test_ssh_program, shown_title, terminal_in, terminal_of,
+};
 use crate::window;
 
 /// Run the window action `name` of `main`, as its accelerator does.
@@ -140,7 +159,14 @@ fn drawn_at(widget: &impl IsA<gtk::Widget>, x: i32, y: i32) -> [u8; 4] {
 fn drawn_tinted(widget: &impl IsA<gtk::Widget>, manager: &adw::StyleManager) -> bool {
     let tint = root::Tint::for_style(manager.is_dark(), manager.is_high_contrast());
     let [r, g, b, a] = drawn_at(widget, 3, 2);
-    a == 255 && [r, g, b] == tint.background_rgb()
+    // Within 2 of each channel: another renderer (GL or Vulkan, llvmpipe on
+    // CI) or a color-state conversion may round differently. That still tells
+    // the tint from an untinted bar by far.
+    a == 255
+        && [r, g, b]
+            .into_iter()
+            .zip(tint.background_rgb())
+            .all(|(drawn, want)| drawn.abs_diff(want) <= 2)
 }
 
 /// The top bar of `main`: the box of its toolbar view that holds the header
@@ -166,6 +192,108 @@ fn window_showing(app: &adw::Application, holder: &PaneHolder) -> window::MainWi
         .expect("the window the pane went to")
 }
 
+/// A check hook installed for one scenario ([`root::set_test_check`]): each
+/// check of a local pane's terminal is answered by the function it was made
+/// with, and counted for that terminal. Dropping it takes the hook away again,
+/// also on the way out of a failing assertion, so that later scenarios use the
+/// real check.
+struct Hook {
+    checked: Rc<RefCell<Vec<Terminal>>>,
+}
+
+impl Hook {
+    fn answering(answer: impl Fn(&Terminal) -> bool + 'static) -> Hook {
+        let checked = Rc::new(RefCell::new(Vec::new()));
+        let seen = Rc::clone(&checked);
+        root::set_test_check(Some(Rc::new(move |terminal: &Terminal| {
+            seen.borrow_mut().push(terminal.clone());
+            answer(terminal)
+        })));
+        Hook { checked }
+    }
+
+    /// How many checks of `terminal` the hook has answered.
+    fn checks_of(&self, terminal: &Terminal) -> usize {
+        self.checked
+            .borrow()
+            .iter()
+            .filter(|checked| *checked == terminal)
+            .count()
+    }
+}
+
+impl Drop for Hook {
+    fn drop(&mut self) {
+        root::set_test_check(None);
+    }
+}
+
+/// A check hook that answers what the pane already shows, so that a check
+/// changes nothing a scenario set with [`root::show_root`].
+fn keep_as_set() -> Hook {
+    Hook::answering(|terminal| {
+        terminal
+            .parent()
+            .and_downcast::<PaneHolder>()
+            .is_some_and(|holder| holder.as_root().get())
+    })
+}
+
+/// Turns the root marks back on when dropped, also on the way out of a
+/// failing assertion.
+struct SwitchBackOn;
+
+impl Drop for SwitchBackOn {
+    fn drop(&mut self) {
+        root::set_enabled(true);
+    }
+}
+
+/// The key controller the watch put on `terminal`, which is in the capture
+/// phase.
+fn watch_keys(terminal: &Terminal) -> gtk::EventControllerKey {
+    let controllers = terminal.observe_controllers();
+    let keys = (0..controllers.n_items())
+        .filter_map(|i| {
+            controllers
+                .item(i)
+                .and_downcast::<gtk::EventControllerKey>()
+        })
+        .find(|keys| keys.name().as_deref() == Some(root::KEYS_NAME))
+        .expect("the watch's key controller");
+    assert_eq!(keys.propagation_phase(), gtk::PropagationPhase::Capture);
+    keys
+}
+
+/// Press `key` with `state` held, as `keys` sees it: true if it took the key.
+fn press(keys: &gtk::EventControllerKey, key: gdk::Key, state: gdk::ModifierType) -> bool {
+    keys.emit_by_name::<bool>("key-pressed", &[&key.into_glib(), &0u32, &state])
+}
+
+/// Whether `main`'s top bar is red now.
+fn is_red(main: &window::MainWindow) -> bool {
+    main.window.has_css_class(WINDOW_CLASS)
+}
+
+/// A new tab in `main` running `/bin/sh` as a local command, as `moniker --
+/// /bin/sh` opens one: unlike a shell tab it keeps its pane, with a note, when
+/// the shell exits with a failure.
+fn command_tab(main: &window::MainWindow, dir: &Path) -> (adw::TabPage, Terminal) {
+    let start = Start {
+        dir: dir.to_path_buf(),
+        title: None,
+        run: Run::Command {
+            argv: vec!["/bin/sh".to_owned()],
+            hold: false,
+        },
+        dir_refused: None,
+    };
+    let terminal = terminal_tab::open_local(&main.view, 1.0, &start, None);
+    let page = main.view.selected_page().expect("the command tab");
+    assert_eq!(terminal_of(&page).as_ref(), Some(&terminal));
+    (page, terminal)
+}
+
 /// The top bar is red while the focused pane of the tab in front is root: not
 /// while another tab is in front, nor while another pane of the tab is
 /// focused. The header bar's icon (with its tooltip) follows the window; the
@@ -173,6 +301,7 @@ fn window_showing(app: &adw::Application, holder: &PaneHolder) -> window::MainWi
 /// root, and its title has nothing added. In a split, the root pane's header is
 /// red with the icon whether it is focused or not, and is never dimmed.
 pub(super) fn the_top_bar_follows_the_focused_pane(dir: &Path) {
+    let _hook = keep_as_set();
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
     let main = main_window(&app, &ctx);
@@ -254,6 +383,7 @@ pub(super) fn the_top_bar_follows_the_focused_pane(dir: &Path) {
 /// and the new window's top bar, show it. The tab it left loses them, unless
 /// another of its panes is root.
 pub(super) fn a_root_pane_moves_with_its_state(dir: &Path) {
+    let _hook = keep_as_set();
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
     let main = main_window(&app, &ctx);
@@ -303,6 +433,7 @@ pub(super) fn a_root_pane_moves_with_its_state(dir: &Path) {
 /// the record icon, then the title; a pane's header in a split shows the root
 /// icon, then the REC badge, then the pane's title.
 pub(super) fn rec_and_root_together(dir: &Path) {
+    let _hook = keep_as_set();
     let transcripts = dir.join("transcripts");
     let ctx = ctx_with(dir, &[]);
     configure(&ctx, &transcripts, true);
@@ -361,9 +492,12 @@ pub(super) fn rec_and_root_together(dir: &Path) {
 }
 
 /// With the switch off, no window is red and no header bar, pane header or tab
-/// shows a mark, in any window, while what each pane was seen to be is kept;
-/// on again, every mark is back.
+/// shows a mark, in any window, and what the local panes were seen to be is
+/// forgotten: their watches look again once it is on. On again, every mark is
+/// back after the panes' first checks (the hook answers that they are root).
 pub(super) fn turning_the_mark_off_hides_everything(dir: &Path) {
+    let _hook = Hook::answering(|_| true);
+    let _on = SwitchBackOn;
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
     let one = main_window(&app, &ctx);
@@ -393,12 +527,15 @@ pub(super) fn turning_the_mark_off_hides_everything(dir: &Path) {
     assert_plain_tab(&tab_one);
     assert_plain_tab(&tab_two);
     assert!(
-        a.as_root().get() && c.as_root().get(),
-        "what was seen is kept"
+        !a.as_root().get() && !c.as_root().get(),
+        "what a local pane was seen to be is forgotten"
     );
 
     root::set_enabled(true);
     assert!(root::enabled());
+    pump_until("both top bars red again, after the first checks", || {
+        is_red(&one) && is_red(&two)
+    });
     all_shown();
 
     one.window.destroy();
@@ -412,6 +549,7 @@ pub(super) fn turning_the_mark_off_hides_everything(dir: &Path) {
 /// so the header bar's variables alone would color nothing), and on a root
 /// pane's header.
 pub(super) fn the_tint_follows_light_and_dark(dir: &Path) {
+    let _hook = keep_as_set();
     let manager = adw::StyleManager::default();
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
@@ -463,5 +601,386 @@ pub(super) fn the_tint_follows_light_and_dark(dir: &Path) {
 
     manager.set_color_scheme(adw::ColorScheme::Default);
     main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A local pane is checked once it has printed something, and is red while
+/// its check says it runs as root: the top bar, the header bar's icon and the
+/// tab's marks come and go with the answer. Moved to a window of its own, it
+/// takes its watch along, and that window follows the check from then on.
+pub(super) fn a_local_pane_follows_its_check(dir: &Path) {
+    let answer = Rc::new(Cell::new(false));
+    let hook = Hook::answering({
+        let answer = Rc::clone(&answer);
+        move |_| answer.get()
+    });
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the launch tab");
+    let holder = pane(&page);
+    let terminal = terminal_of(&page).expect("a local shell");
+
+    let before = root::checks_run();
+    say(&terminal, "first");
+    pump_until("a check of the shell", || hook.checks_of(&terminal) > 0);
+    assert!(root::checks_run() > before, "every check is counted");
+    assert!(!holder.as_root().get());
+    assert_red(&main, false);
+    assert_plain_tab(&page);
+
+    answer.set(true);
+    say(&terminal, "second");
+    pump_until("the top bar red", || is_red(&main));
+    assert!(holder.as_root().get());
+    assert_red(&main, true);
+    assert_root_tab(&page);
+
+    answer.set(false);
+    say(&terminal, "third");
+    pump_until("the top bar back", || !is_red(&main));
+    assert!(!holder.as_root().get());
+    assert_red(&main, false);
+    assert_plain_tab(&page);
+
+    // To a window of its own (from a split: a pane alone in its tab has none
+    // to move from), where it is still checked.
+    act(&main, crate::panes::SPLIT_RIGHT_ACTION);
+    let windows = main_windows(&app);
+    WidgetExt::activate_action(pane_of(&holder).header(), "pane.pane-to-window", None)
+        .expect("pane.pane-to-window");
+    pump_until("a new window", || main_windows(&app) == windows + 1);
+    let own = window_showing(&app, &holder);
+    answer.set(true);
+    say(&terminal, "moved");
+    pump_until("the new window's top bar red", || is_red(&own));
+    assert_red(&own, true);
+    assert_red(&main, false);
+
+    own.window.close();
+    main.window.close();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The checks of a local pane back off while nothing changes (500 ms, 1 s,
+/// 2 s, and on), and output brings them back to 500 ms. Enter (Return, keypad
+/// Enter, ISO Enter), Ctrl+C and Ctrl+D pull the next one in to 100 ms; other
+/// keys, C and D without Ctrl, and Ctrl+Shift+C change nothing; and the
+/// watch's key controller never takes a key from the terminal.
+pub(super) fn the_schedule_backs_off_and_comes_back(dir: &Path) {
+    let _hook = Hook::answering(|_| false);
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the launch tab");
+    let holder = pane(&page);
+    let terminal = terminal_of(&page).expect("a local shell");
+    let delay = || root::delay_of(&holder);
+    let grown = |to: Duration| {
+        pump_until(&format!("the delay to grow to {to:?}"), || {
+            delay() >= Some(to)
+        });
+    };
+
+    say(&terminal, "quiet");
+    grown(Duration::from_secs(2));
+    say(&terminal, "again");
+    pump_until("the delay back at 500 ms", || {
+        delay() == Some(Backoff::FIRST)
+    });
+
+    let keys = watch_keys(&terminal);
+    let none = gdk::ModifierType::empty();
+    let ctrl = gdk::ModifierType::CONTROL_MASK;
+    for (key, state) in [
+        (gdk::Key::Return, none),
+        (gdk::Key::KP_Enter, none),
+        (gdk::Key::ISO_Enter, none),
+        (gdk::Key::c, ctrl),
+        (gdk::Key::d, ctrl),
+    ] {
+        grown(Duration::from_secs(1));
+        assert!(!press(&keys, key, state), "{key:?} goes on to the terminal");
+        assert_eq!(delay(), Some(Backoff::HURRY), "{key:?} with {state:?}");
+    }
+    grown(Duration::from_secs(1));
+    let before = delay();
+    for (key, state) in [
+        (gdk::Key::x, none),
+        (gdk::Key::c, none),
+        (gdk::Key::d, none),
+        (gdk::Key::x, ctrl),
+        // Ctrl+Shift+C is Copy, not an interrupt.
+        (gdk::Key::C, ctrl | gdk::ModifierType::SHIFT_MASK),
+    ] {
+        assert!(!press(&keys, key, state), "{key:?} goes on to the terminal");
+        assert_eq!(delay(), before, "{key:?} with {state:?} changes nothing");
+    }
+
+    main.window.close();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Without a hook the check is the real one: the launch tab's `/bin/sh` is
+/// checked through its pty's foreground process group and `/proc`, and is not
+/// root (its delay grows, which only a check of its own does). Skipped when the
+/// tests run as root.
+pub(super) fn a_real_local_pane_is_not_root(dir: &Path) {
+    if rustix::process::geteuid().is_root() {
+        return; // the shell would be root, and red
+    }
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the launch tab");
+    let holder = pane(&page);
+    let terminal = terminal_of(&page).expect("a local shell");
+
+    let before = root::checks_run();
+    say(&terminal, "real");
+    pump_until("a real check of the shell", || {
+        root::checks_run() > before && root::delay_of(&holder) >= Some(Duration::from_secs(1))
+    });
+    assert!(!holder.as_root().get());
+    assert_red(&main, false);
+    assert_plain_tab(&page);
+
+    main.window.close();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A local session that ends is not red, and is not checked any more: a
+/// command tab's shell, red while it runs (the hook says it is root), exits
+/// with status 3, and its pane stays with the note, neither red nor checked.
+pub(super) fn an_ended_session_is_not_red(dir: &Path) {
+    let hook = Hook::answering(|_| true);
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let launch = main.view.selected_page().expect("the launch tab");
+    let (page, terminal) = command_tab(&main, dir);
+    let holder = pane(&page);
+    // The command tab alone, so that its checks are the only ones.
+    main.view.close_page(&launch);
+    pump_until("the launch tab closed", || main.view.n_pages() == 1);
+
+    say(&terminal, "ended");
+    pump_until("the top bar red", || is_red(&main));
+    assert_root_tab(&page);
+
+    terminal.feed_child(b"exit 3\n");
+    wait_for_text(&terminal, "[session ended: status 3]");
+    pump_until("the top bar back", || !is_red(&main));
+    assert_eq!(
+        terminal_of(&page).as_ref(),
+        Some(&terminal),
+        "the pane stays, with its note"
+    );
+    assert!(!holder.as_root().get());
+    assert_red(&main, false);
+    assert_plain_tab(&page);
+    assert_eq!(root::delay_of(&holder), None, "its watch is gone");
+    let checks = root::checks_run();
+    let own = hook.checks_of(&terminal);
+    pump_for(Duration::from_millis(1500));
+    assert_eq!(hook.checks_of(&terminal), own, "not checked after its end");
+    assert_eq!(root::checks_run(), checks, "no check at all");
+    assert!(!is_red(&main));
+
+    main.window.close();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Closing a pane stops its watch at once, even while its shell lives on (it
+/// ignores the hang-up): nothing checks it any more, and nothing goes wrong.
+/// It was the focused pane and root, so the top bar loses its red as the
+/// other pane, which is not, takes the focus.
+pub(super) fn a_closed_pane_stops_its_watch(dir: &Path) {
+    let rooted: Rc<RefCell<Option<Terminal>>> = Rc::default();
+    let hook = Hook::answering({
+        let rooted = Rc::clone(&rooted);
+        move |terminal| rooted.borrow().as_ref() == Some(terminal)
+    });
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the launch tab");
+    let a = pane(&page);
+    let root_shell = terminal_of(&page).expect("a local shell");
+    rooted.replace(Some(root_shell.clone()));
+    let b = split_with_local(&main, &page);
+    let plain_shell = terminal_in(&b).expect("the second pane's shell");
+    say(&plain_shell, "plain");
+    pump_until("a check of the second pane", || {
+        hook.checks_of(&plain_shell) > 0
+    });
+    crate::panes::focus_pane(&a);
+    assert_eq!(focused(&page), a);
+    say(&root_shell, "root");
+    pump_until("the top bar red", || is_red(&main));
+    assert_red_header(&a, true);
+    assert_red_header(&b, false);
+
+    // From now on its shell ignores the hang-up, so that only the closing can
+    // stop its watch.
+    root_shell.feed_child(b"trap '' HUP\n");
+    say(&root_shell, "trapped");
+    WidgetExt::activate_action(pane_of(&a).header(), "pane.close", None).expect("pane.close");
+    let checked = hook.checks_of(&root_shell);
+    pump_until("the top bar no longer red", || !is_red(&main));
+    assert_eq!(layout_of(&page).holders(), std::slice::from_ref(&b));
+    assert_eq!(focused(&page), b);
+    assert_red(&main, false);
+    assert_plain_tab(&page);
+    assert_eq!(root::delay_of(&a), None, "its watch is gone");
+    assert!(!a.as_root().get());
+    pump_for(Duration::from_millis(1500));
+    assert_eq!(
+        hook.checks_of(&root_shell),
+        checked,
+        "the closed pane is not checked"
+    );
+    assert!(!is_red(&main));
+
+    // Its shell, still running, ends now.
+    root_shell.feed_child(b"exit\n");
+    main.window.close();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A profile that signs in as `root` is red while its connection runs: not
+/// while it waits for the keyring, red once its `ssh` (a fake here) has
+/// started, and not once the connection has ended. One that signs in as
+/// another user is never red. Neither is ever checked (a connection's terminal
+/// runs `ssh`, which runs as the person): the hook would say root to every
+/// check. With the switch off, a root profile's pane hides its red and keeps
+/// what it is; on again, it is red again at once.
+pub(super) fn a_root_profile_is_red_while_connected(bin: &Path, dir: &Path) {
+    let fake = fake_ssh(bin, "root-profile", "echo FAKE-END\nread line\nexit 3");
+    let admin = Profile::new("admin", "admin.example.test", "root");
+    let alice = Profile::new("alice", "alice.example.test", "alice");
+    let keyring = Arc::new(HeldKeyring::new(Arc::new(MemorySecretStore::default())));
+    let ctx = ctx_with_secrets(
+        dir,
+        &[admin.clone(), alice.clone()],
+        Arc::clone(&keyring) as _,
+    );
+    let hook = Hook::answering(|_| true);
+    let _on = SwitchBackOn;
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let launch = main.view.selected_page().expect("the launch tab");
+    set_test_ssh_program(Some(fake));
+
+    // alice: never red, never checked.
+    let (as_alice, list) = new_list(&main, &ctx);
+    click(&list, &alice.id);
+    let alice_terminal = wait_for_session(&as_alice);
+    wait_for_text(&alice_terminal, "FAKE-END");
+    // Only connections from now on: no local pane to check.
+    main.view.close_page(&launch);
+    pump_until("the launch tab closed", || main.view.n_pages() == 1);
+    let checks = root::checks_run();
+    pump_for(Duration::from_millis(1500));
+    assert!(!pane(&as_alice).as_root().get());
+    assert_red(&main, false);
+    assert_plain_tab(&as_alice);
+    assert_eq!(
+        hook.checks_of(&alice_terminal),
+        0,
+        "a connection is not checked"
+    );
+    assert_eq!(root::checks_run(), checks, "no check at all");
+
+    // root: not while it waits for the keyring.
+    keyring.hold();
+    let (as_root, list) = new_list(&main, &ctx);
+    click(&list, &admin.id);
+    let holder = pane(&as_root);
+    pump_until("the pane to say it waits for the keyring", || {
+        labels_in(&holder)
+            .iter()
+            .any(|label| label.label() == WAITING_TEXT && label.is_visible())
+    });
+    assert!(terminal_of(&as_root).is_none(), "it still waits");
+    assert!(!holder.as_root().get());
+    assert_red(&main, false);
+    assert_plain_tab(&as_root);
+    keyring.release();
+    let root_terminal = wait_for_session(&as_root);
+    pump_until("the top bar red", || is_red(&main));
+    assert_red(&main, true);
+    assert_root_tab(&as_root);
+    wait_for_text(&root_terminal, "FAKE-END");
+
+    // The switch off hides it and keeps it: nothing would tell it again.
+    root::set_enabled(false);
+    assert_red(&main, false);
+    assert_plain_tab(&as_root);
+    assert!(holder.as_root().get(), "a profile pane keeps what it is");
+    root::set_enabled(true);
+    assert_red(&main, true);
+    assert_root_tab(&as_root);
+
+    // The connection ends (status 3 keeps the pane, with its note).
+    root_terminal.feed_child(b"\n");
+    wait_for_text(&root_terminal, "[session ended: status 3]");
+    pump_until("the top bar back", || !is_red(&main));
+    assert!(!holder.as_root().get());
+    assert_plain_tab(&as_root);
+    assert_eq!(
+        hook.checks_of(&root_terminal),
+        0,
+        "a connection is not checked"
+    );
+    assert_eq!(hook.checks_of(&alice_terminal), 0);
+
+    set_test_ssh_program(None);
+    main.window.close();
+    pump_for(Duration::from_millis(200));
+}
+
+/// With the switch off a local pane is not checked at all, whatever it prints
+/// or is typed into it, and is not red; on again, it is checked from 500 ms
+/// on, and red again (the hook says it is root).
+pub(super) fn the_switch_stops_the_checks(dir: &Path) {
+    let hook = Hook::answering(|_| true);
+    let _on = SwitchBackOn;
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the launch tab");
+    let holder = pane(&page);
+    let terminal = terminal_of(&page).expect("a local shell");
+    say(&terminal, "red");
+    pump_until("the top bar red", || is_red(&main));
+
+    root::set_enabled(false);
+    assert_red(&main, false);
+    assert_plain_tab(&page);
+    assert!(!holder.as_root().get(), "a local pane's state is forgotten");
+    let checks = root::checks_run();
+    let own = hook.checks_of(&terminal);
+    say(&terminal, "off");
+    assert!(!press(
+        &watch_keys(&terminal),
+        gdk::Key::Return,
+        gdk::ModifierType::empty()
+    ));
+    pump_for(Duration::from_millis(1500));
+    assert_eq!(hook.checks_of(&terminal), own, "not checked while off");
+    assert_eq!(root::checks_run(), checks, "nothing is");
+    assert_red(&main, false);
+
+    root::set_enabled(true);
+    assert_eq!(
+        root::delay_of(&holder),
+        Some(Backoff::FIRST),
+        "checked again from 500 ms"
+    );
+    pump_until("the top bar red again", || is_red(&main));
+    assert_root_tab(&page);
+
+    main.window.close();
     pump_for(Duration::from_millis(200));
 }

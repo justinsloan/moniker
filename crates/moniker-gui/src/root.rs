@@ -21,6 +21,26 @@
 //! * **When to look** is Ptyxis's poll ([`Backoff`]): soon after output, then
 //!   less and less often while nothing changes.
 //!
+//! # Watching
+//!
+//! * **A local pane** (a shell, a command, a Local terminal sequence) is
+//!   watched from the moment its session starts ([`watch_local`], a [`Watch`]
+//!   its holder keeps, so it moves with the pane) until the session ends or
+//!   the pane goes ([`stop`]), hidden tabs included. Its first check comes
+//!   [`Backoff::FIRST`] after the terminal first prints something, and each
+//!   check schedules the next, on the main loop at low priority. The handler
+//!   of the terminal's `contents-changed` does constant work: it never reads
+//!   `/proc` and never restyles, it only compares the delay and, at most,
+//!   moves one timer. Enter, Ctrl+C and Ctrl+D typed in the terminal pull the
+//!   next check in, through a key controller in the capture phase that never
+//!   takes the key. A check is one `tcgetpgrp` and one read of a small `/proc`
+//!   file.
+//! * **A profile pane** is never watched: it is root from the moment its
+//!   connection starts, the jump host's sign-in included, until its `ssh`
+//!   exits, if its profile signs in as `root` (`crate::terminal_tab`).
+//! * **With the switch off nothing is checked** ([`set_enabled`]), and a local
+//!   pane's state is forgotten until its next check once it is on again.
+//!
 //! # Showing
 //!
 //! What was seen is kept on the pane's holder (`PaneHolder::as_root`, set by
@@ -46,13 +66,15 @@
 
 use std::cell::{Cell, RefCell};
 use std::os::fd::BorrowedFd;
+use std::rc::{Rc, Weak};
 use std::time::Duration;
 
-use adw::prelude::*;
-use gtk::gdk;
+use gtk::{gdk, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use rustix::termios::tcgetpgrp;
+use vte4::Terminal;
+use vte4::prelude::*;
 
 use crate::panes;
 use crate::terminal_tab::PaneHolder;
@@ -95,11 +117,31 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// Turn the marks on or off, and show every tab of every main window as it now
-/// is. What each pane's session was seen to be (`PaneHolder::as_root`) is kept
-/// either way.
+/// is.
+///
+/// Off, nothing is checked: every watch's pending check is removed, and what a
+/// local pane was seen to be is forgotten, since nothing would look at it again
+/// while off. A profile pane keeps what it is (its profile's user says it, and
+/// nothing looks again), and [`shown`] hides it. On, every watch checks again
+/// [`Backoff::FIRST`] from now, and a local pane shows its state after that
+/// first check.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn set_enabled(on: bool) {
     ENABLED.set(on);
+    // Collected first: a check scheduled or cancelled borrows nothing of it.
+    let watches: Vec<Rc<Watching>> =
+        WATCHES.with_borrow(|watches| watches.iter().filter_map(Weak::upgrade).collect());
+    for watch in watches {
+        if on {
+            watch.backoff.set(Backoff::new());
+            watch.schedule(Backoff::FIRST);
+        } else {
+            watch.cancel();
+            if let Some(holder) = watch.holder.upgrade() {
+                holder.as_root().set(false);
+            }
+        }
+    }
     for window in gtk::Window::list_toplevels() {
         let Some(main) = window
             .downcast_ref::<gtk::Window>()
@@ -124,7 +166,6 @@ pub(crate) fn shown(holder: &PaneHolder) -> bool {
 /// Say whether the session in the pane of `holder` runs as root (`on`), and
 /// show its pane, tab and window again if that changed. A holder in no pane
 /// layout only keeps the flag.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn show_root(holder: &PaneHolder, on: bool) {
     if holder.as_root().replace(on) != on
         && let Some(layout) = panes::layout_of(holder)
@@ -150,6 +191,276 @@ pub(crate) fn show_in_window(view: &adw::TabView) {
     } else {
         window.remove_css_class(WINDOW_CLASS);
     }
+}
+
+/// What looks whether a local pane's session runs as root, on Ptyxis's
+/// schedule ([`Backoff`]), from the moment the session starts
+/// ([`watch_local`]) until it ends or the pane goes ([`stop`]). The pane's
+/// holder keeps it (`PaneHolder::root_watch`), so it moves with the pane.
+///
+/// It holds the terminal and the holder weakly, so it never keeps a pane
+/// alive. Dropping it removes its timer, its signal handlers and its key
+/// controller.
+pub(crate) struct Watch {
+    inner: Rc<Watching>,
+}
+
+/// The name of a watch's key controller on its terminal ([`watch_local`]).
+pub(crate) const KEYS_NAME: &str = "moniker-root-keys";
+
+/// The state of a [`Watch`], which its timer and its handlers reach weakly.
+struct Watching {
+    terminal: glib::WeakRef<Terminal>,
+    holder: glib::WeakRef<PaneHolder>,
+    keys: glib::WeakRef<gtk::EventControllerKey>,
+    /// The handlers on the terminal: `contents-changed` and `child-exited`.
+    handlers: RefCell<Vec<glib::SignalHandlerId>>,
+    backoff: Cell<Backoff>,
+    /// The pending check: at most one at a time. Its callback takes it out
+    /// before it runs, so a source that has run is never removed.
+    timer: RefCell<Option<glib::SourceId>>,
+    /// The watch was dropped: nothing is scheduled any more.
+    stopped: Cell<bool>,
+}
+
+/// Tests only: a check of a terminal in place of the real one, whether the
+/// program in its foreground runs as root ([`set_test_check`]).
+#[cfg(test)]
+type Check = Rc<dyn Fn(&Terminal) -> bool>;
+
+thread_local! {
+    /// Every watch, to start and stop them all with the switch
+    /// ([`set_enabled`]). Dead ones are pruned as new ones come.
+    static WATCHES: RefCell<Vec<Weak<Watching>>> = const { RefCell::new(Vec::new()) };
+    /// The tests' check in place of the real one ([`set_test_check`]).
+    #[cfg(test)]
+    static TEST_CHECK: RefCell<Option<Check>> = const { RefCell::new(None) };
+    /// How many checks have run ([`checks_run`]).
+    #[cfg(test)]
+    static CHECKS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Watch whether the local session in `terminal`, in the pane of `holder`,
+/// runs as root, from now until it ends: the first check comes
+/// [`Backoff::FIRST`] after the terminal first prints something, and the next
+/// ones on [`Backoff`]'s schedule. Its handler of `contents-changed` does
+/// constant work, on every change the terminal shows; Enter, Ctrl+C and Ctrl+D
+/// typed in it (a key controller in the capture phase, which never takes the
+/// key) pull the next check in to [`Backoff::HURRY`]. The session's end stops
+/// it ([`stop`]).
+pub(crate) fn watch_local(holder: &PaneHolder, terminal: &Terminal) {
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.set_name(Some(KEYS_NAME));
+    let inner = Rc::new(Watching {
+        terminal: terminal.downgrade(),
+        holder: holder.downgrade(),
+        keys: keys.downgrade(),
+        handlers: RefCell::new(Vec::new()),
+        backoff: Cell::new(Backoff::new()),
+        timer: RefCell::new(None),
+        stopped: Cell::new(false),
+    });
+
+    let weak = Rc::downgrade(&inner);
+    let changed = terminal.connect_contents_changed(move |_| {
+        if let Some(inner) = weak.upgrade() {
+            inner.printed();
+        }
+    });
+    let weak = Rc::downgrade(&inner);
+    keys.connect_key_pressed(move |_, key, _, state| {
+        if hurries(key, state)
+            && let Some(inner) = weak.upgrade()
+        {
+            inner.hurry();
+        }
+        glib::Propagation::Proceed
+    });
+    terminal.add_controller(keys);
+    let pane = holder.downgrade();
+    let exited = terminal.connect_child_exited(move |_, _| {
+        if let Some(holder) = pane.upgrade() {
+            stop(&holder);
+        }
+    });
+    inner.handlers.replace(vec![changed, exited]);
+
+    WATCHES.with_borrow_mut(|watches| {
+        watches.retain(|watch| watch.strong_count() > 0);
+        watches.push(Rc::downgrade(&inner));
+    });
+    // Taken out first, so that no borrow is held while an old watch drops.
+    let old = holder.root_watch().replace(Some(Watch { inner }));
+    drop(old);
+}
+
+/// Stop watching the session in the pane of `holder` (it ended, or the pane
+/// went), and show the pane as not root. Nothing is checked for it after this.
+pub(crate) fn stop(holder: &PaneHolder) {
+    let watch = holder.root_watch().take();
+    drop(watch);
+    show_root(holder, false);
+}
+
+/// Whether `key`, typed with `state` held, pulls the next check in: Enter
+/// (Return, keypad Enter or ISO Enter) with any modifiers, or Ctrl+C or Ctrl+D
+/// with Ctrl alone (Caps Lock aside): Ctrl+Shift+C is Copy, not an interrupt.
+fn hurries(key: gdk::Key, state: gdk::ModifierType) -> bool {
+    use gdk::ModifierType as M;
+    // GTK's default modifier mask (`gtk_accelerator_get_default_mod_mask`),
+    // spelled out so that this needs no display.
+    let counted = M::SHIFT_MASK
+        | M::CONTROL_MASK
+        | M::ALT_MASK
+        | M::SUPER_MASK
+        | M::HYPER_MASK
+        | M::META_MASK;
+    match key {
+        gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::ISO_Enter => true,
+        _ => {
+            state & counted == M::CONTROL_MASK
+                && matches!(key.to_lower(), gdk::Key::c | gdk::Key::d)
+        }
+    }
+}
+
+/// Whether the program in the foreground of `terminal` runs as root: the
+/// tests' check if they set one, else [`foreground_is_root`] on its pty.
+fn is_root_now(terminal: &Terminal) -> bool {
+    #[cfg(test)]
+    {
+        CHECKS.set(CHECKS.get() + 1);
+        if let Some(check) = TEST_CHECK.with_borrow(Clone::clone) {
+            return check(terminal);
+        }
+    }
+    terminal
+        .pty()
+        .is_some_and(|pty| foreground_is_root(pty.fd()))
+}
+
+impl Watching {
+    /// The terminal printed something. Constant work: with the switch off,
+    /// nothing; with no check pending, one at the current delay; with one
+    /// pending, moved to [`Backoff::FIRST`] only if the delay was longer.
+    fn printed(self: &Rc<Self>) {
+        if !enabled() {
+            return;
+        }
+        if self.timer.borrow().is_none() {
+            self.schedule(self.backoff.get().delay());
+            return;
+        }
+        let mut backoff = self.backoff.get();
+        if backoff.output() {
+            self.backoff.set(backoff);
+            self.schedule(Backoff::FIRST);
+        }
+    }
+
+    /// Enter, Ctrl+C or Ctrl+D was typed: the next check in
+    /// [`Backoff::HURRY`]. Nothing with the switch off.
+    fn hurry(self: &Rc<Self>) {
+        if !enabled() {
+            return;
+        }
+        let mut backoff = self.backoff.get();
+        let delay = backoff.hurry();
+        self.backoff.set(backoff);
+        self.schedule(delay);
+    }
+
+    /// Check in `delay`, in place of a check pending.
+    fn schedule(self: &Rc<Self>, delay: Duration) {
+        self.cancel();
+        if self.stopped.get() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let source = glib::timeout_add_local_full(delay, glib::Priority::LOW, move || {
+            if let Some(inner) = weak.upgrade() {
+                // This source ends as it returns: it is not to be removed.
+                inner.timer.take();
+                inner.check();
+            }
+            glib::ControlFlow::Break
+        });
+        self.timer.replace(Some(source));
+    }
+
+    /// Remove the check pending, if there is one.
+    fn cancel(&self) {
+        if let Some(source) = self.timer.take() {
+            source.remove();
+        }
+    }
+
+    /// Look whether the session runs as root, show it, and schedule the next
+    /// check: sooner if it changed, later if not. A pane or a terminal that is
+    /// gone, or a terminal no longer in its pane, is not checked.
+    fn check(self: &Rc<Self>) {
+        let (Some(terminal), Some(holder)) = (self.terminal.upgrade(), self.holder.upgrade())
+        else {
+            return;
+        };
+        if self.stopped.get()
+            || !enabled()
+            || terminal.parent().as_ref() != Some(holder.upcast_ref::<gtk::Widget>())
+        {
+            return;
+        }
+        let before = holder.as_root().get();
+        let now = is_root_now(&terminal);
+        show_root(&holder, now);
+        let mut backoff = self.backoff.get();
+        let delay = backoff.checked(now != before);
+        self.backoff.set(backoff);
+        self.schedule(delay);
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        let inner = &self.inner;
+        inner.stopped.set(true);
+        inner.cancel();
+        let handlers = inner.handlers.take();
+        if let Some(terminal) = inner.terminal.upgrade() {
+            for handler in handlers {
+                terminal.disconnect(handler);
+            }
+            if let Some(keys) = inner.keys.upgrade()
+                && keys.widget().as_ref() == Some(terminal.upcast_ref::<gtk::Widget>())
+            {
+                terminal.remove_controller(&keys);
+            }
+        }
+    }
+}
+
+/// Tests only: check terminals with `check` in place of the real check (none:
+/// the real one again). Every scenario that sets one takes it away at its end.
+#[cfg(test)]
+pub(crate) fn set_test_check(check: Option<Check>) {
+    TEST_CHECK.set(check);
+}
+
+/// Tests only: how many checks have run so far, the tests' or the real one.
+#[cfg(test)]
+pub(crate) fn checks_run() -> u32 {
+    CHECKS.get()
+}
+
+/// Tests only: the delay of the watch of `holder`'s pane before its next check
+/// ([`Backoff::delay`]); none while it has no watch.
+#[cfg(test)]
+pub(crate) fn delay_of(holder: &PaneHolder) -> Option<Duration> {
+    holder
+        .root_watch()
+        .borrow()
+        .as_ref()
+        .map(|watch| watch.inner.backoff.get().delay())
 }
 
 /// A color: sRGB channels from 0 to 255 and an opacity from 0 to 1.
@@ -291,8 +602,9 @@ fn contrast(one: Rgba, other: Rgba) -> f64 {
 ///
 /// A window with [`WINDOW_CLASS`] gives libadwaita's header bar variables the
 /// tint, the way GNOME Console does, and its top bar ([`TOP_BARS_CLASS`]) is
-/// drawn in them; a pane header with [`PANE_CLASS`] is drawn in the tint. The
-/// header bar's focused-pane underline is a border and stays.
+/// drawn in them; a pane header with [`PANE_CLASS`] is drawn in the tint. A
+/// pane header's focused underline (`crate::panes`'
+/// `.moniker-pane-header.focused`) is a border and stays.
 pub(crate) fn css(dark: bool, hc: bool) -> String {
     let tint = Tint::for_style(dark, hc);
     let background = tint.background_css();
@@ -361,7 +673,6 @@ pub(crate) fn current_css() -> String {
 /// id of 0, and is root; a root process that dropped to a person has the
 /// opposite and is not. A file without such a line, or with one that does not
 /// parse, is not root.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn effective_uid_is_root(status: &str) -> bool {
     status
         .lines()
@@ -374,7 +685,6 @@ pub(crate) fn effective_uid_is_root(status: &str) -> bool {
 /// Whether process `pid` runs as root, by its `/proc/<pid>/status`. A pid of 0
 /// or below (a group outside our pid namespace has none), a process that is
 /// gone and a file that cannot be read are not root.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn pid_is_root(pid: i32) -> bool {
     pid > 0
         && std::fs::read_to_string(format!("/proc/{pid}/status"))
@@ -384,14 +694,14 @@ pub(crate) fn pid_is_root(pid: i32) -> bool {
 /// Whether the process group in the foreground of the terminal whose pty is
 /// `pty` runs as root, by its leader's id (a group's id is its leader's pid).
 /// Anything that is no terminal, or has no foreground group, is not root.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Neither is a group whose leader has exited while others of it still run:
+/// `/proc/<pgid>` is gone with the leader, as Ptyxis finds it too.
 pub(crate) fn foreground_is_root(pty: BorrowedFd<'_>) -> bool {
     tcgetpgrp(pty).is_ok_and(|group| pid_is_root(group.as_raw_pid()))
 }
 
 /// Whether a profile signs in as root: its user name is exactly `root`. An
 /// account with uid 0 under another name is not seen.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn logs_in_as_root(user: &str) -> bool {
     user == "root"
 }
@@ -408,12 +718,10 @@ pub(crate) fn logs_in_as_root(user: &str) -> bool {
 ///
 /// It only counts delays; the caller owns the timer.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct Backoff {
     delay: Duration,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl Backoff {
     /// The first delay, and the shortest one after a change or output.
     pub(crate) const FIRST: Duration = Duration::from_millis(500);
@@ -552,6 +860,37 @@ mod tests {
             assert!(css.contains(&t.background_css()));
         }
         assert_ne!(css(false, false), css(true, false));
+    }
+
+    #[test]
+    fn enter_ctrl_c_and_ctrl_d_pull_the_next_check_in() {
+        use gdk::{Key, ModifierType as M};
+        let ctrl = M::CONTROL_MASK;
+        for (key, state) in [
+            (Key::Return, M::empty()),
+            (Key::KP_Enter, M::empty()),
+            (Key::ISO_Enter, M::empty()),
+            (Key::Return, M::SHIFT_MASK),
+            (Key::c, ctrl),
+            (Key::d, ctrl),
+            // Caps Lock is not a modifier that counts.
+            (Key::C, ctrl | M::LOCK_MASK),
+            (Key::c, ctrl | M::LOCK_MASK),
+        ] {
+            assert!(hurries(key, state), "{key:?} with {state:?}");
+        }
+        for (key, state) in [
+            (Key::c, M::empty()),
+            (Key::d, M::empty()),
+            (Key::x, ctrl),
+            (Key::z, ctrl),
+            // Ctrl+Shift+C is Copy; Ctrl+Alt+D is not Ctrl+D.
+            (Key::C, ctrl | M::SHIFT_MASK),
+            (Key::d, ctrl | M::ALT_MASK),
+            (Key::space, M::empty()),
+        ] {
+            assert!(!hurries(key, state), "{key:?} with {state:?}");
+        }
     }
 
     #[test]

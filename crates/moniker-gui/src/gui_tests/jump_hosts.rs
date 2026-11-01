@@ -950,11 +950,14 @@ pub(super) fn an_edited_jump_host_still_ends_the_master_it_started(bin: &Path, d
 /// A jump connection that fails (ssh exits with 255, a wrong password say)
 /// leaves ssh's message and Moniker's note in the pane, and the target is never
 /// tried. Nothing went to the background, so no `-O exit` is run. The pane
-/// stays; its transcript is written once.
+/// stays; its transcript is written once. The profile signs in as `root`, so
+/// its pane is red from the jump host's sign-in on (issue #17), and no longer
+/// once that has failed.
 pub(super) fn a_failed_jump_connection_never_tries_the_target(bin: &Path, dir: &Path) {
     let fake = Fake::new(bin, "jh-failed", &dir.join("fake"));
     let bastion = bastion();
-    let web = through(&bastion);
+    let mut web = through(&bastion);
+    web.username = "root".to_owned();
     let run = runtime(dir);
     let ctx = ctx_for(
         dir,
@@ -979,8 +982,12 @@ pub(super) fn a_failed_jump_connection_never_tries_the_target(bin: &Path, dir: &
         .borrow()
         .clone()
         .expect("its shared connection");
+    assert!(holder.as_root().get(), "root while the jump host signs in");
+    assert!(main.window.has_css_class(crate::root::WINDOW_CLASS));
     fake.set("hold-master", false);
     wait_for_text(&terminal, "Could not connect to the jump host bastion.");
+    assert!(!holder.as_root().get(), "not once the sign-in has failed");
+    assert!(!main.window.has_css_class(crate::root::WINDOW_CLASS));
     settled(&link);
     pump_for(Duration::from_millis(300));
     assert!(

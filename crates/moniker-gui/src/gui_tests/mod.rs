@@ -455,6 +455,13 @@ fn gui_integration() {
     root_indicator::rec_and_root_together(&tmp.path().join("root-rec"));
     root_indicator::turning_the_mark_off_hides_everything(&tmp.path().join("root-off"));
     root_indicator::the_tint_follows_light_and_dark(&tmp.path().join("root-tint"));
+    root_indicator::a_local_pane_follows_its_check(&tmp.path().join("root-follows"));
+    root_indicator::the_schedule_backs_off_and_comes_back(&tmp.path().join("root-schedule"));
+    root_indicator::a_real_local_pane_is_not_root(&tmp.path().join("root-real"));
+    root_indicator::an_ended_session_is_not_red(&tmp.path().join("root-ended"));
+    root_indicator::a_closed_pane_stops_its_watch(&tmp.path().join("root-closed"));
+    root_indicator::a_root_profile_is_red_while_connected(&bin, &tmp.path().join("root-profile"));
+    root_indicator::the_switch_stops_the_checks(&tmp.path().join("root-switch"));
     // Issue #9, the Jump Host row on the profile page and in New Profile.
     jump_hosts::the_jump_host_row_offers_usable_profiles(&tmp.path().join("jr-offers"));
     jump_hosts::picking_a_jump_host_saves_it(&tmp.path().join("jr-pick"));

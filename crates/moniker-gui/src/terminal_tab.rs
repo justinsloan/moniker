@@ -8,11 +8,11 @@
 //! and [`start_command`] put a terminal in a pane, and the `open_*` functions
 //! are a new holder page followed by one of those. Everything below that is
 //! said of a tab holds for each pane of a tab with several: its own session,
-//! title, text size, transcript and askpass marker. The tab, the window's
-//! actions and the ☰ menu go by the tab's focused pane. The holder also keeps
-//! what its pane shows ([`PaneKind`]), which a saved session records
-//! (`crate::session_layout`, issue #12), with the folder a local shell last
-//! reported ([`current_folder`]).
+//! title, text size, transcript, askpass marker and root state. The tab, the
+//! window's actions and the ☰ menu go by the tab's focused pane. The holder
+//! also keeps what its pane shows ([`PaneKind`]), which a saved session
+//! records (`crate::session_layout`, issue #12), with the folder a local shell
+//! last reported ([`current_folder`]).
 //!
 //! [`open_profile`] turns a profile into an `ssh` command with
 //! `moniker_core::ssh::terminal_command` and runs it in a VTE tab. The command
@@ -152,6 +152,17 @@
 //! logged. A transcript that cannot be written is reported as a notification in
 //! the window of its tab; a saved one is not announced.
 //!
+//! # Running as root
+//!
+//! A pane shows whether its session runs as root (issue #17, `crate::root`),
+//! as its holder keeps it ([`PaneHolder::as_root`]). A local session is
+//! watched from the moment it starts until it ends or its pane closes
+//! ([`start_shell_in`], [`start_command_in`], [`start_sequence_in`];
+//! [`end_session`]), by a watch the holder keeps ([`PaneHolder::root_watch`]),
+//! so it moves with the pane. A connection is never watched: it is root while
+//! it runs if its profile signs in as `root` ([`Launch::as_root`],
+//! [`start_launch`]), and not once it has ended ([`connection_ended`]).
+//!
 //! # Font and scrollback
 //!
 //! The Preferences' terminal font ([`apply_font`]) applies to every open
@@ -191,7 +202,7 @@ use crate::jump_link::JumpLink;
 use crate::launch_args::{Run, Start, one_line};
 use crate::local_terminal::LocalTerminal;
 use crate::settings::{self, GuiSettings};
-use crate::{panes, theme, zoom};
+use crate::{panes, root, theme, zoom};
 
 pub(crate) use self::holder::PaneHolder;
 
@@ -429,8 +440,9 @@ pub(crate) enum PaneKind {
 
 /// The holder of one pane's session: an empty box that fills the pane, which
 /// later receives a chooser or a terminal. It also keeps the pane's
-/// [`TabTitle`], text size, askpass marker, shared connection to a jump host
-/// and what it shows ([`PaneKind`]), so they move with the pane when it or its
+/// [`TabTitle`], text size, askpass marker, shared connection to a jump host,
+/// what it shows ([`PaneKind`]), and whether its session runs as root with the
+/// watch that looks (`crate::root`), so they move with the pane when it or its
 /// tab is dragged elsewhere.
 mod holder {
     use std::cell::{Cell, RefCell};
@@ -462,6 +474,9 @@ mod holder {
             pub(super) recording: Cell<bool>,
             /// The pane's session runs as root, as last seen (issue #17).
             pub(super) as_root: Cell<bool>,
+            /// What looks whether a local session runs as root, while it runs
+            /// (issue #17).
+            pub(super) root_watch: RefCell<Option<crate::root::Watch>>,
             /// The shared connection of a session through a jump host, until
             /// its connection ends (issue #9).
             pub(super) jump: RefCell<Option<Rc<JumpLink>>>,
@@ -477,6 +492,7 @@ mod holder {
                     kind: RefCell::new(PaneKind::Empty),
                     recording: Cell::new(false),
                     as_root: Cell::new(false),
+                    root_watch: RefCell::new(None),
                     jump: RefCell::new(None),
                 }
             }
@@ -552,6 +568,14 @@ mod holder {
         /// widget is in.)
         pub(crate) fn as_root(&self) -> &Cell<bool> {
             &self.imp().as_root
+        }
+
+        /// The watch that looks whether the pane's local session runs as root
+        /// (`crate::root::watch_local`), from the moment it starts until it
+        /// ends or the pane goes (`crate::root::stop`); `None` for a
+        /// connection, which is never watched. It moves with the pane.
+        pub(crate) fn root_watch(&self) -> &RefCell<Option<crate::root::Watch>> {
+            &self.imp().root_watch
         }
 
         /// The shared connection to the jump host of the pane's session
@@ -1552,6 +1576,9 @@ pub fn terminal_of(page: &adw::TabPage) -> Option<Terminal> {
 /// would live on, and a later prompt of its connection must not find the
 /// marker gone. A child that has already exited released its marker then.
 fn end_session(holder: &PaneHolder) {
+    // Nothing looks at it any more, even if its child outlives the hang-up
+    // (issue #17).
+    root::stop(holder);
     let marker = holder.marker().take();
     let link = holder.jump().take();
     let terminal = holder.first_child().and_downcast::<Terminal>();
@@ -1783,6 +1810,8 @@ fn spawn(terminal: &Terminal, dir: Option<&str>, argv: &[String], envv: &[String
                         if let Some(link) = holder.jump().take() {
                             link.close();
                         }
+                        // Nothing runs: no watch, and not root (issue #17).
+                        root::stop(&holder);
                     }
                     unpark(&terminal);
                 }
@@ -1974,6 +2003,7 @@ pub(crate) fn start_shell_in(
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
     let terminal = begin_session(holder, TabTitle::local());
+    root::watch_local(holder, &terminal);
     // The shell reports its own folder.
     holder.kind().replace(PaneKind::Local { started_in: None });
     // A shell that exits closes its pane, and closing a pane or a tab writes
@@ -2015,6 +2045,7 @@ pub(crate) fn start_command_in(
 ) -> Terminal {
     let program = argv.first().map(String::as_str).unwrap_or_default();
     let terminal = begin_session(holder, TabTitle::program(program));
+    root::watch_local(holder, &terminal);
     // A local terminal for a saved session, in the folder the command really
     // started in; never its command.
     holder.kind().replace(PaneKind::Local {
@@ -2029,6 +2060,8 @@ pub(crate) fn start_command_in(
         // when the pane closes.
         show_note(&terminal, "[could not start: no program to run]");
         holder.child_gone().set(true);
+        // Nothing runs, so there is nothing to watch.
+        root::stop(holder);
     } else {
         spawn(&terminal, folder_to_spawn_in(dir), argv, &[]);
     }
@@ -2068,6 +2101,7 @@ pub(crate) fn start_sequence_in(
     transcript: Option<TranscriptSpec>,
 ) -> Terminal {
     let terminal = begin_session(holder, TabTitle::local());
+    root::watch_local(holder, &terminal);
     // The folder it really starts in, as for a command tab, until the shell it
     // leaves reports its own.
     holder.kind().replace(PaneKind::Local {
@@ -2251,6 +2285,9 @@ pub(crate) struct Launch {
     /// What runs first when the profile goes through a jump host (issue #9):
     /// the jump connection, which signs in to it.
     pub(crate) jump: Option<JumpStage>,
+    /// The profile signs in as `root` (`crate::root::logs_in_as_root`): its
+    /// pane is shown as root while its connection runs (issue #17).
+    pub(crate) as_root: bool,
 }
 
 /// The jump connection of a connection through a jump host: the `ssh` that
@@ -2385,6 +2422,7 @@ pub(crate) fn launch(
             transcript,
             marker: marker_for(ctx, token),
             jump: None,
+            as_root: root::logs_in_as_root(&profile.username),
         });
     };
     let Some(socket) = jump_socket(ctx.runtime_dir.as_deref(), &jump.name) else {
@@ -2424,6 +2462,7 @@ pub(crate) fn launch(
             marker: marker_for(ctx, jump_token),
             link: Rc::new(JumpLink::new(socket, check, exit)),
         }),
+        as_root: root::logs_in_as_root(&profile.username),
     })
 }
 
@@ -2557,6 +2596,12 @@ pub(crate) fn start_profile(
 /// Start what `launched` says in the pane of `holder`, which has not run a
 /// session yet: the connection, after its jump connection if it has one. Every
 /// command goes through the tests' program hook ([`set_test_ssh_program`]).
+///
+/// A profile that signs in as `root` has its pane shown as root from here, the
+/// jump host's sign-in included, until its connection ends
+/// ([`connection_ended`], or the jump host's failed sign-in in
+/// [`start_through_jump`]). A connection is never watched (`crate::root`): its
+/// terminal runs `ssh`, which runs as the person.
 fn start_launch(holder: &PaneHolder, launched: Launch) {
     let Launch {
         title,
@@ -2564,6 +2609,7 @@ fn start_launch(holder: &PaneHolder, launched: Launch) {
         transcript,
         marker,
         jump,
+        as_root,
     } = launched;
     let command = test_hook::command(command);
     match jump {
@@ -2578,6 +2624,7 @@ fn start_launch(holder: &PaneHolder, launched: Launch) {
             start_through_jump(holder, &title, command, transcript, marker, stage);
         }
     }
+    root::show_root(holder, as_root);
 }
 
 /// Show `note` in the pane of `holder` (which has not run a session yet),
@@ -2753,6 +2800,8 @@ fn connection_ended(
     if !shows(holder, terminal) {
         return;
     }
+    // Not root any more, whoever it signed in as (issue #17).
+    root::show_root(holder, false);
     match exit_action(status) {
         ExitAction::Close => close_pane(holder),
         ExitAction::Keep { note } => show_note(terminal, &note),
@@ -2842,6 +2891,8 @@ fn start_through_jump(
             if let Some(session) = &session {
                 session.write_transcript_once();
             }
+            // The connection is over before it began (issue #17).
+            root::show_root(&holder, false);
             show_note(terminal, &jump_failed_note(&name));
             return;
         }
