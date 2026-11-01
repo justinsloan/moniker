@@ -26,6 +26,7 @@ mod form;
 #[cfg(test)]
 mod gui_tests;
 mod hosts;
+mod jump_link;
 mod keyring;
 mod launch_args;
 mod local_only;

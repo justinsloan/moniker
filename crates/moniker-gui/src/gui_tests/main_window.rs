@@ -441,7 +441,8 @@ fn the_connect_time_choice_decides_whether_a_transcript_is_written(bin: &Path, d
 
         let fx = fixture();
         let page = new_holder_page(&fx.view, "x");
-        let mut launched = launch(&pane(&page), &p, sequence, record, &ctx, &case, false);
+        let mut launched = launch(&pane(&page), &p, sequence, record, &ctx, &case, false, None)
+            .expect("a direct connection");
         launched.command.program = fake.clone();
         assert_eq!(launched.transcript.is_some(), expect_file);
 

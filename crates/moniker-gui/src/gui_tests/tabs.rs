@@ -376,7 +376,17 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
     // one (ssh asks in the terminal) and a notification says why, in the tab's
     // window.
     let (ctx, _attached, _secrets) = launch_ctx(dir, dir.join("no-such-helper"));
-    let launched = launch(&pane(&page), &p, None, false, &ctx, &transcripts, true);
+    let launched = launch(
+        &pane(&page),
+        &p,
+        None,
+        false,
+        &ctx,
+        &transcripts,
+        true,
+        None,
+    )
+    .expect("a direct connection");
     assert!(
         launched.command.env.is_empty(),
         "{:?}",
@@ -389,7 +399,17 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
 
     // The helper is there: ssh is pointed at it and nothing is said.
     let (ctx, _area, _secrets) = launch_ctx(dir, make_helper(dir));
-    let launched = launch(&pane(&page), &p, None, false, &ctx, &transcripts, true);
+    let launched = launch(
+        &pane(&page),
+        &p,
+        None,
+        false,
+        &ctx,
+        &transcripts,
+        true,
+        None,
+    )
+    .expect("a direct connection");
     let names: Vec<&str> = launched
         .command
         .env
@@ -414,7 +434,17 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
 
     // No password stored and no helper: nothing to explain.
     let (ctx, _area, _secrets) = launch_ctx(dir, dir.join("no-such-helper"));
-    let launched = launch(&pane(&page), &p, None, false, &ctx, &transcripts, false);
+    let launched = launch(
+        &pane(&page),
+        &p,
+        None,
+        false,
+        &ctx,
+        &transcripts,
+        false,
+        None,
+    )
+    .expect("a direct connection");
     assert!(launched.command.env.is_empty());
     assert!(launched.marker.is_none());
     assert_eq!(ctx.notice.last_text(), None);
@@ -467,7 +497,9 @@ pub(super) fn the_marker_is_released_when_the_session_ends(bin: &Path, dir: &Pat
             &ctx,
             &dir.join("transcripts"),
             true,
-        );
+            None,
+        )
+        .expect("a direct connection");
         launched.command.program = fake;
         let token = launched
             .command

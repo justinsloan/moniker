@@ -15,7 +15,7 @@
 //! The scenarios live in one file per area ([`tabs`], [`main_window`],
 //! [`windows`], [`save_transcripts`], [`transcript_indicator`],
 //! [`preferences`], [`notifications`], [`sync`], [`profiles`], [`recordings`],
-//! [`sessions`], [`local_terminal`]);
+//! [`sessions`], [`local_terminal`], [`jump_hosts`]);
 //! this file holds the test function that calls them, the helpers they
 //! share, and [`markup_is_shown_literally_everywhere`], the one scenario that
 //! spans the areas. The transcripts go to a temporary directory the tests pass
@@ -48,6 +48,7 @@ use crate::terminal_tab::{
 use crate::{form, new_tab, window};
 
 mod hosts;
+mod jump_hosts;
 mod local_terminal;
 mod main_window;
 mod notifications;
@@ -446,6 +447,27 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #9, a pane connecting through its profile's jump host.
+    jump_hosts::a_profile_connects_through_its_jump_host(&bin, &tmp.path().join("jh-connect"));
+    jump_hosts::closing_the_pane_ends_its_shared_connection(&bin, &tmp.path().join("jh-close"));
+    jump_hosts::two_panes_keep_their_own_shared_connections(&bin, &tmp.path().join("jh-two"));
+    jump_hosts::an_edited_jump_host_still_ends_the_master_it_started(
+        &bin,
+        &tmp.path().join("jh-edited"),
+    );
+    jump_hosts::a_failed_jump_connection_never_tries_the_target(&bin, &tmp.path().join("jh-fail"));
+    jump_hosts::a_waiting_profile_connects_nowhere(&bin, &tmp.path().join("jh-waiting"));
+    jump_hosts::a_jump_host_gone_while_the_keyring_waits_connects_nowhere(
+        &bin,
+        &tmp.path().join("jh-held"),
+    );
+    jump_hosts::no_private_runtime_folder_connects_nowhere(&bin, &tmp.path().join("jh-no-run"));
+    jump_hosts::the_jump_host_s_password_needs_the_helper_too(&bin, &tmp.path().join("jh-helper"));
+    jump_hosts::a_restored_layout_pane_goes_through_its_jump_host(
+        &bin,
+        &tmp.path().join("jh-layout"),
+    );
+    jump_hosts::rec_lasts_from_the_jump_host_to_the_target_s_end(&bin, &tmp.path().join("jh-rec"));
     // Issue #13, startup sequences for the local terminal.
     local_terminal::a_plain_pick_runs_the_default_and_leaves_a_shell(&tmp.path().join("ls-pick"));
     local_terminal::the_choices_offer_just_open_and_each_sequence(&tmp.path().join("ls-choices"));

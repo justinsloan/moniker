@@ -68,6 +68,23 @@
 //! in the runtime directory, gone at logout), which is always safe. A tab
 //! moving to another window takes it along and removes nothing.
 //!
+//! # Jump hosts
+//!
+//! A profile with a jump host (issue #9) connects through it in two steps on
+//! the pane's one terminal ([`start_through_jump`]), each an `ssh` that Moniker
+//! starts itself, so that the askpass helper answers each one's own password
+//! prompt from that profile's stored password, with a one-time marker of its
+//! own, and never a hop's: first the jump connection, which signs in to the
+//! jump host as the master of a shared connection and goes to the background,
+//! then the profile's own `ssh`, through that master. The pane keeps the
+//! shared connection (`crate::jump_link`, with the holder, so it moves with the
+//! pane) and ends its master when its connection ends, by itself or because
+//! the pane, its tab or its window closed ([`end_session`]). A profile whose
+//! jump host is not saved here or goes through one of its own, or that finds
+//! no private runtime folder for the shared connection's socket, connects
+//! nowhere: its pane says why and runs nothing ([`launch`], [`start_profile`]).
+//! None ever connects directly in its place.
+//!
 //! # Copy and paste
 //!
 //! Ctrl+Shift+C and Ctrl+Shift+V are the main window's `win.copy` and
@@ -158,6 +175,7 @@ use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::askpass::{AskpassToken, release_marker};
+use moniker_core::jump::{JumpSocket, PaneCommands, pane_commands, route};
 use moniker_core::profile::{Profile, StartupSequence};
 use moniker_core::secrets::{SecretStore, password_key};
 use moniker_core::ssh::{SshCommand, local_command, terminal_command};
@@ -169,6 +187,7 @@ use vte4::prelude::*;
 use vte4::{Format, PtyFlags, Terminal};
 
 use crate::context::{AppContext, Notice};
+use crate::jump_link::JumpLink;
 use crate::launch_args::{Run, Start, one_line};
 use crate::local_terminal::LocalTerminal;
 use crate::settings::{self, GuiSettings};
@@ -410,10 +429,12 @@ pub(crate) enum PaneKind {
 
 /// The holder of one pane's session: an empty box that fills the pane, which
 /// later receives a chooser or a terminal. It also keeps the pane's
-/// [`TabTitle`], text size, askpass marker and what it shows ([`PaneKind`]),
-/// so they move with the pane when it or its tab is dragged elsewhere.
+/// [`TabTitle`], text size, askpass marker, shared connection to a jump host
+/// and what it shows ([`PaneKind`]), so they move with the pane when it or its
+/// tab is dragged elsewhere.
 mod holder {
     use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     use gtk::glib;
     use gtk::prelude::*;
@@ -421,6 +442,7 @@ mod holder {
     use gtk4 as gtk;
 
     use super::{FALLBACK_TITLE, OneTimeMarker, PaneKind, TabTitle, zoom};
+    use crate::jump_link::JumpLink;
 
     mod imp {
         use super::*;
@@ -438,6 +460,9 @@ mod holder {
             pub(super) kind: RefCell<PaneKind>,
             /// The pane's session saves a transcript that is not written yet.
             pub(super) recording: Cell<bool>,
+            /// The shared connection of a session through a jump host, until
+            /// its connection ends (issue #9).
+            pub(super) jump: RefCell<Option<Rc<JumpLink>>>,
         }
 
         impl Default for PaneHolder {
@@ -449,6 +474,7 @@ mod holder {
                     scale: Cell::new(zoom::DEFAULT),
                     kind: RefCell::new(PaneKind::Empty),
                     recording: Cell::new(false),
+                    jump: RefCell::new(None),
                 }
             }
         }
@@ -514,6 +540,15 @@ mod holder {
         /// REC meanwhile (`crate::panes`).
         pub(crate) fn recording(&self) -> &Cell<bool> {
             &self.imp().recording
+        }
+
+        /// The shared connection to the jump host of the pane's session
+        /// (`crate::jump_link`), from the moment the session starts until its
+        /// connection ends; `None` for a session that does not go through a
+        /// jump host. It moves with the pane, so closing the tab a pane left
+        /// ends nothing of it.
+        pub(crate) fn jump(&self) -> &RefCell<Option<Rc<JumpLink>>> {
+            &self.imp().jump
         }
     }
 }
@@ -1506,6 +1541,7 @@ pub fn terminal_of(page: &adw::TabPage) -> Option<Terminal> {
 /// marker gone. A child that has already exited released its marker then.
 fn end_session(holder: &PaneHolder) {
     let marker = holder.marker().take();
+    let link = holder.jump().take();
     let terminal = holder.first_child().and_downcast::<Terminal>();
     while let Some(child) = holder.first_child() {
         holder.remove(&child);
@@ -1518,6 +1554,13 @@ fn end_session(holder: &PaneHolder) {
     }
     // Otherwise there is no child, and no marker is left to release: the
     // child's exit released it.
+    //
+    // Then the shared connection to a jump host the session went through, if
+    // its connection had not ended already (issue #9): its master is ended
+    // once the `ssh` that went through it was hung up.
+    if let Some(link) = link {
+        link.close();
+    }
 }
 
 thread_local! {
@@ -1719,9 +1762,15 @@ fn spawn(terminal: &Terminal, dir: Option<&str>, argv: &[String], envv: &[String
                 eprintln!("{}", start_failure_log(&program, err.message()));
                 if let Some(terminal) = weak.upgrade() {
                     show_note(&terminal, &start_failure_note(&program, err.message()));
-                    // No child: nothing to wait for when the tab closes.
+                    // No child: nothing to wait for when the tab closes. A
+                    // connection through a jump host that cannot go on (its
+                    // jump connection or its own `ssh` did not start) ends its
+                    // shared connection now.
                     if let Some(holder) = terminal.parent().and_downcast::<PaneHolder>() {
                         holder.child_gone().set(true);
+                        if let Some(link) = holder.jump().take() {
+                            link.close();
+                        }
                     }
                     unpark(&terminal);
                 }
@@ -2159,12 +2208,38 @@ impl OneTimeMarker {
 /// Everything needed to open the tab for a connection to a profile.
 pub(crate) struct Launch {
     pub(crate) title: String,
+    /// The profile's own `ssh`; when the profile has a jump host, it goes
+    /// through the shared connection of [`jump`](Launch::jump) (its
+    /// `ProxyCommand`).
     pub(crate) command: SshCommand,
     pub(crate) transcript: Option<TranscriptSpec>,
     /// The connection's one-time askpass marker, for the tab to remove when the
     /// session is over. `None` without a token, or without a runtime directory
     /// (then the helper cannot make one either).
     pub(crate) marker: Option<OneTimeMarker>,
+    /// What runs first when the profile goes through a jump host (issue #9):
+    /// the jump connection, which signs in to it.
+    pub(crate) jump: Option<JumpStage>,
+}
+
+/// The jump connection of a connection through a jump host: the `ssh` that
+/// signs in to the jump host as the master of a shared connection, with a
+/// one-time askpass marker of its own, and the link that ends that master when
+/// the pane's connection ends (`crate::jump_link`).
+pub(crate) struct JumpStage {
+    /// The jump host's profile name, for what a failure says.
+    pub(crate) name: String,
+    pub(crate) master: SshCommand,
+    /// The master's one-time askpass marker, as [`Launch::marker`] is the
+    /// target's.
+    pub(crate) marker: Option<OneTimeMarker>,
+    pub(crate) link: Rc<JumpLink>,
+}
+
+/// What a pane says when its jump host's `ssh` did not sign in (a wrong
+/// password, an unreachable host, a refused host key), below ssh's own message.
+fn jump_failed_note(name: &str) -> String {
+    format!("Could not connect to the jump host {name}.")
 }
 
 /// Work out the pane for connecting to `profile` with its startup sequence
@@ -2175,6 +2250,22 @@ pub(crate) struct Launch {
 /// stored password cannot be used, in the window of `holder`, the pane being
 /// opened: a connection started from the Connection Profiles window opens its
 /// tab in a main window, and that is where the note belongs.
+///
+/// A profile with a jump host (issue #9) goes where `moniker_core::jump::route`
+/// says with the window's profiles as they are now: through the jump host, with
+/// a [`JumpStage`] that signs in to it first (`moniker_core::jump::pane_commands`
+/// builds the commands of both). `jump_with_password` is the id of the jump host
+/// the keyring found a stored password for: any other one (the profile was given
+/// another jump host since the keyring was asked) counts as having none, and ssh
+/// asks for its password in the terminal (plan Ruling R4). The jump host's
+/// stored password needs the askpass helper, as the profile's does.
+///
+/// `Err` is the note of a connection that must not start at all, never a direct
+/// connection in its place: the route's refusal (the jump host is not saved
+/// here, or goes through a jump host of its own), no private runtime folder for
+/// the shared connection's socket (`moniker_core::jump::JumpSocket`), or a jump
+/// host whose user name or host cannot go in the hop's command.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn launch(
     holder: &PaneHolder,
     profile: &Profile,
@@ -2183,20 +2274,86 @@ pub(crate) fn launch(
     ctx: &AppContext,
     transcript_dir: &Path,
     has_password: bool,
-) -> Launch {
-    if let Some(note) = askpass_notice(has_password, &ctx.askpass_path) {
+    jump_with_password: Option<&str>,
+) -> Result<Launch, String> {
+    // Bind first so the store borrow ends here.
+    let jump = {
+        let store = ctx.store.borrow();
+        let route = route(profile, |id| store.get(id));
+        match route.refusal() {
+            Some(refusal) => Err(refusal),
+            None => Ok(route.jump().cloned()),
+        }
+    }?;
+    let transcript = transcript_spec(profile, record, transcript_dir, &ctx.notice);
+    let Some(jump) = jump else {
+        if let Some(note) = askpass_notice(has_password, &ctx.askpass_path) {
+            ctx.notice.show_near(holder, note);
+        }
+        let (command, token) =
+            connection_command(profile, sequence, &ctx.askpass_path, has_password);
+        return Ok(Launch {
+            title: tab_title(profile),
+            command,
+            transcript,
+            marker: marker_for(ctx, token),
+            jump: None,
+        });
+    };
+    let socket = ctx
+        .runtime_dir
+        .as_deref()
+        .and_then(|dir| JumpSocket::new(dir).ok())
+        .ok_or_else(|| {
+            format!(
+                "Could not connect through the jump host {}: there is no private runtime \
+                 folder for its shared connection.",
+                jump.name
+            )
+        })?;
+    let jump_has_password = jump_with_password == Some(jump.id.as_str());
+    if let Some(note) = askpass_notice(has_password || jump_has_password, &ctx.askpass_path) {
         ctx.notice.show_near(holder, note);
     }
-    let (command, token) = connection_command(profile, sequence, &ctx.askpass_path, has_password);
-    let marker = token
-        .zip(ctx.runtime_dir.clone())
-        .map(|(token, dir)| OneTimeMarker::new(dir, token));
-    Launch {
+    let usable = askpass_usable(&ctx.askpass_path);
+    let token = (has_password && usable).then(AskpassToken::new);
+    let jump_token = (jump_has_password && usable).then(AskpassToken::new);
+    let startup = sequence.and_then(|i| profile.sequences.get(i));
+    let PaneCommands {
+        master,
+        target,
+        check,
+        exit,
+    } = pane_commands(
+        profile,
+        startup,
+        &jump,
+        &socket,
+        &ctx.askpass_path,
+        token.as_ref(),
+        jump_token.as_ref(),
+    )
+    .ok_or_else(|| format!("Could not connect through the jump host {}.", jump.name))?;
+    Ok(Launch {
         title: tab_title(profile),
-        command,
-        transcript: transcript_spec(profile, record, transcript_dir, &ctx.notice),
-        marker,
-    }
+        command: target,
+        transcript,
+        marker: marker_for(ctx, token),
+        jump: Some(JumpStage {
+            name: jump.name.clone(),
+            master,
+            marker: marker_for(ctx, jump_token),
+            link: Rc::new(JumpLink::new(socket, check, exit)),
+        }),
+    })
+}
+
+/// The one-time marker of a connection whose `ssh` was given `token`, in the
+/// runtime directory where the helper makes it; none without either.
+fn marker_for(ctx: &AppContext, token: Option<AskpassToken>) -> Option<OneTimeMarker> {
+    token
+        .zip(ctx.runtime_dir.clone())
+        .map(|(token, dir)| OneTimeMarker::new(dir, token))
 }
 
 /// Connect to `profile` in a new tab, running its startup sequence number
@@ -2233,6 +2390,14 @@ pub fn open_profile(
 /// port changed just before connecting) run first on the same worker, and the
 /// window has read the file again by then (issue #7). The startup sequence is
 /// the one the person picked, as they saw it.
+///
+/// A profile with a jump host (issue #9) has the keyring asked, in the same
+/// job, for the stored password of the jump host its route names when it is
+/// picked; when the answer is back the route is worked out again ([`launch`],
+/// plan Ruling R4). A profile whose route is refused when it is picked (its
+/// jump host is not saved, or goes through one of its own) asks the keyring
+/// nothing and shows why at once ([`refuse`]); one refused by then shows why
+/// too. Neither ever connects directly.
 pub(crate) fn start_profile(
     holder: &PaneHolder,
     ctx: &Rc<AppContext>,
@@ -2240,7 +2405,6 @@ pub(crate) fn start_profile(
     sequence: Option<usize>,
     record: bool,
 ) {
-    let waiting = show_waiting(holder);
     // The profile's pane from now on, also while it waits and after its
     // session has ended.
     holder.kind().replace(PaneKind::Profile {
@@ -2254,14 +2418,37 @@ pub(crate) fn start_profile(
         .borrow_mut()
         .adopt(TabTitle::remote(tab_title(profile)));
     refresh_title(holder);
+    // Bind first so the store borrow ends here.
+    let picked = {
+        let store = ctx.store.borrow();
+        let route = route(profile, |id| store.get(id));
+        match route.refusal() {
+            Some(refusal) => Err(refusal),
+            None => Ok(route.jump().cloned()),
+        }
+    };
+    let asked_jump = match picked {
+        Ok(jump) => jump,
+        Err(refusal) => {
+            refuse(holder, &tab_title(profile), &refusal);
+            return;
+        }
+    };
+    let waiting = show_waiting(holder);
     let asked = profile.clone();
     let profile = profile.clone();
     let holder = holder.downgrade();
     let ctx_done = Rc::clone(ctx);
     crate::keyring::read(
         ctx,
-        move |secrets| has_stored_password(&asked, secrets),
-        move |has_password| {
+        move |secrets| {
+            let has_password = has_stored_password(&asked, secrets);
+            let jump_with_password = asked_jump
+                .filter(|jump| has_stored_password(jump, secrets))
+                .map(|jump| jump.id);
+            (has_password, jump_with_password)
+        },
+        move |answer| {
             let ctx = ctx_done;
             let Some(holder) = holder.upgrade() else {
                 return;
@@ -2280,29 +2467,60 @@ pub(crate) fn start_profile(
                 }
                 None => profile,
             };
-            let Launch {
-                title,
-                command,
-                transcript,
-                marker,
-            } = launch(
+            let (has_password, jump_with_password) = answer.unwrap_or((false, None));
+            let launched = launch(
                 &holder,
                 &profile,
                 sequence,
                 record,
                 &ctx,
                 &ctx.transcripts_dir(),
-                has_password.unwrap_or(false),
+                has_password,
+                jump_with_password.as_deref(),
             );
-            start_command(
-                &holder,
-                &title,
-                test_hook::command(command),
-                transcript,
-                marker,
-            );
+            match launched {
+                Ok(launched) => start_launch(&holder, launched),
+                Err(note) => refuse(&holder, &tab_title(&profile), &note),
+            }
         },
     );
+}
+
+/// Start what `launched` says in the pane of `holder`, which has not run a
+/// session yet: the connection, after its jump connection if it has one. Every
+/// command goes through the tests' program hook ([`set_test_ssh_program`]).
+fn start_launch(holder: &PaneHolder, launched: Launch) {
+    let Launch {
+        title,
+        command,
+        transcript,
+        marker,
+        jump,
+    } = launched;
+    let command = test_hook::command(command);
+    match jump {
+        None => {
+            start_command(holder, &title, command, transcript, marker);
+        }
+        Some(stage) => {
+            let stage = JumpStage {
+                master: test_hook::command(stage.master),
+                ..stage
+            };
+            start_through_jump(holder, &title, command, transcript, marker, stage);
+        }
+    }
+}
+
+/// Show `note` in the pane of `holder` (which has not run a session yet),
+/// titled `title`, in place of a connection that must not start: a terminal
+/// that shows the note and runs nothing. With no child there is no transcript
+/// and no REC, and closing the pane has nothing to hang up; the pane stays
+/// until it is closed.
+fn refuse(holder: &PaneHolder, title: &str, note: &str) {
+    let terminal = begin_session(holder, TabTitle::remote(title.to_owned()));
+    holder.child_gone().set(true);
+    show_note(&terminal, note);
 }
 
 /// How long a tab waits for the keyring before it says so: a quick answer
@@ -2365,9 +2583,11 @@ pub(crate) fn set_test_ssh_program(program: Option<String>) {
     test_hook::PROGRAM.replace(program);
 }
 
-/// Where [`set_test_ssh_program`] takes effect. Outside tests the command is
-/// passed on untouched.
-mod test_hook {
+/// Where [`set_test_ssh_program`] takes effect: every command a pane runs goes
+/// through [`command`](test_hook::command), the commands of its shared
+/// connection to a jump host too (`crate::jump_link`). Outside tests the
+/// command is passed on untouched.
+pub(crate) mod test_hook {
     use moniker_core::ssh::SshCommand;
 
     #[cfg(test)]
@@ -2377,7 +2597,7 @@ mod test_hook {
     }
 
     #[cfg(test)]
-    pub(super) fn command(mut cmd: SshCommand) -> SshCommand {
+    pub(crate) fn command(mut cmd: SshCommand) -> SshCommand {
         if let Some(program) = PROGRAM.with_borrow(Clone::clone) {
             cmd.program = program;
         }
@@ -2385,7 +2605,7 @@ mod test_hook {
     }
 
     #[cfg(not(test))]
-    pub(super) fn command(cmd: SshCommand) -> SshCommand {
+    pub(crate) fn command(cmd: SshCommand) -> SshCommand {
         cmd
     }
 }
@@ -2431,22 +2651,138 @@ pub(crate) fn start_command(
         holder,
         #[strong]
         session,
-        move |terminal, status| {
-            // `ssh` is gone: no prompt of this connection can come any more.
-            if let Some(marker) = holder.marker().take() {
-                marker.release();
-            }
-            if let Some(session) = &session {
-                session.write_transcript_once();
-            }
-            match exit_action(status) {
-                ExitAction::Close => close_pane(&holder),
-                ExitAction::Keep { note } => show_note(terminal, &note),
-            }
-        }
+        move |terminal, status| connection_ended(&holder, terminal, session.as_ref(), status)
     ));
 
     let (argv, envv) = spawn_args(&cmd);
+    spawn(&terminal, None, &argv, &envv);
+    terminal
+}
+
+/// The connection shown in `terminal`, in the pane of `holder`, has ended with
+/// `status`: its `ssh` is gone, so no prompt of it can come any more and its
+/// one-time marker goes; the shared connection to its jump host, if it went
+/// through one, is ended (`crate::jump_link`); its transcript is written; and
+/// the pane closes after a clean exit or keeps the note after any other end.
+///
+/// A terminal no longer in its pane (the pane was closed, which hung its child
+/// up and took the marker and the shared connection) leaves the pane alone.
+fn connection_ended(
+    holder: &PaneHolder,
+    terminal: &Terminal,
+    session: Option<&Rc<Session>>,
+    status: i32,
+) {
+    if let Some(marker) = holder.marker().take() {
+        marker.release();
+    }
+    if let Some(link) = holder.jump().take() {
+        link.close();
+    }
+    if let Some(session) = session {
+        session.write_transcript_once();
+    }
+    if !shows(holder, terminal) {
+        return;
+    }
+    match exit_action(status) {
+        ExitAction::Close => close_pane(holder),
+        ExitAction::Keep { note } => show_note(terminal, &note),
+    }
+}
+
+/// Whether the pane of `holder` still shows `terminal`.
+fn shows(holder: &PaneHolder, terminal: &Terminal) -> bool {
+    terminal.parent().as_ref() == Some(holder.upcast_ref::<gtk::Widget>())
+}
+
+/// [`start_command`] for a connection through a jump host (issue #9): first
+/// `stage`'s jump connection, then `cmd`, the profile's own `ssh`, both on the
+/// same terminal and both children of Moniker itself, so that the askpass
+/// helper answers each one's own password prompt and never another's.
+///
+/// The master signs in to the jump host with its own one-time marker, its
+/// prompts and messages in the pane (its host key the first time, a password
+/// that is not stored), and goes to the background once signed in. When it
+/// exits its marker goes, and then:
+///
+/// * with success, the target runs on the same terminal at once (a master that
+///   nothing attaches to ends by itself soon after it signed in), with its own
+///   marker, while the pane learns the master's process
+///   ([`JumpLink::learn_pid`]); from then on the connection ends as one
+///   without a jump host does ([`connection_ended`]), and ends the shared
+///   connection with it;
+/// * with any other end (a wrong password, an unreachable host, a refused host
+///   key), the target is never tried: the shared connection is ended, the
+///   transcript is written, and the pane keeps ssh's message with a note of
+///   Moniker's below it ([`jump_failed_note`]).
+///
+/// The transcript and REC cover both: one recording from the jump host's
+/// sign-in to the target's end. Closing the pane while the master signs in
+/// hangs it up ([`end_session`]); one that got through all the same went to
+/// the background by then, and is ended once its process is known.
+fn start_through_jump(
+    holder: &PaneHolder,
+    title: &str,
+    cmd: SshCommand,
+    transcript: Option<TranscriptSpec>,
+    marker: Option<OneTimeMarker>,
+    stage: JumpStage,
+) -> Terminal {
+    let JumpStage {
+        name,
+        master,
+        marker: master_marker,
+        link,
+    } = stage;
+    let terminal = begin_session(holder, TabTitle::remote(title.to_owned()));
+    holder.marker().replace(master_marker);
+    holder.jump().replace(Some(Rc::clone(&link)));
+    let session = start_recording(&terminal, transcript);
+    // The target and its marker, until the jump host has signed in.
+    let next = RefCell::new(Some((cmd, marker)));
+    let pane = holder.downgrade();
+
+    terminal.connect_child_exited(move |terminal, status| {
+        let holder = pane.upgrade();
+        let Some((cmd, marker)) = next.take() else {
+            // The target's exit.
+            if let Some(holder) = &holder {
+                connection_ended(holder, terminal, session.as_ref(), status);
+            }
+            return;
+        };
+        // The master's exit: no prompt of its sign-in can come any more.
+        let Some(holder) = holder.filter(|holder| shows(holder, terminal)) else {
+            // Its pane was closed while it signed in: it was hung up, and its
+            // marker goes with the closed pane's terminal (`park`). One that
+            // signed in all the same is in the background now.
+            if status == 0 {
+                link.learn_pid();
+            }
+            return;
+        };
+        if let Some(marker) = holder.marker().take() {
+            marker.release();
+        }
+        if status != 0 {
+            holder.jump().take();
+            link.close();
+            if let Some(session) = &session {
+                session.write_transcript_once();
+            }
+            show_note(terminal, &jump_failed_note(&name));
+            return;
+        }
+        // Signed in: the target, on the same terminal.
+        holder.child_gone().set(false);
+        holder.marker().replace(marker);
+        link.learn_pid();
+        let (argv, envv) = spawn_args(&cmd);
+        spawn(terminal, None, &argv, &envv);
+    });
+
+    let (argv, envv) = spawn_args(&master);
     spawn(&terminal, None, &argv, &envv);
     terminal
 }
