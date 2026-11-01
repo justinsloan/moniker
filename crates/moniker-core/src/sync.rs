@@ -1124,9 +1124,12 @@ pub fn run_client(
 /// A completed exchange is `Ok` whatever the exit status.
 ///
 /// With `jump`, whose [`hop`](JumpLeg::hop) `cmd` is to carry as its
-/// `ProxyCommand`, the leg's master signs in to the jump host before `cmd`
-/// starts, within the same limit, and is ended when this returns, whatever
-/// happens after it signed in, a panic included (see `sign_in_to_jump_host`).
+/// `ProxyCommand` (`-o ProxyCommand=<hop>` among its options; a `cmd` that does
+/// not is an [`io::ErrorKind::InvalidInput`] error, and nothing starts, so a
+/// caller cannot sign in to the jump host and reach the partner directly), the
+/// leg's master signs in to the jump host before `cmd` starts, within the same
+/// limit, and is ended when this returns, whatever happens after it signed in,
+/// a panic included (see `sign_in_to_jump_host`).
 /// A master that fails stops the sync before `cmd` starts:
 /// [`SyncError::JumpHostKeyUnknown`] when its stderr says "Host key
 /// verification failed", else [`SyncError::JumpFailed`].
@@ -1180,6 +1183,14 @@ fn sync_over_ssh_with_timeout(
     check_passphrase(passphrase)?;
     local.ready()?;
     check_not_away(&*local, stale)?;
+    // Fail closed: a leg's master signs in to the jump host only for a command
+    // that goes through it, or the sync would reach the partner directly.
+    if jump.is_some_and(|leg| !goes_through(cmd, leg)) {
+        return Err(SyncError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the sync's ssh does not go through the jump host",
+        )));
+    }
     let deadline = Instant::now() + timeout;
     // Declared before the child, so it is dropped after it: the master is
     // ended once the sync's own ssh is gone, on every path, panics included.
@@ -1237,6 +1248,18 @@ fn sync_over_ssh_with_timeout(
     }
 }
 
+/// Whether `cmd` takes `leg`'s hop as the `ProxyCommand` option of its `ssh`
+/// (`-o ProxyCommand=<hop>` before the `--` that ends the options), as
+/// `crate::ssh::sync_command` builds it for its `proxy`.
+fn goes_through(cmd: &SshCommand, leg: &JumpLeg) -> bool {
+    let option = format!("ProxyCommand={}", leg.hop);
+    let end = cmd.args.iter().position(|arg| arg == "--");
+    let options = &cmd.args[..end.unwrap_or(cmd.args.len())];
+    options
+        .windows(2)
+        .any(|pair| pair[0] == "-o" && pair[1] == option)
+}
+
 /// Make `command` start its process where `terminal` says: in a session of its
 /// own, with no controlling terminal, for [`SshTerminal::Detached`], else in
 /// this process's. The one place that does so, for the sync's `ssh` and its
@@ -1274,7 +1297,9 @@ fn set_terminal(command: &mut Command, terminal: SshTerminal) {
 /// cannot be learned is used all the same and ended with `ssh -O exit`.
 ///
 /// Failed, nothing of it runs any more (one still signing in at `deadline` is
-/// killed and reaped), and the error says why:
+/// killed and reaped; that one and one ended by a signal are also asked to
+/// end with `ssh -O exit`, as ssh's `-f` fork may have come just before), and
+/// the error says why:
 /// [`SyncError::JumpHostKeyUnknown`] when it exited saying "Host key
 /// verification failed", else [`SyncError::JumpFailed`] with how it ended and
 /// its last stderr lines, sanitized as for [`explain_exit`].
@@ -1327,18 +1352,27 @@ fn sign_in_to_jump_host(
         Ok(Some(_)) if stderr.contains(HOST_KEY_FAILED) => SyncError::JumpHostKeyUnknown {
             name: leg.name.clone(),
         },
-        Ok(Some(status)) => failed(with_stderr(how_ssh_ended(status), &stderr)),
-        Ok(None) => failed(with_stderr(
-            "ssh did not sign in in time".to_string(),
-            &stderr,
-        )),
+        Ok(Some(status)) => {
+            if status.code().is_none() {
+                // Ended by a signal: it may have forked its background part
+                // before, which nothing else would end.
+                end_through_socket(&leg.exit);
+            }
+            failed(with_stderr(how_ssh_ended(status), &stderr))
+        }
+        Ok(None) => {
+            // Killed at the deadline, which can land just after ssh's `-f`
+            // fork: ended as a master would be.
+            end_through_socket(&leg.exit);
+            failed(with_stderr(
+                "ssh did not sign in in time".to_string(),
+                &stderr,
+            ))
+        }
         Err(e) => {
             // How it ended is not known, so it may have signed in: ended as a
             // master would be.
-            drop(EndsMaster {
-                pidfd: None,
-                exit: &leg.exit,
-            });
+            end_through_socket(&leg.exit);
             failed(format!("its end could not be read: {e}"))
         }
     })
@@ -1363,9 +1397,15 @@ impl Drop for EndsMaster<'_> {
             .as_ref()
             .is_some_and(|pidfd| end_master(pidfd).is_ok());
         if !ended {
-            let _ = run_control(self.exit, CONTROL_LIMIT);
+            end_through_socket(self.exit);
         }
     }
+}
+
+/// Ask a master to end with `exit` (`ssh -O exit` through its socket), best
+/// effort, within [`CONTROL_LIMIT`]. With no master listening it fails at once.
+fn end_through_socket(exit: &SshCommand) {
+    let _ = run_control(exit, CONTROL_LIMIT);
 }
 
 /// Failures that say only that the stream broke, so the exit status and
@@ -5377,7 +5417,9 @@ exit 255"#,
     fn a_failed_jump_connection_names_the_jump_host_and_never_starts_the_target() {
         let mut a = side(&[(prof("one"), Some("pw-one"))]);
         let a_file = file_of(&a.path);
-        let failed = |fake: &FakeJump, timeout: Duration, a: &mut Side| {
+        // `ran` is what ran: the master and, should it have been left behind,
+        // the `-O exit` that ends it. Never the target.
+        let failed = |fake: &FakeJump, timeout: Duration, a: &mut Side, ran: &[&str]| {
             let err = fake.sync(&mut a.state, timeout).unwrap_err();
             let SyncError::JumpFailed { name, detail } = &err else {
                 panic!("expected JumpFailed, got {err:?}");
@@ -5388,16 +5430,13 @@ exit 255"#,
                 format!("could not connect to the jump host bastion: {detail}")
             );
             assert!(!detail.chars().any(char::is_control), "{detail:?}");
-            // Never the target, and no master to end.
-            assert!(
-                fake.log().iter().all(|ran| ran == "master"),
-                "{:?}",
-                fake.log()
-            );
+            assert_eq!(fake.log(), ran);
             detail.clone()
         };
 
         // The jump host refuses the login: the last lines ssh wrote, cleaned.
+        // ssh exited with a status before it went to the background, so there
+        // is no master to end.
         let fake = FakeJump::new();
         fake.script(
             "master",
@@ -5406,20 +5445,23 @@ printf 'early noise\nalice@bastion.example: Permission denied \033[1m(publickey,
 exit 255"#,
         );
         assert_eq!(
-            failed(&fake, SYNC_TIMEOUT, &mut a),
+            failed(&fake, SYNC_TIMEOUT, &mut a, &["master"]),
             "ssh exited with status 255: early noise | \
              alice@bastion.example: Permission denied [1m(publickey,password)."
         );
 
-        // Killed by a signal, saying nothing.
+        // Killed by a signal, saying nothing. It may have forked its
+        // background part first, so the master is ended through its socket.
         let fake = FakeJump::new();
         fake.script("master", r#"echo master >> "$D/log"; kill -KILL $$"#);
         assert_eq!(
-            failed(&fake, SYNC_TIMEOUT, &mut a),
+            failed(&fake, SYNC_TIMEOUT, &mut a, &["master", "exit"]),
             "ssh was terminated by a signal"
         );
 
-        // Still signing in when the sync's time is up: killed and reaped.
+        // Still signing in when the sync's time is up: killed and reaped, and
+        // asked to end too, because the time can be up just after ssh's `-f`
+        // fork.
         let fake = FakeJump::new();
         fake.script(
             "master",
@@ -5430,7 +5472,7 @@ exec sleep 30"#,
         );
         let start = Instant::now();
         assert_eq!(
-            failed(&fake, Duration::from_secs(1), &mut a),
+            failed(&fake, Duration::from_secs(1), &mut a, &["master", "exit"]),
             "ssh did not sign in in time: Connecting to bastion.example"
         );
         assert!(
@@ -5448,12 +5490,65 @@ exec sleep 30"#,
         // No ssh to start.
         let mut fake = FakeJump::new();
         fake.leg.master.program = "/nonexistent/moniker-test-ssh".to_string();
-        let detail = failed(&fake, SYNC_TIMEOUT, &mut a);
+        let detail = failed(&fake, SYNC_TIMEOUT, &mut a, &[]);
         assert!(
             detail.starts_with("could not start /nonexistent/moniker-test-ssh: "),
             "{detail}"
         );
 
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(a.secrets.writes(), 0);
+    }
+
+    #[test]
+    fn a_command_that_does_not_go_through_the_hop_is_refused_before_the_master() {
+        // A caller that signed in to the jump host and then reached the
+        // partner directly would defeat the person's choice of route: fail
+        // closed, before anything starts.
+        let fake = FakeJump::new();
+        let db = prof("db");
+        let askpass = Path::new("/nonexistent/moniker-askpass");
+        let hop = fake.leg.hop.clone();
+        let wrong = [
+            // No proxy at all.
+            sync_command(&db, askpass, false, SERVER_PROGRAM, None),
+            // Another jump host's.
+            sync_command(
+                &db,
+                askpass,
+                false,
+                SERVER_PROGRAM,
+                Some("ssh -W '[%h]:%p' elsewhere"),
+            ),
+            // The hop's text where it is no option: as the remote command.
+            sync_command(&db, askpass, false, &format!("ProxyCommand={hop}"), None),
+        ];
+        let mut a = side(&[(prof("one"), Some("pw-one"))]);
+        let a_file = file_of(&a.path);
+        for cmd in wrong {
+            let cmd = played_by(cmd, &fake.path("target"));
+            let err = sync_over_ssh_with_timeout(
+                &mut a.state,
+                &cmd,
+                Some(&fake.leg),
+                PASS,
+                SshTerminal::Inherit,
+                StaleSync::Refuse,
+                SYNC_TIMEOUT,
+            )
+            .unwrap_err();
+            let SyncError::Io(io_err) = &err else {
+                panic!("expected an I/O error, got {err:?}");
+            };
+            assert_eq!(io_err.kind(), io::ErrorKind::InvalidInput, "{err:?}");
+            assert_eq!(
+                io_err.to_string(),
+                "the sync's ssh does not go through the jump host"
+            );
+        }
+        // Neither the master nor the target ever ran.
+        assert_eq!(fake.log(), Vec::<String>::new());
+        assert!(!fake.path("pid").exists());
         assert_eq!(file_of(&a.path), a_file);
         assert_eq!(a.secrets.writes(), 0);
     }

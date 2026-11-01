@@ -256,6 +256,8 @@ KEYRING_PW=moniker-e2e-throwaway # protects only the throwaway keyring in $T
 MSG_NO_SYNC_KEY='no sync key is set on the remote machine (where `moniker-server sync-serve` runs); run `moniker-server sync-key set` there'
 MSG_WRONG_KEY="the sync passphrases differ (or the data was corrupted on the way)"
 MSG_NO_SERVER="moniker-server is not installed on the remote machine (or not on its PATH)"
+# SyncError::PeerTooOld: a machine older than jump hosts turned a sync away.
+MSG_PEER_TOO_OLD="the other machine runs an older Moniker, which does not know jump hosts; update it to sync while a profile has a jump host"
 
 # Refuse unless this really is the private setup.
 assert_private_env() {
@@ -650,6 +652,11 @@ EOF
 # names its host key 127.0.0.1 while its host name is localhost; the second's
 # has no route and canonicalizes its host name, localhost, to
 # localhost.localhost (which ssh does only for a connection without a proxy).
+# $SYNC_PARTNER_HOST is the partner of the sync through a jump host, whose
+# entry also has a ProxyJump to a host that does not exist, so that it can only
+# be reached by the route on the command line; $OLD_HOST is the machine that
+# predates jump hosts. Their host keys and the jump host's are in $T/kh before
+# the sync, which pins StrictHostKeyChecking=yes (trust_in_shim_kh).
 write_ssh_shim() {
     local real
     real=$(command -v ssh) || return 1
@@ -676,7 +683,12 @@ Host $VIA_CANON_HOST
   HostName localhost
   CanonicalizeHostname yes
   CanonicalDomains localhost
-Host $VIA_JUMP_HOST $VIA_TARGET_HOST $VIA_CANON_HOST ::1
+Host $SYNC_PARTNER_HOST
+  HostName 127.0.0.1
+  ProxyJump nowhere.invalid
+Host $OLD_HOST
+  HostName 127.0.0.1
+Host $VIA_JUMP_HOST $VIA_TARGET_HOST $VIA_CANON_HOST $SYNC_PARTNER_HOST $OLD_HOST ::1
   PubkeyAuthentication yes
   IdentitiesOnly yes
   IdentityFile $T/client_key
@@ -810,6 +822,8 @@ MASTER_PID=     # set by learn_master
 VIA_JUMP_HOST=bastion-e2e # hosts of the profiles of the connections through a jump host
 VIA_TARGET_HOST=db-e2e    # (their entries in $T/ssh_config: write_ssh_shim)
 VIA_CANON_HOST=canon-e2e
+SYNC_PARTNER_HOST=partner-e2e # hosts of the syncs through a jump host (see write_ssh_shim)
+OLD_HOST=old-e2e
 VIA_READY=      # set once via_setup has seeded them
 VIA_JUMP_ID=    # their ids
 VIA_DB_ID=
@@ -1211,6 +1225,138 @@ check_jump_host_ipv6_target() {
     connect_through_jump_host via-v6 "$VIA_V6_ID" ::1
 }
 
+# ---------- syncs through a partner's jump host (issue #9) ----------
+#
+# `moniker-server sync` opens the jump host's shared connection itself, goes
+# through it to the partner and ends it. A sync has no one-time token, so there
+# is no marker that shows the helper answered a prompt. What shows it here:
+#   * the askpass helper `moniker-server` uses is a copy that logs each prompt
+#     and the profile it was asked for, then becomes the real helper
+#     (make_sync_tools), so the log has the master's prompt and the partner's,
+#     in that order, and nothing else;
+#   * the throwaway sshds refuse every password, as a user-level sshd must, and
+#     log it ("Failed password"): a password was sent, which only the helper can
+#     have done (no terminal, and ssh is told to ask the helper), and the key
+#     then signs in ("Accepted publickey"). The jump host's sshd sees exactly
+#     one of each: the master's. The hop goes through that connection, so it
+#     signs in to nothing, and the partner's sshd sees exactly one: the sync's.
+
+SYNC_TOOLS=    # $T/synctools: a moniker-server whose askpass helper logs the prompts
+PARTNER_ID=    # the sync partner's profile id on A
+
+# The jump host's and the partner's host keys are in $T/kh, the known_hosts of
+# the ssh shim: the sync pins StrictHostKeyChecking=yes, so nothing is added on
+# first use.
+trust_in_shim_kh() { # trust_in_shim_kh PORT
+    printf '[127.0.0.1]:%s %s\n' "$1" "$(cat "$T/hostkey.pub")" >>"$T/kh"
+}
+
+# A copy of moniker-server in $SYNC_TOOLS, with a moniker-askpass beside it (the
+# product looks for the helper next to its own executable) that logs the
+# profile and the prompt to $T/sync-askpass.log and then execs the real helper:
+# its parent is still the ssh that asked, as the helper requires.
+make_sync_tools() {
+    SYNC_TOOLS=$T/synctools
+    mkdir -p "$SYNC_TOOLS" && cp -- "$BIN/moniker-server" "$SYNC_TOOLS/moniker-server" || return 1
+    cat >"$SYNC_TOOLS/moniker-askpass" <<EOF
+#!/bin/sh
+printf 'profile=%s prompt=%s\n' "\${MONIKER_PROFILE_ID-}" "\$1" >>"$T/sync-askpass.log"
+exec "$BIN/moniker-askpass" "\$1"
+EOF
+    chmod 700 "$SYNC_TOOLS/moniker-askpass"
+}
+
+jump_folder_empty() { [ -z "$(ls -A -- "$JUMP_DIR" 2>/dev/null)" ]; }
+
+# How many lines of a throwaway sshd's log (NAME) match PATTERN.
+sshd_log_count() { grep -c -- "$2" "$T/sshd_$1.log"; }
+
+check_sync_through_a_jump_host() {
+    local sync_port carried_a carried_b pw_a pw_b names sock
+    local jump_failed jump_accepted partner_failed partner_accepted
+    via_setup || return 1
+    make_sync_tools || { REASON="cannot make the copy of moniker-server"; return 1; }
+    wait_for 5 jump_folder_empty || { REASON="precondition: an earlier check left a socket in $JUMP_DIR"; return 1; }
+    # The partner: a server whose PATH finds this build's moniker-server, so
+    # that sync-serve runs as instance B; it takes a password and then the key.
+    start_sshd pwsync "$BIN:$SYSTEM_PATH" both || { REASON="cannot start the partner's sshd"; return 1; }
+    sync_port=$SSHD_PORT
+    trust_in_shim_kh "$JUMP_PORT" && trust_in_shim_kh "$sync_port" || { REASON="cannot trust the host keys"; return 1; }
+    PARTNER_ID=$(seed_password_profile sync-partner "$SYNC_PARTNER_HOST" "$sync_port" via-bastion) ||
+        { REASON="cannot seed the partner's profile"; return 1; }
+    # The configuration sends the partner through a jump host that does not
+    # exist: the sync gets there only by the route on its command line.
+    capture env PATH="$T/shim:$PATH" ssh -G -p "$sync_port" -- "$ME@$SYNC_PARTNER_HOST"
+    grep -qx 'proxyjump nowhere.invalid' "$OUT" ||
+        { REASON="precondition: the configuration does not send the partner through nowhere.invalid"; return 1; }
+    # One new profile with a password on each side, to travel through it.
+    pw_a="pw-$(random_token)" pw_b="pw-$(random_token)"
+    carried_a=$(A "$HELPER" seed-profile --name carried-a --host carried-a.example.test --user alice) &&
+        printf '%s\n' "$pw_a" | A "$HELPER" set-secret carried-a &&
+        carried_b=$(B "$HELPER" seed-profile --name carried-b --host carried-b.example.test --user bob) &&
+        printf '%s\n' "$pw_b" | B "$HELPER" set-secret carried-b ||
+        { REASON="cannot seed the profiles to carry"; return 1; }
+    jump_failed=$(sshd_log_count pwjump "Failed password for $ME ")
+    jump_accepted=$(sshd_log_count pwjump "Accepted publickey for $ME ")
+    partner_failed=$(sshd_log_count pwsync "Failed password for $ME ")
+    partner_accepted=$(sshd_log_count pwsync "Accepted publickey for $ME ")
+
+    : >"$T/sync-askpass.log"
+    capture A env PATH="$T/shim:$PATH" setsid -w timeout 60 "$SYNC_TOOLS/moniker-server" sync sync-partner
+    # Whatever happens, no master is left running (run_jump_check ends these).
+    for sock in "$JUMP_DIR"/*; do [ ! -S "$sock" ] || JUMP_SOCKETS+=("$sock"); done
+    [ "$RC" -eq 0 ] || { REASON="moniker-server sync exited $RC: $(err_summary)"; return 1; }
+
+    # Both sides got what the other had, passwords included.
+    names=$(B "$HELPER" list)
+    grep -qxF carried-a <<<"$names" && grep -qxF sync-partner <<<"$names" ||
+        { REASON="B does not list A's profiles (carried-a, sync-partner)"; return 1; }
+    grep -qxF carried-b <<<"$(A "$HELPER" list)" || { REASON="A does not list carried-b"; return 1; }
+    [ "$(secret_of B "$carried_a")" = "$pw_a" ] || { REASON="carried-a's password did not arrive on B"; return 1; }
+    [ "$(secret_of A "$carried_b")" = "$pw_b" ] || { REASON="carried-b's password did not arrive on A"; return 1; }
+
+    # The helper answered the master (the jump host's profile), then the
+    # partner's ssh (the partner's profile), and nothing else asked.
+    [ "$(grep -c '^profile=' "$T/sync-askpass.log")" -eq 2 ] &&
+        [ "$(sed -n 1p "$T/sync-askpass.log")" = "profile=$VIA_JUMP_ID prompt=$ME@127.0.0.1's password: " ] &&
+        [ "$(sed -n 2p "$T/sync-askpass.log")" = "profile=$PARTNER_ID prompt=$ME@127.0.0.1's password: " ] ||
+        { REASON="the prompts asked were not the master's and the partner's (log: $(tr '\n' '~' <"$T/sync-askpass.log"))"; return 1; }
+    # One password sent and one key login at each sshd: the master's at the
+    # jump host's, the sync's at the partner's. A hop that signed in by itself,
+    # or a partner reached directly after the master, would show as another.
+    [ "$(sshd_log_count pwjump "Failed password for $ME ")" -eq $((jump_failed + 1)) ] &&
+        [ "$(sshd_log_count pwjump "Accepted publickey for $ME ")" -eq $((jump_accepted + 1)) ] ||
+        { REASON="the jump host's sshd did not see exactly one password and one key login"; return 1; }
+    [ "$(sshd_log_count pwsync "Failed password for $ME ")" -eq $((partner_failed + 1)) ] &&
+        [ "$(sshd_log_count pwsync "Accepted publickey for $ME ")" -eq $((partner_accepted + 1)) ] ||
+        { REASON="the partner's sshd did not see exactly one password and one key login"; return 1; }
+    # The master was ended with the sync (it is signaled, not waited for).
+    wait_for 5 jump_folder_empty || { REASON="a socket is left in $JUMP_DIR: $(ls -A "$JUMP_DIR" | tr '\n' ' ')"; return 1; }
+}
+
+# A machine older than jump hosts turns a sync away while A holds a profile
+# with a jump host (the HELLO says version 2), and nothing changes on either
+# side. Its sync-serve is the helper's stand-in, which answers as the old code
+# did: ERROR frame, code 2.
+check_jump_hosts_keep_an_old_machine_out() {
+    local before old_port
+    via_setup || return 1
+    grep -q '"jump_host"' "$(A "$HELPER" store-path)" ||
+        { REASON="precondition: A holds no profile with a jump host"; return 1; }
+    mkdir -p "$T/oldbin" &&
+        printf '#!/bin/sh\nexec "%s" serve-version-1\n' "$HELPER" >"$T/oldbin/moniker-server" &&
+        chmod 700 "$T/oldbin/moniker-server" || { REASON="cannot make the old moniker-server"; return 1; }
+    start_sshd oldpartner "$T/oldbin:$SYSTEM_PATH" key || { REASON="cannot start the old machine's sshd"; return 1; }
+    old_port=$SSHD_PORT
+    trust_in_shim_kh "$old_port" || { REASON="cannot trust the host key"; return 1; }
+    seed_password_profile old-machine "$OLD_HOST" "$old_port" >/dev/null || { REASON="cannot seed the old machine's profile"; return 1; }
+    before=$(state_snapshot) || { REASON="cannot read the state before the sync"; return 1; }
+    capture A env PATH="$T/shim:$PATH" "${MONX[@]}" sync old-machine
+    [ "$RC" -ne 0 ] || { REASON="exit status 0, expected a failure"; return 1; }
+    grep -qF "$MSG_PEER_TOO_OLD" "$ERR" || { REASON="unexpected message: $(err_summary)"; return 1; }
+    unchanged_since "$before"
+}
+
 # ---------- inner main ----------
 
 inner_main() {
@@ -1253,6 +1399,8 @@ inner_main() {
     run_jump_check "jump connection: the product's commands reach the target through its jump host" check_connection_through_a_jump_host
     run_jump_check "jump connection: the helper names the target as the connection does, not canonicalized" check_jump_host_target_named_as_connected
     run_jump_check "jump connection: an IPv6 target is reached through the jump host" check_jump_host_ipv6_target
+    run_jump_check "sync through a partner's jump host: converges, the helper answers both, no master is left" check_sync_through_a_jump_host
+    run_jump_check "sync: a machine older than jump hosts is kept out while a profile has one" check_jump_hosts_keep_an_old_machine_out
 
     say "== summary: $PASSED passed, $FAILED failed"
     [ "$FAILED" -eq 0 ]

@@ -10,13 +10,15 @@
 //! ssh channel. Its stdout carries protocol frames and nothing else, so no
 //! function on that path may print to stdout.
 
+use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use moniker_cli::{sanitize_for_terminal, store_path};
 use moniker_core::askpass::{DevTty, TtyPrompter};
+use moniker_core::jump::{self, JumpLeg, JumpSocket, Route};
 use moniker_core::profile::Profile;
 use moniker_core::secrets::{
     KeyringSecretStore, SYNC_PASSPHRASE_KEY, SecretStore, check_sync_passphrase, password_key,
@@ -228,27 +230,42 @@ fn serve_with(
 }
 
 /// `moniker-server sync [--allow-stale] <profile-name>`: the local half of a
-/// sync, over ssh.
+/// sync, over ssh. A partner that goes through a jump host is reached through a
+/// shared connection to it, which this sync opens and ends (issue #9).
 fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
-    // The switch and the profile are looked at before anything touches the keyring.
+    // The switch, the profile and its route are looked at before anything
+    // touches the keyring.
     let store = open_store()?;
     if !store.sync_switch().is_on() {
         return Err(sync_error_text(&SyncError::SyncOff));
     }
     let profile = find_profile(&store, name)?.clone();
+    let jump = partner_jump(&store, &profile)?;
 
     let secrets = KeyringSecretStore::new();
     let passphrase = sync_passphrase(&secrets, NO_SYNC_KEY_LOCAL)?;
-    let has_password = secrets
-        .get(&password_key(&profile.id))
-        .map_err(|e| format!("cannot look up the stored password: {e}"))?
-        .is_some();
+    let has_password = stored_password(&secrets, &profile, "the stored password")?;
+    let jump_has_password = match &jump {
+        Some(jump) => stored_password(&secrets, jump, "the jump host's stored password")?,
+        None => false,
+    };
 
     let current = std::env::current_exe()
         .map_err(|e| format!("cannot locate the moniker-server executable: {e}"))?;
     let askpass = current.with_file_name("moniker-askpass");
     check_askpass(has_password, &askpass)?;
-    let cmd = sync_command(&profile, &askpass, has_password, SERVER_PROGRAM, None);
+    check_askpass(jump_has_password, &askpass)?;
+    let leg = jump
+        .as_ref()
+        .map(|jump| jump_leg(jump, runtime_dir().as_deref(), &askpass, jump_has_password))
+        .transpose()?;
+    let cmd = sync_command(
+        &profile,
+        &askpass,
+        has_password,
+        SERVER_PROGRAM,
+        leg.as_ref().map(|leg| leg.hop.as_str()),
+    );
 
     let mut local = LocalState::new(store, Box::new(secrets));
     let stale = if allow_stale {
@@ -259,7 +276,7 @@ fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
     let outcome = sync_over_ssh(
         &mut local,
         &cmd,
-        None,
+        leg.as_ref(),
         &passphrase,
         SshTerminal::Inherit,
         stale,
@@ -362,6 +379,70 @@ fn sync_error_text(err: &SyncError) -> String {
     }
 }
 
+/// The jump host `profile` goes through, if it has one, to sync with it: the
+/// route's own text as the error when the jump host is no longer saved or goes
+/// through a jump host of its own (Moniker uses one jump host only, and never
+/// connects straight to a partner the person routed through one). Decided from
+/// the profile file alone, before the keyring is asked for anything.
+fn partner_jump(store: &ProfileStore, profile: &Profile) -> Result<Option<Profile>, String> {
+    let route = jump::route(profile, |id| store.get(id));
+    match route.refusal() {
+        Some(why) => Err(why),
+        None => Ok(route.jump().cloned()),
+    }
+}
+
+/// Whether a password is stored for `profile`; `what` names it in the error.
+fn stored_password(
+    secrets: &dyn SecretStore,
+    profile: &Profile,
+    what: &str,
+) -> Result<bool, String> {
+    secrets
+        .get(&password_key(&profile.id))
+        .map(|password| password.is_some())
+        .map_err(|e| format!("cannot look up {what}: {e}"))
+}
+
+/// The per-user runtime folder (`XDG_RUNTIME_DIR`), where a jump connection's
+/// socket goes.
+fn runtime_dir() -> Option<PathBuf> {
+    runtime_dir_from(std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+/// The folder `value` (`XDG_RUNTIME_DIR`) names, if it is an absolute path; the
+/// askpass helper ignores anything else too.
+fn runtime_dir_from(value: Option<OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|dir| dir.is_absolute())
+}
+
+/// The commands of a sync's connection through `jump`: a new socket in
+/// `runtime_dir`, which must be a runtime folder private to this user, and the
+/// leg made for it, its master answered by the jump host's stored password when
+/// `has_password`. Refused, before anything is started, when there is no such
+/// folder (`JumpSocket::new` says no, and a socket anywhere else could be
+/// reached by others) or when the jump host's user name or host cannot go in
+/// the hop's shell string: failing closed, the sync never goes straight to the
+/// partner instead.
+fn jump_leg(
+    jump: &Profile,
+    runtime_dir: Option<&Path>,
+    askpass: &Path,
+    has_password: bool,
+) -> Result<JumpLeg, String> {
+    let socket = runtime_dir
+        .and_then(|dir| JumpSocket::new(dir).ok())
+        .ok_or_else(|| {
+            format!(
+                "cannot connect through the jump host {}: \
+                 no private runtime folder for its shared connection",
+                jump.name
+            )
+        })?;
+    JumpLeg::for_sync(jump, &socket, askpass, has_password)
+        .ok_or_else(|| format!("cannot connect through the jump host {}", jump.name))
+}
+
 /// A sync runs with no terminal, so a stored password reaches ssh only through
 /// the `moniker-askpass` helper. If one is stored and the helper is not an
 /// existing file, say so now, before connecting, instead of failing later with
@@ -424,8 +505,11 @@ fn find_profile<'a>(store: &'a ProfileStore, name: &str) -> Result<&'a Profile, 
 }
 
 /// The output of `profile list`: `<name>  <user>@<host>:<port>` per profile, or
-/// `No profiles.`; a profile kept on this machine (it never syncs) ends with
-/// `  (this machine only)`. Every field is made safe to print.
+/// `No profiles.`. A profile that goes through a jump host (found among
+/// `profiles`, which are all the live ones) continues with `  via <its name>`,
+/// or `  (jump host no longer saved)` when none is saved; a profile kept on this
+/// machine (it never syncs) ends with `  (this machine only)`. Every field is
+/// made safe to print.
 fn profile_list_text(profiles: &[&Profile]) -> String {
     if profiles.is_empty() {
         return "No profiles.\n".to_owned();
@@ -433,12 +517,20 @@ fn profile_list_text(profiles: &[&Profile]) -> String {
     profiles
         .iter()
         .map(|p| {
+            let route = jump::route(p, |id| profiles.iter().copied().find(|q| q.id == id));
             format!(
-                "{}  {}@{}:{}{}\n",
+                "{}  {}@{}:{}{}{}\n",
                 sanitize_for_terminal(&p.name),
                 sanitize_for_terminal(&p.username),
                 sanitize_for_terminal(&p.host),
                 p.port,
+                match route {
+                    Route::Direct => String::new(),
+                    Route::Missing => "  (jump host no longer saved)".to_owned(),
+                    Route::Through(jump) | Route::Chained(jump) => {
+                        format!("  via {}", sanitize_for_terminal(&jump.name))
+                    }
+                },
                 if p.local_only {
                     "  (this machine only)"
                 } else {
@@ -889,6 +981,191 @@ mod tests {
         p.port = 22;
         let text = profile_list_text(&[&p]);
         assert_eq!(text, "a?b?c  u?ser@h?.example.com:22\n");
+    }
+
+    // ----- jump hosts (issue #9) -----
+
+    const OTHER_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+    /// `p`, going through `jump`.
+    fn via(p: Profile, jump: &Profile) -> Profile {
+        Profile {
+            jump_host: Some(jump.id.clone()),
+            ..p
+        }
+    }
+
+    #[test]
+    fn profile_list_names_the_jump_host() {
+        let bastion = Profile::new("Bastion", "bastion.example.com", "admin");
+        let db = via(Profile::new("Db", "db", "alice"), &bastion);
+        let lost = Profile {
+            jump_host: Some(OTHER_ID.to_owned()),
+            ..Profile::new("Lost", "lost", "alice")
+        };
+        let kept = Profile {
+            local_only: true,
+            ..via(Profile::new("Kept", "kept", "alice"), &bastion)
+        };
+        let kept_lost = Profile {
+            local_only: true,
+            ..Profile {
+                jump_host: Some(OTHER_ID.to_owned()),
+                ..Profile::new("KeptLost", "kept", "alice")
+            }
+        };
+        let all = [&bastion, &db, &lost, &kept, &kept_lost];
+        assert_eq!(
+            profile_list_text(&all),
+            "Bastion  admin@bastion.example.com:22\n\
+             Db  alice@db:22  via Bastion\n\
+             Lost  alice@lost:22  (jump host no longer saved)\n\
+             Kept  alice@kept:22  via Bastion  (this machine only)\n\
+             KeptLost  alice@kept:22  (jump host no longer saved)  (this machine only)\n"
+        );
+    }
+
+    #[test]
+    fn profile_list_makes_the_jump_host_s_name_safe_to_print() {
+        let bastion = Profile::new("bas\x1b[2Jtion", "bastion", "admin");
+        let db = via(Profile::new("db", "db", "alice"), &bastion);
+        assert_eq!(
+            profile_list_text(&[&bastion, &db]),
+            "bas?[2Jtion  admin@bastion:22\ndb  alice@db:22  via bas?[2Jtion\n"
+        );
+    }
+
+    #[test]
+    fn a_partner_through_a_saved_jump_host_gives_it() {
+        let bastion = Profile::new("Bastion", "bastion.example.com", "admin");
+        let db = via(Profile::new("Db", "db", "alice"), &bastion);
+        let (_dir, store) = store_with(vec![bastion.clone(), db.clone()]);
+        assert_eq!(partner_jump(&store, &db).unwrap().unwrap().id, bastion.id);
+        // No jump host: straight to the partner.
+        assert_eq!(partner_jump(&store, &bastion).unwrap(), None);
+    }
+
+    #[test]
+    fn a_waiting_or_chained_partner_is_refused_with_the_routes_text() {
+        let outer = Profile::new("Outer", "outer", "admin");
+        let mid = via(Profile::new("Mid", "mid", "admin"), &outer);
+        let db = via(Profile::new("Db", "db", "alice"), &mid);
+        let lost = Profile {
+            jump_host: Some(OTHER_ID.to_owned()),
+            ..Profile::new("Lost", "lost", "alice")
+        };
+        let (_dir, store) = store_with(vec![outer, mid, db.clone(), lost.clone()]);
+        assert_eq!(
+            partner_jump(&store, &db).unwrap_err(),
+            "Mid goes through a jump host of its own. Moniker uses only one jump host."
+        );
+        assert_eq!(
+            partner_jump(&store, &lost).unwrap_err(),
+            "This profile's jump host is no longer saved."
+        );
+    }
+
+    /// A private runtime folder, short enough for a socket's path.
+    fn runtime_folder() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::Builder::new()
+            .prefix("rt")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_jump_connection_needs_a_private_runtime_folder() {
+        let bastion = Profile::new("Bastion", "bastion.example.com", "admin");
+        let askpass = Path::new("/nonexistent/moniker-askpass");
+        let no_folder = "cannot connect through the jump host Bastion: \
+                         no private runtime folder for its shared connection";
+        assert_eq!(
+            jump_leg(&bastion, None, askpass, false).unwrap_err(),
+            no_folder
+        );
+        // Not an absolute path, or no folder at all.
+        for bad in ["relative/run", "/nonexistent/moniker-run"] {
+            assert_eq!(
+                jump_leg(&bastion, Some(Path::new(bad)), askpass, false).unwrap_err(),
+                no_folder,
+                "{bad}"
+            );
+        }
+        // One that others may write in.
+        let open = runtime_folder();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(open.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        assert_eq!(
+            jump_leg(&bastion, Some(open.path()), askpass, false).unwrap_err(),
+            no_folder
+        );
+    }
+
+    #[test]
+    fn a_jump_connection_the_hop_refuses_is_not_made() {
+        // A user name the hop's shell string cannot carry (the profile
+        // validation keeps it out of a store; a leg must still refuse).
+        let folder = runtime_folder();
+        let bad = Profile::new("Bastion", "bastion.example.com", "ad min");
+        let err = jump_leg(
+            &bad,
+            Some(folder.path()),
+            Path::new("/nonexistent/moniker-askpass"),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err, "cannot connect through the jump host Bastion");
+    }
+
+    #[test]
+    fn a_jump_connection_is_made_for_the_jump_host_with_its_password() {
+        let folder = runtime_folder();
+        let bastion = Profile::new("Bastion", "bastion.example.com", "admin");
+        let askpass = Path::new("/usr/lib/moniker/moniker-askpass");
+        let leg = jump_leg(&bastion, Some(folder.path()), askpass, true).unwrap();
+        assert_eq!(leg.name, "Bastion");
+        // The master answers for the jump host's password, not the partner's.
+        let env: Vec<_> = leg
+            .master
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        assert!(
+            env.contains(&("MONIKER_PROFILE_ID", &bastion.id)),
+            "{env:?}"
+        );
+        // The socket is the one the hop and the commands share, in the
+        // runtime folder.
+        let socket = leg
+            .master
+            .args
+            .iter()
+            .find(|arg| arg.starts_with(folder.path().to_str().unwrap()))
+            .unwrap()
+            .clone();
+        assert!(socket.contains("/moniker/jump/"), "{socket}");
+        assert!(leg.hop.contains(&socket), "{}", leg.hop);
+        // Without a stored password the master has none to ask the helper for.
+        let leg = jump_leg(&bastion, Some(folder.path()), askpass, false).unwrap();
+        assert!(leg.master.env.is_empty(), "{:?}", leg.master.env);
+    }
+
+    #[test]
+    fn the_runtime_folder_is_the_one_the_environment_names() {
+        assert_eq!(
+            runtime_dir_from(Some("/run/user/1000".into())),
+            Some(PathBuf::from("/run/user/1000"))
+        );
+        // The helper ignores anything else too.
+        assert_eq!(runtime_dir_from(Some("run".into())), None);
+        assert_eq!(runtime_dir_from(Some("".into())), None);
+        assert_eq!(runtime_dir_from(None), None);
     }
 
     // ----- the sync switch (issue #10) -----

@@ -253,6 +253,76 @@ fn profile_list_marks_a_profile_kept_on_this_machine() {
         .stdout("Box  root@10.0.0.5:22  (this machine only)\nWeb  admin@example.com:22\n");
 }
 
+/// A profile named `name` that goes through the profile `jump` (any id).
+fn via(name: &str, host: &str, jump: &str) -> Profile {
+    Profile {
+        jump_host: Some(jump.to_owned()),
+        ..Profile::new(name, host, "alice")
+    }
+}
+
+#[test]
+fn profile_list_names_the_jump_host() {
+    let env = Env::new();
+    let bastion = Profile::new("Bastion", "bastion.example.com", "admin");
+    let bastion_id = bastion.id.clone();
+    env.seed(bastion);
+    env.seed(via("Db", "db", &bastion_id));
+    env.seed(Profile {
+        local_only: true,
+        ..via("Kept", "kept", &bastion_id)
+    });
+    // A jump host nobody has.
+    env.seed(via("Lost", "lost", "00000000-0000-4000-8000-000000000001"));
+    env.moniker()
+        .args(["profile", "list"])
+        .assert()
+        .success()
+        .stdout(
+            "Bastion  admin@bastion.example.com:22\n\
+             Db  alice@db:22  via Bastion\n\
+             Kept  alice@kept:22  via Bastion  (this machine only)\n\
+             Lost  alice@lost:22  (jump host no longer saved)\n",
+        );
+}
+
+#[test]
+fn sync_refuses_a_waiting_partner_before_the_keyring() {
+    let env = Env::new();
+    env.seed(via("Db", "db", "00000000-0000-4000-8000-000000000001"));
+    let assert = env.moniker().args(["sync", "Db"]).assert().failure();
+    let out = assert.get_output();
+    assert!(out.stdout.is_empty());
+    // The route's own text, and nothing about the keyring or the sync key,
+    // which a sync would have asked for next.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim_end(),
+        "moniker-server: This profile's jump host is no longer saved."
+    );
+}
+
+#[test]
+fn sync_refuses_a_chained_partner() {
+    let env = Env::new();
+    let outer = Profile::new("Outer", "outer.example.com", "admin");
+    let outer_id = outer.id.clone();
+    // The jump host of Db goes through a jump host of its own.
+    let mid = via("Mid", "mid.example.com", &outer_id);
+    let mid_id = mid.id.clone();
+    env.seed(outer);
+    env.seed(mid);
+    env.seed(via("Db", "db", &mid_id));
+    let assert = env.moniker().args(["sync", "Db"]).assert().failure();
+    let out = assert.get_output();
+    assert!(out.stdout.is_empty());
+    // Named by the jump host that goes through another, as the route says.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim_end(),
+        "moniker-server: Mid goes through a jump host of its own. \
+         Moniker uses only one jump host."
+    );
+}
+
 #[test]
 fn sync_switch_turns_sync_off_and_on() {
     let env = Env::new();

@@ -17,7 +17,8 @@
 //! through the same code the product uses instead of assuming a file layout.
 //! `connection-argv` prints the commands of a connection through a jump host
 //! as the product builds them, so the script runs exactly those with real
-//! OpenSSH.
+//! OpenSSH. `serve-version-1` stands in for the `sync-serve` of a Moniker that
+//! predates jump hosts.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +32,7 @@ use moniker_core::profile::Profile;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore, password_key};
 use moniker_core::ssh::SshCommand;
 use moniker_core::store::ProfileStore;
+use moniker_core::sync::{KIND_ERROR, KIND_HELLO, SyncError, read_frame, write_frame};
 use zeroize::Zeroizing;
 
 /// Exit status of `get-secret` when there is no secret (other failures use 2).
@@ -96,6 +98,11 @@ enum Command {
     StorePath,
     /// Print `live`, `tombstone` or `absent` for the profile with this id
     ProfileState { id: String },
+    /// Be the `moniker-server sync-serve` of a Moniker older than jump hosts:
+    /// read one HELLO from stdin and turn a version other than 1 away with
+    /// the ERROR frame (code 2) such a server sends
+    #[command(name = "serve-version-1")]
+    ServeVersion1,
 }
 
 fn main() -> ExitCode {
@@ -132,6 +139,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
         Command::List => list().map(|()| ExitCode::SUCCESS),
         Command::StorePath => store_path_cmd().map(|()| ExitCode::SUCCESS),
         Command::ProfileState { id } => profile_state(&id).map(|()| ExitCode::SUCCESS),
+        Command::ServeVersion1 => serve_version_1().map(|()| ExitCode::SUCCESS),
     }
 }
 
@@ -354,6 +362,35 @@ fn list() -> Result<(), String> {
 fn store_path_cmd() -> Result<(), String> {
     println!("{}", store_path()?.display());
     Ok(())
+}
+
+/// The server half of a sync as Moniker 0.7.0 and older play it for a client
+/// that says version 2: one HELLO is read, and an ERROR frame (kind 3, then
+/// code 2 and the text of `SyncError::VersionMismatch`, as `send_error`
+/// writes it) is the answer. Nothing else is read, said or changed; stdout
+/// carries frames only. A client that says version 1 is not what this stands
+/// in for, and gets an error frame with the code for any other failure (255).
+fn serve_version_1() -> Result<(), String> {
+    const VERSION_MISMATCH: u8 = 2;
+    const OTHER: u8 = 255;
+    let (kind, hello) =
+        read_frame(&mut io::stdin().lock()).map_err(|e| format!("no HELLO to answer: {e}"))?;
+    if kind != KIND_HELLO {
+        return Err(format!(
+            "expected a HELLO (kind {KIND_HELLO}), got kind {kind}"
+        ));
+    }
+    let (code, text) = match hello.first() {
+        Some(1) => (
+            OTHER,
+            "serve-version-1 only turns a client of version 2 away".to_owned(),
+        ),
+        _ => (VERSION_MISMATCH, SyncError::VersionMismatch.to_string()),
+    };
+    let mut payload = vec![code];
+    payload.extend_from_slice(text.as_bytes());
+    write_frame(&mut io::stdout().lock(), KIND_ERROR, &payload)
+        .map_err(|e| format!("cannot write to standard output: {e}"))
 }
 
 /// `live`, `tombstone` (deleted, record kept) or `absent` (no record at all).
