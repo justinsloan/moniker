@@ -7,14 +7,15 @@
 //!
 //! Version 2, `{"version":2,"sync_off":<bool>,"profiles":[...]}`, is written
 //! exactly when the sync switch is not on (see [`SyncSwitch`]) or a profile is
-//! kept on this machine (`local_only`); otherwise the file is version 1, as it
-//! always was. Older versions refuse a file of another version and leave it
-//! alone, so none of them can serve or start a sync from a file that says sync
-//! is off or holds a profile that must not leave. A profile's default startup
-//! sequence (`startup_sequence`) is neither: it leaves the version alone, and
-//! an older version reads the file and drops the field. Version 1 has no
-//! switch and reads as on. The switch lives in this file so that one atomic
-//! write under the store's lock changes it together with the profiles.
+//! kept on this machine (`local_only`) and no profile has a jump host (that is
+//! version 3, below); otherwise the file is version 1, as it always was. Older
+//! versions refuse a file of another version and leave it alone, so none of
+//! them can serve or start a sync from a file that says sync is off or holds a
+//! profile that must not leave. A profile's default startup sequence
+//! (`startup_sequence`) is neither: it leaves the version alone, and an older
+//! version reads the file and drops the field. Version 1 has no switch and
+//! reads as on. The switch lives in this file so that one atomic write under
+//! the store's lock changes it together with the profiles.
 //!
 //! Version 3, `{"version":3,"sync_off":<bool>,"profiles":[...]}`, is written
 //! exactly while a live profile has a jump host (`jump_host`, the profile it
@@ -58,8 +59,9 @@ use serde::Serialize;
 
 use crate::profile::{Profile, ProfileError, now_ms};
 
-/// The format of a file that holds neither the sync switch off nor a profile
-/// kept on this machine: what every version before the switch wrote.
+/// The format of a file that holds neither the sync switch off, nor a profile
+/// kept on this machine, nor a profile with a jump host: what every version
+/// before the switch wrote.
 const FORMAT_V1: u64 = 1;
 /// The format that carries `sync_off`. Written only when it matters (module docs).
 const FORMAT_V2: u64 = 2;

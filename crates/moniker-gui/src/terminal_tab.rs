@@ -2166,16 +2166,35 @@ pub(crate) fn askpass_notice(has_password: bool, askpass: &Path) -> Option<&'sta
 /// the askpass helper, with a fresh token. If the helper is not an existing
 /// file, a stored password cannot be used: the command is the plain one, there
 /// is no token, and `ssh` asks in the terminal ([`askpass_notice`] says so).
-pub(crate) fn connection_command(
+///
+/// Direct only: a profile with a jump host goes through
+/// `jump::pane_commands` (see [`launch`]), never through this.
+fn connection_command(
     profile: &Profile,
     sequence: Option<usize>,
     askpass: &Path,
     has_password: bool,
 ) -> (SshCommand, Option<AskpassToken>) {
+    debug_assert!(
+        profile.jump_host.is_none(),
+        "a routed profile goes through jump::pane_commands"
+    );
     let startup = sequence.and_then(|i| profile.sequences.get(i));
     let token = (has_password && askpass_usable(askpass)).then(AskpassToken::new);
     let command = terminal_command(profile, startup, askpass, token.as_ref(), None);
     (command, token)
+}
+
+/// [`connection_command`] for the window tests' fake `ssh`, which connect
+/// profiles that have no jump host.
+#[cfg(test)]
+pub(crate) fn connection_command_for_tests(
+    profile: &Profile,
+    sequence: Option<usize>,
+    askpass: &Path,
+    has_password: bool,
+) -> (SshCommand, Option<AskpassToken>) {
+    connection_command(profile, sequence, askpass, has_password)
 }
 
 /// The one-time askpass marker of one connection (`moniker_core::askpass`):

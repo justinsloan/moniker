@@ -42,8 +42,8 @@ use crate::context::AppContext;
 use crate::notify::NotificationArea;
 use crate::session_file::{Kind, Node, PaneRecord, TabRecord};
 use crate::terminal_tab::{
-    connection_command, has_stored_password, set_test_ssh_program, tab_title, terminal_of,
-    terminal_text,
+    connection_command_for_tests, has_stored_password, set_test_ssh_program, tab_title,
+    terminal_of, terminal_text,
 };
 use crate::{form, new_tab, window};
 
@@ -398,7 +398,7 @@ fn fake_command(
 ) -> moniker_core::ssh::SshCommand {
     let askpass = Path::new(program).with_file_name(HELPER);
     let (mut cmd, _token) =
-        connection_command(p, sequence, &askpass, has_stored_password(p, secrets));
+        connection_command_for_tests(p, sequence, &askpass, has_stored_password(p, secrets));
     assert_eq!(cmd.program, "ssh", "the real program is the system ssh");
     cmd.program = program.to_owned();
     cmd

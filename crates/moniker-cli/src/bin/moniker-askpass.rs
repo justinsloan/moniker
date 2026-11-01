@@ -20,12 +20,17 @@
 //! user, host, port and key file (run from argv, with `--` before the
 //! destination, within five seconds: `moniker_core::ssh_config`, and only for a
 //! prompt that could be that login's), which is how `~/.ssh/config` is taken
-//! into account: an alias, a `HostName`, a `HostKeyAlias`. If `ssh -G` fails or its answer is ambiguous,
-//! the profile's own user and host are expected, as before. `ssh -G` sees no
-//! remote command, so a `Match sessiontype` or `Match command` block (OpenSSH
-//! 10.0 and later) is judged as for a plain login. The helper logs nothing: no
-//! prompt, no answer, no profile data. On failure stdout stays empty and stderr
-//! gets one generic line, and the exit status is 1.
+//! into account: an alias, a `HostName`, a `HostKeyAlias`. For a profile that
+//! has a jump host the lookup adds a fixed `ProxyCommand` stand-in (never run),
+//! so that `ssh -G` resolves the connection as the routed one is made: ssh
+//! canonicalizes a host name only for a connection without a proxy
+//! (`moniker_core::ssh::login_resolve_command`). If `ssh -G` fails or its
+//! answer is ambiguous, the profile's own user and host are expected, as
+//! before. `ssh -G` sees no remote command, so a `Match sessiontype` or
+//! `Match command` block (OpenSSH 10.0 and later) is judged as for a plain
+//! login. The helper logs nothing: no prompt, no answer, no profile data. On
+//! failure stdout stays empty and stderr gets one generic line, and the exit
+//! status is 1.
 
 use std::io::{self, Write};
 use std::panic;

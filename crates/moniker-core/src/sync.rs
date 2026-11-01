@@ -1252,9 +1252,10 @@ fn sync_over_ssh_with_timeout(
 /// Whether `cmd` takes `leg`'s hop as the `ProxyCommand` of its `ssh`, as
 /// `crate::ssh::sync_command` builds it for its `proxy`: `-o ProxyCommand=<hop>`
 /// before the `--` that ends the options, and the first proxy option there.
-/// ssh uses the first `ProxyCommand` or `ProxyJump` it is given (from `-o` or
-/// `-J`) and ignores the rest, so any such option before the hop's, in any
-/// spelling, sends the sync somewhere else.
+/// ssh uses the first `ProxyCommand` or `ProxyJump` it is given, from `-o` or
+/// `-J`, and a later `-o` one changes nothing; a `-J` after a `ProxyCommand` it
+/// refuses outright ("Cannot specify -J with ProxyCommand"). So any such option
+/// before the hop's, in any spelling, sends the sync somewhere else.
 fn goes_through(cmd: &SshCommand, leg: &JumpLeg) -> bool {
     let hop = format!("ProxyCommand={}", leg.hop);
     let end = cmd.args.iter().position(|arg| arg == "--");
@@ -5527,8 +5528,9 @@ exec sleep 30"#,
     #[test]
     fn the_hop_must_be_the_first_proxy_option_ssh_sees() {
         // ssh takes the first ProxyCommand or ProxyJump it is given, from
-        // `-o` or `-J`; a later one changes nothing. So a command carries the
-        // hop only if nothing of the kind comes before it.
+        // `-o` or `-J`; a later `-o` one changes nothing, and a `-J` after a
+        // ProxyCommand it refuses. So a command carries the hop only if
+        // nothing of the kind comes before it.
         let fake = FakeJump::new();
         let hop = format!("ProxyCommand={}", fake.leg.hop);
         let command = |args: &[&str]| SshCommand {
@@ -5539,7 +5541,9 @@ exec sleep 30"#,
         let goes = |args: &[&str]| goes_through(&command(args), &fake.leg);
 
         assert!(goes(&["-p", "22", "-o", &hop, "-T", "--", "alice@db"]));
-        // Another after it is ssh's second, which it ignores.
+        // Another `-o` after it is ssh's second, which it ignores; a `-J` after
+        // it ssh refuses ("Cannot specify -J with ProxyCommand"), so the sync
+        // never runs, and never elsewhere.
         assert!(goes(&["-o", &hop, "-o", "ProxyCommand=other", "--", "x"]));
         assert!(goes(&["-o", &hop, "-J", "elsewhere", "--", "x"]));
 

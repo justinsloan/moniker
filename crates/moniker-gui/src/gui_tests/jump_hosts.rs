@@ -2117,12 +2117,22 @@ pub(super) fn deleting_a_jump_host_names_who_goes_through_it(dir: &Path) {
 
 // ----- the lists and the host marks -----
 
-/// The sidebar list of the Connection Profiles window `window`.
-fn sidebar_of(window: &adw::Window) -> gtk::ListBox {
-    all_widgets::<gtk::ListBox>(window)
-        .into_iter()
-        .find(|list| list.widget_name() == profiles::SIDEBAR_NAME)
-        .expect("the sidebar")
+/// The sidebar list of the Connection Profiles window `window`, once it has a
+/// row for each of the profiles `ids`.
+fn sidebar_of(window: &adw::Window, ids: &[&str]) -> gtk::ListBox {
+    let find = || {
+        all_widgets::<gtk::ListBox>(window)
+            .into_iter()
+            .find(|list| list.widget_name() == profiles::SIDEBAR_NAME)
+    };
+    pump_until("the sidebar to list the profiles", || {
+        find().is_some_and(|list| {
+            let rows = all_widgets::<adw::ActionRow>(&list);
+            ids.iter()
+                .all(|id| rows.iter().any(|row| row.widget_name() == *id))
+        })
+    });
+    find().expect("the sidebar")
 }
 
 /// The line under each profile's name in `list`, for the profiles `ids` in
@@ -2183,8 +2193,6 @@ pub(super) fn both_lists_say_which_jump_host(dir: &Path) {
     let page = new_tab::open(&main.view, &ctx);
     let tab_list = list_in(&page).expect("the new-tab list");
     let profiles_window = window::open_profiles(&app, &ctx);
-    pump_for(Duration::from_millis(300));
-    let sidebar = sidebar_of(&profiles_window);
     let ids = [
         bastion.id.as_str(),
         mid.id.as_str(),
@@ -2194,6 +2202,7 @@ pub(super) fn both_lists_say_which_jump_host(dir: &Path) {
         plain.id.as_str(),
         v6.id.as_str(),
     ];
+    let sidebar = sidebar_of(&profiles_window, &ids);
     let said = |via: &str| {
         vec![
             "bob@bastion.example.test:22".to_owned(),
@@ -2326,8 +2335,14 @@ pub(super) fn a_profile_behind_a_jump_host_is_never_pinged(dir: &Path) {
 
     // The sidebar says the same.
     let profiles_window = window::open_profiles(&app, &ctx);
-    pump_for(Duration::from_millis(300));
-    let sidebar = sidebar_of(&profiles_window);
+    let sidebar = sidebar_of(
+        &profiles_window,
+        &[&bastion.id, &db.id, &direct.id, &lost.id],
+    );
+    pump_until("the sidebar's marks for the direct profiles", || {
+        mark_shown(&mark(&sidebar, &direct)) == answers()
+            && mark_shown(&mark(&sidebar, &bastion)) == answers()
+    });
     assert_eq!(mark_shown(&mark(&sidebar, &db)), dash(through_bastion));
     assert_eq!(mark_shown(&mark(&sidebar, &lost)), dash(gone));
     assert_eq!(mark_shown(&mark(&sidebar, &direct)), answers());

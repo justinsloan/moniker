@@ -31,8 +31,10 @@
 //! partner goes is decided from the window's profiles when the sync is asked for
 //! ([`sync_request`]) and looked at again on the worker, before the keyring is
 //! read and again after ([`check_route_unchanged`]): a partner whose jump host is
-//! no longer saved, or goes through one of its own, waits, and a sync never goes
-//! straight to a partner the person routed through a jump host.
+//! no longer saved, or goes through one of its own, waits; one whose address was
+//! edited since is not signed in to at the old one; and a sync never goes
+//! straight to a partner the person routed through a jump host ([`run_with`]
+//! refuses that too, as the core sees only argv).
 //!
 //! The sync key is held in `Zeroizing` buffers and never shown; every message
 //! is plain text (profile names come from sync data and may contain markup
@@ -129,6 +131,13 @@ pub(crate) fn explain(err: &SyncError) -> String {
         // The same words as a pane's, for the same reason.
         SyncError::JumpFailed { name, detail } if detail == NO_RUNTIME_FOLDER => {
             no_runtime_folder_note(name)
+        }
+        // Here `name` is the partner's: the jump host is what is missing.
+        SyncError::JumpFailed { name, detail } if detail == NO_JUMP_HOST_GIVEN => {
+            format!(
+                "{name} goes through a jump host, and this sync was started without it. \
+                 Sync again."
+            )
         }
         // The jump host's login failed or it did not answer. The detail is
         // ssh's own words (sanitized in core), which can carry the jump host's
@@ -402,9 +411,10 @@ pub(crate) const JUMP_CHANGED: &str = "This profile's jump host changed just now
 /// had it if the file no longer has it). It stops the sync, with the route's own
 /// text, when the jump host is no longer saved or goes through one of its own;
 /// and with [`JUMP_CHANGED`] when it is a different jump host from `asked`, or
-/// there was none or is none now: never straight to the partner, and never with
-/// the password of another jump host. A file that cannot be opened is a store
-/// error, as for [`check_switch_is_on`].
+/// the same one with another host, port, user name or key file, or there was
+/// none or is none now: never straight to the partner, never to an address the
+/// person did not choose, and never with the password of another jump host. A
+/// file that cannot be opened is a store error, as for [`check_switch_is_on`].
 pub(crate) fn check_route_unchanged(
     store_path: &Path,
     partner: &Profile,
@@ -416,10 +426,30 @@ pub(crate) fn check_route_unchanged(
     if let Some(refusal) = route.refusal() {
         return Err(SyncFailure::NotStarted(refusal));
     }
-    if route.jump().map(|jump| &jump.id) != asked.map(|jump| &jump.id) {
-        return Err(SyncFailure::NotStarted(JUMP_CHANGED.to_owned()));
+    let same = match (route.jump(), asked) {
+        (None, None) => true,
+        (Some(now), Some(asked)) => same_connection(now, asked),
+        _ => false,
+    };
+    if same {
+        Ok(())
+    } else {
+        Err(SyncFailure::NotStarted(JUMP_CHANGED.to_owned()))
     }
-    Ok(())
+}
+
+/// Whether `now` and `asked` are one jump host that connects the same way: the
+/// leg of a sync is built from `asked`, and the stored password looked up is
+/// for its id, so a host, port, user name or key file edited since (a sync that
+/// landed while this one waited at the keyring, a snapshot not yet reloaded)
+/// would send the master, and the password, where the person did not choose.
+/// The name is not part of the connection.
+fn same_connection(now: &Profile, asked: &Profile) -> bool {
+    now.id == asked.id
+        && now.host == asked.host
+        && now.port == asked.port
+        && now.username == asked.username
+        && now.key_file == asked.key_file
 }
 
 /// The profile file, for a check on the worker. The error text carries no file
@@ -525,6 +555,11 @@ pub(crate) const SYNC_IS_OFF: &str = "Sync is turned off on this machine.";
 /// folder holds the socket of the jump connection ([`jump_leg`]).
 const NO_RUNTIME_FOLDER: &str = "there is no private runtime folder for its shared connection";
 
+/// What a [`SyncError::JumpFailed`] says (as its detail, with the partner's name)
+/// when the worker was given a partner that goes through a jump host and no jump
+/// host to go through ([`run_with`]).
+const NO_JUMP_HOST_GIVEN: &str = "the sync was started without the jump host";
+
 /// The worker's whole job: open this thread's own store and secret store, build
 /// the ssh command, and run the exchange. `tweak` may change the command before
 /// it runs (the real runner changes nothing; tests swap in a fake `ssh`).
@@ -540,6 +575,16 @@ pub(crate) fn run_with(
     secrets: Box<dyn SecretStore>,
     mut tweak: impl FnMut(&mut SshCommand),
 ) -> Result<SyncOutcome, SyncError> {
+    // The core sees only argv: a partner the person routed through a jump host
+    // and given no jump host here would be synced straight, a connection that
+    // way was never chosen. `sync_request` and the checks on the worker make
+    // this unreachable; it stays as the last line.
+    if inputs.profile.jump_host.is_some() && inputs.jump.is_none() {
+        return Err(SyncError::JumpFailed {
+            name: inputs.profile.name.clone(),
+            detail: NO_JUMP_HOST_GIVEN.to_owned(),
+        });
+    }
     // StoreError messages carry no file contents.
     let store =
         ProfileStore::open(&inputs.store_path).map_err(|e| SyncError::Store(e.to_string()))?;
@@ -2213,6 +2258,46 @@ mod tests {
     }
 
     #[test]
+    fn the_worker_does_not_sync_straight_to_a_partner_routed_through_a_jump_host() {
+        let mut w = world();
+        let _bastion = add_jump_host(&mut w);
+        let no_ssh = |_: &mut SshCommand| panic!("ssh must not be started");
+        // The inputs name no jump host, though the partner has one: the core
+        // sees only argv and would sync straight to it.
+        let err = run_with(
+            inputs_for(&w, false),
+            Box::new(MemorySecretStore::default()),
+            no_ssh,
+        )
+        .unwrap_err();
+        match &err {
+            SyncError::JumpFailed { name, detail } => {
+                assert_eq!(name, &w.profile.name);
+                assert_eq!(detail, NO_JUMP_HOST_GIVEN);
+            }
+            other => panic!("got {other:?}"),
+        }
+        // Said in the partner's name, as plain text, with no markup parsed.
+        assert_eq!(
+            explain(&err),
+            "Prod <web> goes through a jump host, and this sync was started without it. \
+             Sync again."
+        );
+
+        // Without a jump host on the partner, none is needed.
+        go_through(&mut w, None);
+        let result = run_with(
+            inputs_for(&w, false),
+            Box::new(MemorySecretStore::default()),
+            |cmd| cmd.program = "/nonexistent/ssh".to_owned(),
+        );
+        assert!(
+            !matches!(result, Err(SyncError::JumpFailed { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn a_jump_host_changed_since_the_request_stops_the_worker() {
         let mut w = world();
         let bastion = add_jump_host(&mut w);
@@ -2247,6 +2332,71 @@ mod tests {
         // Deleted: the partner waits, and is never synced direct.
         other().delete(&bastion.id).unwrap();
         assert_eq!(check(&w, asked).as_deref(), Some(MISSING));
+    }
+
+    #[test]
+    fn a_jump_host_edited_since_the_request_stops_the_worker() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        let other = || ProfileStore::open(w.store.path()).unwrap();
+        let check = |asked: &Profile| {
+            check_route_unchanged(w.store.path(), &w.profile, Some(asked))
+                .err()
+                .map(|failure| failure_text(&failure))
+        };
+        let changed = Some(JUMP_CHANGED.to_owned());
+        assert_eq!(check(&bastion), None);
+
+        // The same jump host id, but the master would sign in to the old
+        // address (or as the old user, or with the old key) while the stored
+        // password is looked up for the id: every part of where it connects
+        // stops the sync, whichever way the file was edited.
+        let edits = [
+            (
+                "host",
+                Profile {
+                    host: "elsewhere.example.test".to_owned(),
+                    ..bastion.clone()
+                },
+            ),
+            (
+                "port",
+                Profile {
+                    port: 2222,
+                    ..bastion.clone()
+                },
+            ),
+            (
+                "user name",
+                Profile {
+                    username: "mallory".to_owned(),
+                    ..bastion.clone()
+                },
+            ),
+            (
+                "key file",
+                Profile {
+                    key_file: Some(PathBuf::from("/tmp/other-key")),
+                    ..bastion.clone()
+                },
+            ),
+        ];
+        for (what, edited) in edits {
+            other().upsert(edited).unwrap();
+            assert_eq!(check(&bastion), changed, "the jump host's {what}");
+            // Put back: the same as asked again.
+            other().upsert(bastion.clone()).unwrap();
+            assert_eq!(check(&bastion), None, "{what} put back");
+        }
+
+        // A rename changes nothing of where the connection goes.
+        other()
+            .upsert(Profile {
+                name: "Renamed".to_owned(),
+                ..bastion.clone()
+            })
+            .unwrap();
+        assert_eq!(check(&bastion), None);
     }
 
     #[test]
