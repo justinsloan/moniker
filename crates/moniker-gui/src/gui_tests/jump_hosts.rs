@@ -21,6 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
+use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::askpass::{claim_marker, marker_dir};
@@ -32,20 +33,22 @@ use vte4::Terminal;
 use vte4::prelude::*;
 
 use super::main_window::test_app;
+use super::profiles::{Setup, items_of, saved, shown_item};
 use super::windows::main_window;
 use super::{
-    HeldKeyring, files_in, make_helper, pane, pump_for, pump_until, shown, wait_for_session,
-    wait_for_text,
+    HeldKeyring, HeldProfileFile, all_widgets, button_labeled, files_in, make_helper, pane,
+    pump_for, pump_until, shown, wait_for_session, wait_for_text,
 };
 use crate::context::AppContext;
 use crate::jump_link::JumpLink;
 use crate::panes::{self, REC_PREFIX};
+use crate::profiles::jump_row::ROW_TITLE;
 use crate::session_file::{Kind, Node, PaneRecord, TabRecord};
 use crate::terminal_tab::{
     ASKPASS_MISSING_NOTICE, PaneHolder, close_pane, open_profile, set_test_ssh_program,
     start_profile, terminal_in, terminal_text,
 };
-use crate::{keyring, session_layout, settings};
+use crate::{form, keyring, session_layout, settings};
 
 /// The fake `ssh` of one scenario and the folder where it writes down what it
 /// did:
@@ -1417,4 +1420,637 @@ pub(super) fn rec_lasts_from_the_jump_host_to_the_target_s_end(bin: &Path, dir: 
     set_test_ssh_program(None);
     main.window.close();
     pump_for(Duration::from_millis(200));
+}
+
+// ----- the Jump Host row: the profile page and New Profile -----
+
+/// The question deleting a profile asks, before the line about the profiles
+/// that go through it.
+const DELETE_BODY: &str = "This removes the profile and its stored password. It cannot be undone.";
+
+/// `p` with a fixed id ending in `n`, so that two of the same name come in a
+/// known order (by name, then by id).
+fn with_id(mut p: Profile, n: u8) -> Profile {
+    p.id = format!("00000000-0000-4000-8000-0000000000{n:02x}");
+    p
+}
+
+/// A profile `name` (at `<name>.example.test`) that goes through `jump`.
+fn going_through(name: &str, jump: &Profile) -> Profile {
+    let mut p = Profile::new(name, &format!("{name}.example.test"), "alice");
+    p.jump_host = Some(jump.id.clone());
+    p
+}
+
+/// The Jump Host row under `root` (the window, on a profile's page, or the New
+/// Profile dialog).
+fn jump_row(root: &impl IsA<gtk::Widget>) -> adw::ComboRow {
+    all_widgets::<adw::ComboRow>(root)
+        .into_iter()
+        .find(|row| row.title() == ROW_TITLE)
+        .expect("the Jump Host row")
+}
+
+/// What the row's subtitle says, `""` for nothing.
+fn note(row: &adw::ComboRow) -> String {
+    row.subtitle().map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// Choose `label` in `row`, as a click on its list does; a save it makes is
+/// not waited for.
+fn choose(row: &adw::ComboRow, label: &str) {
+    let at = items_of(row)
+        .iter()
+        .position(|item| item == label)
+        .unwrap_or_else(|| panic!("no {label:?} in {:?}", items_of(row)));
+    row.set_selected(u32::try_from(at).expect("a small position"));
+}
+
+/// The titles of the rows under `root`, in order.
+fn row_titles(root: &impl IsA<gtk::Widget>) -> Vec<String> {
+    all_widgets::<adw::PreferencesRow>(root)
+        .iter()
+        .map(|row| row.title().to_string())
+        .collect()
+}
+
+/// The group titled `title` on the shown page.
+fn group(s: &Setup, title: &str) -> adw::PreferencesGroup {
+    all_widgets::<adw::PreferencesGroup>(&s.window)
+        .into_iter()
+        .find(|group| group.title() == title)
+        .unwrap_or_else(|| panic!("no {title:?} group"))
+}
+
+/// The entry row titled `title` under `root`.
+fn entry_in(root: &impl IsA<gtk::Widget>, title: &str) -> adw::EntryRow {
+    all_widgets::<adw::EntryRow>(root)
+        .into_iter()
+        .find(|r| r.title() == title)
+        .unwrap_or_else(|| panic!("no {title:?} row"))
+}
+
+/// Open the New Profile dialog (＋), once it shows.
+fn new_profile_dialog(s: &Setup) -> adw::Dialog {
+    all_widgets::<gtk::Button>(&s.window)
+        .into_iter()
+        .find(|b| b.tooltip_text().as_deref() == Some("Add Profile"))
+        .expect("the + button")
+        .emit_clicked();
+    pump_until("the New Profile dialog", || {
+        s.window.visible_dialog().is_some()
+    });
+    s.window.visible_dialog().expect("the New Profile dialog")
+}
+
+/// The alert on show over the window, once it shows.
+fn question(s: &Setup) -> adw::AlertDialog {
+    pump_until("the question", || {
+        s.window
+            .visible_dialog()
+            .and_downcast::<adw::AlertDialog>()
+            .is_some()
+    });
+    s.window
+        .visible_dialog()
+        .and_downcast::<adw::AlertDialog>()
+        .expect("the question")
+}
+
+/// Ask to delete the shown profile, and give back the question's body after
+/// answering Cancel.
+fn delete_question(s: &Setup) -> String {
+    button_labeled(&s.window, "Delete Profile")
+        .expect("the delete button")
+        .emit_clicked();
+    let dialog = question(s);
+    assert!(!dialog.is_body_use_markup(), "the body parses markup");
+    let body = dialog.body().to_string();
+    button_labeled(&dialog, "Cancel")
+        .expect("the question's Cancel button")
+        .emit_clicked();
+    pump_until("the question to go", || s.window.visible_dialog().is_none());
+    body
+}
+
+/// The row offers None, then the profiles this one can go through by name:
+/// not itself, none that goes through a jump host of its own, no deleted one.
+/// Two of the same name, and one named like an entry of the row's own, show
+/// their address too. It is the last row of the Connection group.
+pub(super) fn the_jump_host_row_offers_usable_profiles(dir: &Path) {
+    let web = with_id(Profile::new("web", "web.example.test", "alice"), 1);
+    let alpha = with_id(Profile::new("alpha", "alpha.example.test", "bob"), 2);
+    let first = with_id(Profile::new("bastion", "b1.example.test", "bob"), 3);
+    let mut second = with_id(Profile::new("bastion", "fe80::1", "carol"), 4);
+    second.port = 2222;
+    let k = with_id(Profile::new("k", "k.example.test", "kim"), 5);
+    let mut chained = with_id(Profile::new("chained", "c.example.test", "carl"), 6);
+    chained.jump_host = Some(k.id.clone());
+    let none = with_id(Profile::new("None", "n.example.test", "nina"), 7);
+    let gone = with_id(Profile::new("gone", "g.example.test", "gus"), 8);
+    let s = Setup::open(
+        dir,
+        &[
+            web.clone(),
+            alpha,
+            first,
+            second.clone(),
+            k,
+            chained.clone(),
+            none,
+            gone.clone(),
+        ],
+    );
+    s.other_store()
+        .delete(&gone.id)
+        .expect("delete it elsewhere");
+    s.ctx.profiles_changed();
+    s.select(&web.id);
+
+    let row = jump_row(&s.window);
+    assert!(row.is_mapped());
+    assert!(row.is_sensitive());
+    assert!(!row.uses_markup());
+    assert_eq!(
+        row_titles(&group(&s, "Connection")),
+        ["Name", "Host", "Username", "Port", ROW_TITLE],
+        "last in the Connection group"
+    );
+    assert_eq!(
+        items_of(&row),
+        [
+            "None",
+            "alpha",
+            "bastion (bob@b1.example.test:22)",
+            "bastion (carol@[fe80::1]:2222)",
+            "k",
+            "None (nina@n.example.test:22)",
+        ]
+    );
+    assert_eq!(shown_item(&row), "None");
+    assert_eq!(note(&row), "", "no note: no subtitle");
+
+    // A rename elsewhere ends the clash: the names follow the file.
+    s.elsewhere(&second.id, |p| p.name = "inner".to_owned());
+    s.ctx.profiles_changed();
+    let names = [
+        "None",
+        "alpha",
+        "bastion",
+        "inner",
+        "k",
+        "None (nina@n.example.test:22)",
+    ];
+    assert_eq!(items_of(&row), names);
+    assert_eq!(shown_item(&row), "None");
+
+    // A profile's own jump host is selected among them, and web is one of
+    // them for that profile.
+    s.select(&chained.id);
+    let row = jump_row(&s.window);
+    let mut names = names.to_vec();
+    names.push("web");
+    assert_eq!(items_of(&row), names);
+    assert_eq!(shown_item(&row), "k");
+    assert_eq!(note(&row), "");
+
+    let written = s.file_bytes();
+    pump_for(Duration::from_millis(300));
+    assert_eq!(keyring::pending(), 0, "showing the row saved nothing");
+    assert_eq!(s.file_bytes(), written);
+    assert_eq!(
+        s.ctx.config_routes.on_main(),
+        0,
+        "no ssh -G on the main thread"
+    );
+    s.close();
+}
+
+/// A pick saves at once (off the main thread), and the row follows the file.
+/// A pick the file no longer allows (its jump host got one of its own
+/// meanwhile) is refused under the lock: nothing is written, and the row goes
+/// back with the reason.
+pub(super) fn picking_a_jump_host_saves_it(dir: &Path) {
+    let web = Profile::new("web", "web.example.test", "alice");
+    let alpha = Profile::new("alpha", "alpha.example.test", "bob");
+    let beta = Profile::new("beta", "beta.example.test", "bob");
+    let k = Profile::new("k", "k.example.test", "kim");
+    let s = Setup::open(dir, &[web.clone(), alpha.clone(), beta.clone(), k.clone()]);
+    s.select(&web.id);
+    let row = jump_row(&s.window);
+    let first = s.file_bytes();
+    let before = s.on_disk(&web.id).expect("web").updated_at;
+    pump_for(Duration::from_millis(300));
+    assert_eq!(keyring::pending(), 0);
+    assert_eq!(s.file_bytes(), first, "building the page wrote nothing");
+
+    choose(&row, "alpha");
+    saved();
+    let stored = s.on_disk(&web.id).expect("web");
+    assert_eq!(stored.jump_host.as_deref(), Some(alpha.id.as_str()));
+    assert!(stored.updated_at > before);
+    assert_eq!(shown_item(&row), "alpha");
+    assert!(!row.has_css_class("error"));
+
+    // Another machine chose beta: the row shows it, and a refresh saves
+    // nothing.
+    s.elsewhere(&web.id, |p| p.jump_host = Some(beta.id.clone()));
+    let written = s.file_bytes();
+    s.ctx.profiles_changed();
+    assert_eq!(shown_item(&row), "beta");
+    pump_for(Duration::from_millis(300));
+    assert_eq!(keyring::pending(), 0);
+    assert_eq!(s.file_bytes(), written, "a refresh wrote nothing");
+
+    // alpha is given a jump host of its own before the page heard of it (the
+    // file watch has not reloaded: nothing ran the main loop since the
+    // write). The pick is judged on the file under the lock and refused.
+    s.elsewhere(&alpha.id, |p| p.jump_host = Some(k.id.clone()));
+    let written = s.file_bytes();
+    choose(&row, "alpha");
+    saved();
+    assert_eq!(s.file_bytes(), written, "nothing was written");
+    assert_eq!(
+        s.on_disk(&web.id).expect("web").jump_host.as_deref(),
+        Some(beta.id.as_str())
+    );
+    assert_eq!(shown_item(&row), "beta", "back to what the file says");
+    assert_eq!(
+        items_of(&row),
+        ["None", "beta", "k"],
+        "alpha is a chain now"
+    );
+    assert!(row.has_css_class("error"));
+    assert_eq!(
+        s.ctx.notice.last_text().as_deref(),
+        Some(chain_text("alpha").as_str())
+    );
+
+    // A pick that cannot be saved (the file cannot be replaced) goes back too,
+    // with the reason.
+    fs::set_permissions(&s.dir, fs::Permissions::from_mode(0o500)).expect("chmod");
+    choose(&row, "k");
+    saved();
+    fs::set_permissions(&s.dir, fs::Permissions::from_mode(0o700)).expect("chmod back");
+    assert_eq!(s.file_bytes(), written, "nothing was written");
+    assert_eq!(shown_item(&row), "beta", "back to what the file says");
+    assert!(row.has_css_class("error"));
+    assert!(
+        s.ctx
+            .notice
+            .last_text()
+            .is_some_and(|text| text.starts_with("Could not save the profile")),
+        "{:?}",
+        s.ctx.notice.last_text()
+    );
+
+    // While a pick waits to be saved (the file held, as a sync that waits for
+    // the keyring holds it), the window goes on and the row keeps showing the
+    // pick through a refresh; once the file is free, it is saved.
+    let held = HeldProfileFile::hold(&s.dir);
+    choose(&row, "k");
+    s.ctx.profiles_changed();
+    assert_eq!(shown_item(&row), "k", "the pick, not the file's beta");
+    assert_eq!(keyring::pending(), 1, "the save waits");
+    held.release();
+    saved();
+    assert_eq!(
+        s.on_disk(&web.id).expect("web").jump_host.as_deref(),
+        Some(k.id.as_str())
+    );
+    assert_eq!(shown_item(&row), "k");
+
+    // None clears it, and the mark.
+    choose(&row, "None");
+    saved();
+    assert_eq!(s.on_disk(&web.id).expect("web").jump_host, None);
+    assert_eq!(shown_item(&row), "None");
+    assert!(!row.has_css_class("error"));
+    s.close();
+}
+
+/// Put `host` in or out of one of the fake `~/.ssh/config`'s sets
+/// (`context::ConfigRoutes`).
+fn set_host(set: &std::sync::Mutex<std::collections::HashSet<String>>, host: &str, on: bool) {
+    let mut set = set.lock().expect("the fake's set");
+    if on {
+        set.insert(host.to_owned());
+    } else {
+        set.remove(host);
+    }
+}
+
+/// The row's subtitle carries one note, the most urgent first: a jump host not
+/// saved here, one that goes through a jump host of its own, one kept on this
+/// machine only, then a route that `~/.ssh/config` sets for this profile's
+/// host (asked on a worker thread); each goes in turn. Only an answer about
+/// the connection the profile has now is used.
+pub(super) fn the_row_shows_one_note_most_urgent_first(dir: &Path) {
+    let k = Profile::new("k", "k.example.test", "kim");
+    let mut bastion = Profile::new("bastion", "bastion.example.test", "bob");
+    bastion.local_only = true;
+    bastion.jump_host = Some(k.id.clone());
+    let web = going_through("web", &bastion);
+    let s = Setup::open(dir, &[k.clone(), web.clone()]);
+    let routes = Arc::clone(&s.ctx.config_routes);
+    // ~/.ssh/config sends web's host through another host too.
+    set_host(&routes.through, &web.host, true);
+    s.select(&web.id);
+    let row = jump_row(&s.window);
+
+    // 1. Its jump host is not saved here.
+    assert_eq!(items_of(&row), ["None", "k", form::JUMP_NO_LONGER_SAVED]);
+    assert_eq!(shown_item(&row), form::JUMP_NO_LONGER_SAVED);
+    assert_eq!(note(&row), form::JUMP_CHOOSE_ANOTHER);
+    pump_until("the config check", || routes.answered() == 1);
+    pump_for(Duration::from_millis(100));
+    assert_eq!(
+        note(&row),
+        form::JUMP_CHOOSE_ANOTHER,
+        "the more urgent note"
+    );
+
+    // 2. It arrives (a sync), going through a jump host of its own.
+    s.other_store().upsert(bastion.clone()).expect("save");
+    s.ctx.profiles_changed();
+    assert_eq!(items_of(&row), ["None", "k", "bastion"]);
+    assert_eq!(shown_item(&row), "bastion");
+    assert_eq!(note(&row), chain_text("bastion"));
+
+    // 3. Without one: it is kept on this machine only, and web is not.
+    s.elsewhere(&bastion.id, |p| p.jump_host = None);
+    s.ctx.profiles_changed();
+    assert_eq!(items_of(&row), ["None", "bastion", "k"]);
+    assert_eq!(shown_item(&row), "bastion");
+    assert_eq!(note(&row), form::kept_here_note("bastion"));
+
+    // 4. It syncs: what ~/.ssh/config says is the note left.
+    s.elsewhere(&bastion.id, |p| p.local_only = false);
+    s.ctx.profiles_changed();
+    assert_eq!(note(&row), form::config_route_note("bastion"));
+    assert_eq!(routes.answered(), 1, "asked once for the same connection");
+
+    // 5. web's host changes: asked again, for that connection, which goes
+    // straight there. No note, no subtitle.
+    s.elsewhere(&web.id, |p| p.host = "direct.example.test".to_owned());
+    s.ctx.profiles_changed();
+    assert_eq!(note(&row), "", "not before it says so");
+    pump_until("the config check of the new host", || {
+        routes.answered() == 2
+    });
+    pump_for(Duration::from_millis(100));
+    assert_eq!(note(&row), "");
+
+    // 6. An answer about a connection the profile no longer has is not used:
+    // the one about slow (held until web went back to direct) says "through
+    // another host".
+    set_host(&routes.through, "slow.example.test", true);
+    set_host(&routes.held, "slow.example.test", true);
+    s.elsewhere(&web.id, |p| p.host = "slow.example.test".to_owned());
+    s.ctx.profiles_changed();
+    s.elsewhere(&web.id, |p| p.host = "direct.example.test".to_owned());
+    s.ctx.profiles_changed();
+    pump_until("the check of direct again", || routes.answered() == 3);
+    set_host(&routes.held, "slow.example.test", false);
+    pump_until("the check of slow", || routes.answered() == 4);
+    pump_for(Duration::from_millis(200));
+    assert_eq!(note(&row), "", "the answer about slow came too late");
+    // Asked anew once the profile is there again, it is used.
+    s.elsewhere(&web.id, |p| p.host = "slow.example.test".to_owned());
+    s.ctx.profiles_changed();
+    pump_until("the note about slow", || {
+        note(&row) == form::config_route_note("bastion")
+    });
+    assert_eq!(routes.on_main(), 0, "no ssh -G on the main thread");
+    s.close();
+}
+
+/// On a profile that others go through, the row is grayed out with a line
+/// that names them (three, then how many more). One that has a jump host
+/// anyway (from a merge) shows it, grayed, and says it is a chain. Once nobody
+/// goes through it, the row can be used again.
+pub(super) fn the_row_is_grayed_on_a_profile_others_go_through(dir: &Path) {
+    let bastion = Profile::new("bastion", "bastion.example.test", "bob");
+    let other = Profile::new("other", "other.example.test", "olga");
+    let web = going_through("web", &bastion);
+    let s = Setup::open(dir, &[bastion.clone(), other.clone(), web.clone()]);
+    s.select(&bastion.id);
+    let row = jump_row(&s.window);
+    assert!(!row.is_sensitive());
+    assert_eq!(note(&row), "web goes through this profile.");
+    assert_eq!(shown_item(&row), "None");
+
+    let db = going_through("db", &bastion);
+    s.other_store().upsert(db.clone()).expect("save");
+    s.ctx.profiles_changed();
+    assert_eq!(note(&row), "db and web go through this profile.");
+    let app = going_through("app", &bastion);
+    let cache = going_through("cache", &bastion);
+    s.other_store().upsert(app.clone()).expect("save");
+    s.other_store().upsert(cache.clone()).expect("save");
+    s.ctx.profiles_changed();
+    assert!(!row.is_sensitive());
+    assert_eq!(
+        note(&row),
+        "app, cache, db, and 1 more go through this profile."
+    );
+
+    // A jump host of its own anyway, from a merge.
+    s.elsewhere(&bastion.id, |p| p.jump_host = Some(other.id.clone()));
+    s.ctx.profiles_changed();
+    assert!(!row.is_sensitive());
+    assert_eq!(shown_item(&row), "other");
+    assert_eq!(
+        note(&row),
+        format!(
+            "app, cache, db, and 1 more go through this profile. {}",
+            chain_text("bastion")
+        )
+    );
+
+    for p in [&web, &db, &app, &cache] {
+        s.elsewhere(&p.id, |p| p.jump_host = None);
+    }
+    s.ctx.profiles_changed();
+    assert!(row.is_sensitive());
+    assert_eq!(shown_item(&row), "other");
+    assert_eq!(note(&row), "");
+    s.close();
+}
+
+/// New Profile has the same row after Port, None to start with and the same
+/// choices, with its notes (the kept-here one follows the dialog's own switch)
+/// and the file's changes while it is open. Create saves the choice with the
+/// profile, judged again under the lock: a jump host deleted meanwhile is
+/// refused in the dialog, and nothing is created.
+pub(super) fn new_profile_has_the_jump_host_row(dir: &Path) {
+    let mut bastion = Profile::new("bastion", "bastion.example.test", "bob");
+    bastion.local_only = true;
+    let k = Profile::new("k", "k.example.test", "kim");
+    let mut chained = Profile::new("chained", "c.example.test", "carl");
+    chained.jump_host = Some(k.id.clone());
+    let s = Setup::open(dir, &[bastion.clone(), k.clone(), chained]);
+
+    let dialog = new_profile_dialog(&s);
+    assert_eq!(
+        row_titles(&dialog)[..6],
+        [
+            "Name",
+            "Host",
+            "Username",
+            "Port",
+            ROW_TITLE,
+            "Password (optional)"
+        ],
+        "after Port"
+    );
+    let row = jump_row(&dialog);
+    assert!(!row.uses_markup());
+    assert_eq!(items_of(&row), ["None", "bastion", "k"], "no chain");
+    assert_eq!(shown_item(&row), "None");
+    assert_eq!(note(&row), "");
+
+    // A jump host kept on this machine only, for a profile that syncs.
+    choose(&row, "bastion");
+    pump_until("the note", || note(&row) == form::kept_here_note("bastion"));
+    let sync = all_widgets::<adw::SwitchRow>(&dialog)
+        .into_iter()
+        .find(|r| r.title() == "Sync to other machines")
+        .expect("the Sync to other machines switch");
+    sync.set_active(false);
+    assert_eq!(note(&row), "", "kept here too");
+    sync.set_active(true);
+    assert_eq!(note(&row), form::kept_here_note("bastion"));
+
+    // The choices follow the file while the dialog is open.
+    s.elsewhere(&k.id, |p| p.name = "kappa".to_owned());
+    s.ctx.profiles_changed();
+    assert_eq!(items_of(&row), ["None", "bastion", "kappa"]);
+    assert_eq!(shown_item(&row), "bastion");
+
+    entry_in(&dialog, "Name").set_text("NAS");
+    entry_in(&dialog, "Host").set_text("nas.lan");
+    entry_in(&dialog, "Username").set_text("admin");
+    button_labeled(&dialog, "Create")
+        .expect("the Create button")
+        .emit_clicked();
+    pump_until("the dialog to close", || {
+        s.window.visible_dialog().is_none()
+    });
+    let created = s
+        .ctx
+        .store
+        .borrow()
+        .live()
+        .iter()
+        .find(|p| p.name == "NAS")
+        .map(|p| (*p).clone())
+        .expect("the new profile");
+    assert_eq!(created.jump_host.as_deref(), Some(bastion.id.as_str()));
+    assert_eq!(
+        s.on_disk(&created.id).expect("in the file").jump_host,
+        created.jump_host
+    );
+
+    // Again, with the jump host deleted before the dialog heard of it.
+    let dialog = new_profile_dialog(&s);
+    let row = jump_row(&dialog);
+    choose(&row, "bastion");
+    pump_until("the pick", || shown_item(&row) == "bastion");
+    s.other_store()
+        .delete(&bastion.id)
+        .expect("delete it elsewhere");
+    let written = s.file_bytes();
+    entry_in(&dialog, "Name").set_text("NAS2");
+    entry_in(&dialog, "Host").set_text("nas2.lan");
+    entry_in(&dialog, "Username").set_text("admin");
+    button_labeled(&dialog, "Create")
+        .expect("the Create button")
+        .emit_clicked();
+    saved();
+    let error = all_widgets::<gtk::Label>(&dialog)
+        .into_iter()
+        .find(|l| l.has_css_class("error") && l.is_visible())
+        .expect("the dialog's error");
+    assert_eq!(error.label(), form::JUMP_GONE);
+    assert!(s.window.visible_dialog().is_some(), "the dialog stays open");
+    assert_eq!(s.file_bytes(), written, "nothing was created");
+    // Once it hears of it, the row says so.
+    s.ctx.profiles_changed();
+    assert_eq!(shown_item(&row), form::JUMP_NO_LONGER_SAVED);
+    assert_eq!(note(&row), form::JUMP_CHOOSE_ANOTHER);
+    button_labeled(&dialog, "Cancel")
+        .expect("the Cancel button")
+        .emit_clicked();
+    pump_until("the dialog to close", || {
+        s.window.visible_dialog().is_none()
+    });
+    s.close();
+}
+
+/// Deleting a profile that others go through says so in its question, naming
+/// them (one, two, then three and how many more); deleting it leaves them
+/// waiting, with it still as their jump host.
+pub(super) fn deleting_a_jump_host_names_who_goes_through_it(dir: &Path) {
+    let bastion = Profile::new("bastion", "bastion.example.test", "bob");
+    let web = going_through("web", &bastion);
+    let s = Setup::open(dir, &[bastion.clone(), web.clone()]);
+    s.select(&bastion.id);
+    assert_eq!(
+        delete_question(&s),
+        format!(
+            "{DELETE_BODY}\n\nweb goes through it. It won't connect until you choose another \
+             jump host for it."
+        )
+    );
+
+    let db = going_through("db", &bastion);
+    s.other_store().upsert(db.clone()).expect("save");
+    s.ctx.profiles_changed();
+    assert_eq!(
+        delete_question(&s),
+        format!(
+            "{DELETE_BODY}\n\ndb and web go through it. They won't connect until you choose \
+             another jump host for them."
+        )
+    );
+
+    for name in ["app", "cache"] {
+        s.other_store()
+            .upsert(going_through(name, &bastion))
+            .expect("save");
+    }
+    s.ctx.profiles_changed();
+    assert_eq!(
+        delete_question(&s),
+        format!(
+            "{DELETE_BODY}\n\napp, cache, db, and 1 more go through it. They won't connect \
+             until you choose another jump host for them."
+        )
+    );
+
+    // Nobody goes through web: the question as it always was.
+    s.select(&web.id);
+    assert_eq!(delete_question(&s), DELETE_BODY);
+
+    // Deleting bastion leaves them waiting.
+    s.select(&bastion.id);
+    button_labeled(&s.window, "Delete Profile")
+        .expect("the delete button")
+        .emit_clicked();
+    let dialog = question(&s);
+    button_labeled(&dialog, "Delete")
+        .expect("the question's Delete button")
+        .emit_clicked();
+    saved();
+    pump_until("the profile to go", || s.on_disk(&bastion.id).is_none());
+    for p in [&web, &db] {
+        assert_eq!(
+            s.on_disk(&p.id).expect("still saved").jump_host.as_deref(),
+            Some(bastion.id.as_str()),
+            "{} waits for another jump host",
+            p.name
+        );
+    }
+    s.close();
 }

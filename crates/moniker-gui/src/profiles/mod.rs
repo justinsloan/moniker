@@ -6,7 +6,8 @@
 //! sub-page ([`sequence_page`]) pushed over the page in the content pane;
 //! Cancel (or Escape) returns to it. The rows that list the sequences, with
 //! the "Default sequence" row, are one component ([`sequence_rows`]) that the
-//! profile page and the Local terminal page share.
+//! profile page and the Local terminal page share. The "Jump Host" row (issue
+//! #9) is one too ([`jump_row`]), on the profile page and in New Profile.
 //!
 //! Above the profiles, the sidebar has a Local terminal entry (issue #13),
 //! always shown whatever the search: it is not a profile, and nothing about
@@ -39,6 +40,7 @@
 //! Profile data is shown with Pango markup off everywhere, and the page title
 //! is a plain label, because names come from other machines.
 
+pub(crate) mod jump_row;
 mod local_page;
 mod new_profile;
 mod page;

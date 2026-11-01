@@ -34,6 +34,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
+use moniker_core::profile::Profile;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore};
 use moniker_core::store::{ProfileStore, StoreError};
 use moniker_core::transcript;
@@ -93,6 +94,87 @@ fn host_check() -> crate::hosts::Check {
 #[cfg(test)]
 fn host_check() -> crate::hosts::Check {
     crate::hosts::Check::new(|_, _| crate::hosts::Reach::Unknown)
+}
+
+/// Whether `~/.ssh/config` sends a profile's connection through another host
+/// (a `ProxyJump` or `ProxyCommand`), as `ssh -G` reports it without Moniker's
+/// own route: the Jump Host row says so, as the profile's jump host wins
+/// (issue #9). It runs `ssh -G`, so it is only ever called on a worker thread
+/// (`profiles::jump_row`), never on the main thread.
+pub(crate) type ConfigRoute = Arc<dyn Fn(&Profile) -> bool + Send + Sync>;
+
+/// The real [`ConfigRoute`]: `ssh -G` for the profile's own connection.
+#[cfg(not(test))]
+fn config_route() -> ConfigRoute {
+    use moniker_core::ssh_config::{PingTarget, effective_config, ping_target};
+    Arc::new(|profile| {
+        effective_config(profile).and_then(|dump| ping_target(&dump))
+            == Some(PingTarget::ThroughAnotherHost)
+    })
+}
+
+/// Tests: what stands for `~/.ssh/config` ([`ConfigRoute`]), so that no test
+/// runs `ssh -G`. A profile whose host is in `through` is sent through another
+/// host. While its host is in `held`, an answer waits (on its worker thread),
+/// for a scenario that changes the profile meanwhile. It counts the answers it
+/// gave and the calls made on the thread that made it (the main thread, in the
+/// window tests), which the GUI never makes.
+#[cfg(test)]
+pub(crate) struct ConfigRoutes {
+    pub(crate) through: std::sync::Mutex<std::collections::HashSet<String>>,
+    pub(crate) held: std::sync::Mutex<std::collections::HashSet<String>>,
+    answered: std::sync::atomic::AtomicUsize,
+    on_main: std::sync::atomic::AtomicUsize,
+    main: std::thread::ThreadId,
+}
+
+#[cfg(test)]
+impl ConfigRoutes {
+    fn new() -> Arc<ConfigRoutes> {
+        Arc::new(ConfigRoutes {
+            through: std::sync::Mutex::default(),
+            held: std::sync::Mutex::default(),
+            answered: std::sync::atomic::AtomicUsize::new(0),
+            on_main: std::sync::atomic::AtomicUsize::new(0),
+            main: std::thread::current().id(),
+        })
+    }
+
+    /// The check a test context uses.
+    fn check(self: &Arc<Self>) -> ConfigRoute {
+        let routes = Arc::clone(self);
+        Arc::new(move |profile| routes.answer(profile))
+    }
+
+    fn answer(&self, profile: &Profile) -> bool {
+        use std::sync::atomic::Ordering;
+        let has = |set: &std::sync::Mutex<std::collections::HashSet<String>>| {
+            set.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&profile.host)
+        };
+        if std::thread::current().id() == self.main {
+            // Counted, and never held: the main thread would wait for good.
+            self.on_main.fetch_add(1, Ordering::SeqCst);
+        } else {
+            while has(&self.held) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let through = has(&self.through);
+        self.answered.fetch_add(1, Ordering::SeqCst);
+        through
+    }
+
+    /// How many answers it gave.
+    pub(crate) fn answered(&self) -> usize {
+        self.answered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many times it was asked on the main thread.
+    pub(crate) fn on_main(&self) -> usize {
+        self.on_main.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// The profile file as the main thread has it: read, and read again after
@@ -168,6 +250,12 @@ pub struct AppContext {
     /// Whether each saved host answers a ping, for the marks in the profile
     /// lists: one status per host for the whole app.
     pub(crate) hosts: Rc<crate::hosts::Hosts>,
+    /// Whether `~/.ssh/config` sends a profile through another host, for the
+    /// Jump Host row's note (issue #9). Called on worker threads only.
+    pub(crate) config_route: ConfigRoute,
+    /// In tests, what `config_route` answers from ([`ConfigRoutes`]).
+    #[cfg(test)]
+    pub(crate) config_routes: Arc<ConfigRoutes>,
     /// The watch on the profile file's directory, kept alive here.
     monitor: RefCell<Option<gio::FileMonitor>>,
     /// A reload is already scheduled by the file watch.
@@ -239,8 +327,16 @@ impl AppContext {
     ) -> AppContext {
         let pings = settings::load(&settings_path).ping_hosts;
         let local_terminal_path = settings_path.with_file_name(local_terminal::FILE_NAME);
+        #[cfg(test)]
+        let config_routes = ConfigRoutes::new();
         AppContext {
             hosts: crate::hosts::Hosts::new(pings, host_check()),
+            #[cfg(not(test))]
+            config_route: config_route(),
+            #[cfg(test)]
+            config_route: config_routes.check(),
+            #[cfg(test)]
+            config_routes,
             store: RefCell::new(ProfileSnapshot(store)),
             secrets,
             askpass_path,

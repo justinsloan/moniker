@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
+use moniker_core::jump;
 use moniker_core::profile::{Profile, ProfileError, StartupSequence, now_ms};
 use moniker_core::secrets::{SecretStore, password_key};
 use moniker_core::store::ProfileStore;
@@ -26,6 +27,10 @@ pub struct FormValues {
     /// new profile takes it: an existing profile keeps its own, which changes
     /// through [`Field::LocalOnly`] alone, after the profile page's question.
     pub local_only: bool,
+    /// The profile a new profile goes through (issue #9), `None` for none. Only
+    /// a new profile takes it, as `local_only`: an existing profile keeps its
+    /// own, which changes through [`apply_jump_host`] alone.
+    pub jump_host: Option<String>,
 }
 
 /// Label of the editor's check box that removes the stored password. It says
@@ -52,17 +57,19 @@ pub enum PasswordAction {
 /// Turn the editor's values into a [`Profile`], or a message for the user.
 ///
 /// An edit keeps the `id`, the startup sequences (edited on their own page)
-/// and anything else the form does not show of `existing`, `local_only`
-/// included (it changes only through [`Field::LocalOnly`], after the profile
-/// page's question); otherwise the profile is new, with a fresh id, no
-/// sequences and `local_only` as the form says. Name, host, username and
-/// key file are trimmed. The result has passed [`Profile::validate`].
+/// and anything else the form does not show of `existing`, `local_only` and
+/// the jump host included (they change only through [`Field::LocalOnly`],
+/// after the profile page's question, and [`apply_jump_host`]); otherwise the
+/// profile is new, with a fresh id, no sequences, and `local_only` and the
+/// jump host as the form says. Name, host, username and key file are trimmed.
+/// The result has passed [`Profile::validate`].
 pub fn build_profile(form: &FormValues, existing: Option<&Profile>) -> Result<Profile, String> {
     let mut profile = match existing {
         Some(p) => p.clone(),
         None => {
             let mut new = Profile::new("", "", "");
             new.local_only = form.local_only;
+            new.jump_host = form.jump_host.clone();
             new
         }
     };
@@ -144,6 +151,12 @@ pub fn subtitle(profile: &Profile) -> String {
 ///    just stored is removed again: a retry builds a new profile id, so it
 ///    would otherwise be orphaned.
 ///
+/// A new profile's jump host (issue #9) is judged again under the store's
+/// lock, as on the profile page ([`apply_jump_host`]): a sync may have deleted
+/// it, or given it a jump host of its own, since the dialog listed it. A
+/// refusal is a failed write: nothing is written, and the password just stored
+/// is removed again. (An edit keeps its own jump host: [`build_profile`].)
+///
 /// Messages never contain the password or a startup command.
 pub fn save_profile(
     store: &RefCell<ProfileStore>,
@@ -156,8 +169,7 @@ pub fn save_profile(
     let profile = build_profile(form, existing)?;
     let action = password_action(typed_password, remove_password)?;
 
-    let id = profile.id.clone();
-    let key = password_key(&id);
+    let key = password_key(&profile.id);
     match action {
         PasswordAction::Set => secrets
             .set(&key, typed_password)
@@ -168,19 +180,53 @@ pub fn save_profile(
         PasswordAction::Keep => {}
     }
 
-    // Bind first so the store borrow ends here.
-    let saved = store.borrow_mut().upsert(profile);
-    if let Err(err) = saved {
-        let mut message = format!("Could not save the profile: {err}");
-        if action == PasswordAction::Set && existing.is_none() && secrets.delete(&key).is_err() {
+    let new = existing.is_none();
+    let jump = new.then(|| (profile.id.clone(), profile.jump_host.clone()));
+    let saved = write_checked(store, profile, |all| {
+        let (id, choice) = jump?;
+        jump_choice_error(all, &id, choice.as_deref())
+    });
+    if let Err(mut message) = saved {
+        if action == PasswordAction::Set && new && secrets.delete(&key).is_err() {
             message
                 .push_str(" The password just stored in the keyring could not be removed again.");
         }
         return Err(message);
     }
-    // The store stamped `updated_at`; hand back what it holds.
-    let stored = store.borrow().get(&id).cloned();
-    stored.ok_or_else(|| GONE.to_owned())
+    saved
+}
+
+/// Write `profile` as [`ProfileStore::upsert`] does (`updated_at` stamped now,
+/// and past the version it replaces), in one locked read-change-write, unless
+/// `check`, asked on the profiles as the file holds them under the lock,
+/// refuses with a message: then nothing is written. `Ok` is the profile as
+/// stored.
+fn write_checked(
+    store: &RefCell<ProfileStore>,
+    profile: Profile,
+    check: impl FnOnce(&[Profile]) -> Option<String>,
+) -> Result<Profile, String> {
+    let result = store.borrow_mut().update(|current| {
+        if let Some(message) = check(current) {
+            return Ok((current.to_vec(), Err(message)));
+        }
+        let floor = current
+            .iter()
+            .find(|p| p.id == profile.id)
+            .map_or(i64::MIN, |old| old.updated_at.saturating_add(1));
+        let stored = Profile {
+            updated_at: now_ms().max(floor),
+            ..profile
+        };
+        let mut next: Vec<Profile> = current
+            .iter()
+            .filter(|p| p.id != stored.id)
+            .cloned()
+            .collect();
+        next.push(stored.clone());
+        Ok((next, Ok(stored)))
+    });
+    result.unwrap_or_else(|err| Err(format!("Could not save the profile: {err}")))
 }
 
 /// What the person sees when a field is applied to a profile that is gone.
@@ -281,6 +327,131 @@ pub fn apply_field(
             return Err(CHOICE_CHANGED.to_owned());
         }
         field.set_on(profile);
+        Ok(true)
+    })?;
+    // `None` only for a change that says it changed nothing; this one never does.
+    saved.ok_or_else(|| GONE.to_owned())
+}
+
+/// What the profile page or New Profile says when the jump host picked is not
+/// a live profile when the choice is saved (a sync deleted it since the row
+/// listed it).
+pub const JUMP_GONE: &str = "This jump host is no longer saved. Choose another.";
+
+/// The Jump Host row's entry for a jump host that is not saved here (issue #9):
+/// the profile names one that a sync deleted, or that never arrived.
+pub const JUMP_NO_LONGER_SAVED: &str = "No longer saved";
+
+/// The Jump Host row's line under [`JUMP_NO_LONGER_SAVED`].
+pub const JUMP_CHOOSE_ANOTHER: &str = "Choose another jump host, or None.";
+
+/// `names` as a sentence lists them: `web`; `web and db`; `web, db, and
+/// app`; past three, the first three and how many more (`web, db, app, and 2
+/// more`).
+pub fn name_list(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        [first, second, third] => format!("{first}, {second}, and {third}"),
+        [first, second, third, rest @ ..] => {
+            format!("{first}, {second}, {third}, and {} more", rest.len())
+        }
+    }
+}
+
+/// The grayed Jump Host row's line on a profile that `names` go through: it
+/// cannot have a jump host of its own.
+pub fn going_through_line(names: &[&str]) -> String {
+    match names {
+        [one] => format!("{one} goes through this profile."),
+        _ => format!("{} go through this profile.", name_list(names)),
+    }
+}
+
+/// The line the question deleting a profile adds when `names` go through it:
+/// they wait for another jump host, and connect nowhere meanwhile.
+pub fn delete_line(names: &[&str]) -> String {
+    match names {
+        [one] => format!(
+            "{one} goes through it. It won't connect until you choose another jump host for it."
+        ),
+        _ => format!(
+            "{} go through it. They won't connect until you choose another jump host for them.",
+            name_list(names)
+        ),
+    }
+}
+
+/// The refusal of a jump host for a profile that `names` go through: Moniker
+/// uses one jump host only.
+fn others_go_through(names: &[&str]) -> String {
+    match names {
+        [one] => {
+            format!("{one} goes through this profile, so it cannot have a jump host of its own.")
+        }
+        _ => format!(
+            "{} go through this profile, so it cannot have a jump host of its own.",
+            name_list(names)
+        ),
+    }
+}
+
+/// The Jump Host row's note for a jump host kept on this machine only, chosen
+/// for a profile that syncs: to the other machines it is a deletion, so the
+/// profile waits there.
+pub fn kept_here_note(jump: &str) -> String {
+    format!("{jump} is kept on this machine only, so your other machines won't have it.")
+}
+
+/// The Jump Host row's note for a profile whose own `ssh -G` (without
+/// Moniker's route) sends it through another host: the profile's route wins.
+pub fn config_route_note(jump: &str) -> String {
+    format!(
+        "~/.ssh/config also sends this host through another host. Moniker goes through {jump} \
+         instead."
+    )
+}
+
+/// Why the profile `for_id` cannot go through `choice` (a profile's id), when
+/// it cannot, judged on `all` (the profiles, tombstones included, as the file
+/// holds them): `None` for no jump host, which is always allowed, and for a
+/// usable one (`jump::usable_jump_hosts`). Moniker uses one jump host only, so
+/// a profile that others go through cannot be given one (checked first: no
+/// other choice would do), and a choice that is gone ([`JUMP_GONE`]) or goes
+/// through a jump host of its own (`jump::chain_text`) is refused. The
+/// profile itself as its own jump host is left to [`Profile::validate`].
+pub fn jump_choice_error(all: &[Profile], for_id: &str, choice: Option<&str>) -> Option<String> {
+    let choice = choice?;
+    let others = jump::going_through(for_id, all);
+    if !others.is_empty() {
+        let names: Vec<&str> = others.iter().map(|p| p.name.as_str()).collect();
+        return Some(others_go_through(&names));
+    }
+    match all.iter().find(|p| p.id == choice && !p.deleted) {
+        None => Some(JUMP_GONE.to_owned()),
+        Some(jump) if jump.jump_host.is_some() => Some(jump::chain_text(&jump.name)),
+        Some(_) => None,
+    }
+}
+
+/// Save the jump host of the live profile `id` (issue #9): `choice` is the id
+/// of the profile it goes through, `None` for none. Like [`apply_field`], on
+/// the profile as the file holds it under the store's lock, with a new
+/// `updated_at`; and the choice is judged there too ([`jump_choice_error`]),
+/// on every profile as the file holds them then, since a sync may have changed
+/// them after the page listed the choices. A refusal writes nothing. Runs on
+/// the keyring worker (`crate::keyring::write_profiles`).
+pub fn apply_jump_host(
+    store: &RefCell<ProfileStore>,
+    id: &str,
+    choice: Option<String>,
+) -> Result<Profile, String> {
+    let saved = rewrite_live_with(store, id, |all, profile| {
+        if let Some(refusal) = jump_choice_error(all, id, choice.as_deref()) {
+            return Err(refusal);
+        }
+        profile.jump_host = choice;
         Ok(true)
     })?;
     // `None` only for a change that says it changed nothing; this one never does.
@@ -532,10 +703,19 @@ pub struct NewProfile {
     /// Keep the profile on this machine only from the start (issue #10): no
     /// question, since nothing of it exists on another machine yet.
     pub local_only: bool,
+    /// The profile it goes through (issue #9), `None` for none: one of the
+    /// usable jump hosts the dialog offered, judged again when it is saved
+    /// ([`jump_choice_error`]).
+    pub jump_host: Option<String>,
 }
 
 /// Save a new profile (and its password, if one was typed: keyring first) and
 /// return its id. Everything else is edited afterwards on the profile page.
+///
+/// The jump host chosen is judged again under the store's lock, as on the
+/// profile page ([`save_profile`]): a sync may have deleted it, or given it a
+/// jump host of its own, since the dialog listed it. Then nothing is written,
+/// and the password stored first is removed again.
 pub fn create_profile(
     store: &RefCell<ProfileStore>,
     secrets: &dyn SecretStore,
@@ -550,6 +730,7 @@ pub fn create_profile(
         key_file: String::new(),
         transcript: false,
         local_only: new.local_only,
+        jump_host: new.jump_host.clone(),
     };
     save_profile(store, secrets, &form, typed_password, false, None).map(|p| p.id)
 }
@@ -597,13 +778,25 @@ fn rewrite_live_if(
     id: &str,
     change: impl FnOnce(&mut Profile) -> Result<bool, String>,
 ) -> Result<Option<Profile>, String> {
+    rewrite_live_with(store, id, |_, profile| change(profile))
+}
+
+/// [`rewrite_live_if`] for a change that also looks at the other profiles
+/// (issue #9: whether a jump host can be chosen): besides the profile to
+/// change, `change` gets every profile as the file holds them under the lock,
+/// tombstones included (that profile among them, as it is before the change).
+fn rewrite_live_with(
+    store: &RefCell<ProfileStore>,
+    id: &str,
+    change: impl FnOnce(&[Profile], &mut Profile) -> Result<bool, String>,
+) -> Result<Option<Profile>, String> {
     let result = store.borrow_mut().update(|current| {
         let unchanged = current.to_vec();
         let Some(old) = current.iter().find(|p| p.id == id && !p.deleted) else {
             return Ok((unchanged, Err(GONE.to_owned())));
         };
         let mut changed = old.clone();
-        match change(&mut changed) {
+        match change(current, &mut changed) {
             Ok(true) => {}
             Ok(false) => return Ok((unchanged, Ok(None))),
             Err(message) => return Ok((unchanged, Err(message))),
@@ -653,6 +846,7 @@ mod tests {
             key_file: String::new(),
             transcript: false,
             local_only: false,
+            jump_host: None,
         }
     }
 
@@ -693,6 +887,34 @@ mod tests {
         let synced = Profile::new("Old", "old.example.com", "bob");
         v.local_only = true;
         assert!(!build_profile(&v, Some(&synced)).unwrap().local_only);
+    }
+
+    #[test]
+    fn only_a_new_profile_takes_its_jump_host_from_the_form() {
+        // Only apply_jump_host (the Jump Host row, which judges the choice)
+        // changes an existing profile's.
+        let bastion = Profile::new("bastion", "b.example.com", "bob");
+        let mut v = values();
+        v.jump_host = Some(bastion.id.clone());
+        assert_eq!(
+            build_profile(&v, None).unwrap().jump_host.as_deref(),
+            Some(bastion.id.as_str())
+        );
+        let existing = Profile::new("Old", "old.example.com", "bob");
+        assert_eq!(build_profile(&v, Some(&existing)).unwrap().jump_host, None);
+        let mut through = existing.clone();
+        through.jump_host = Some(bastion.id.clone());
+        v.jump_host = None;
+        assert_eq!(
+            build_profile(&v, Some(&through)).unwrap().jump_host,
+            through.jump_host
+        );
+        // A jump host that is no profile id is refused like any invalid field.
+        v.jump_host = Some("not an id".to_owned());
+        assert_eq!(
+            build_profile(&v, None).unwrap_err(),
+            describe(ProfileError::JumpHost)
+        );
     }
 
     #[test]
@@ -1822,6 +2044,7 @@ mod tests {
             username: "admin".to_owned(),
             port: 2200,
             local_only: false,
+            jump_host: None,
         }
     }
 
@@ -2138,5 +2361,301 @@ mod tests {
 
         assert!(err.contains("Could not save the profile"), "got: {err}");
         assert!(stored_password(&secrets, &existing.id).is_some());
+    }
+
+    // ---- jump hosts (issue #9) ----
+
+    use moniker_core::jump::chain_text;
+
+    #[test]
+    fn name_list_forms() {
+        assert_eq!(name_list(&["web"]), "web");
+        assert_eq!(name_list(&["web", "db"]), "web and db");
+        assert_eq!(name_list(&["web", "db", "app"]), "web, db, and app");
+        assert_eq!(
+            name_list(&["web", "db", "app", "x"]),
+            "web, db, app, and 1 more"
+        );
+        assert_eq!(
+            name_list(&["web", "db", "app", "x", "y"]),
+            "web, db, app, and 2 more"
+        );
+    }
+
+    #[test]
+    fn the_lines_naming_who_goes_through_say_one_or_several() {
+        assert_eq!(
+            going_through_line(&["web"]),
+            "web goes through this profile."
+        );
+        assert_eq!(
+            going_through_line(&["web", "db"]),
+            "web and db go through this profile."
+        );
+        assert_eq!(
+            delete_line(&["web"]),
+            "web goes through it. It won't connect until you choose another jump host for it."
+        );
+        assert_eq!(
+            delete_line(&["web", "db", "app", "x"]),
+            "web, db, app, and 1 more go through it. They won't connect until you choose \
+             another jump host for them."
+        );
+        assert_eq!(
+            kept_here_note("bastion"),
+            "bastion is kept on this machine only, so your other machines won't have it."
+        );
+        assert_eq!(
+            config_route_note("bastion"),
+            "~/.ssh/config also sends this host through another host. Moniker goes through \
+             bastion instead."
+        );
+    }
+
+    /// A store holding `profiles`, as saved.
+    fn store_of(profiles: &[&Profile]) -> (tempfile::TempDir, RefCell<ProfileStore>) {
+        let (dir, store) = temp_store();
+        for p in profiles {
+            store.borrow_mut().upsert((*p).clone()).unwrap();
+        }
+        (dir, store)
+    }
+
+    /// A profile `name` going through `jump`, or through nothing.
+    fn through(name: &str, jump: Option<&Profile>) -> Profile {
+        let mut p = Profile::new(name, &format!("{name}.example.com"), "alice");
+        p.jump_host = jump.map(|j| j.id.clone());
+        p
+    }
+
+    #[test]
+    fn jump_choice_error_allows_a_usable_choice_and_none() {
+        let bastion = through("bastion", None);
+        let web = through("web", None);
+        let all = [bastion.clone(), web.clone()];
+        assert_eq!(jump_choice_error(&all, &web.id, Some(&bastion.id)), None);
+        assert_eq!(jump_choice_error(&all, &web.id, None), None);
+        // A jump host kept on this machine only can be chosen too (the page
+        // says the other machines won't have it).
+        let mut kept = through("kept", None);
+        kept.local_only = true;
+        let all = [kept.clone(), web.clone()];
+        assert_eq!(jump_choice_error(&all, &web.id, Some(&kept.id)), None);
+    }
+
+    #[test]
+    fn apply_jump_host_sets_and_clears() {
+        let bastion = through("bastion", None);
+        let web = through("web", None);
+        let (dir, store) = store_of(&[&bastion, &web]);
+
+        let saved = apply_jump_host(&store, &web.id, Some(bastion.id.clone())).unwrap();
+        assert_eq!(saved.jump_host.as_deref(), Some(bastion.id.as_str()));
+        assert_eq!(on_disk(&dir, &web.id).unwrap(), saved);
+        assert_eq!(
+            store.borrow().get(&web.id),
+            Some(&saved),
+            "the handle's view too"
+        );
+
+        let cleared = apply_jump_host(&store, &web.id, None).unwrap();
+        assert_eq!(cleared.jump_host, None);
+        assert_eq!(on_disk(&dir, &web.id).unwrap().jump_host, None);
+        // Nothing else of the profile changed.
+        assert_eq!(cleared.name, "web");
+        assert_eq!(cleared.host, web.host);
+    }
+
+    #[test]
+    fn apply_jump_host_refuses_a_chain() {
+        let k = through("k", None);
+        let bastion = through("bastion", Some(&k));
+        let web = through("web", None);
+        let (dir, store) = store_of(&[&k, &bastion, &web]);
+        let before = file_bytes(&dir);
+
+        let err = apply_jump_host(&store, &web.id, Some(bastion.id.clone())).unwrap_err();
+        assert_eq!(err, chain_text("bastion"));
+        assert_eq!(file_bytes(&dir), before, "nothing was written");
+
+        // Judged on the file as it is under the lock, not on what this handle
+        // read: another process (a sync) gives a jump host of its own to a
+        // profile that had none.
+        let alpha = through("alpha", None);
+        store.borrow_mut().upsert(alpha.clone()).unwrap();
+        let mut chained = alpha.clone();
+        chained.jump_host = Some(k.id.clone());
+        other_handle(&dir).upsert(chained).unwrap();
+        let before = file_bytes(&dir);
+        let err = apply_jump_host(&store, &web.id, Some(alpha.id.clone())).unwrap_err();
+        assert_eq!(err, chain_text("alpha"));
+        assert_eq!(file_bytes(&dir), before);
+        assert_eq!(on_disk(&dir, &web.id).unwrap().jump_host, None);
+
+        // A loop is refused too: k cannot go through bastion, which goes
+        // through k (as alpha does now).
+        let err = apply_jump_host(&store, &k.id, Some(bastion.id.clone())).unwrap_err();
+        assert_eq!(
+            err,
+            "alpha and bastion go through this profile, so it cannot have a jump host of its own."
+        );
+    }
+
+    #[test]
+    fn apply_jump_host_refuses_a_jump_host_that_is_gone() {
+        let bastion = through("bastion", None);
+        let web = through("web", None);
+        let (dir, store) = store_of(&[&bastion, &web]);
+        // Deleted elsewhere after this handle read the file.
+        other_handle(&dir).delete(&bastion.id).unwrap();
+        let before = file_bytes(&dir);
+
+        let err = apply_jump_host(&store, &web.id, Some(bastion.id.clone())).unwrap_err();
+        assert_eq!(err, JUMP_GONE);
+        assert_eq!(file_bytes(&dir), before);
+
+        // An id that was never here.
+        let never = Profile::new("x", "x", "x").id;
+        assert_eq!(
+            apply_jump_host(&store, &web.id, Some(never)).unwrap_err(),
+            JUMP_GONE
+        );
+        // The profile itself is no jump host either (validation says so).
+        assert_eq!(
+            apply_jump_host(&store, &web.id, Some(web.id.clone())).unwrap_err(),
+            describe(ProfileError::JumpHost)
+        );
+        assert_eq!(file_bytes(&dir), before);
+    }
+
+    #[test]
+    fn apply_jump_host_refuses_when_others_go_through_this_profile() {
+        let bastion = through("bastion", None);
+        let other = through("other", None);
+        let web = through("web", Some(&bastion));
+        let (dir, store) = store_of(&[&bastion, &other, &web]);
+        let before = file_bytes(&dir);
+
+        let err = apply_jump_host(&store, &bastion.id, Some(other.id.clone())).unwrap_err();
+        assert_eq!(
+            err,
+            "web goes through this profile, so it cannot have a jump host of its own."
+        );
+        assert_eq!(file_bytes(&dir), before);
+
+        // Two of them, one arriving after this handle read the file.
+        other_handle(&dir)
+            .upsert(through("db", Some(&bastion)))
+            .unwrap();
+        let err = apply_jump_host(&store, &bastion.id, Some(other.id.clone())).unwrap_err();
+        assert_eq!(
+            err,
+            "db and web go through this profile, so it cannot have a jump host of its own."
+        );
+
+        // None is always allowed: it gives the profile no jump host.
+        let saved = apply_jump_host(&store, &bastion.id, None).unwrap();
+        assert_eq!(saved.jump_host, None);
+    }
+
+    #[test]
+    fn apply_jump_host_moves_updated_at() {
+        let bastion = through("bastion", None);
+        let web = through("web", None);
+        let (dir, store) = store_of(&[&bastion, &web]);
+        // A stamp in the future (another machine's clock): the edit still goes
+        // past it, so it wins the next merge.
+        let mut ahead = on_disk(&dir, &web.id).unwrap();
+        ahead.updated_at = now_ms() + 60_000;
+        other_handle(&dir)
+            .update(|current| {
+                let next = current
+                    .iter()
+                    .map(|p| {
+                        if p.id == ahead.id {
+                            ahead.clone()
+                        } else {
+                            p.clone()
+                        }
+                    })
+                    .collect();
+                Ok((next, ()))
+            })
+            .unwrap();
+        let before = on_disk(&dir, &web.id).unwrap().updated_at;
+        assert_eq!(before, ahead.updated_at);
+
+        let saved = apply_jump_host(&store, &web.id, Some(bastion.id.clone())).unwrap();
+        assert!(saved.updated_at > before, "{} > {before}", saved.updated_at);
+        assert_eq!(on_disk(&dir, &web.id).unwrap().updated_at, saved.updated_at);
+    }
+
+    #[test]
+    fn apply_jump_host_to_a_profile_that_is_gone() {
+        let bastion = through("bastion", None);
+        let web = through("web", None);
+        let (dir, store) = store_of(&[&bastion, &web]);
+        other_handle(&dir).delete(&web.id).unwrap();
+        assert_eq!(
+            apply_jump_host(&store, &web.id, Some(bastion.id.clone())).unwrap_err(),
+            GONE
+        );
+    }
+
+    #[test]
+    fn create_profile_with_a_jump_host() {
+        let bastion = through("bastion", None);
+        let (dir, store) = store_of(&[&bastion]);
+        let secrets = MemorySecretStore::default();
+        let mut new = new_values();
+        new.jump_host = Some(bastion.id.clone());
+
+        let id = create_profile(&store, &secrets, &new, PASSWORD).unwrap();
+        let p = on_disk(&dir, &id).expect("the new profile");
+        assert_eq!(p.jump_host.as_deref(), Some(bastion.id.as_str()));
+        assert_eq!(p.name, "NAS");
+        assert_eq!(stored_password(&secrets, &id), Some(PASSWORD.to_owned()));
+
+        // None, as the dialog starts.
+        let id = create_profile(&store, &secrets, &new_values(), "").unwrap();
+        assert_eq!(on_disk(&dir, &id).unwrap().jump_host, None);
+    }
+
+    #[test]
+    fn create_profile_refuses_a_jump_host_under_the_lock() {
+        let k = through("k", None);
+        let bastion = through("bastion", None);
+        let (dir, store) = store_of(&[&k, &bastion]);
+        let secrets = MemorySecretStore::default();
+        let mut new = new_values();
+        new.jump_host = Some(bastion.id.clone());
+
+        // A sync gives the jump host one of its own after the dialog read the
+        // file: the profile is not created, and the password stored for it
+        // first is removed again.
+        let mut chained = bastion.clone();
+        chained.jump_host = Some(k.id.clone());
+        other_handle(&dir).upsert(chained).unwrap();
+        let before = file_bytes(&dir);
+        let err = create_profile(&store, &secrets, &new, PASSWORD).unwrap_err();
+        assert_eq!(err, chain_text("bastion"));
+        assert!(!err.contains(PASSWORD));
+        assert_eq!(file_bytes(&dir), before, "nothing was written");
+        assert!(
+            secret_count(&secrets).contains("entries: 0"),
+            "no password left"
+        );
+
+        // Deleted meanwhile.
+        other_handle(&dir).delete(&bastion.id).unwrap();
+        let before = file_bytes(&dir);
+        let err = create_profile(&store, &secrets, &new, PASSWORD).unwrap_err();
+        assert_eq!(err, JUMP_GONE);
+        assert_eq!(file_bytes(&dir), before);
+        assert!(secret_count(&secrets).contains("entries: 0"));
+        assert!(
+            other_handle(&dir).live().iter().all(|p| p.name != "NAS"),
+            "no profile was created"
+        );
     }
 }

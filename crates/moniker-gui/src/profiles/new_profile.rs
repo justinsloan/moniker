@@ -8,12 +8,16 @@
 //! freezes the window), and hands the new id back so the window selects it;
 //! everything else is edited on its page. A switch, "Sync to other machines",
 //! on unless turned off, creates the profile already kept on this machine only
-//! (issue #10): no question, since nothing of it exists elsewhere yet. While the
+//! (issue #10): no question, since nothing of it exists elsewhere yet. The
+//! "Jump Host" row after Port (issue #9, [`JumpRow`]) offers the profiles the
+//! new one can go through, None to start with, as on the profile page; it
+//! follows the profile file while the dialog is open, and the choice is judged
+//! again when the profile is created ([`form::create_profile`]). While the
 //! profile is being created, Create is off. Errors are shown inside the dialog,
 //! which stays open so they can be fixed, and never contain the password.
 
 use std::cell::Cell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::glib;
@@ -21,6 +25,7 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use zeroize::Zeroizing;
 
+use super::jump_row::JumpRow;
 use crate::context::AppContext;
 use crate::form::{self, NewProfile};
 use crate::{keyring, local_only};
@@ -31,6 +36,8 @@ struct Fields {
     host: adw::EntryRow,
     username: adw::EntryRow,
     port: adw::SpinRow,
+    /// "Jump Host": the profile the new one goes through, None to start with.
+    jump: Rc<JumpRow>,
     password: adw::PasswordEntryRow,
     /// "Sync to other machines": off creates the profile kept on this machine.
     sync: adw::SwitchRow,
@@ -60,7 +67,14 @@ impl Fields {
             // The spin row is limited to 1..=65535.
             port: u16::try_from(self.port.value().round() as i64).unwrap_or(0),
             local_only: !self.sync.is_active(),
+            jump_host: self.jump.choice(),
         }
+    }
+
+    /// Show the Jump Host row's choices and notes again: the profiles changed,
+    /// or whether the new profile is kept on this machine did.
+    fn show_jump(&self) {
+        self.jump.show_new(!self.sync.is_active());
     }
 }
 
@@ -77,7 +91,7 @@ pub(super) fn show(
             .use_markup(false)
             .build()
     };
-    let fields = Rc::new(Fields {
+    let fields = Rc::new_cyclic(|weak: &Weak<Fields>| Fields {
         name: entry("Name"),
         host: entry("Host"),
         username: entry("Username"),
@@ -86,6 +100,19 @@ pub(super) fn show(
             .adjustment(&gtk::Adjustment::new(22.0, 1.0, 65535.0, 1.0, 10.0, 0.0))
             .numeric(true)
             .build(),
+        // A pick only changes the notes: shown again from the main loop, as
+        // the row asks (it is still telling of the pick).
+        jump: JumpRow::new(ctx, None, {
+            let weak = weak.clone();
+            move |_| {
+                let weak = weak.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(fields) = weak.upgrade() {
+                        fields.show_jump();
+                    }
+                });
+            }
+        }),
         password: adw::PasswordEntryRow::builder()
             .title("Password (optional)")
             .use_markup(false)
@@ -116,14 +143,21 @@ pub(super) fn show(
     group.add(&fields.host);
     group.add(&fields.username);
     group.add(&fields.port);
+    group.add(fields.jump.row());
     group.add(&fields.password);
-    // The subtitle says what the switch is doing, as on the profile page.
-    fields.sync.connect_active_notify(|row| {
+    fields.show_jump();
+    // The subtitle says what the switch is doing, as on the profile page; the
+    // Jump Host row's note on a jump host kept here depends on it too.
+    let weak = Rc::downgrade(&fields);
+    fields.sync.connect_active_notify(move |row| {
         row.set_subtitle(if row.is_active() {
             local_only::SYNCS_SUBTITLE
         } else {
             local_only::KEPT_SUBTITLE
         });
+        if let Some(fields) = weak.upgrade() {
+            fields.show_jump();
+        }
     });
     let sync_group = adw::PreferencesGroup::new();
     sync_group.add(&fields.sync);
@@ -185,6 +219,15 @@ pub(super) fn show(
             }
         }
     ));
+
+    // The choices follow the profile file (a sync, another window) while the
+    // dialog is open.
+    let weak = Rc::downgrade(&fields);
+    ctx.on_profiles_changed(&dialog, move || {
+        if let Some(fields) = weak.upgrade() {
+            fields.show_jump();
+        }
+    });
 
     cancel.connect_clicked(glib::clone!(
         #[weak]

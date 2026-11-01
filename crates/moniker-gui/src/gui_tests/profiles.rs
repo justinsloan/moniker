@@ -83,18 +83,18 @@ enum Opened {
 type Connected = Rc<RefCell<Vec<Opened>>>;
 
 /// An open Connection Profiles window and what is behind it.
-struct Setup {
-    dir: PathBuf,
-    ctx: Rc<AppContext>,
+pub(super) struct Setup {
+    pub(super) dir: PathBuf,
+    pub(super) ctx: Rc<AppContext>,
     secrets: Arc<CountingSecrets>,
-    window: adw::Window,
+    pub(super) window: adw::Window,
     connected: Connected,
     _app: adw::Application,
 }
 
 impl Setup {
     /// Open the window over a store holding `profiles`.
-    fn open(dir: &Path, profiles: &[Profile]) -> Setup {
+    pub(super) fn open(dir: &Path, profiles: &[Profile]) -> Setup {
         Setup::open_with(dir, profiles, |secrets| secrets)
     }
 
@@ -147,7 +147,7 @@ impl Setup {
         }
     }
 
-    fn select(&self, id: &str) {
+    pub(super) fn select(&self, id: &str) {
         profiles::select(&self.window, id);
         pump_for(Duration::from_millis(100));
     }
@@ -192,19 +192,19 @@ impl Setup {
     }
 
     /// The profile `id` as it is in the file now.
-    fn on_disk(&self, id: &str) -> Option<Profile> {
+    pub(super) fn on_disk(&self, id: &str) -> Option<Profile> {
         ProfileStore::open(&self.dir.join("profiles.json"))
             .expect("store")
             .get(id)
             .cloned()
     }
 
-    fn file_bytes(&self) -> Vec<u8> {
+    pub(super) fn file_bytes(&self) -> Vec<u8> {
         fs::read(self.dir.join("profiles.json")).expect("profile file")
     }
 
     /// Another handle on the file, as a sync in another process has.
-    fn other_store(&self) -> ProfileStore {
+    pub(super) fn other_store(&self) -> ProfileStore {
         ProfileStore::open(&self.dir.join("profiles.json")).expect("store")
     }
 
@@ -292,7 +292,7 @@ impl Setup {
     }
 
     /// Write `change` to the file as another process (a sync) would.
-    fn elsewhere(&self, id: &str, change: impl FnOnce(&mut Profile)) {
+    pub(super) fn elsewhere(&self, id: &str, change: impl FnOnce(&mut Profile)) {
         let mut profile = self.on_disk(id).expect("the profile");
         change(&mut profile);
         self.other_store().upsert(profile).expect("save");
@@ -416,7 +416,7 @@ impl Setup {
             .any(|page| page.title() == "No profile selected" && page.is_mapped())
     }
 
-    fn close(self) {
+    pub(super) fn close(self) {
         self.window.close();
         pump_for(Duration::from_millis(100));
     }
@@ -437,7 +437,7 @@ fn press_apply(row: &impl IsA<adw::EntryRow>) {
 
 /// Wait until every save asked for is back: they run on the keyring worker
 /// (issue #7), and the page shows the outcome once they are.
-fn saved() {
+pub(super) fn saved() {
     pump_until("the saves", || keyring::pending() == 0);
 }
 
@@ -1419,7 +1419,7 @@ pub(super) fn a_sequence_changed_elsewhere_is_not_overwritten(dir: &Path) {
 // ----- the default sequence (issue #12) -----
 
 /// The strings a combo row offers, in order.
-fn items_of(row: &adw::ComboRow) -> Vec<String> {
+pub(super) fn items_of(row: &adw::ComboRow) -> Vec<String> {
     let model = row.model().expect("the row's list");
     (0..model.n_items())
         .map(|i| {
@@ -1434,7 +1434,7 @@ fn items_of(row: &adw::ComboRow) -> Vec<String> {
 }
 
 /// The string the combo row has selected.
-fn shown_item(row: &adw::ComboRow) -> String {
+pub(super) fn shown_item(row: &adw::ComboRow) -> String {
     row.selected_item()
         .and_downcast::<gtk::StringObject>()
         .map(|item| item.string().to_string())

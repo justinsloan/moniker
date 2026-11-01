@@ -447,6 +447,13 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #9, the Jump Host row on the profile page and in New Profile.
+    jump_hosts::the_jump_host_row_offers_usable_profiles(&tmp.path().join("jr-offers"));
+    jump_hosts::picking_a_jump_host_saves_it(&tmp.path().join("jr-pick"));
+    jump_hosts::the_row_shows_one_note_most_urgent_first(&tmp.path().join("jr-notes"));
+    jump_hosts::the_row_is_grayed_on_a_profile_others_go_through(&tmp.path().join("jr-grayed"));
+    jump_hosts::new_profile_has_the_jump_host_row(&tmp.path().join("jr-new"));
+    jump_hosts::deleting_a_jump_host_names_who_goes_through_it(&tmp.path().join("jr-delete"));
     // Issue #9, a pane connecting through its profile's jump host.
     jump_hosts::a_profile_connects_through_its_jump_host(&bin, &tmp.path().join("jh-connect"));
     jump_hosts::closing_the_pane_ends_its_shared_connection(&bin, &tmp.path().join("jh-close"));
@@ -1250,7 +1257,83 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     list.popdown();
     pump_until("the default sequence list to close", || !list.is_visible());
 
-    // The delete confirmation names the profile as it is. Cancel leaves it be.
+    // The Jump Host row (issue #9) offers the profiles it can go through by
+    // name, two named alike with their address, as the choice shown and in its
+    // list; its notes name the jump host. All of it is plain text. (Another
+    // process writes the file, as a sync does.)
+    let mut jump = Profile::new(MARKUP_NAME, "jump.test", "j");
+    jump.local_only = true;
+    let twin = Profile::new(MARKUP_NAME, "twin.test", "t");
+    // ~/.ssh/config sends the profile's host through another host too.
+    ctx.config_routes
+        .through
+        .lock()
+        .expect("the fake's set")
+        .insert(p.host.clone());
+    let elsewhere = |change: &dyn Fn(&mut ProfileStore)| {
+        change(&mut ProfileStore::open(&dir.join("profiles.json")).expect("the store"));
+        ctx.profiles_changed();
+    };
+    let edit = |store: &mut ProfileStore, id: &str, change: &dyn Fn(&mut Profile)| {
+        let mut profile = store.get(id).cloned().expect("the profile");
+        change(&mut profile);
+        store.upsert(profile).expect("save");
+    };
+    elsewhere(&|store| {
+        store.upsert(jump.clone()).expect("save");
+        store.upsert(twin.clone()).expect("save");
+        edit(store, &p.id, &|p| p.jump_host = Some(jump.id.clone()));
+    });
+    let jump_row = all_widgets::<adw::ComboRow>(&profiles_window)
+        .into_iter()
+        .find(|row| row.title() == crate::profiles::jump_row::ROW_TITLE)
+        .expect("the Jump Host row");
+    assert!(!jump_row.uses_markup(), "jump host row parses markup");
+    let jump_label = format!("{MARKUP_NAME} (j@jump.test:22)");
+    let twin_label = format!("{MARKUP_NAME} (t@twin.test:22)");
+    let chosen = jump_row
+        .selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .expect("the chosen jump host");
+    assert_eq!(chosen.string(), jump_label.as_str());
+    literal_labels("jump host row", &jump_row, &jump_label);
+    let note_is = |what: &str, note: &str| {
+        pump_until(what, || jump_row.subtitle().as_deref() == Some(note));
+        literal_labels(what, &jump_row, note);
+    };
+    note_is("kept here note", &form::kept_here_note(MARKUP_NAME));
+    ActionRowExt::activate(&jump_row);
+    let list: gtk::Popover = find_widget(&jump_row).expect("the row's list");
+    pump_until("the jump host list to open", || list.is_visible());
+    pump_until("the jump host list to show its entries", || {
+        let labels = labels_in(&list);
+        labels.iter().any(|l| l.label() == twin_label) && labels.iter().any(|l| l.label() == "None")
+    });
+    literal_labels("jump host list", &list, &jump_label);
+    literal_labels("jump host list", &list, &twin_label);
+    list.popdown();
+    pump_until("the jump host list to close", || !list.is_visible());
+    elsewhere(&|store| edit(store, &jump.id, &|j| j.local_only = false));
+    note_is("config note", &form::config_route_note(MARKUP_NAME));
+    elsewhere(&|store| edit(store, &jump.id, &|j| j.jump_host = Some(twin.id.clone())));
+    note_is("chain note", &moniker_core::jump::chain_text(MARKUP_NAME));
+    // Once another profile goes through this one, the row is grayed with a
+    // line that names it.
+    let through_p = {
+        let mut w = Profile::new(MARKUP_NAME, "w.test", "w");
+        w.jump_host = Some(p.id.clone());
+        w
+    };
+    elsewhere(&|store| {
+        edit(store, &jump.id, &|j| j.jump_host = None);
+        edit(store, &p.id, &|p| p.jump_host = None);
+        store.upsert(through_p.clone()).expect("save");
+    });
+    note_is("grayed line", &form::going_through_line(&[MARKUP_NAME]));
+    assert!(!jump_row.is_sensitive());
+
+    // The delete confirmation names the profile as it is, and the profile that
+    // goes through it. Cancel leaves it be.
     button_labeled(&profiles_window, "Delete Profile")
         .expect("the delete button")
         .emit_clicked();
@@ -1266,6 +1349,13 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
         "dialog heading parses markup"
     );
     literal_labels("delete dialog", &dialog, &heading);
+    let body = format!(
+        "This removes the profile and its stored password. It cannot be undone.\n\n{}",
+        form::delete_line(&[MARKUP_NAME])
+    );
+    assert_eq!(dialog.body().as_str(), body);
+    assert!(!dialog.is_body_use_markup(), "dialog body parses markup");
+    literal_labels("delete dialog body", &dialog, &body);
     button_labeled(&dialog, "Cancel")
         .expect("the dialog's Cancel button")
         .emit_clicked();

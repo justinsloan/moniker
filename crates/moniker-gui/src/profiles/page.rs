@@ -37,6 +37,15 @@
 //! the Local terminal page uses too (issue #13); this page gives it the
 //! sub-page to open and the save of a pick, which saves like any other field.
 //!
+//! The Connection group ends with the "Jump Host" row (issue #9,
+//! [`JumpRow`]): the profile this one's connection goes through. A pick saves
+//! like any other field, with [`form::apply_jump_host`], which judges the
+//! choice again under the store's lock; the row shows its notes (a jump host
+//! no longer saved, a chain, one kept on this machine only, a route that
+//! `~/.ssh/config` sets), and is grayed out on a profile that others go
+//! through. Deleting a profile that others go through says, in its question,
+//! that they will wait for another jump host.
+//!
 //! The page never reads the keyring: it cannot show whether a password is
 //! stored. A Secret Service call on every selection could prompt with a
 //! locked keyring. What it does write there (a new password, removing the
@@ -56,10 +65,13 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
+use moniker_core::jump;
 use moniker_core::profile::Profile;
 use moniker_core::secrets::password_key;
+use moniker_core::store::ProfileStore;
 use zeroize::Zeroizing;
 
+use super::jump_row::JumpRow;
 use super::saving::Saving;
 use super::sequence_page::{self, Owner};
 use super::sequence_rows::{PROFILE_WORDING, SequenceRows};
@@ -123,6 +135,8 @@ struct Inner {
     /// The pending save of a changed port, if one is waiting to settle.
     port_timer: RefCell<Option<glib::SourceId>>,
     port_saving: Rc<Saving>,
+    /// "Jump Host" (issue #9), last in the Connection group (module docs).
+    jump: Rc<JumpRow>,
     password: adw::PasswordEntryRow,
     key_file: adw::ActionRow,
     key_clear: gtk::Button,
@@ -310,6 +324,14 @@ impl ProfilePage {
             port_stored: Cell::new(profile.port),
             port_timer: RefCell::new(None),
             port_saving,
+            jump: JumpRow::new(ctx, Some(&profile.id), {
+                let weak = weak.clone();
+                move |choice| {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.save_jump_host(choice);
+                    }
+                }
+            }),
             password,
             key_file,
             key_clear,
@@ -351,6 +373,9 @@ impl ProfilePage {
             sync_question: RefCell::new(None),
             sync_focus: RowFocus::default(),
         });
+        // The jump host's row ends the Connection group, after Port.
+        connection.add(inner.jump.row());
+        inner.jump.show_profile(profile);
         inner.set_sync_here(profile.local_only);
         inner.show_key_file(profile.key_file.as_ref());
         inner
@@ -388,6 +413,9 @@ impl ProfilePage {
         if !inner.key_saving.busy() {
             inner.show_key_file(profile.key_file.as_ref());
         }
+        // Its choices and notes depend on the other profiles too, which the
+        // window has just read again as well.
+        inner.jump.show_profile(profile);
         // A question or a save of the row under way keeps what the person
         // asked for on show; a question that is cancelled meanwhile goes back
         // to what the file says now.
@@ -517,39 +545,53 @@ impl Inner {
         field: Field,
         then: impl FnOnce(&Rc<Inner>, &Result<Profile, String>) + 'static,
     ) {
-        saving.begin();
         let id = self.id.clone();
+        self.save_with(
+            row,
+            saving,
+            move |store| form::apply_field(store, &id, field),
+            then,
+        );
+    }
+
+    /// [`save`](Self::save) for a change that is not one [`Field`]: `work`
+    /// makes it on the keyring worker, with the worker's own handle on the
+    /// profile file.
+    fn save_with(
+        self: &Rc<Self>,
+        row: &impl IsA<gtk::Widget>,
+        saving: &Rc<Saving>,
+        work: impl FnOnce(&RefCell<ProfileStore>) -> Result<Profile, String> + Send + 'static,
+        then: impl FnOnce(&Rc<Inner>, &Result<Profile, String>) + 'static,
+    ) {
+        saving.begin();
         let ctx = Rc::clone(&self.ctx);
         let weak = Rc::downgrade(self);
         let row = row.clone().upcast::<gtk::Widget>();
         let saving = Rc::clone(saving);
-        keyring::write_profiles(
-            &self.ctx,
-            move |store| form::apply_field(store, &id, field),
-            move |result| {
-                saving.end();
-                match weak.upgrade() {
-                    Some(inner) => {
-                        match &result {
-                            Ok(_) => row.remove_css_class("error"),
-                            Err(message) => {
-                                row.add_css_class("error");
-                                ctx.notice.show_near(&row, message);
-                            }
+        keyring::write_profiles(&self.ctx, work, move |result| {
+            saving.end();
+            match weak.upgrade() {
+                Some(inner) => {
+                    match &result {
+                        Ok(_) => row.remove_css_class("error"),
+                        Err(message) => {
+                            row.add_css_class("error");
+                            ctx.notice.show_near(&row, message);
                         }
-                        then(&inner, &result);
                     }
-                    // The page has gone (another profile selected, the window
-                    // closed) while the save waited: a failure is still told.
-                    None => {
-                        if let Err(message) = &result {
-                            ctx.notice.show(message);
-                        }
+                    then(&inner, &result);
+                }
+                // The page has gone (another profile selected, the window
+                // closed) while the save waited: a failure is still told.
+                None => {
+                    if let Err(message) = &result {
+                        ctx.notice.show(message);
                     }
                 }
-                ctx.profiles_changed();
-            },
-        );
+            }
+            ctx.profiles_changed();
+        });
     }
 
     /// Save what was typed in a text row. The row keeps the focus but takes no
@@ -661,6 +703,21 @@ impl Inner {
         }
         self.port_stored.set(port);
         self.save(&self.port, &self.port_saving, Field::Port(port), |_, _| {});
+    }
+
+    /// Save the jump host picked (`None`: none) on the keyring worker
+    /// ([`form::apply_jump_host`], which judges it again on the file as it is
+    /// then). The row shows the pick meanwhile; once the save is back the
+    /// refresh shows what the file has, which puts a refused pick back, its
+    /// reason told near the row.
+    fn save_jump_host(self: &Rc<Self>, choice: Option<String>) {
+        let id = self.id.clone();
+        self.save_with(
+            self.jump.row(),
+            self.jump.saving(),
+            move |store| form::apply_jump_host(store, &id, choice),
+            |_, _| {},
+        );
     }
 
     /// The spin row is limited to 1..=65535; 0 would fail validation anyway.
@@ -939,23 +996,35 @@ impl Inner {
         );
     }
 
-    /// Ask before deleting the profile, naming it literally.
+    /// Ask before deleting the profile, naming it literally, and naming the
+    /// profiles that go through it (issue #9): they keep it as their jump host
+    /// and connect nowhere until another is chosen for them.
     fn ask_delete(self: &Rc<Self>) {
         // Bind first so the store borrow ends here.
-        let name = self
-            .ctx
-            .store
-            .borrow()
-            .get(&self.id)
-            .map(|p| p.name.clone());
+        let (name, through) = {
+            let store = self.ctx.store.borrow();
+            let name = store.get(&self.id).map(|p| p.name.clone());
+            let through: Vec<String> = jump::going_through(&self.id, store.live())
+                .into_iter()
+                .map(|p| p.name.clone())
+                .collect();
+            (name, through)
+        };
         let Some(name) = name else {
             self.ctx.notice.show_near(&self.key_file, form::GONE);
             return;
         };
+        let mut body =
+            "This removes the profile and its stored password. It cannot be undone.".to_owned();
+        if !through.is_empty() {
+            let names: Vec<&str> = through.iter().map(String::as_str).collect();
+            body.push_str("\n\n");
+            body.push_str(&form::delete_line(&names));
+        }
         let dialog = adw::AlertDialog::builder()
             .heading(format!("Delete \u{201c}{name}\u{201d}?"))
             .heading_use_markup(false)
-            .body("This removes the profile and its stored password. It cannot be undone.")
+            .body(body)
             .body_use_markup(false)
             .build();
         dialog.add_response("cancel", "Cancel");
