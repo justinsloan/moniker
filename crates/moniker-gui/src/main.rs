@@ -37,6 +37,7 @@ mod panes;
 mod preferences;
 mod profiles;
 mod recordings;
+mod root;
 mod session_file;
 mod session_layout;
 mod sessions_menu;
