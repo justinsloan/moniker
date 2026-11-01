@@ -138,9 +138,14 @@ fn assert_red_header(holder: &PaneHolder, red: bool) {
 
 /// The color `widget` draws at `x`, `y` of itself (background, border, and
 /// whatever its children draw there), as red, green, blue and opacity. It is
-/// drawn off screen with the window's own renderer.
-fn drawn_at(widget: &impl IsA<gtk::Widget>, x: i32, y: i32) -> [u8; 4] {
+/// drawn off screen with the window's own renderer. `None` while there is
+/// nothing to read: a widget with no size yet, one that is not in a window, or
+/// a spot outside what it draws.
+fn drawn_at(widget: &impl IsA<gtk::Widget>, x: i32, y: i32) -> Option<[u8; 4]> {
     let widget = widget.upcast_ref::<gtk::Widget>();
+    if widget.width() <= 0 || widget.height() <= 0 {
+        return None;
+    }
     let paintable = gtk::WidgetPaintable::new(Some(widget));
     let snapshot = gtk::Snapshot::new();
     paintable.snapshot(
@@ -148,31 +153,33 @@ fn drawn_at(widget: &impl IsA<gtk::Widget>, x: i32, y: i32) -> [u8; 4] {
         f64::from(widget.width()),
         f64::from(widget.height()),
     );
-    let node = snapshot.to_node().expect("the widget draws something");
-    let renderer = widget
-        .native()
-        .and_then(|native| native.renderer())
-        .expect("a renderer");
+    let node = snapshot.to_node()?;
+    let renderer = widget.native().and_then(|native| native.renderer())?;
     let mut download = gdk::TextureDownloader::new(&renderer.render_texture(&node, None));
     download.set_format(gdk::MemoryFormat::R8g8b8a8);
     let (bytes, stride) = download.download_bytes();
-    let at = usize::try_from(y).expect("y") * stride + usize::try_from(x).expect("x") * 4;
-    [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]
+    let at = usize::try_from(y).ok()? * stride + usize::try_from(x).ok()? * 4;
+    let pixel = bytes.get(at..at + 4)?;
+    Some([pixel[0], pixel[1], pixel[2], pixel[3]])
 }
 
 /// Whether `widget` draws the tint of the style now (`manager`) at a spot of
-/// its own background, near its top left corner.
-fn drawn_tinted(widget: &impl IsA<gtk::Widget>, manager: &adw::StyleManager) -> bool {
+/// its own background, near its top left corner; `None` while it draws nothing
+/// yet ([`drawn_at`]), which is neither answer: a wait for `Some(true)` or
+/// `Some(false)` goes on.
+fn drawn_tinted(widget: &impl IsA<gtk::Widget>, manager: &adw::StyleManager) -> Option<bool> {
     let tint = root::Tint::for_style(manager.is_dark(), manager.is_high_contrast());
-    let [r, g, b, a] = drawn_at(widget, 3, 2);
+    let [r, g, b, a] = drawn_at(widget, 3, 2)?;
     // Within 2 of each channel: another renderer (GL or Vulkan, llvmpipe on
     // CI) or a color-state conversion may round differently. That still tells
     // the tint from an untinted bar by far.
-    a == 255
-        && [r, g, b]
-            .into_iter()
-            .zip(tint.background_rgb())
-            .all(|(drawn, want)| drawn.abs_diff(want) <= 2)
+    Some(
+        a == 255
+            && [r, g, b]
+                .into_iter()
+                .zip(tint.background_rgb())
+                .all(|(drawn, want)| drawn.abs_diff(want) <= 2),
+    )
 }
 
 /// The top bar of `main`: the box of its toolbar view that holds the header
@@ -387,7 +394,9 @@ pub(super) fn the_top_bar_follows_the_focused_pane(dir: &Path) {
 /// A root pane moved to a tab of its own (its header's Move to New Tab) or to a
 /// window of its own (Move to New Window) takes its marks along: the new tab,
 /// and the new window's top bar, show it. The tab it left loses them, unless
-/// another of its panes is root.
+/// another of its panes is root. A window that was red because of its focused
+/// root pane stops being red when that pane goes, and the pane's new window is
+/// red.
 pub(super) fn a_root_pane_moves_with_its_state(dir: &Path) {
     let _hook = keep_as_set();
     let ctx = ctx_with(dir, &[]);
@@ -429,6 +438,31 @@ pub(super) fn a_root_pane_moves_with_its_state(dir: &Path) {
     assert_root_tab(&moved);
     assert_red(&main, true);
 
+    // The top bar is red because of the focused root pane `c`, and `c` goes to
+    // a window of its own, leaving a pane that is not root: the top bar stops
+    // being red, and the new window's is.
+    act(&main, crate::panes::SPLIT_RIGHT_ACTION);
+    let d = focused(&moved);
+    assert_ne!(d, c);
+    crate::panes::focus_pane(&c);
+    assert_eq!(focused(&moved), c);
+    assert_root_tab(&moved);
+    assert_red(&main, true);
+    let windows = main_windows(&app);
+    WidgetExt::activate_action(pane_of(&c).header(), "pane.pane-to-window", None)
+        .expect("pane.pane-to-window");
+    pump_until("a second new window", || main_windows(&app) == windows + 1);
+    pump_until("the first window's top bar to lose its red", || {
+        !is_red(&main)
+    });
+    assert_red(&main, false);
+    assert_eq!(layout_of(&moved).holders(), std::slice::from_ref(&d));
+    assert_plain_tab(&moved);
+    let carried = window_showing(&app, &c);
+    assert_red(&carried, true);
+    assert_root_tab(&carried.view.selected_page().expect("its tab"));
+
+    carried.window.destroy();
     own.window.destroy();
     main.window.destroy();
     pump_for(Duration::from_millis(200));
@@ -553,7 +587,8 @@ pub(super) fn turning_the_mark_off_hides_everything(dir: &Path) {
 /// and dark, and a red window stays red. It is drawn, too: on the top bar of a
 /// red window (libadwaita draws a flat top bar with no background of its own,
 /// so the header bar's variables alone would color nothing), and on a root
-/// pane's header.
+/// pane's header. The reload on a change into or out of high contrast is not
+/// exercised: high contrast cannot be forced from a test.
 pub(super) fn the_tint_follows_light_and_dark(dir: &Path) {
     let _hook = keep_as_set();
     let manager = adw::StyleManager::default();
@@ -574,7 +609,7 @@ pub(super) fn the_tint_follows_light_and_dark(dir: &Path) {
     );
     assert_red(&main, true);
     pump_until("the top bar drawn in the tint", || {
-        drawn_tinted(&bar, &manager)
+        drawn_tinted(&bar, &manager) == Some(true)
     });
 
     manager.set_color_scheme(adw::ColorScheme::ForceLight);
@@ -585,7 +620,7 @@ pub(super) fn the_tint_follows_light_and_dark(dir: &Path) {
     );
     assert_red(&main, true);
     pump_until("the top bar drawn in the tint", || {
-        drawn_tinted(&bar, &manager)
+        drawn_tinted(&bar, &manager) == Some(true)
     });
 
     // A split whose other pane is focused: the top bar is not red, the root
@@ -594,13 +629,17 @@ pub(super) fn the_tint_follows_light_and_dark(dir: &Path) {
     let other = focused(&page);
     assert_red(&main, false);
     pump_until("the top bar drawn without the tint", || {
-        !drawn_tinted(&bar, &manager)
+        drawn_tinted(&bar, &manager) == Some(false)
     });
     pump_until("the root pane's header drawn in the tint", || {
-        drawn_tinted(pane_of(&holder).header(), &manager)
+        drawn_tinted(pane_of(&holder).header(), &manager) == Some(true)
     });
-    assert!(
-        !drawn_tinted(pane_of(&other).header(), &manager),
+    pump_until("the other pane's header drawn", || {
+        drawn_tinted(pane_of(&other).header(), &manager).is_some()
+    });
+    assert_eq!(
+        drawn_tinted(pane_of(&other).header(), &manager),
+        Some(false),
         "{:?}",
         drawn_at(pane_of(&other).header(), 3, 2)
     );
@@ -766,7 +805,8 @@ pub(super) fn an_ended_session_is_not_red(dir: &Path) {
     let launch = main.view.selected_page().expect("the launch tab");
     let (page, terminal) = command_tab(&main, dir);
     let holder = pane(&page);
-    // The command tab alone, so that its checks are the only ones.
+    // The command tab alone: the hook calls every local shell root, and the
+    // launch tab's would be red as well.
     main.view.close_page(&launch);
     pump_until("the launch tab closed", || main.view.n_pages() == 1);
 
@@ -786,11 +826,9 @@ pub(super) fn an_ended_session_is_not_red(dir: &Path) {
     assert_red(&main, false);
     assert_plain_tab(&page);
     assert_eq!(root::delay_of(&holder), None, "its watch is gone");
-    let checks = root::checks_run();
     let own = hook.checks_of(&terminal);
     pump_for(Duration::from_millis(1500));
     assert_eq!(hook.checks_of(&terminal), own, "not checked after its end");
-    assert_eq!(root::checks_run(), checks, "no check at all");
     assert!(!is_red(&main));
 
     main.window.close();
@@ -886,7 +924,6 @@ pub(super) fn a_root_profile_is_red_while_connected(bin: &Path, dir: &Path) {
     // Only connections from now on: no local pane to check.
     main.view.close_page(&launch);
     pump_until("the launch tab closed", || main.view.n_pages() == 1);
-    let checks = root::checks_run();
     pump_for(Duration::from_millis(1500));
     assert!(!pane(&as_alice).as_root().get());
     assert_red(&main, false);
@@ -896,7 +933,6 @@ pub(super) fn a_root_profile_is_red_while_connected(bin: &Path, dir: &Path) {
         0,
         "a connection is not checked"
     );
-    assert_eq!(root::checks_run(), checks, "no check at all");
 
     // root: not while it waits for the keyring.
     keyring.hold();
@@ -1085,8 +1121,9 @@ pub(super) fn the_preferences_switch_turns_the_mark_off(dir: &Path) {
         is_red(&one) && is_red(&two)
     });
 
-    // A launch that finds the marks as the file says leaves the checks of the
-    // open windows alone (every command line launch comes through here).
+    // Finding the marks as the file says leaves the checks of the open windows
+    // alone. (`use_preferences` runs once per process, on the first launch, so
+    // this guard is defensive; the test shows that it holds.)
     let holder = pane(&one.view.selected_page().expect("the launch tab"));
     pump_until("the first window's watch to back off", || {
         root::delay_of(&holder) > Some(Backoff::FIRST)

@@ -70,9 +70,8 @@ const FONT_RESET_NAME: &str = "preferences-font-reset";
 const FONT_SUBTITLE: &str = "Used by every terminal; changes apply at once";
 const FONT_RESET_TOOLTIP: &str = "Use the System Font";
 const SCROLLBACK_SUBTITLE: &str = "Lines kept for scrolling back in ordinary tabs";
-pub(crate) const ROOT_TITLE: &str = "Show when a session runs as root";
-pub(crate) const ROOT_SUBTITLE: &str =
-    "Turns the top bar red while the program in front runs as root.";
+const ROOT_TITLE: &str = "Show when a session runs as root";
+const ROOT_SUBTITLE: &str = "Turns the top bar red while the program in front runs as root.";
 const SAVE_ALL_TITLE: &str = "Save transcripts of all sessions";
 const SAVE_ALL_SUBTITLE: &str = "Every new tab, including the first at launch. Tabs that save a \
 transcript keep all their scrollback.";

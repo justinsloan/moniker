@@ -163,13 +163,15 @@
 //! it runs if its profile signs in as `root` ([`Launch::as_root`],
 //! [`start_launch`]), and not once it has ended ([`connection_ended`]).
 //!
-//! # Font and scrollback
+//! # Font, scrollback and the root marks
 //!
 //! The Preferences' terminal font ([`apply_font`]) applies to every open
 //! terminal at once and to every new one; the scrollback of ordinary tabs
 //! ([`set_scrollback`]) applies to tabs opened after the change. Both are kept
-//! here for [`new_terminal`] and set once per terminal, never per frame;
-//! [`use_preferences`] takes them from the settings file at launch.
+//! here for [`new_terminal`] and set once per terminal, never per frame. The
+//! switch "Show when a session runs as root" is kept in `crate::root`
+//! (`root::set_enabled`); [`use_preferences`] takes all three from the
+//! settings file at launch.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, c_long};
@@ -1232,10 +1234,11 @@ thread_local! {
 /// from `settings` (the settings file read at launch): the open terminals get
 /// the font, new tabs the scrollback, and the open windows the marks.
 ///
-/// The marks are touched only if the setting differs from what they are now:
-/// every command-line launch comes through here, and one that finds the marks
-/// as the file says must not start the checks of the windows already open over
-/// again.
+/// The marks are touched only if the setting differs from what they are now.
+/// This runs once per process, from `main::launch` on the first launch, when no
+/// window is open yet; the guard is defensive, so that a caller that finds the
+/// marks as the file says never starts the checks of the windows already open
+/// over again.
 pub(crate) fn use_preferences(settings: &GuiSettings) {
     apply_font(font_description(settings.font.as_deref()).as_ref());
     set_scrollback(settings.scrollback_lines);
@@ -2611,6 +2614,13 @@ pub(crate) fn start_profile(
 /// ([`connection_ended`], or the jump host's failed sign-in in
 /// [`start_through_jump`]). A connection is never watched (`crate::root`): its
 /// terminal runs `ssh`, which runs as the person.
+///
+/// The mark is set before anything is started, not after. It is the holder's,
+/// which [`begin_session`] leaves alone, and a start that fails clears it
+/// ([`spawn`]'s `root::stop`) when VTE reports the failure, which a task that
+/// returns inside the main loop's dispatch may do before `spawn_async` itself
+/// returns. Set first, the failure always has the last word, and a connection
+/// that did not start is never left red.
 fn start_launch(holder: &PaneHolder, launched: Launch) {
     let Launch {
         title,
@@ -2620,6 +2630,7 @@ fn start_launch(holder: &PaneHolder, launched: Launch) {
         jump,
         as_root,
     } = launched;
+    root::show_root(holder, as_root);
     let command = test_hook::command(command);
     match jump {
         None => {
@@ -2633,7 +2644,6 @@ fn start_launch(holder: &PaneHolder, launched: Launch) {
             start_through_jump(holder, &title, command, transcript, marker, stage);
         }
     }
-    root::show_root(holder, as_root);
 }
 
 /// Show `note` in the pane of `holder` (which has not run a session yet),

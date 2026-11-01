@@ -60,7 +60,7 @@
 //! for a screen reader. The tint ([`Tint`]) is fixed colors, light or dark,
 //! with a text color of its own, so that the text on it keeps at least 4.5:1
 //! whatever the theme's own header color is; it follows the application's
-//! style ([`follow_style`]). Nothing moves or fades.
+//! style ([`follow_style`]). Nothing animates or blinks.
 //!
 //! Nothing here is per frame, and nothing here reads a secret.
 
@@ -107,7 +107,8 @@ thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(true) };
     /// The provider of the tint, once [`follow_style`] has installed it.
     static PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
-    /// The style sheet the provider has now.
+    /// The style sheet the provider has now, for the tests ([`current_css`]).
+    #[cfg(test)]
     static LOADED: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
@@ -604,6 +605,13 @@ fn contrast(one: Rgba, other: Rgba) -> f64 {
 /// drawn in them; a pane header with [`PANE_CLASS`] is drawn in the tint. A
 /// pane header's focused underline (`crate::panes`'
 /// `.moniker-pane-header.focused`) is a border and stays.
+///
+/// The variables are set for the whole subtree of the window, not only its top
+/// bar. libadwaita paints `searchbar > revealer > box` and
+/// `actionbar > revealer > box` with `var(--headerbar-bg-color)` when they are
+/// not in a toolbar view's top bar, so a search bar or an action bar added to
+/// the content of a main window would turn red with the top bar. A main window
+/// has none today.
 pub(crate) fn css(dark: bool, hc: bool) -> String {
     let tint = Tint::for_style(dark, hc);
     let background = tint.background_css();
@@ -654,6 +662,7 @@ fn load_tint(manager: &adw::StyleManager) {
     if let Some(provider) = PROVIDER.with_borrow(Clone::clone) {
         provider.load_from_string(&text);
     }
+    #[cfg(test)]
     LOADED.set(text);
 }
 
