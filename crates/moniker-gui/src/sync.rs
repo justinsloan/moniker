@@ -24,6 +24,16 @@
 //! It lets one run at a time and tells whoever listens
 //! ([`AppContext::on_sync_event`]) when it starts and ends.
 //!
+//! A partner that goes through a jump host (issue #9) is synced through it, as
+//! `moniker-server sync` does it: the sync signs in to the jump host with an
+//! `ssh` of its own, then reaches the partner through that shared connection
+//! (`moniker_core::jump::JumpLeg`), and ends it when the sync is over. Where the
+//! partner goes is decided from the window's profiles when the sync is asked for
+//! ([`sync_request`]) and looked at again on the worker, before the keyring is
+//! read and again after ([`check_route_unchanged`]): a partner whose jump host is
+//! no longer saved, or goes through one of its own, waits, and a sync never goes
+//! straight to a partner the person routed through a jump host.
+//!
 //! The sync key is held in `Zeroizing` buffers and never shown; every message
 //! is plain text (profile names come from sync data and may contain markup
 //! characters).
@@ -35,6 +45,7 @@ use std::sync::Arc;
 
 use gtk::glib;
 use gtk4 as gtk;
+use moniker_core::jump::{self, JumpLeg};
 use moniker_core::profile::Profile;
 #[cfg(not(test))]
 use moniker_core::secrets::KeyringSecretStore;
@@ -50,15 +61,24 @@ use zeroize::Zeroizing;
 
 use crate::context::AppContext;
 use crate::settings::{self, GuiSettings};
+use crate::terminal_tab::{jump_socket, no_runtime_folder_note};
 
 /// Everything a sync's exchange needs, completed on the worker from a
 /// [`SyncRequest`] and the keyring. No `Debug`: it holds the sync passphrase.
 pub(crate) struct SyncInputs {
     pub(crate) profile: Profile,
     pub(crate) has_password: bool,
+    /// The jump host the partner goes through, if it has one (issue #9): the
+    /// sync signs in to it first, with its own stored password if it has one.
+    pub(crate) jump: Option<Profile>,
+    /// Whether a password is stored for `jump`.
+    pub(crate) jump_has_password: bool,
     pub(crate) passphrase: Zeroizing<String>,
     pub(crate) askpass: PathBuf,
     pub(crate) store_path: PathBuf,
+    /// The per-user runtime folder, where the jump connection's socket is made
+    /// ([`run_with`]).
+    pub(crate) runtime_dir: Option<PathBuf>,
     /// Whether to go ahead when a machine has been away (issue #8).
     pub(crate) stale: StaleSync,
 }
@@ -100,6 +120,28 @@ pub(crate) fn explain(err: &SyncError) -> String {
         }
         SyncError::SyncOff => SYNC_IS_OFF.to_owned(),
         SyncError::PeerSyncOff => "Sync is turned off on the other machine.".to_owned(),
+        SyncError::PeerTooOld => "The other machine runs an older Moniker, which does not know \
+            jump hosts. Update it to sync while a profile has a jump host."
+            .to_owned(),
+        SyncError::JumpHostKeyUnknown { name } => {
+            format!("Connect to {name} once in a tab first, so its host key is known.")
+        }
+        // The same words as a pane's, for the same reason.
+        SyncError::JumpFailed { name, detail } if detail == NO_RUNTIME_FOLDER => {
+            no_runtime_folder_note(name)
+        }
+        // The jump host's login failed or it did not answer. The detail is
+        // ssh's own words (sanitized in core), which can carry the jump host's
+        // address and user name: only the name is said, and for a refused login
+        // what a sync cannot do.
+        SyncError::JumpFailed { name, detail } => {
+            let text = format!("Could not connect to the jump host {name}.");
+            if detail.contains("Permission denied") {
+                format!("{text} {CANNOT_ASK}")
+            } else {
+                text
+            }
+        }
         // ssh's login failed. It cannot ask anyone (it has no terminal), so a
         // password that is not stored, or a key that needs its passphrase,
         // ends here too.
@@ -264,22 +306,35 @@ pub(crate) fn after_manual_success(settings: &GuiSettings, partner_id: &str) -> 
 /// GUI.
 pub(crate) struct SyncRequest {
     pub(crate) profile: Profile,
+    /// The jump host the partner goes through, as the window's profiles have it
+    /// (issue #9); `None` when the partner has none.
+    pub(crate) jump: Option<Profile>,
     pub(crate) askpass: PathBuf,
     pub(crate) store_path: PathBuf,
+    /// The per-user runtime folder for the jump connection's socket.
+    pub(crate) runtime_dir: Option<PathBuf>,
     pub(crate) stale: StaleSync,
 }
 
-/// On the main thread: the profile to sync with, and where the worker finds
-/// the profile file and the askpass helper. Reads no secret.
+/// On the main thread: the profile to sync with, the jump host it goes through
+/// if it has one, and where the worker finds the profile file, the askpass
+/// helper and (for a jump host's socket) the runtime folder `runtime_dir`.
+/// Reads no secret.
 ///
 /// Refused while sync is turned off, here and now, so that no worker starts and
 /// the keyring is not read for a sync that cannot run (issue #10). This is the
 /// snapshot's word, which can be a moment behind the file: the worker looks at
 /// the file itself before it reads the keyring ([`check_switch_is_on`]), and the
 /// core refuses again before anything is sent, which is what protects the data.
+///
+/// Refused too, with the route's own text, when the partner's jump host is no
+/// longer saved or goes through a jump host of its own (issue #9): such a partner
+/// waits, and is never synced straight in its place. Nothing starts and nothing
+/// is read from the keyring, as for a sync that is turned off.
 pub(crate) fn sync_request(
     store: &ProfileStore,
     askpass: &Path,
+    runtime_dir: Option<&Path>,
     profile_id: &str,
 ) -> Result<SyncRequest, String> {
     if !store.sync_switch().is_on() {
@@ -297,10 +352,17 @@ pub(crate) fn sync_request(
         .get(profile_id)
         .cloned()
         .ok_or_else(|| "That profile no longer exists.".to_owned())?;
+    let route = jump::route(&profile, |id| store.get(id));
+    if let Some(refusal) = route.refusal() {
+        return Err(refusal);
+    }
+    let jump = route.jump().cloned();
     Ok(SyncRequest {
         profile,
+        jump,
         askpass: askpass.to_path_buf(),
         store_path,
+        runtime_dir: runtime_dir.map(Path::to_path_buf),
         stale: StaleSync::Refuse,
     })
 }
@@ -315,19 +377,63 @@ pub(crate) fn sync_request(
 /// core: a switch that cannot be read counts as off, and a file that cannot be
 /// opened is a store error, as [`run_with`] would say.
 pub(crate) fn check_switch_is_on(store_path: &Path) -> Result<(), SyncFailure> {
-    // StoreError messages carry no file contents.
-    let store = ProfileStore::open(store_path)
-        .map_err(|err| SyncFailure::Sync(SyncError::Store(err.to_string())))?;
-    if store.sync_switch().is_on() {
+    if open_store(store_path)?.sync_switch().is_on() {
         Ok(())
     } else {
         Err(SyncFailure::Sync(SyncError::SyncOff))
     }
 }
 
+/// What a sync says when its partner was given another jump host, or had its
+/// jump host taken off or put on, since the sync was asked for.
+pub(crate) const JUMP_CHANGED: &str = "This profile's jump host changed just now. Sync again.";
+
+/// On the worker: whether the partner still goes where the request said (issue
+/// #9), by the profile file as it is now. The request was made from the main
+/// thread's snapshot, which another process or a sync can have outdated, and
+/// the keyring read that follows can wait at an unlock prompt for as long as
+/// the person takes. Nothing in the core protects against a partner synced
+/// the wrong way, so this is asked before the keyring is read and again after
+/// it, just before the exchange. `partner` is the profile the request was made
+/// for, `asked` the jump host it carried (and the stored password looked up is
+/// for).
+///
+/// The route is worked out from the partner as the file has it (as the request
+/// had it if the file no longer has it). It stops the sync, with the route's own
+/// text, when the jump host is no longer saved or goes through one of its own;
+/// and with [`JUMP_CHANGED`] when it is a different jump host from `asked`, or
+/// there was none or is none now: never straight to the partner, and never with
+/// the password of another jump host. A file that cannot be opened is a store
+/// error, as for [`check_switch_is_on`].
+pub(crate) fn check_route_unchanged(
+    store_path: &Path,
+    partner: &Profile,
+    asked: Option<&Profile>,
+) -> Result<(), SyncFailure> {
+    let store = open_store(store_path)?;
+    let now = store.get(&partner.id).unwrap_or(partner);
+    let route = jump::route(now, |id| store.get(id));
+    if let Some(refusal) = route.refusal() {
+        return Err(SyncFailure::NotStarted(refusal));
+    }
+    if route.jump().map(|jump| &jump.id) != asked.map(|jump| &jump.id) {
+        return Err(SyncFailure::NotStarted(JUMP_CHANGED.to_owned()));
+    }
+    Ok(())
+}
+
+/// The profile file, for a check on the worker. The error text carries no file
+/// contents (`StoreError`).
+fn open_store(store_path: &Path) -> Result<ProfileStore, SyncFailure> {
+    ProfileStore::open(store_path)
+        .map_err(|err| SyncFailure::Sync(SyncError::Store(err.to_string())))
+}
+
 /// On the worker: complete `request` from `secrets`, in the CLI's order: the
-/// sync key, then whether the profile has a stored password (and, if it has,
-/// that the askpass helper exists). The `Err` text never holds the key.
+/// sync key, then whether the partner has a stored password and, with a jump
+/// host, whether it has (a keyring that cannot say counts as none), and then,
+/// if either has, that the askpass helper exists. The `Err` text never holds
+/// the key.
 pub(crate) fn complete_inputs(
     request: SyncRequest,
     secrets: &dyn SecretStore,
@@ -342,21 +448,42 @@ pub(crate) fn complete_inputs(
         }
     };
     // A keyring error here means "no stored password": ssh then asks in the
-    // terminal, which for a sync means the sync fails with ssh's message.
-    let has_password = matches!(secrets.get(&password_key(&request.profile.id)), Ok(Some(_)));
+    // terminal, which for a sync means the sync fails with ssh's message. The
+    // same for the jump host's password, whose ssh is asked about it first.
+    let stored = |profile: &Profile| matches!(secrets.get(&password_key(&profile.id)), Ok(Some(_)));
+    let has_password = stored(&request.profile);
+    let jump_has_password = request.jump.as_ref().is_some_and(stored);
     // A sync has no terminal to ask in: with a stored password but no helper to
-    // answer ssh, say so now rather than fail with an authentication error.
-    if has_password && !request.askpass.is_file() {
-        return Err(SyncFailure::NotStarted(ASKPASS_MISSING_SYNC.to_owned()));
+    // answer ssh, say so now rather than fail with an authentication error. The
+    // partner's is looked at first, as the command line does.
+    if !request.askpass.is_file() {
+        if has_password {
+            return Err(SyncFailure::NotStarted(ASKPASS_MISSING_SYNC.to_owned()));
+        }
+        if let (true, Some(jump)) = (jump_has_password, &request.jump) {
+            let why = askpass_missing_for_jump(&jump.name);
+            return Err(SyncFailure::NotStarted(why));
+        }
     }
     Ok(SyncInputs {
         profile: request.profile,
         has_password,
+        jump: request.jump,
+        jump_has_password,
         passphrase,
         askpass: request.askpass,
         store_path: request.store_path,
+        runtime_dir: request.runtime_dir,
         stale: request.stale,
     })
+}
+
+/// [`ASKPASS_MISSING_SYNC`] for the stored password of the jump host `name`.
+fn askpass_missing_for_jump(name: &str) -> String {
+    format!(
+        "moniker-askpass not found next to moniker, so the stored password of the jump host \
+         {name} cannot be used for the sync (build with `cargo build --workspace`)."
+    )
 }
 
 /// Why a sync that had started (its worker ran) did not succeed.
@@ -394,36 +521,76 @@ pub(crate) const NO_SYNC_KEY: &str = "Set a sync key first.";
 /// the refusal of a request, and the core's own error ([`explain`]).
 pub(crate) const SYNC_IS_OFF: &str = "Sync is turned off on this machine.";
 
+/// What a [`SyncError::JumpFailed`] says (as its detail) when no private runtime
+/// folder holds the socket of the jump connection ([`jump_leg`]).
+const NO_RUNTIME_FOLDER: &str = "there is no private runtime folder for its shared connection";
+
 /// The worker's whole job: open this thread's own store and secret store, build
 /// the ssh command, and run the exchange. `tweak` may change the command before
 /// it runs (the real runner changes nothing; tests swap in a fake `ssh`).
+///
+/// With a jump host (issue #9) the sync goes through a shared connection to it:
+/// a new socket in the runtime folder, the commands that sign in to the jump host
+/// and end the connection ([`jump_leg`]), and the partner's command taking the
+/// hop through that socket as its `ProxyCommand`. `tweak` is applied to each of
+/// them (the target's and the leg's three), and must leave their arguments
+/// alone: the core refuses a sync whose command does not carry the leg's hop.
 pub(crate) fn run_with(
     inputs: SyncInputs,
     secrets: Box<dyn SecretStore>,
-    tweak: impl FnOnce(&mut SshCommand),
+    mut tweak: impl FnMut(&mut SshCommand),
 ) -> Result<SyncOutcome, SyncError> {
     // StoreError messages carry no file contents.
     let store =
         ProfileStore::open(&inputs.store_path).map_err(|e| SyncError::Store(e.to_string()))?;
     let mut local = LocalState::new(store, secrets);
+    let mut leg = inputs
+        .jump
+        .as_ref()
+        .map(|jump| jump_leg(&inputs, jump))
+        .transpose()?;
     let mut cmd = sync_command(
         &inputs.profile,
         &inputs.askpass,
         inputs.has_password,
         SERVER_PROGRAM,
-        None,
+        leg.as_ref().map(|leg| leg.hop.as_str()),
     );
     tweak(&mut cmd);
+    if let Some(leg) = &mut leg {
+        for command in [&mut leg.master, &mut leg.check, &mut leg.exit] {
+            tweak(command);
+        }
+    }
     // In a session of its own: a question ssh would ask on a terminal fails at
-    // once instead of waiting in the terminal Moniker was started from.
+    // once instead of waiting in the terminal Moniker was started from. The
+    // jump host's ssh too.
     sync_over_ssh(
         &mut local,
         &cmd,
-        None,
+        leg.as_ref(),
         &inputs.passphrase,
         SshTerminal::Detached,
         inputs.stale,
     )
+}
+
+/// The commands of the sync's connection through `jump`: a new socket in the
+/// runtime folder and the leg made for it, its master answered by the jump
+/// host's stored password when there is one. Refused, before anything is
+/// started, when there is no private runtime folder (`jump_socket` says why on
+/// standard error: a socket anywhere else could be reached by others) or when
+/// the jump host's user name or host cannot go in the hop's command: the sync
+/// never goes straight to the partner in its place.
+fn jump_leg(inputs: &SyncInputs, jump: &Profile) -> Result<JumpLeg, SyncError> {
+    let failed = |detail: &str| SyncError::JumpFailed {
+        name: jump.name.clone(),
+        detail: detail.to_owned(),
+    };
+    let socket = jump_socket(inputs.runtime_dir.as_deref(), &jump.name)
+        .ok_or_else(|| failed(NO_RUNTIME_FOLDER))?;
+    JumpLeg::for_sync(jump, &socket, &inputs.askpass, inputs.jump_has_password)
+        .ok_or_else(|| failed("its user name or host cannot be used in the connection command"))
 }
 
 // ----- the worker thread -----
@@ -539,12 +706,14 @@ pub(crate) enum SyncEvent<'a> {
 /// `Err` (a plain sentence) if it does not start: [`ALREADY_RUNNING`] while
 /// another sync of this app runs, [`SYNC_IS_OFF`] while sync is turned off or a
 /// request to turn it off is still being saved ([`AppContext::sync_is_on`]),
-/// or what is wrong with the profile (gone, or its file path not absolute).
+/// or what is wrong with the profile (gone, its file path not absolute, or its
+/// jump host not saved or itself going through one: the route's text, issue #9).
 /// Nothing here reads the keyring: the worker reads the sync key and the
-/// stored-password flag ([`complete_inputs`]), after it has looked at the
-/// profile file ([`check_switch_is_on`]), and what it finds missing (no key, no
-/// askpass helper, an unreadable keyring, sync turned off meanwhile) comes back
-/// as the sync's result, like any failure of the exchange.
+/// stored-password flags ([`complete_inputs`]), after it has looked at the
+/// profile file ([`check_switch_is_on`], [`check_route_unchanged`]), and what it
+/// finds missing (no key, no askpass helper, an unreadable keyring, sync turned
+/// off or the route changed meanwhile) comes back as the sync's result, like any
+/// failure of the exchange.
 ///
 /// Once started, listeners hear [`SyncEvent::Started`]. When the worker is
 /// done (on the main thread): the running flag is cleared, a success reloads
@@ -570,7 +739,12 @@ where
     // Bind first so the store borrow ends here.
     let mut request = {
         let store = ctx.store.borrow();
-        sync_request(&store, &ctx.askpass_path, partner_id)
+        sync_request(
+            &store,
+            &ctx.askpass_path,
+            ctx.runtime_dir.as_deref(),
+            partner_id,
+        )
     }?;
     request.stale = stale;
     let open_secrets = worker_secrets(ctx);
@@ -579,8 +753,12 @@ where
     let ctx = Rc::clone(ctx);
     let work = move || {
         check_switch_is_on(&request.store_path)?;
+        check_route_unchanged(&request.store_path, &request.profile, request.jump.as_ref())?;
         let secrets = open_secrets();
         let inputs = complete_inputs(request, secrets.as_ref())?;
+        // The keyring may have waited at an unlock prompt for as long as the
+        // person took: the jump host can have been deleted or changed meanwhile.
+        check_route_unchanged(&inputs.store_path, &inputs.profile, inputs.jump.as_ref())?;
         run(inputs).map_err(SyncFailure::Sync)
     };
     start_sync(work, move |result| {
@@ -751,6 +929,66 @@ mod tests {
             assert!(explain(&err).contains(SENTINEL));
             assert_eq!(explain(&err), err.to_string());
         }
+    }
+
+    #[test]
+    fn explain_jump_errors() {
+        assert_eq!(
+            explain(&SyncError::PeerTooOld),
+            "The other machine runs an older Moniker, which does not know jump hosts. \
+             Update it to sync while a profile has a jump host."
+        );
+        assert_eq!(
+            explain(&SyncError::JumpHostKeyUnknown {
+                name: "Bastion".to_owned()
+            }),
+            "Connect to Bastion once in a tab first, so its host key is known."
+        );
+        // A jump host that did not answer: its name, not ssh's words (which
+        // can carry its address and user name).
+        let failed = SyncError::JumpFailed {
+            name: "Bastion".to_owned(),
+            detail: format!("ssh exited with status 255: bob@bastion: Refused {SENTINEL}"),
+        };
+        assert_eq!(
+            explain(&failed),
+            "Could not connect to the jump host Bastion."
+        );
+        // A refused login: a sync cannot ask, so the hint follows.
+        let refused = SyncError::JumpFailed {
+            name: "Bastion".to_owned(),
+            detail: "ssh exited with status 255: bob@bastion: Permission denied \
+                     (publickey,password)."
+                .to_owned(),
+        };
+        assert_eq!(
+            explain(&refused),
+            "Could not connect to the jump host Bastion. A sync cannot ask for a password or \
+             a key passphrase: store the profile's password, or add the key to ssh-agent."
+        );
+        // The name is plain text, whatever characters it has.
+        let markup = SyncError::JumpFailed {
+            name: "<b>x</b> &amp;".to_owned(),
+            detail: String::new(),
+        };
+        assert_eq!(
+            explain(&markup),
+            "Could not connect to the jump host <b>x</b> &amp;."
+        );
+        // No private folder for the socket: said as a pane says it.
+        let no_folder = SyncError::JumpFailed {
+            name: "Bastion".to_owned(),
+            detail: NO_RUNTIME_FOLDER.to_owned(),
+        };
+        assert_eq!(
+            explain(&no_folder),
+            "Could not connect through the jump host Bastion: there is no private runtime \
+             folder for its shared connection."
+        );
+        assert_eq!(
+            failure_text(&SyncFailure::Sync(failed)),
+            "Could not connect to the jump host Bastion."
+        );
     }
 
     // ----- outcome_text -----
@@ -1022,14 +1260,14 @@ mod tests {
         askpass: &Path,
         profile_id: &str,
     ) -> Result<SyncInputs, String> {
-        let request = sync_request(store, askpass, profile_id)?;
+        let request = sync_request(store, askpass, None, profile_id)?;
         complete_inputs(request, secrets).map_err(|failure| failure_text(&failure))
     }
 
     #[test]
     fn a_missing_key_is_its_own_failure_and_never_shows_a_key() {
         let w = world();
-        let request = || sync_request(&w.store, &w.askpass, &w.profile.id).unwrap();
+        let request = || sync_request(&w.store, &w.askpass, None, &w.profile.id).unwrap();
         assert!(matches!(
             complete_inputs(request(), &w.secrets),
             Err(SyncFailure::NoSyncKey)
@@ -1237,7 +1475,7 @@ mod tests {
         // The partner is still there: Sync Now is shown, grayed out.
         assert_eq!(live_partner(&partner, &w.store), Some(w.profile.id.clone()));
         // No request, so no worker and no keyring read.
-        let err = sync_request(&w.store, &w.askpass, &w.profile.id)
+        let err = sync_request(&w.store, &w.askpass, None, &w.profile.id)
             .err()
             .expect("refused");
         assert_eq!(err, SYNC_IS_OFF);
@@ -1247,7 +1485,7 @@ mod tests {
             auto_sync_target(&partner, &w.store),
             Some(w.profile.id.clone())
         );
-        assert!(sync_request(&w.store, &w.askpass, &w.profile.id).is_ok());
+        assert!(sync_request(&w.store, &w.askpass, None, &w.profile.id).is_ok());
     }
 
     #[test]
@@ -1259,7 +1497,7 @@ mod tests {
         fs::write(w.store.path(), r#"{"version":2,"profiles":[]}"#).unwrap();
         let unreadable = ProfileStore::open(w.store.path()).unwrap();
         assert_eq!(auto_sync_target(&partner, &unreadable), None);
-        let err = sync_request(&unreadable, &w.askpass, &w.profile.id);
+        let err = sync_request(&unreadable, &w.askpass, None, &w.profile.id);
         assert_eq!(err.err().as_deref(), Some(SYNC_IS_OFF));
     }
 
@@ -1275,7 +1513,7 @@ mod tests {
             .set_sync(false)
             .unwrap();
         assert!(w.store.sync_switch().is_on(), "stale");
-        assert!(sync_request(&w.store, &w.askpass, &w.profile.id).is_ok());
+        assert!(sync_request(&w.store, &w.askpass, None, &w.profile.id).is_ok());
         match check_switch_is_on(w.store.path()) {
             Err(SyncFailure::Sync(SyncError::SyncOff)) => {}
             other => panic!("{:?}", other.err()),
@@ -1409,9 +1647,12 @@ mod tests {
         SyncInputs {
             profile: w.profile.clone(),
             has_password,
+            jump: None,
+            jump_has_password: false,
             passphrase: Zeroizing::new(KEY.to_owned()),
             askpass: w.askpass.clone(),
             store_path: w.store.path().to_path_buf(),
+            runtime_dir: None,
             stale: StaleSync::Refuse,
         }
     }
@@ -1450,6 +1691,8 @@ mod tests {
         // No controlling terminal: ssh cannot ask in the terminal Moniker was
         // started from.
         assert!(lines.contains(&"SESSION-LEADER"), "{lines:?}");
+        // No jump host, no hop: straight to the partner.
+        assert!(!record.contains("ProxyCommand"), "{record}");
     }
 
     #[test]
@@ -1498,6 +1741,561 @@ mod tests {
         match result {
             Err(SyncError::Store(message)) => assert!(!message.contains("not json"), "{message}"),
             other => panic!("got {other:?}"),
+        }
+    }
+
+    // ----- a sync through the partner's jump host (issue #9) -----
+
+    /// The text of a partner whose jump host is not saved here.
+    const MISSING: &str = "This profile's jump host is no longer saved.";
+
+    /// Save a jump host "Bastion" and make the world's profile go through it.
+    /// `world.profile` is the partner as saved now.
+    fn add_jump_host(w: &mut World) -> Profile {
+        let bastion = Profile::new("Bastion", "bastion.example.test", "bob");
+        w.store.upsert(bastion.clone()).unwrap();
+        let bastion = w.store.get(&bastion.id).unwrap().clone();
+        go_through(w, Some(&bastion.id));
+        bastion
+    }
+
+    /// Make the world's profile go through the jump host `id` (or none).
+    fn go_through(w: &mut World, id: Option<&str>) {
+        let mut partner = w.profile.clone();
+        partner.jump_host = id.map(str::to_owned);
+        w.store.upsert(partner).unwrap();
+        w.profile = w.store.get(&w.profile.id).unwrap().clone();
+    }
+
+    /// A keyring that has the sync key and fails on every other read.
+    struct OnlyTheKey;
+
+    impl SecretStore for OnlyTheKey {
+        fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SecretError> {
+            if key == SYNC_PASSPHRASE_KEY {
+                Ok(Some(Zeroizing::new(KEY.to_owned())))
+            } else {
+                Err(SecretError::Unavailable("no bus".to_owned()))
+            }
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretError> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            Ok(())
+        }
+        fn probe(&self) -> Result<(), SecretError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_partner_through_a_saved_jump_host_carries_it() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        let request = sync_request(&w.store, &w.askpass, None, &w.profile.id).unwrap();
+        assert_eq!(request.jump.as_ref(), Some(&bastion));
+        assert_eq!(request.profile, w.profile);
+        // No jump host set: none carried.
+        go_through(&mut w, None);
+        let request = sync_request(&w.store, &w.askpass, None, &w.profile.id).unwrap();
+        assert_eq!(request.jump, None);
+        // The runtime folder travels with the request.
+        let folder = Path::new("/run/user/1000");
+        let request = sync_request(&w.store, &w.askpass, Some(folder), &w.profile.id).unwrap();
+        assert_eq!(request.runtime_dir.as_deref(), Some(folder));
+    }
+
+    #[test]
+    fn a_waiting_partner_is_not_synced() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        w.secrets.set(SYNC_PASSPHRASE_KEY, KEY).unwrap();
+        // Its jump host was deleted (a sync did it, say): it waits.
+        w.store.delete(&bastion.id).unwrap();
+        let err = sync_request(&w.store, &w.askpass, None, &w.profile.id)
+            .err()
+            .expect("refused");
+        assert_eq!(err, MISSING);
+        // One whose jump host this machine never had waits the same way.
+        go_through(&mut w, Some("00000000-0000-4000-8000-000000000009"));
+        assert_eq!(
+            sync_request(&w.store, &w.askpass, None, &w.profile.id)
+                .err()
+                .as_deref(),
+            Some(MISSING)
+        );
+        // Refused from the profile file alone: a keyring that fails on every
+        // read is never asked, or the key's error would come first.
+        assert_eq!(
+            gather_inputs(&w.store, &Broken, &w.askpass, &w.profile.id)
+                .err()
+                .as_deref(),
+            Some(MISSING)
+        );
+        // Never straight to the partner instead.
+        assert!(sync_request(&w.store, &w.askpass, None, &w.profile.id).is_err());
+    }
+
+    #[test]
+    fn a_chained_partner_is_not_synced() {
+        let mut w = world();
+        let far = Profile::new("Far", "far.example.test", "carol");
+        w.store.upsert(far.clone()).unwrap();
+        let mid = Profile {
+            jump_host: Some(far.id.clone()),
+            ..Profile::new("Mid", "mid.example.test", "bob")
+        };
+        w.store.upsert(mid.clone()).unwrap();
+        go_through(&mut w, Some(&mid.id));
+        let err = sync_request(&w.store, &w.askpass, None, &w.profile.id)
+            .err()
+            .expect("refused");
+        assert_eq!(
+            err,
+            "Mid goes through a jump host of its own. Moniker uses only one jump host."
+        );
+        assert_eq!(
+            gather_inputs(&w.store, &Broken, &w.askpass, &w.profile.id)
+                .err()
+                .as_deref(),
+            Some(err.as_str()),
+            "before the keyring"
+        );
+    }
+
+    #[test]
+    fn the_jump_host_s_password_is_looked_up() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        w.secrets.set(SYNC_PASSPHRASE_KEY, KEY).unwrap();
+        let inputs = |w: &World| {
+            let Ok(inputs) = gather(w, &w.profile.id) else {
+                panic!("gathering failed");
+            };
+            inputs
+        };
+
+        // Nothing stored for either.
+        let got = inputs(&w);
+        assert_eq!(got.jump.as_ref(), Some(&bastion));
+        assert!(!got.has_password && !got.jump_has_password);
+
+        // Each flag follows its own profile's password.
+        w.secrets
+            .set(&password_key(&bastion.id), "jump-pw")
+            .unwrap();
+        let got = inputs(&w);
+        assert!(!got.has_password, "the partner has none");
+        assert!(got.jump_has_password);
+        w.secrets.delete(&password_key(&bastion.id)).unwrap();
+        w.secrets
+            .set(&password_key(&w.profile.id), "partner-pw")
+            .unwrap();
+        let got = inputs(&w);
+        assert!(got.has_password);
+        assert!(
+            !got.jump_has_password,
+            "the partner's is not the jump host's"
+        );
+        w.secrets
+            .set(&password_key(&bastion.id), "jump-pw")
+            .unwrap();
+        let got = inputs(&w);
+        assert!(got.has_password && got.jump_has_password);
+
+        // A keyring that fails to read a password counts as none, for both:
+        // the sync then fails with ssh's own message.
+        let request = sync_request(&w.store, &w.askpass, None, &w.profile.id).unwrap();
+        let Ok(got) = complete_inputs(request, &OnlyTheKey) else {
+            panic!("a failed password read stopped the sync");
+        };
+        assert!(!got.has_password && !got.jump_has_password);
+
+        // Without a jump host there is nothing to look up, even if a password
+        // is stored under that profile's id.
+        go_through(&mut w, None);
+        let got = inputs(&w);
+        assert_eq!(got.jump, None);
+        assert!(!got.jump_has_password);
+    }
+
+    #[test]
+    fn a_stored_jump_password_without_the_helper_stops_before_connecting() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        w.secrets.set(SYNC_PASSPHRASE_KEY, KEY).unwrap();
+        w.secrets
+            .set(&password_key(&bastion.id), "jump-pw")
+            .unwrap();
+        let missing = Path::new("/nonexistent/moniker/moniker-askpass");
+        let err = gather_inputs(&w.store, &w.secrets, missing, &w.profile.id)
+            .err()
+            .expect("an error");
+        assert_eq!(
+            err,
+            "moniker-askpass not found next to moniker, so the stored password of the jump \
+             host Bastion cannot be used for the sync (build with `cargo build --workspace`)."
+        );
+        assert!(!err.contains("jump-pw"), "{err}");
+        // With the helper there, and with only the partner's password stored,
+        // it is the partner's that is named.
+        assert!(gather(&w, &w.profile.id).is_ok());
+        w.secrets.delete(&password_key(&bastion.id)).unwrap();
+        w.secrets
+            .set(&password_key(&w.profile.id), "partner-pw")
+            .unwrap();
+        assert_eq!(
+            gather_inputs(&w.store, &w.secrets, missing, &w.profile.id)
+                .err()
+                .as_deref(),
+            Some(ASKPASS_MISSING_SYNC)
+        );
+        // Both stored: the partner's is the first to be missed.
+        w.secrets
+            .set(&password_key(&bastion.id), "jump-pw")
+            .unwrap();
+        assert_eq!(
+            gather_inputs(&w.store, &w.secrets, missing, &w.profile.id)
+                .err()
+                .as_deref(),
+            Some(ASKPASS_MISSING_SYNC)
+        );
+        // Neither stored: no helper needed.
+        w.secrets.delete(&password_key(&bastion.id)).unwrap();
+        w.secrets.delete(&password_key(&w.profile.id)).unwrap();
+        assert!(gather_inputs(&w.store, &w.secrets, missing, &w.profile.id).is_ok());
+    }
+
+    /// A fake `ssh` for a sync through a jump host. For each run it appends to
+    /// `jump-record` the role it played (`master` when it is given `-M`,
+    /// `check` or `exit` when it is given `-O`, else `target`), its arguments
+    /// and the askpass variables it was given. The master "goes to the
+    /// background" (exits 0), a check finds no master (exits 1), and the
+    /// target finds no moniker-server (exits 127).
+    fn fake_jump_ssh(dir: &Path) -> PathBuf {
+        let path = dir.join("fake-jump-ssh");
+        let record = dir.join("jump-record");
+        let script = format!(
+            "#!/bin/sh\n\
+             role=target; prev=\n\
+             for a in \"$@\"; do\n\
+             [ \"$a\" = -M ] && role=master\n\
+             [ \"$prev\" = -O ] && role=$a\n\
+             prev=$a\n\
+             done\n\
+             {{\n\
+             echo \"RUN:$role\"\n\
+             for a in \"$@\"; do printf 'ARG:%s\\n' \"$a\"; done\n\
+             printf 'SSH_ASKPASS=%s\\n' \"${{SSH_ASKPASS-unset}}\"\n\
+             printf 'MONIKER_PROFILE_ID=%s\\n' \"${{MONIKER_PROFILE_ID-unset}}\"\n\
+             }} >> '{}'\n\
+             case $role in target) exit 127;; check) exit 1;; *) exit 0;; esac\n",
+            record.display()
+        );
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// What [`fake_jump_ssh`] recorded: each run's role, then its lines.
+    fn jump_runs(dir: &Path) -> Vec<(String, Vec<String>)> {
+        let mut runs: Vec<(String, Vec<String>)> = Vec::new();
+        let record = fs::read_to_string(dir.join("jump-record")).unwrap_or_default();
+        for line in record.lines() {
+            match line.strip_prefix("RUN:") {
+                Some(role) => runs.push((role.to_owned(), Vec::new())),
+                None => runs
+                    .last_mut()
+                    .expect("a line before any run")
+                    .1
+                    .push(line.to_owned()),
+            }
+        }
+        runs
+    }
+
+    /// A private folder with a short path, standing for the runtime folder.
+    fn runtime_folder() -> tempfile::TempDir {
+        let dir = tempfile::Builder::new()
+            .prefix("rt")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// Inputs for a sync with the world's partner through `bastion`, the socket
+    /// made in `runtime`, and a password stored for the jump host only.
+    fn jump_inputs(w: &World, bastion: &Profile, runtime: &Path) -> SyncInputs {
+        SyncInputs {
+            jump: Some(bastion.clone()),
+            jump_has_password: true,
+            runtime_dir: Some(runtime.to_path_buf()),
+            ..inputs_for(w, false)
+        }
+    }
+
+    #[test]
+    fn the_worker_builds_the_jump_leg() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        let dir = w.store.path().parent().unwrap().to_path_buf();
+        let fake = fake_jump_ssh(&dir);
+        let runtime = runtime_folder();
+        let mut swapped = 0;
+        let result = run_with(
+            jump_inputs(&w, &bastion, runtime.path()),
+            Box::new(MemorySecretStore::default()),
+            |cmd| {
+                // Only the program: the arguments are the real ones, and the
+                // core checks that the sync's goes through the hop.
+                cmd.program = fake.to_str().unwrap().to_owned();
+                swapped += 1;
+            },
+        );
+        // Exit status 127 from the target means moniker-server was not found.
+        assert!(
+            matches!(result, Err(SyncError::ServerNotFound)),
+            "got {result:?}"
+        );
+        assert_eq!(swapped, 4, "the target, the master, the check and the exit");
+
+        let runs = jump_runs(&dir);
+        let roles: Vec<&str> = runs.iter().map(|(role, _)| role.as_str()).collect();
+        // Signed in to the jump host first, its pid asked for, then the
+        // partner through it; the master is ended last, by name, since its
+        // pid was not learned.
+        assert_eq!(roles, ["master", "check", "target", "exit"]);
+        let line = |role: usize, prefix: &str| -> String {
+            runs[role]
+                .1
+                .iter()
+                .find_map(|l| l.strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("no {prefix} for {role}: {:?}", runs[role].1))
+                .to_owned()
+        };
+        let args = |role: usize| -> Vec<String> {
+            runs[role]
+                .1
+                .iter()
+                .filter_map(|l| l.strip_prefix("ARG:").map(str::to_owned))
+                .collect()
+        };
+
+        // The master signs in to the jump host, answered by the jump host's
+        // stored password; the sync's own ssh has none stored for the partner,
+        // so it is offered no helper.
+        let master = args(0);
+        assert_eq!(
+            master.last().map(String::as_str),
+            Some("bob@bastion.example.test")
+        );
+        assert!(master.contains(&"-M".to_owned()), "{master:?}");
+        assert_eq!(line(0, "MONIKER_PROFILE_ID="), bastion.id);
+        assert_eq!(line(0, "SSH_ASKPASS="), w.askpass.display().to_string());
+        assert_eq!(line(2, "MONIKER_PROFILE_ID="), "unset");
+        assert_eq!(line(2, "SSH_ASKPASS="), "unset");
+
+        // One socket in the runtime folder, named by all four.
+        let socket = master
+            .iter()
+            .skip_while(|a| *a != "-S")
+            .nth(1)
+            .expect("the master's -S")
+            .clone();
+        let jump_folder = runtime.path().join("moniker").join("jump");
+        assert!(
+            Path::new(&socket).starts_with(&jump_folder),
+            "{socket} is not in {}",
+            jump_folder.display()
+        );
+        assert!(args(1).contains(&socket), "{:?}", args(1));
+        assert!(args(3).contains(&socket), "{:?}", args(3));
+        assert!(args(1).contains(&"check".to_owned()));
+        assert!(args(3).contains(&"exit".to_owned()));
+
+        // The target's ssh takes the hop as its ProxyCommand, through that
+        // socket and to the target.
+        let target = args(2);
+        let hop = target
+            .iter()
+            .find_map(|a| a.strip_prefix("ProxyCommand="))
+            .expect("a ProxyCommand");
+        assert!(hop.starts_with(&format!("ssh -S {socket} ")), "{hop}");
+        assert!(hop.ends_with("-- bob@bastion.example.test"), "{hop}");
+        assert_eq!(target.last().map(String::as_str), Some("sync-serve"));
+        assert!(
+            target.contains(&"alice@app.example.test".to_owned()),
+            "{target:?}"
+        );
+
+        // Nothing secret is in argv.
+        let record = fs::read_to_string(dir.join("jump-record")).unwrap();
+        assert!(!record.contains("jump-pw") && !record.contains("correct horse"));
+
+        // The other way round: the partner's stored password is for the
+        // partner's ssh, and the jump host's has none to be answered with.
+        fs::remove_file(dir.join("jump-record")).unwrap();
+        let inputs = SyncInputs {
+            has_password: true,
+            jump_has_password: false,
+            ..jump_inputs(&w, &bastion, runtime.path())
+        };
+        let result = run_with(inputs, Box::new(MemorySecretStore::default()), |cmd| {
+            cmd.program = fake.to_str().unwrap().to_owned();
+        });
+        assert!(
+            matches!(result, Err(SyncError::ServerNotFound)),
+            "{result:?}"
+        );
+        let runs = jump_runs(&dir);
+        let env_of = |role: usize, prefix: &str| -> String {
+            runs[role]
+                .1
+                .iter()
+                .find_map(|l| l.strip_prefix(prefix))
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(env_of(0, "SSH_ASKPASS="), "unset", "the master");
+        assert_eq!(env_of(0, "MONIKER_PROFILE_ID="), "unset");
+        assert_eq!(env_of(2, "MONIKER_PROFILE_ID="), w.profile.id, "the target");
+        assert_eq!(env_of(2, "SSH_ASKPASS="), w.askpass.display().to_string());
+    }
+
+    #[test]
+    fn the_worker_does_not_run_a_jump_connection_it_cannot_make() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        let runtime = runtime_folder();
+        let no_ssh = |_: &mut SshCommand| panic!("ssh must not be started");
+        let named = |err: Result<SyncOutcome, SyncError>| match err {
+            Err(SyncError::JumpFailed { name, detail }) => {
+                assert_eq!(name, "Bastion");
+                detail
+            }
+            other => panic!("got {other:?}"),
+        };
+
+        // No runtime folder at all.
+        let mut inputs = jump_inputs(&w, &bastion, runtime.path());
+        inputs.runtime_dir = None;
+        let detail = named(run_with(
+            inputs,
+            Box::new(MemorySecretStore::default()),
+            no_ssh,
+        ));
+        assert_eq!(detail, NO_RUNTIME_FOLDER);
+
+        // One others may write in: a socket there could be reached by them.
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let detail = named(run_with(
+            jump_inputs(&w, &bastion, runtime.path()),
+            Box::new(MemorySecretStore::default()),
+            no_ssh,
+        ));
+        assert_eq!(detail, NO_RUNTIME_FOLDER);
+        assert!(
+            !runtime.path().join("moniker").exists(),
+            "nothing was made in it"
+        );
+
+        // A relative one.
+        let mut inputs = jump_inputs(&w, &bastion, runtime.path());
+        inputs.runtime_dir = Some(PathBuf::from("run/user/1000"));
+        let detail = named(run_with(
+            inputs,
+            Box::new(MemorySecretStore::default()),
+            no_ssh,
+        ));
+        assert_eq!(detail, NO_RUNTIME_FOLDER);
+    }
+
+    #[test]
+    fn a_jump_host_changed_since_the_request_stops_the_worker() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        let asked = Some(&bastion);
+        let check = |w: &World, asked: Option<&Profile>| {
+            check_route_unchanged(w.store.path(), &w.profile, asked)
+                .err()
+                .map(|failure| failure_text(&failure))
+        };
+        // The same as asked.
+        assert_eq!(check(&w, asked), None);
+
+        // Edits made through another handle on the file, as another process
+        // (or a sync) would make them. `w.store` is then a stale snapshot, as
+        // the main thread's is until the file watch reloads it.
+        let other = || ProfileStore::open(w.store.path()).unwrap();
+
+        // The jump host gains a jump host of its own: one hop only.
+        let far = Profile::new("Far", "far.example.test", "carol");
+        other().upsert(far.clone()).unwrap();
+        other()
+            .upsert(Profile {
+                jump_host: Some(far.id.clone()),
+                ..bastion.clone()
+            })
+            .unwrap();
+        assert_eq!(
+            check(&w, asked).as_deref(),
+            Some("Bastion goes through a jump host of its own. Moniker uses only one jump host.")
+        );
+
+        // Deleted: the partner waits, and is never synced direct.
+        other().delete(&bastion.id).unwrap();
+        assert_eq!(check(&w, asked).as_deref(), Some(MISSING));
+    }
+
+    #[test]
+    fn another_route_than_the_one_asked_for_stops_the_worker() {
+        let mut w = world();
+        let bastion = add_jump_host(&mut w);
+        let other_host = Profile::new("Gate", "gate.example.test", "dave");
+        w.store.upsert(other_host.clone()).unwrap();
+        let other = || ProfileStore::open(w.store.path()).unwrap();
+        let check = |w: &World, asked: Option<&Profile>| {
+            check_route_unchanged(w.store.path(), &w.profile, asked)
+                .err()
+                .map(|failure| failure_text(&failure))
+        };
+        let changed = Some(JUMP_CHANGED.to_owned());
+
+        // The partner was given another saved jump host: the password that
+        // was looked up is the old one's.
+        let rerouted = Profile {
+            jump_host: Some(other_host.id.clone()),
+            ..w.profile.clone()
+        };
+        other().upsert(rerouted).unwrap();
+        assert_eq!(check(&w, Some(&bastion)), changed);
+
+        // The jump host was taken off: not a direct sync that nobody asked for.
+        let direct = Profile {
+            jump_host: None,
+            ..w.profile.clone()
+        };
+        other().upsert(direct).unwrap();
+        assert_eq!(check(&w, Some(&bastion)), changed);
+
+        // And one was put on a request made without.
+        assert_eq!(check(&w, None), None);
+        let through = Profile {
+            jump_host: Some(bastion.id.clone()),
+            ..w.profile.clone()
+        };
+        other().upsert(through).unwrap();
+        assert_eq!(check(&w, None), changed);
+
+        // A file that cannot be opened is a store error that quotes nothing.
+        fs::write(w.store.path(), "{ not json SENTINEL").unwrap();
+        match check_route_unchanged(w.store.path(), &w.profile, None) {
+            Err(SyncFailure::Sync(SyncError::Store(message))) => {
+                assert!(!message.contains("SENTINEL"), "{message}");
+            }
+            other => panic!("{:?}", other.err()),
         }
     }
 }

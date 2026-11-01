@@ -4,7 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -299,6 +299,11 @@ impl SyncRig {
 struct Seen {
     name: String,
     has_password: bool,
+    /// The name of the jump host the partner goes through, if it has one, and
+    /// whether a password is stored for it (issue #9).
+    jump: Option<String>,
+    jump_has_password: bool,
+    runtime_dir: Option<PathBuf>,
     passphrase: String,
     thread: ThreadId,
 }
@@ -315,6 +320,9 @@ fn fake_runner(
         seen.send(Seen {
             name: inputs.profile.name.clone(),
             has_password: inputs.has_password,
+            jump: inputs.jump.as_ref().map(|jump| jump.name.clone()),
+            jump_has_password: inputs.jump_has_password,
+            runtime_dir: inputs.runtime_dir.clone(),
             passphrase: inputs.passphrase.as_str().to_owned(),
             thread: thread::current().id(),
         })
@@ -3052,4 +3060,348 @@ pub(super) fn the_launch_sync_of_a_machine_that_has_been_away_only_says_so(dir: 
         "no alert"
     );
     close_all(&app);
+}
+
+// ----- a partner behind a jump host (issue #9) -----
+
+/// Save `p` in the profile file through a handle of its own, as the command
+/// line (or a sync from another process) would, and let `ctx` read it.
+fn save_elsewhere(ctx: &AppContext, p: Profile) {
+    let path = ctx.store.borrow().path().to_path_buf();
+    ProfileStore::open(&path).unwrap().upsert(p).unwrap();
+    ctx.profiles_changed();
+}
+
+/// A new saved profile named `name`, through another handle ([`save_elsewhere`]).
+fn save_new_elsewhere(ctx: &AppContext, name: &str, jump: Option<&Profile>) -> Profile {
+    let p = Profile {
+        jump_host: jump.map(|jump| jump.id.clone()),
+        ..Profile::new(
+            name,
+            &format!("{}.example.test", name.to_lowercase()),
+            "bob",
+        )
+    };
+    save_elsewhere(ctx, p.clone());
+    ctx.store.borrow().get(&p.id).expect("saved").clone()
+}
+
+/// `partner` with its jump host set to `jump` (or none), saved elsewhere.
+fn route_through(ctx: &AppContext, partner: &Profile, jump: Option<&Profile>) {
+    let partner = Profile {
+        jump_host: jump.map(|jump| jump.id.clone()),
+        ..ctx.store.borrow().get(&partner.id).expect("saved").clone()
+    };
+    save_elsewhere(ctx, partner);
+}
+
+const MISSING: &str = "This profile's jump host is no longer saved.";
+
+/// A partner whose jump host is not saved here, or goes through a jump host of
+/// its own, is not synced, and never directly instead: whichever way the sync
+/// is asked for, the person is told why at once, no sync starts, and neither the
+/// sync key nor any password is read.
+pub(super) fn a_partner_that_waits_for_its_jump_host_is_not_synced(dir: &Path) {
+    let reads = Reads::default();
+    let (ctx, secrets, profile) = sync_ctx_counting(dir, true, Some(SYNC_KEY), &reads);
+    let partner = profile.expect("a profile");
+    secrets
+        .set(&password_key(&partner.id), "pw-for-ssh")
+        .unwrap();
+    set_partner(&ctx, &partner, true);
+    // Its jump host is not saved here: only the id is.
+    route_through(
+        &ctx,
+        &partner,
+        Some(&Profile::new("Gone", "gone.example.test", "bob")),
+    );
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
+    let area = super::bare_area();
+    ctx.notice.attach(&area);
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
+    assert!(page.sync_button.is_sensitive());
+    let runs = Arc::new(AtomicUsize::new(0));
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    let (main_reads, worker_reads) = (
+        reads.main.load(Ordering::SeqCst),
+        reads.worker.load(Ordering::SeqCst),
+    );
+    let nothing_ran = |what: &str| {
+        assert!(!ctx.sync_running.get(), "{what}: nothing started");
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "{what}: no ssh");
+        assert_eq!(
+            reads.worker.load(Ordering::SeqCst),
+            worker_reads,
+            "{what}: neither the sync key nor a password was read"
+        );
+        assert_eq!(reads.main.load(Ordering::SeqCst), main_reads, "{what}");
+    };
+
+    // The Sync button.
+    page.sync_button.emit_clicked();
+    assert_eq!(page.result.label(), MISSING);
+    assert!(has_css(&page.result, "error"));
+    nothing_ran("the sync page");
+
+    // Sync Now.
+    app.activate_action("sync-now", None);
+    assert_eq!(
+        ctx.notice.last_text().as_deref(),
+        Some(format!("Sync failed: {MISSING}").as_str())
+    );
+    nothing_ran("Sync Now");
+
+    // The sync on launch: one notification.
+    let delivered = ctx.notice.delivered();
+    super::launch_at_home(&app, &ctx);
+    pump_until("the notification", || ctx.notice.delivered() > delivered);
+    pump_for(Duration::from_millis(300));
+    assert_eq!(ctx.notice.delivered(), delivered + 1, "exactly one");
+    assert_eq!(
+        ctx.notice.last_text().as_deref(),
+        Some(format!("Automatic sync failed: {MISSING}").as_str())
+    );
+    nothing_ran("the launch");
+
+    // A jump host that goes through one of its own: one hop only.
+    let far = save_new_elsewhere(&ctx, "Far", None);
+    let mid = save_new_elsewhere(&ctx, "Mid", Some(&far));
+    route_through(&ctx, &partner, Some(&mid));
+    let chained = "Mid goes through a jump host of its own. Moniker uses only one jump host.";
+    page.sync_button.emit_clicked();
+    assert_eq!(page.result.label(), chained);
+    assert!(has_css(&page.result, "error"));
+    nothing_ran("a chain");
+    app.activate_action("sync-now", None);
+    assert_eq!(
+        ctx.notice.last_text().as_deref(),
+        Some(format!("Sync failed: {chained}").as_str())
+    );
+    nothing_ran("Sync Now, a chain");
+
+    // Straight to its host again, it syncs.
+    route_through(&ctx, &partner, None);
+    let (tx, rx) = mpsc::channel();
+    set_runner(
+        &ctx,
+        fake_runner(tx, Arc::clone(&runs), Duration::ZERO, || Ok(added(0))),
+    );
+    page.sync_button.emit_clicked();
+    pump_until("the sync", || rx.try_recv().is_ok());
+    pump_until("it to finish", || !ctx.sync_running.get());
+    drop(page);
+    close_all(&app);
+}
+
+/// The jump host and its stored password reach the worker, whichever way the
+/// sync is asked for, and the keyring is still read on the worker only. A jump
+/// host with no password stored says so, and the partner's password is its own.
+pub(super) fn a_sync_goes_through_the_partner_s_jump_host(dir: &Path) {
+    let reads = Reads::default();
+    let (mut ctx, secrets, profile) = sync_ctx_counting(dir, true, Some(SYNC_KEY), &reads);
+    let partner = profile.expect("a profile");
+    // The runtime folder is the context's, as in the app.
+    let runtime = dir.join("run");
+    fs::create_dir_all(&runtime).expect("the runtime folder");
+    Rc::get_mut(&mut ctx)
+        .expect("no one else holds the context yet")
+        .runtime_dir = Some(runtime.clone());
+    set_partner(&ctx, &partner, true);
+    let bastion = save_new_elsewhere(&ctx, "Bastion", None);
+    route_through(&ctx, &partner, Some(&bastion));
+    secrets
+        .set(&password_key(&partner.id), "pw-for-ssh")
+        .unwrap();
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
+    let main = window::build(&app, &ctx);
+    main.window.present();
+    let profiles_window = open_sync_page(&app, &ctx);
+    let page = page_in(&profiles_window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
+    let main_reads = reads.main.load(Ordering::SeqCst);
+
+    let check = |what: &str, jump_password: bool, start: &dyn Fn()| {
+        let worker_reads = reads.worker.load(Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel();
+        set_runner(
+            &ctx,
+            fake_runner(tx, Arc::new(AtomicUsize::new(0)), Duration::ZERO, || {
+                Ok(added(0))
+            }),
+        );
+        start();
+        pump_until(what, || {
+            rx.try_recv().is_ok_and(|seen| {
+                assert_eq!(seen.name, partner.name, "{what}: the partner");
+                assert_eq!(
+                    seen.jump.as_deref(),
+                    Some("Bastion"),
+                    "{what}: its jump host"
+                );
+                assert!(seen.has_password, "{what}: the partner's password");
+                assert_eq!(
+                    seen.jump_has_password, jump_password,
+                    "{what}: the jump host's"
+                );
+                assert_eq!(
+                    seen.runtime_dir.as_deref(),
+                    Some(runtime.as_path()),
+                    "{what}"
+                );
+                assert_ne!(seen.thread, thread::current().id(), "{what}: on the worker");
+                true
+            })
+        });
+        pump_until("the sync to finish", || !ctx.sync_running.get());
+        assert_eq!(
+            reads.main.load(Ordering::SeqCst),
+            main_reads,
+            "{what}: no keyring read on the main thread"
+        );
+        assert!(
+            reads.worker.load(Ordering::SeqCst) > worker_reads,
+            "{what}: the worker read it"
+        );
+    };
+
+    // No password stored for the jump host: the worker finds none.
+    check("the sync page", false, &|| page.sync_button.emit_clicked());
+    // Stored: the worker finds it, for each way to ask.
+    secrets
+        .set(&password_key(&bastion.id), "pw-for-the-jump")
+        .unwrap();
+    check("the sync page, stored", true, &|| {
+        page.sync_button.emit_clicked();
+    });
+    check("Sync Now", true, &|| app.activate_action("sync-now", None));
+    check("the sync on launch", true, &|| {
+        super::launch_at_home(&app, &ctx);
+    });
+    drop(page);
+    close_all(&app);
+}
+
+/// The profile file is looked at again on the worker: a jump host deleted after
+/// the sync was asked for, while the window's profiles still said it was there,
+/// stops the sync before the keyring is read; one deleted while the keyring is
+/// being read (an unlock prompt can take as long as the person likes) stops it
+/// before the exchange. Neither syncs straight to the partner.
+pub(super) fn a_jump_host_deleted_meanwhile_stops_the_sync(dir: &Path) {
+    let reads = Reads::default();
+    let (ctx, secrets, profile) = sync_ctx_counting(dir, true, Some(SYNC_KEY), &reads);
+    let partner = profile.expect("a profile");
+    secrets
+        .set(&password_key(&partner.id), "pw-for-ssh")
+        .unwrap();
+    set_partner(&ctx, &partner, true);
+    let bastion = save_new_elsewhere(&ctx, "Bastion", None);
+    route_through(&ctx, &partner, Some(&bastion));
+    let path = ctx.store.borrow().path().to_path_buf();
+    let app = test_app();
+    crate::add_actions(&app, &ctx);
+    let area = super::bare_area();
+    ctx.notice.attach(&area);
+    let window = open_sync_page(&app, &ctx);
+    let page = page_in(&window);
+    pump_until("the page to read the key's state", || {
+        page.key_status.label() != sync::KEY_CHECKING
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    // Deleted through another handle; the window's profiles are not reloaded.
+    ProfileStore::open(&path)
+        .unwrap()
+        .delete(&bastion.id)
+        .unwrap();
+    assert!(
+        ctx.store.borrow().get(&bastion.id).is_some(),
+        "the snapshot is stale"
+    );
+    let worker_reads = reads.worker.load(Ordering::SeqCst);
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    page.sync_button.emit_clicked();
+    assert!(ctx.sync_running.get(), "the snapshot said it was there");
+    pump_until("the sync to stop", || !ctx.sync_running.get());
+    assert_eq!(page.result.label(), MISSING);
+    assert!(has_css(&page.result, "error"));
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "no ssh");
+    assert_eq!(
+        reads.worker.load(Ordering::SeqCst),
+        worker_reads,
+        "before the sync key or a password was read"
+    );
+
+    // Back, and deleted while the worker reads the partner's password.
+    save_elsewhere(&ctx, bastion.clone());
+    assert!(ctx.store.borrow().get(&bastion.id).is_some());
+    let (store, gets) = (Arc::clone(&secrets), Arc::clone(&reads.worker));
+    let on_key = password_key(&partner.id);
+    let deleted = Arc::new(AtomicUsize::new(0));
+    *ctx.sync_secrets.borrow_mut() = Some(Arc::new({
+        let (path, jump_id, deleted) = (path.clone(), bastion.id.clone(), Arc::clone(&deleted));
+        move || {
+            Box::new(DeletesWhenAsked {
+                inner: Shared {
+                    store: Arc::clone(&store),
+                    gets: Arc::clone(&gets),
+                },
+                on_key: on_key.clone(),
+                path: path.clone(),
+                jump_id: jump_id.clone(),
+                deleted: Arc::clone(&deleted),
+            })
+        }
+    }));
+    let worker_reads = reads.worker.load(Ordering::SeqCst);
+    set_runner(&ctx, counting(&runs, || Ok(added(1))));
+    page.sync_button.emit_clicked();
+    pump_until("the sync to stop", || !ctx.sync_running.get());
+    assert_eq!(deleted.load(Ordering::SeqCst), 1, "deleted during the read");
+    assert_eq!(page.result.label(), MISSING);
+    assert!(
+        reads.worker.load(Ordering::SeqCst) > worker_reads,
+        "the keyring was read: this is the second look"
+    );
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "no ssh");
+    drop(page);
+    close_all(&app);
+}
+
+/// A keyring that deletes a jump host from the profile file when it is asked for
+/// the password stored under `on_key`, once: the person (or a sync from another
+/// process) acting while the sync waits at the keyring.
+struct DeletesWhenAsked {
+    inner: Shared,
+    on_key: String,
+    path: PathBuf,
+    jump_id: String,
+    deleted: Arc<AtomicUsize>,
+}
+
+impl SecretStore for DeletesWhenAsked {
+    fn get(&self, key: &str) -> Result<Option<Zeroizing<String>>, SecretError> {
+        if key == self.on_key && self.deleted.fetch_add(1, Ordering::SeqCst) == 0 {
+            ProfileStore::open(&self.path)
+                .and_then(|mut store| store.delete(&self.jump_id))
+                .expect("delete the jump host");
+        }
+        self.inner.get(key)
+    }
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
+        self.inner.set(key, value)
+    }
+    fn delete(&self, key: &str) -> Result<(), SecretError> {
+        self.inner.delete(key)
+    }
+    fn probe(&self) -> Result<(), SecretError> {
+        self.inner.probe()
+    }
 }

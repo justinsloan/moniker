@@ -2280,6 +2280,32 @@ fn socket_failure_log(name: &str, reason: &str) -> String {
     )
 }
 
+/// A new socket for a shared connection through the jump host `name`, in the
+/// runtime folder `runtime_dir` (`moniker_core::jump::JumpSocket`), for a pane
+/// or a sync. `None` when there is no private folder to put it in (no folder
+/// known, or one that is not this user's alone, or a path a shell string cannot
+/// hold): why goes to standard error ([`socket_failure_log`]), and the caller
+/// tells the person in its own place ([`no_runtime_folder_note`]). A connection
+/// never falls back to a socket anywhere else, where others could reach it.
+pub(crate) fn jump_socket(runtime_dir: Option<&Path>, name: &str) -> Option<JumpSocket> {
+    let reason = match runtime_dir.map(JumpSocket::new) {
+        Some(Ok(socket)) => return Some(socket),
+        Some(Err(err)) => err.to_string(),
+        None => "XDG_RUNTIME_DIR is not set to an absolute path".to_owned(),
+    };
+    eprintln!("{}", socket_failure_log(name, &reason));
+    None
+}
+
+/// What a connection through the jump host `name` says when [`jump_socket`] found
+/// no private folder, in a pane's note and in a sync's message alike.
+pub(crate) fn no_runtime_folder_note(name: &str) -> String {
+    format!(
+        "Could not connect through the jump host {name}: there is no private runtime \
+         folder for its shared connection."
+    )
+}
+
 /// Work out the pane for connecting to `profile` with its startup sequence
 /// number `sequence`: its title, the `ssh` command and the transcript settings.
 /// `record` says whether the session is recorded (see [`transcript_spec`]), and
@@ -2330,20 +2356,8 @@ pub(crate) fn launch(
             jump: None,
         });
     };
-    let socket = match ctx.runtime_dir.as_deref().map(JumpSocket::new) {
-        Some(Ok(socket)) => socket,
-        unusable => {
-            let reason = match unusable {
-                Some(Err(err)) => err.to_string(),
-                _ => "XDG_RUNTIME_DIR is not set to an absolute path".to_owned(),
-            };
-            eprintln!("{}", socket_failure_log(&jump.name, &reason));
-            return Err(format!(
-                "Could not connect through the jump host {}: there is no private runtime \
-                 folder for its shared connection.",
-                jump.name
-            ));
-        }
+    let Some(socket) = jump_socket(ctx.runtime_dir.as_deref(), &jump.name) else {
+        return Err(no_runtime_folder_note(&jump.name));
     };
     let jump_has_password = stored.jump.as_deref() == Some(jump.id.as_str());
     if let Some(note) = askpass_notice(has_password || jump_has_password, &ctx.askpass_path) {

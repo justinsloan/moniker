@@ -469,6 +469,10 @@ fn gui_integration() {
         &tmp.path().join("jh-layout"),
     );
     jump_hosts::rec_lasts_from_the_jump_host_to_the_target_s_end(&bin, &tmp.path().join("jh-rec"));
+    // Issue #9, the app's syncs through the partner's jump host.
+    sync::a_partner_that_waits_for_its_jump_host_is_not_synced(&tmp.path().join("jh-sync-wait"));
+    sync::a_sync_goes_through_the_partner_s_jump_host(&tmp.path().join("jh-sync-through"));
+    sync::a_jump_host_deleted_meanwhile_stops_the_sync(&tmp.path().join("jh-sync-meanwhile"));
     // Issue #13, startup sequences for the local terminal.
     local_terminal::a_plain_pick_runs_the_default_and_leaves_a_shell(&tmp.path().join("ls-pick"));
     local_terminal::the_choices_offer_just_open_and_each_sequence(&tmp.path().join("ls-choices"));
