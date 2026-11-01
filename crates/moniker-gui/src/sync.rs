@@ -411,6 +411,7 @@ pub(crate) fn run_with(
         &inputs.askpass,
         inputs.has_password,
         SERVER_PROGRAM,
+        None,
     );
     tweak(&mut cmd);
     // In a session of its own: a question ssh would ask on a terminal fails at

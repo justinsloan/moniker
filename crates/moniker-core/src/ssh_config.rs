@@ -33,8 +33,9 @@ pub const CONFIG_LIMIT: Duration = Duration::from_secs(5);
 /// The most of `ssh -G`'s output that is read: it prints a few kilobytes.
 const CONFIG_MAX_BYTES: u64 = 256 * 1024;
 
-/// The variables that lead `ssh` to the askpass helper, kept from `ssh -G`.
-const HELPER_ENV: [&str; 5] = [
+/// The variables that lead `ssh` to the askpass helper, kept from `ssh -G`
+/// (and from the jump connections' control commands, `crate::jump::run_control`).
+pub(crate) const HELPER_ENV: [&str; 5] = [
     "SSH_ASKPASS",
     "SSH_ASKPASS_REQUIRE",
     "MONIKER_PROFILE_ID",

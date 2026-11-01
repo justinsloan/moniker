@@ -2125,7 +2125,7 @@ pub(crate) fn connection_command(
 ) -> (SshCommand, Option<AskpassToken>) {
     let startup = sequence.and_then(|i| profile.sequences.get(i));
     let token = (has_password && askpass_usable(askpass)).then(AskpassToken::new);
-    let command = terminal_command(profile, startup, askpass, token.as_ref());
+    let command = terminal_command(profile, startup, askpass, token.as_ref(), None);
     (command, token)
 }
 
@@ -2502,7 +2502,7 @@ mod tests {
         };
         let p = profile();
         let token = AskpassToken::new();
-        let ssh = terminal_command(&p, Some(&seq), Path::new("/x/askpass"), Some(&token));
+        let ssh = terminal_command(&p, Some(&seq), Path::new("/x/askpass"), Some(&token), None);
         let (argv, env) = spawn_args(&ssh);
         let remote = "uptime\necho $HOME\nexec \"$SHELL\" -l";
         assert_eq!(argv.last().map(String::as_str), Some(remote));

@@ -4,6 +4,18 @@
 //! GUI spawns [`terminal_command`] inside a VTE tab and the sync code spawns
 //! [`sync_command`] headlessly.
 //!
+//! A profile with a jump host is reached in two steps, each an `ssh` that
+//! Moniker starts itself, so that the askpass helper answers each one's own
+//! login (a hop's `ssh` is never Moniker's child). First
+//! [`jump_master_command`] (or [`jump_sync_master_command`] for a sync) signs in
+//! to the jump host as the master of a shared connection at a private socket
+//! (`crate::jump::JumpSocket`) and goes to the background. Then the target's
+//! command runs with a `ProxyCommand` ([`hop_command`]) whose `ssh` only asks
+//! that master for a channel to the target (`-W`). [`jump_control_command`]
+//! asks the master for its process id or tells it to end. No TCP port is
+//! opened. The master ends by itself `crate::jump::PERSIST_SECS` after its last
+//! channel closed, should Moniker not end it first.
+//!
 //! The builders take no password, so none can reach argv or the environment
 //! (both are visible through `/proc`). When a password is stored, `ssh` is
 //! pointed at the `moniker-askpass` helper through `SSH_ASKPASS`; only the
@@ -24,6 +36,7 @@
 use std::path::Path;
 
 use crate::askpass::{AskpassToken, PID_ENV, TOKEN_ENV};
+use crate::jump::PERSIST_SECS;
 use crate::profile::{Profile, StartupSequence};
 
 /// The system `ssh` binary, found on `PATH` so ssh-agent, `known_hosts` and
@@ -94,9 +107,16 @@ fn commands(seq: &StartupSequence) -> Option<String> {
 /// `ssh` invocation for an interactive terminal tab.
 ///
 /// Arguments, in order: `-p <port>`, `-i <key>` if the profile has a key file,
-/// `-t` only if there is a remote command (so the startup sequence gets a tty),
-/// `--`, `<username>@<host>`, then the remote command as a single argument if
-/// any.
+/// `-o ProxyCommand=<proxy>` if the connection goes through a jump host
+/// (`proxy` is [`hop_command`]'s, one argv entry), `-t` only if there is a
+/// remote command (so the startup sequence gets a tty), `--`,
+/// `<username>@<host>`, then the remote command as a single argument if any.
+///
+/// A `ProxyCommand` on the command line comes before anything in
+/// `~/.ssh/config`, so a `ProxyJump` or `ProxyCommand` the configuration sets
+/// for this host is not used: the profile's route wins. It changes no `user`,
+/// `hostname` or `hostkeyalias` (no `Match` criterion reads it), so the
+/// identity the askpass helper expects ([`resolve_command`]) is the same.
 ///
 /// There is no limit on password prompts: `ssh` allows its usual three. The
 /// askpass helper answers at most one of them with the stored password (the
@@ -115,27 +135,21 @@ pub fn terminal_command(
     seq: Option<&StartupSequence>,
     askpass: &Path,
     token: Option<&AskpassToken>,
+    proxy: Option<&str>,
 ) -> SshCommand {
     debug_assert!(!p.deleted, "ssh command requested for a tombstone");
     let remote = remote_command(seq);
     let mut args = connection_args(p);
+    push_proxy(&mut args, proxy);
     if remote.is_some() {
         args.push("-t".to_string());
     }
     push_destination(&mut args, p);
     args.extend(remote);
-    let env = match token {
-        Some(token) => {
-            let mut env = askpass_env(p, askpass, true);
-            env.push((TOKEN_ENV.to_string(), token.as_str().to_string()));
-            env
-        }
-        None => Vec::new(),
-    };
     SshCommand {
         program: SSH_PROGRAM.to_string(),
         args,
-        env,
+        env: token_env(p, askpass, token),
     }
 }
 
@@ -143,9 +157,11 @@ pub fn terminal_command(
 /// host with no tty.
 ///
 /// Arguments, in order: `-p <port>`, `-i <key>` if the profile has a key file,
-/// `-T`, `-o StrictHostKeyChecking=yes`, `-o NumberOfPasswordPrompts=1`, `--`,
-/// `<username>@<host>`, `<remote_server>`, `sync-serve`. With no tty, an
-/// unknown host key fails instead of prompting.
+/// `-o ProxyCommand=<proxy>` if the connection goes through a jump host (as for
+/// [`terminal_command`]), `-T`, `-o StrictHostKeyChecking=yes`,
+/// `-o NumberOfPasswordPrompts=1`, `--`, `<username>@<host>`,
+/// `<remote_server>`, `sync-serve`. With no tty, an unknown host key fails
+/// instead of prompting.
 ///
 /// `remote_server` is the remote command name or path, normally
 /// [`SERVER_PROGRAM`]. It is trusted, code-supplied input: it is not quoted and
@@ -163,9 +179,11 @@ pub fn sync_command(
     askpass: &Path,
     has_password: bool,
     remote_server: &str,
+    proxy: Option<&str>,
 ) -> SshCommand {
     debug_assert!(!p.deleted, "ssh command requested for a tombstone");
     let mut args = connection_args(p);
+    push_proxy(&mut args, proxy);
     args.push("-T".to_string());
     push_option(&mut args, "StrictHostKeyChecking=yes");
     push_option(&mut args, "NumberOfPasswordPrompts=1");
@@ -176,6 +194,164 @@ pub fn sync_command(
         program: SSH_PROGRAM.to_string(),
         args,
         env: askpass_env(p, askpass, has_password),
+    }
+}
+
+/// The `ProxyCommand` that takes a connection to its target through the jump
+/// host's shared connection at `socket`: exactly
+/// `ssh -S <socket> -o ControlMaster=no -o BatchMode=yes -W %h:%p -p <port> -- <username>@<host>`
+/// with every `%` of the host doubled, given to [`terminal_command`] or
+/// [`sync_command`] as their `proxy`.
+///
+/// It is the one shell string Moniker makes: `ssh` expands its `%` tokens and
+/// runs it with `$SHELL -c`. So nothing in it is quoted text: the socket's path
+/// is `[A-Za-z0-9/._-]` (`crate::jump::JumpSocket` makes no other), the user
+/// name `[A-Za-z0-9._@-]` and the host `[A-Za-z0-9._:%-]`
+/// (`Profile::validate`), none of them special to a shell, and the port is
+/// digits. A host's `%` (an IPv6 zone, `fe80::1%eth0`) is doubled so that the
+/// expansion gives it back instead of reading a token (`%e` is none, and ssh
+/// would refuse the command).
+///
+/// `-W %h:%p` asks the master for a channel to the target's host and port as
+/// the target's `ssh` sees them (after `~/.ssh/config`). `ControlMaster=no`
+/// keeps this `ssh` from becoming a master itself. `BatchMode=yes` and no `-i`:
+/// should the shared connection be gone, this `ssh`, a child of the target's
+/// and not of Moniker, would have to sign in to the jump host itself; it then
+/// fails (or uses ssh-agent) and never asks for anything, and no key-file path
+/// enters the shell string.
+pub fn hop_command(jump: &Profile, socket: &Path) -> String {
+    debug_assert!(!jump.deleted, "ssh command requested for a tombstone");
+    let socket = socket.to_string_lossy();
+    debug_assert!(
+        [&*socket, &jump.username, &jump.host]
+            .iter()
+            .all(|word| word.bytes().all(is_hop_byte)),
+        "a value of the hop's shell string has an unsafe character"
+    );
+    format!(
+        "{SSH_PROGRAM} -S {socket} -o ControlMaster=no -o BatchMode=yes -W %h:%p -p {port} \
+         -- {user}@{host}",
+        port = jump.port,
+        user = jump.username,
+        host = jump.host.replace('%', "%%"),
+    )
+}
+
+/// Whether `byte` may be in a value of [`hop_command`]'s shell string: the
+/// characters of the socket's path, the user name and the host, together.
+fn is_hop_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':' | b'%' | b'@')
+}
+
+/// `ssh` invocation that signs in to the jump host `jump` in a terminal tab
+/// and then serves as the master of a shared connection at `socket`, in the
+/// background.
+///
+/// Arguments, in order: `-p <port>`, `-i <key>` if the jump host's profile has
+/// a key file, `-f`, `-N`, `-M`, `-S <socket>`,
+/// `-o ControlPersist=<PERSIST_SECS>`, `--`, `<username>@<host>`. `-f` sends
+/// `ssh` to the background once it has signed in, so the tab's terminal sees it
+/// exit (status 0) and can run the target's `ssh` next; `-N` runs nothing on
+/// the jump host. The master ends by itself `PERSIST_SECS` after its last
+/// channel closed: a backstop, should Moniker not end it first.
+///
+/// Nothing here sets a route for the jump host: a `ProxyJump` that
+/// `~/.ssh/config` sets for it is followed (and its hop asks in the terminal,
+/// as for any connection).
+///
+/// The environment is [`terminal_command`]'s for `token`, with the jump host's
+/// id: the five variables when its password is stored, else empty. The `ssh`
+/// that asks for the password is this one, Moniker's child, before it goes to
+/// the background.
+pub fn jump_master_command(
+    jump: &Profile,
+    socket: &Path,
+    askpass: &Path,
+    token: Option<&AskpassToken>,
+) -> SshCommand {
+    SshCommand {
+        program: SSH_PROGRAM.to_string(),
+        args: master_args(jump, socket, &[]),
+        env: token_env(jump, askpass, token),
+    }
+}
+
+/// [`jump_master_command`] for a sync, which has no tty and no terminal to ask
+/// in.
+///
+/// Arguments, in order: those of [`jump_master_command`] up to
+/// `-o ControlPersist=<PERSIST_SECS>`, then `-o StrictHostKeyChecking=yes`,
+/// `-o NumberOfPasswordPrompts=1`, `--`, `<username>@<host>`. The environment
+/// is [`sync_command`]'s for the jump host: with `has_password`, the four
+/// variables with its id and no one-time token, else empty.
+pub fn jump_sync_master_command(
+    jump: &Profile,
+    socket: &Path,
+    askpass: &Path,
+    has_password: bool,
+) -> SshCommand {
+    SshCommand {
+        program: SSH_PROGRAM.to_string(),
+        args: master_args(
+            jump,
+            socket,
+            &["StrictHostKeyChecking=yes", "NumberOfPasswordPrompts=1"],
+        ),
+        env: askpass_env(jump, askpass, has_password),
+    }
+}
+
+/// The master's arguments ([`jump_master_command`]), with `options` as `-o`
+/// options after `ControlPersist`.
+fn master_args(jump: &Profile, socket: &Path, options: &[&str]) -> Vec<String> {
+    debug_assert!(!jump.deleted, "ssh command requested for a tombstone");
+    let mut args = connection_args(jump);
+    args.extend(["-f", "-N", "-M", "-S"].map(String::from));
+    args.push(socket.to_string_lossy().into_owned());
+    push_option(&mut args, &format!("ControlPersist={PERSIST_SECS}"));
+    for option in options {
+        push_option(&mut args, option);
+    }
+    push_destination(&mut args, jump);
+    args
+}
+
+/// What [`jump_control_command`] asks the master.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JumpControl {
+    /// Whether it runs, and its process id: `Master running (pid=N)` on stderr
+    /// (`crate::jump::master_pid`).
+    Check,
+    /// To end at once: it closes its channels and removes the socket.
+    Exit,
+}
+
+/// `ssh -O check` or `ssh -O exit` for the master at `socket`, which serves the
+/// jump host `jump`.
+///
+/// Arguments, in order: `-S <socket>`, `-O`, `check` or `exit`, `-p <port>`,
+/// `--`, `<username>@<host>`. No environment: it only talks to the master over
+/// the socket, and when no master answers there it fails at once instead of
+/// connecting, so it never signs in or asks for anything.
+pub fn jump_control_command(jump: &Profile, socket: &Path, op: JumpControl) -> SshCommand {
+    debug_assert!(!jump.deleted, "ssh command requested for a tombstone");
+    let op = match op {
+        JumpControl::Check => "check",
+        JumpControl::Exit => "exit",
+    };
+    let mut args = vec![
+        "-S".to_string(),
+        socket.to_string_lossy().into_owned(),
+        "-O".to_string(),
+        op.to_string(),
+        "-p".to_string(),
+        jump.port.to_string(),
+    ];
+    push_destination(&mut args, jump);
+    SshCommand {
+        program: SSH_PROGRAM.to_string(),
+        args,
+        env: Vec::new(),
     }
 }
 
@@ -216,6 +392,13 @@ fn push_option(args: &mut Vec<String>, option: &str) {
     args.push(option.to_string());
 }
 
+/// `-o ProxyCommand=<proxy>`, if there is a `proxy`.
+fn push_proxy(args: &mut Vec<String>, proxy: Option<&str>) {
+    if let Some(proxy) = proxy {
+        push_option(args, &format!("ProxyCommand={proxy}"));
+    }
+}
+
 /// The `--` separator and then `<username>@<host>`, so that neither can be
 /// parsed as an `ssh` option.
 fn push_destination(args: &mut Vec<String>, p: &Profile) {
@@ -225,7 +408,7 @@ fn push_destination(args: &mut Vec<String>, p: &Profile) {
 
 /// The environment that makes `ssh` ask `moniker-askpass` for the password:
 /// empty when no password is stored. Carries only the non-secret profile id
-/// and this process's id; [`terminal_command`] adds its token.
+/// and this process's id; [`token_env`] adds a terminal connection's token.
 fn askpass_env(p: &Profile, askpass: &Path, has_password: bool) -> Vec<(String, String)> {
     if !has_password {
         return Vec::new();
@@ -239,6 +422,18 @@ fn askpass_env(p: &Profile, askpass: &Path, has_password: bool) -> Vec<(String, 
         ("MONIKER_PROFILE_ID".to_string(), p.id.clone()),
         (PID_ENV.to_string(), std::process::id().to_string()),
     ]
+}
+
+/// [`askpass_env`] and the connection's one-time token, for an `ssh` in a
+/// terminal tab ([`terminal_command`], [`jump_master_command`]); empty without
+/// a token (no password stored, or no helper to answer).
+fn token_env(p: &Profile, askpass: &Path, token: Option<&AskpassToken>) -> Vec<(String, String)> {
+    let Some(token) = token else {
+        return Vec::new();
+    };
+    let mut env = askpass_env(p, askpass, true);
+    env.push((TOKEN_ENV.to_string(), token.as_str().to_string()));
+    env
 }
 
 #[cfg(test)]
@@ -273,7 +468,7 @@ mod tests {
     #[test]
     fn no_sequence_means_no_remote_command() {
         assert_eq!(remote_command(None), None);
-        let cmd = terminal_command(&profile(), None, askpass(), None);
+        let cmd = terminal_command(&profile(), None, askpass(), None, None);
         assert!(!cmd.args.contains(&"-t".to_string()), "{:?}", cmd.args);
         assert_eq!(cmd.args.last().unwrap(), "alice@example.com");
     }
@@ -287,7 +482,7 @@ mod tests {
         );
         // The whole script is one argv entry, last, after the destination, and
         // `-t` (before `--`) gives it a tty.
-        let cmd = terminal_command(&profile(), Some(&s), askpass(), None);
+        let cmd = terminal_command(&profile(), Some(&s), askpass(), None, None);
         assert_eq!(
             cmd.args.last().unwrap(),
             "sudo apt update\nuptime\nexec \"$SHELL\" -l"
@@ -312,7 +507,7 @@ mod tests {
         for commands in [&["", "  ", "\t"][..], &[][..]] {
             let s = seq(commands);
             assert_eq!(remote_command(Some(&s)), None, "{commands:?}");
-            let cmd = terminal_command(&profile(), Some(&s), askpass(), None);
+            let cmd = terminal_command(&profile(), Some(&s), askpass(), None, None);
             assert!(!cmd.args.contains(&"-t".to_string()), "{:?}", cmd.args);
             assert_eq!(cmd.args.last().unwrap(), "alice@example.com");
         }
@@ -385,10 +580,15 @@ mod tests {
 
         for p in [&bad_host, &bad_user] {
             let s = seq(&["uptime"]);
-            let sync = sync_command(p, askpass(), false, "moniker-server");
-            let term = terminal_command(p, Some(&s), askpass(), None);
+            let sync = sync_command(p, askpass(), false, "moniker-server", None);
+            let term = terminal_command(p, Some(&s), askpass(), None, None);
             let resolve = resolve_command(p);
-            for cmd in [&sync, &term, &resolve] {
+            // A jump host's commands, the profile being the jump host.
+            let master = jump_master_command(p, socket(), askpass(), None);
+            let sync_master = jump_sync_master_command(p, socket(), askpass(), false);
+            let check = jump_control_command(p, socket(), JumpControl::Check);
+            let exit = jump_control_command(p, socket(), JumpControl::Exit);
+            for cmd in [&sync, &term, &resolve, &master, &sync_master, &check, &exit] {
                 let dd = position(&cmd.args, "--");
                 assert!(
                     cmd.args[..dd].iter().all(|a| !a.contains("oProxyCommand")),
@@ -407,7 +607,7 @@ mod tests {
         }
         // The username case is the dangerous one: the whole destination
         // argument starts with `-oProxy...`, so only `--` protects it.
-        let cmd = terminal_command(&bad_user, None, askpass(), None);
+        let cmd = terminal_command(&bad_user, None, askpass(), None, None);
         assert!(cmd.args.last().unwrap().starts_with("-oProxy"));
     }
 
@@ -416,7 +616,7 @@ mod tests {
         let mut p = profile();
         p.port = 2222;
         p.key_file = Some("/home/alice/.ssh/id ed25519".into());
-        let cmd = terminal_command(&p, None, askpass(), None);
+        let cmd = terminal_command(&p, None, askpass(), None, None);
         assert_eq!(
             cmd.args,
             strs(&[
@@ -429,7 +629,7 @@ mod tests {
             ])
         );
         let s = seq(&["uptime"]);
-        let cmd = terminal_command(&p, Some(&s), askpass(), None);
+        let cmd = terminal_command(&p, Some(&s), askpass(), None, None);
         assert_eq!(
             cmd.args,
             strs(&[
@@ -462,7 +662,7 @@ mod tests {
 
     #[test]
     fn default_port_without_key_file() {
-        let cmd = terminal_command(&profile(), None, askpass(), None);
+        let cmd = terminal_command(&profile(), None, askpass(), None, None);
         assert_eq!(&cmd.args[..2], &strs(&["-p", "22"])[..]);
         assert!(!cmd.args.contains(&"-i".to_string()));
     }
@@ -478,8 +678,8 @@ mod tests {
         let s = seq(&["uptime"]);
         let t = token();
         for cmd in [
-            terminal_command(&profile(), None, askpass(), None),
-            terminal_command(&profile(), Some(&s), askpass(), Some(&t)),
+            terminal_command(&profile(), None, askpass(), None, None),
+            terminal_command(&profile(), Some(&s), askpass(), Some(&t), None),
         ] {
             assert!(
                 cmd.args
@@ -508,11 +708,11 @@ mod tests {
             ("MONIKER_ASKPASS_TOKEN".to_string(), t.as_str().to_string()),
         ];
         assert_eq!(
-            terminal_command(&p, Some(&s), askpass(), Some(&t)).env,
+            terminal_command(&p, Some(&s), askpass(), Some(&t), None).env,
             expected
         );
         assert_eq!(
-            terminal_command(&p, None, askpass(), Some(&t)).env,
+            terminal_command(&p, None, askpass(), Some(&t), None).env,
             expected
         );
         assert_eq!(expected[3].0, PID_ENV);
@@ -523,14 +723,18 @@ mod tests {
     fn no_token_no_env() {
         let p = profile();
         let s = seq(&["uptime"]);
-        assert!(terminal_command(&p, None, askpass(), None).env.is_empty());
         assert!(
-            terminal_command(&p, Some(&s), askpass(), None)
+            terminal_command(&p, None, askpass(), None, None)
                 .env
                 .is_empty()
         );
         assert!(
-            sync_command(&p, askpass(), false, "moniker-server")
+            terminal_command(&p, Some(&s), askpass(), None, None)
+                .env
+                .is_empty()
+        );
+        assert!(
+            sync_command(&p, askpass(), false, "moniker-server", None)
                 .env
                 .is_empty()
         );
@@ -540,7 +744,7 @@ mod tests {
     fn sync_command_still_allows_one_prompt_and_no_token() {
         // Sync has no terminal to fall back to: one prompt, then it fails.
         let p = profile();
-        let cmd = sync_command(&p, askpass(), true, "moniker-server");
+        let cmd = sync_command(&p, askpass(), true, "moniker-server", None);
         let limit = position(&cmd.args, "NumberOfPasswordPrompts=1");
         assert_eq!(cmd.args[limit - 1], "-o");
         assert!(limit < position(&cmd.args, "--"));
@@ -561,7 +765,7 @@ mod tests {
 
     #[test]
     fn sync_command_is_non_interactive() {
-        let cmd = sync_command(&profile(), askpass(), false, "moniker-server");
+        let cmd = sync_command(&profile(), askpass(), false, "moniker-server", None);
         assert_eq!(cmd.program, "ssh");
         assert!(cmd.args.contains(&"-T".to_string()), "{:?}", cmd.args);
         assert!(
@@ -577,7 +781,7 @@ mod tests {
         let mut p = profile();
         p.port = 2200;
         p.key_file = Some("/k/id".into());
-        let cmd = sync_command(&p, askpass(), false, "moniker-server");
+        let cmd = sync_command(&p, askpass(), false, "moniker-server", None);
         assert_eq!(
             cmd.args,
             strs(&[
@@ -603,6 +807,7 @@ mod tests {
             askpass(),
             false,
             "/opt/moniker/bin/moniker-server",
+            None,
         );
         assert!(
             cmd.args
@@ -615,7 +820,7 @@ mod tests {
     #[should_panic(expected = "tombstone")]
     fn terminal_builder_rejects_tombstones_in_debug_builds() {
         let t = profile().tombstone(1);
-        let _ = terminal_command(&t, None, askpass(), None);
+        let _ = terminal_command(&t, None, askpass(), None, None);
     }
 
     #[test]
@@ -623,6 +828,335 @@ mod tests {
     #[should_panic(expected = "tombstone")]
     fn sync_builder_rejects_tombstones_in_debug_builds() {
         let t = profile().tombstone(1);
-        let _ = sync_command(&t, askpass(), false, "moniker-server");
+        let _ = sync_command(&t, askpass(), false, "moniker-server", None);
+    }
+
+    // ----- jump hosts -----
+
+    /// A socket as `crate::jump::JumpSocket` makes one.
+    const SOCKET: &str = "/run/user/1000/moniker/jump/0123456789abcdef0123456789abcdef";
+
+    fn socket() -> &'static Path {
+        Path::new(SOCKET)
+    }
+
+    fn bastion() -> Profile {
+        let mut p = Profile::new("Bastion", "bastion.example.com", "bob");
+        p.port = 2201;
+        p
+    }
+
+    /// `terminal_command`'s environment for `p` with token `t`.
+    fn terminal_env(p: &Profile, t: &AskpassToken) -> Vec<(String, String)> {
+        vec![
+            (
+                "SSH_ASKPASS".to_string(),
+                "/usr/lib/moniker/moniker-askpass".to_string(),
+            ),
+            ("SSH_ASKPASS_REQUIRE".to_string(), "force".to_string()),
+            ("MONIKER_PROFILE_ID".to_string(), p.id.clone()),
+            ("MONIKER_PID".to_string(), std::process::id().to_string()),
+            ("MONIKER_ASKPASS_TOKEN".to_string(), t.as_str().to_string()),
+        ]
+    }
+
+    /// No option of `cmd` sends the connection through another host: a
+    /// `ProxyCommand`, a `ProxyJump` or `-J`.
+    fn sets_no_route(cmd: &SshCommand) -> bool {
+        cmd.args.iter().all(|a| {
+            let a = a.to_lowercase();
+            !a.contains("proxycommand") && !a.contains("proxyjump") && a != "-j"
+        })
+    }
+
+    #[test]
+    fn the_master_signs_in_then_goes_to_the_background() {
+        assert_eq!(crate::jump::PERSIST_SECS, 10);
+        let jump = bastion();
+        let cmd = jump_master_command(&jump, socket(), askpass(), None);
+        assert_eq!(cmd.program, "ssh");
+        assert_eq!(
+            cmd.args,
+            strs(&[
+                "-p",
+                "2201",
+                "-f",
+                "-N",
+                "-M",
+                "-S",
+                SOCKET,
+                "-o",
+                "ControlPersist=10",
+                "--",
+                "bob@bastion.example.com",
+            ])
+        );
+        assert!(cmd.env.is_empty(), "{:?}", cmd.env);
+        // The jump host's own route in ~/.ssh/config stays: Moniker sets none.
+        assert!(sets_no_route(&cmd), "{:?}", cmd.args);
+
+        // With a key file and a stored password: the jump host's own id and
+        // the connection's token, as for a terminal tab.
+        let mut keyed = jump.clone();
+        keyed.key_file = Some("/home/bob/.ssh/id ed25519".into());
+        let t = token();
+        let cmd = jump_master_command(&keyed, socket(), askpass(), Some(&t));
+        assert_eq!(
+            cmd.args,
+            strs(&[
+                "-p",
+                "2201",
+                "-i",
+                "/home/bob/.ssh/id ed25519",
+                "-f",
+                "-N",
+                "-M",
+                "-S",
+                SOCKET,
+                "-o",
+                "ControlPersist=10",
+                "--",
+                "bob@bastion.example.com",
+            ])
+        );
+        assert_eq!(cmd.env, terminal_env(&keyed, &t));
+        assert!(sets_no_route(&cmd), "{:?}", cmd.args);
+    }
+
+    #[test]
+    fn the_sync_master_never_asks_twice() {
+        let mut jump = bastion();
+        jump.key_file = Some("/k/id".into());
+        let cmd = jump_sync_master_command(&jump, socket(), askpass(), true);
+        assert_eq!(cmd.program, "ssh");
+        assert_eq!(
+            cmd.args,
+            strs(&[
+                "-p",
+                "2201",
+                "-i",
+                "/k/id",
+                "-f",
+                "-N",
+                "-M",
+                "-S",
+                SOCKET,
+                "-o",
+                "ControlPersist=10",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "--",
+                "bob@bastion.example.com",
+            ])
+        );
+        // As `sync_command`'s: the jump host's id and no one-time token.
+        assert_eq!(
+            cmd.env,
+            sync_command(&jump, askpass(), true, "moniker-server", None).env
+        );
+        assert!(
+            cmd.env
+                .iter()
+                .any(|(k, v)| k == "MONIKER_PROFILE_ID" && *v == jump.id)
+        );
+        assert!(cmd.env.iter().all(|(k, _)| k != TOKEN_ENV));
+        assert!(sets_no_route(&cmd), "{:?}", cmd.args);
+        assert!(
+            jump_sync_master_command(&jump, socket(), askpass(), false)
+                .env
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_hop_reaches_the_target_through_the_socket() {
+        let expected = format!(
+            "ssh -S {SOCKET} -o ControlMaster=no -o BatchMode=yes -W %h:%p -p 2201 \
+             -- bob@bastion.example.com"
+        );
+        assert_eq!(hop_command(&bastion(), socket()), expected);
+        // A key file never enters the shell string, and the hop needs none: it
+        // goes through the shared connection (or fails, never asking).
+        let mut keyed = bastion();
+        keyed.key_file = Some("/home/bob/.ssh/id_ed25519".into());
+        assert_eq!(hop_command(&keyed, socket()), expected);
+    }
+
+    #[test]
+    fn a_host_with_a_zone_has_its_percent_doubled() {
+        // ssh expands `%` in a ProxyCommand: `%e` would be an unknown token.
+        let mut jump = bastion();
+        jump.host = "fe80::1%eth0".to_string();
+        assert_eq!(
+            hop_command(&jump, socket()),
+            format!(
+                "ssh -S {SOCKET} -o ControlMaster=no -o BatchMode=yes -W %h:%p -p 2201 \
+                 -- bob@fe80::1%%eth0"
+            )
+        );
+        // Every `%` of the host, and only those.
+        jump.host = "a%b%%c".to_string();
+        assert!(hop_command(&jump, socket()).ends_with(" -W %h:%p -p 2201 -- bob@a%%b%%%%c"));
+    }
+
+    #[test]
+    fn the_target_goes_through_the_proxy_before_its_tty_and_sequence() {
+        let hop = hop_command(&bastion(), socket());
+        let proxy = format!("ProxyCommand={hop}");
+        let p = profile();
+        let s = seq(&["uptime"]);
+        let t = token();
+        let cmd = terminal_command(&p, Some(&s), askpass(), Some(&t), Some(&hop));
+        assert_eq!(
+            cmd.args,
+            strs(&[
+                "-p",
+                "22",
+                "-o",
+                &proxy,
+                "-t",
+                "--",
+                "alice@example.com",
+                "uptime\nexec \"$SHELL\" -l",
+            ])
+        );
+        // The target's own id and token: the jump host's are the master's.
+        assert_eq!(cmd.env, terminal_env(&p, &t));
+
+        // With a key file and no sequence: after `-i`, and no `-t`.
+        let mut keyed = profile();
+        keyed.key_file = Some("/k/id".into());
+        let cmd = terminal_command(&keyed, None, askpass(), None, Some(&hop));
+        assert_eq!(
+            cmd.args,
+            strs(&[
+                "-p",
+                "22",
+                "-i",
+                "/k/id",
+                "-o",
+                &proxy,
+                "--",
+                "alice@example.com"
+            ])
+        );
+        assert!(cmd.env.is_empty());
+
+        // The ProxyCommand is one argv entry, never split.
+        assert_eq!(
+            cmd.args
+                .iter()
+                .filter(|a| a.contains("ProxyCommand"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_sync_through_a_jump_host() {
+        let hop = hop_command(&bastion(), socket());
+        let p = profile();
+        let cmd = sync_command(&p, askpass(), true, "moniker-server", Some(&hop));
+        assert_eq!(
+            cmd.args,
+            strs(&[
+                "-p",
+                "22",
+                "-o",
+                &format!("ProxyCommand={hop}"),
+                "-T",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "NumberOfPasswordPrompts=1",
+                "--",
+                "alice@example.com",
+                "moniker-server",
+                "sync-serve",
+            ])
+        );
+        assert_eq!(
+            cmd.env,
+            sync_command(&p, askpass(), true, "moniker-server", None).env
+        );
+    }
+
+    #[test]
+    fn control_commands_carry_no_environment() {
+        let mut jump = bastion();
+        jump.key_file = Some("/k/id".into());
+        for (op, word) in [(JumpControl::Check, "check"), (JumpControl::Exit, "exit")] {
+            let cmd = jump_control_command(&jump, socket(), op);
+            assert_eq!(cmd.program, "ssh");
+            assert_eq!(
+                cmd.args,
+                strs(&[
+                    "-S",
+                    SOCKET,
+                    "-O",
+                    word,
+                    "-p",
+                    "2201",
+                    "--",
+                    "bob@bastion.example.com",
+                ])
+            );
+            assert!(cmd.env.is_empty(), "{:?}", cmd.env);
+        }
+    }
+
+    #[test]
+    fn no_builder_carries_a_password() {
+        // A builder takes no password, so none can be in argv or the
+        // environment. What a profile carries besides its connection (here its
+        // name) goes nowhere either, and the environment holds only the
+        // helper's non-secret variables.
+        const SECRET: &str = "correct horse battery staple";
+        let named = |mut p: Profile| {
+            p.name = SECRET.to_string();
+            p
+        };
+        let (p, jump) = (named(profile()), named(bastion()));
+        let s = seq(&["uptime"]);
+        let t = token();
+        let hop = hop_command(&jump, socket());
+        let commands = [
+            terminal_command(&p, Some(&s), askpass(), Some(&t), Some(&hop)),
+            sync_command(&p, askpass(), true, "moniker-server", Some(&hop)),
+            resolve_command(&p),
+            jump_master_command(&jump, socket(), askpass(), Some(&t)),
+            jump_sync_master_command(&jump, socket(), askpass(), true),
+            jump_control_command(&jump, socket(), JumpControl::Check),
+            jump_control_command(&jump, socket(), JumpControl::Exit),
+        ];
+        let allowed = [
+            "SSH_ASKPASS",
+            "SSH_ASKPASS_REQUIRE",
+            "MONIKER_PROFILE_ID",
+            PID_ENV,
+            TOKEN_ENV,
+        ];
+        assert!(!hop.contains(SECRET), "{hop}");
+        for cmd in &commands {
+            assert!(
+                cmd.args.iter().all(|a| !a.contains(SECRET)),
+                "{:?}",
+                cmd.args
+            );
+            for (name, value) in &cmd.env {
+                assert!(allowed.contains(&name.as_str()), "{name}");
+                assert!(!value.contains(SECRET), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "tombstone")]
+    fn jump_builders_reject_tombstones_in_debug_builds() {
+        let t = bastion().tombstone(1);
+        let _ = jump_master_command(&t, socket(), askpass(), None);
     }
 }

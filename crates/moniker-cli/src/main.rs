@@ -248,7 +248,7 @@ fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
         .map_err(|e| format!("cannot locate the moniker-server executable: {e}"))?;
     let askpass = current.with_file_name("moniker-askpass");
     check_askpass(has_password, &askpass)?;
-    let cmd = sync_command(&profile, &askpass, has_password, SERVER_PROGRAM);
+    let cmd = sync_command(&profile, &askpass, has_password, SERVER_PROGRAM, None);
 
     let mut local = LocalState::new(store, Box::new(secrets));
     let stale = if allow_stale {

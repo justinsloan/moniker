@@ -3736,6 +3736,7 @@ mod tests {
             Path::new("/usr/bin/moniker-askpass"),
             true,
             "moniker-server",
+            None,
         );
         assert!(cmd.args.iter().any(|a| a == "dana@machine-b.example.org"));
     }

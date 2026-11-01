@@ -100,7 +100,7 @@ pub const PID_ENV: &str = "MONIKER_PID";
 
 /// The directory of Moniker's files in the runtime directory, and the one of
 /// the markers in it: `<runtime>/moniker/askpass`.
-const RUNTIME_SUBDIR: &str = "moniker";
+pub(crate) const RUNTIME_SUBDIR: &str = "moniker";
 const MARKER_SUBDIR: &str = "askpass";
 
 /// The one-time token of one terminal connection: a random v4 UUID, lowercase
@@ -113,6 +113,14 @@ impl AskpassToken {
     /// A fresh random token.
     pub fn new() -> AskpassToken {
         AskpassToken(Uuid::new_v4().hyphenated().to_string())
+    }
+
+    /// The token `text` names, if it is a canonical UUID (lowercase and
+    /// hyphenated, as [`new`](AskpassToken::new) makes them), so that it can
+    /// name no other path. For tools that choose the token themselves, such as
+    /// the end-to-end check's helper.
+    pub fn parse(text: &str) -> Option<AskpassToken> {
+        is_canonical_uuid(text).then(|| AskpassToken(text.to_owned()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -169,16 +177,25 @@ pub fn release_marker(runtime_dir: &Path, token: &str) {
 /// directory on the way (see [`claim_marker`]). With `create`, missing
 /// directories are made.
 fn open_marker_dir(runtime_dir: &Path, token: &str, create: bool) -> io::Result<OwnedFd> {
-    if !runtime_dir.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the runtime directory is not an absolute path",
-        ));
-    }
     if !is_canonical_uuid(token) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "the askpass token is not a canonical UUID",
+        ));
+    }
+    runtime_subdir(runtime_dir, MARKER_SUBDIR, create)
+}
+
+/// The directory `<runtime_dir>/moniker/<name>`, opened, if `runtime_dir` is an
+/// absolute path and both directories are private ([`private_dir`]); with
+/// `create`, missing ones are made. No symlink below `runtime_dir` is followed.
+/// The markers are in one (`askpass`), the sockets of the jump hosts' shared
+/// connections in another (`crate::jump::JumpSocket`).
+pub(crate) fn runtime_subdir(runtime_dir: &Path, name: &str, create: bool) -> io::Result<OwnedFd> {
+    if !runtime_dir.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the runtime directory is not an absolute path",
         ));
     }
     let runtime = openat(
@@ -188,7 +205,7 @@ fn open_marker_dir(runtime_dir: &Path, token: &str, create: bool) -> io::Result<
         Mode::empty(),
     )?;
     let moniker = private_dir(&runtime, RUNTIME_SUBDIR, create)?;
-    private_dir(&moniker, MARKER_SUBDIR, create)
+    private_dir(&moniker, name, create)
 }
 
 /// The directory `name` in `parent`, opened without following a symlink, if it
@@ -219,7 +236,7 @@ fn private_dir(parent: impl AsFd, name: &str, create: bool) -> io::Result<OwnedF
     if !private {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "the askpass marker directory is not private to this user",
+            "a directory of Moniker's in the runtime directory is not private to this user",
         ));
     }
     Ok(dir)
@@ -1240,6 +1257,23 @@ mod tests {
             assert_eq!(token.as_str(), token.as_str().to_lowercase());
         }
         assert_eq!(TOKEN_ENV, "MONIKER_ASKPASS_TOKEN");
+    }
+
+    #[test]
+    fn a_token_given_as_text_must_be_a_canonical_uuid() {
+        assert_eq!(AskpassToken::parse(TOKEN).unwrap().as_str(), TOKEN);
+        let made = AskpassToken::new();
+        assert_eq!(AskpassToken::parse(made.as_str()), Some(made));
+        for text in [
+            "",
+            "x",
+            "../evil",
+            "6F1C2A3B-4D5E-4F60-8A7B-9C0D1E2F3A4B",
+            "{6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b}",
+            "6f1c2a3b4d5e4f608a7b9c0d1e2f3a4b",
+        ] {
+            assert_eq!(AskpassToken::parse(text), None, "{text:?}");
+        }
     }
 
     #[test]

@@ -640,7 +640,12 @@ EOF
 # `hopped` is reached through a ProxyJump hop whose prompt names the same
 # user@host as the target's: the target's prompt names its HostKeyAlias,
 # 127.0.0.1, the hop's its host, also 127.0.0.1 (OpenSSH refuses a jump to the
-# very host, port and user it connects to, hence the alias).
+# very host, port and user it connects to, hence the alias). $VIA_JUMP_HOST and
+# $VIA_TARGET_HOST are the jump host and the target of
+# check_connection_through_a_jump_host: each signs in with the key after the
+# password (see "jump connections" below), and the target's entry has a
+# ProxyJump of its own, to a host that does not exist, and names its host key
+# 127.0.0.1 while its host name is localhost.
 write_ssh_shim() {
     local real
     real=$(command -v ssh) || return 1
@@ -657,6 +662,17 @@ Host hopped
   HostName localhost
   HostKeyAlias 127.0.0.1
   ProxyJump $ME@127.0.0.1:$PW_PORT
+Host $VIA_JUMP_HOST
+  HostName 127.0.0.1
+Host $VIA_TARGET_HOST
+  HostName localhost
+  HostKeyAlias 127.0.0.1
+  ProxyJump nowhere.invalid
+Host $VIA_JUMP_HOST $VIA_TARGET_HOST
+  PubkeyAuthentication yes
+  IdentitiesOnly yes
+  IdentityFile $T/client_key
+  PreferredAuthentications password,publickey
 Host *
   UserKnownHostsFile $T/kh
   StrictHostKeyChecking accept-new
@@ -665,10 +681,12 @@ Host *
 EOF
 }
 
-# Seed a profile on A with a stored password; prints its id.
-seed_password_profile() { # seed_password_profile NAME HOST [PORT]
-    local id
-    id=$(A "$HELPER" seed-profile --name "$1" --host "$2" --port "${3:-$PW_PORT}" --user "$ME") || return 1
+# Seed a profile on A with a stored password, going through the profile named
+# JUMP_HOST if one is given; prints its id.
+seed_password_profile() { # seed_password_profile NAME HOST [PORT [JUMP_HOST]]
+    local id via=()
+    [ -z "${4:-}" ] || via=(--jump-host "$4")
+    id=$(A "$HELPER" seed-profile --name "$1" --host "$2" --port "${3:-$PW_PORT}" --user "$ME" "${via[@]}") || return 1
     printf '%s\n' "pw-$(random_token)" | A "$HELPER" set-secret "$1" || return 1
     printf '%s' "$id"
 }
@@ -781,6 +799,10 @@ JUMP_SIGNIN=()  # ssh options: the password first, then the key
 JUMP_SOCKETS=() # sockets of the masters a check started
 JUMP_MASTERS=() # ids of those masters, once known (learn_master)
 MASTER_PID=     # set by learn_master
+VIA_JUMP_HOST=bastion-e2e # hosts of check_connection_through_a_jump_host's profiles
+VIA_TARGET_HOST=db-e2e    # (their entries in $T/ssh_config: write_ssh_shim)
+CMD_ARGS=()     # a command the product built (built_command): the program, then its arguments
+CMD_ENV=()      # and the variables it adds, NAME=value
 
 new_token() { cat /proc/sys/kernel/random/uuid; }
 jump_socket() { printf '%s/%s' "$JUMP_DIR" "$(random_token | cut -c1-32)"; }
@@ -1025,6 +1047,112 @@ check_no_listening_port() {
     end_master "$sock"
 }
 
+# The command STAGE (master, target, check or exit) from what
+# `e2e_helper connection-argv` printed to FILE, into CMD_ARGS and CMD_ENV.
+built_command() { # built_command FILE STAGE
+    local line stage=
+    CMD_ARGS=() CMD_ENV=()
+    while IFS= read -r line; do
+        case $line in
+        "arg "*) [ "$stage" != "$2" ] || CMD_ARGS+=("${line#arg }") ;;
+        "env "*) [ "$stage" != "$2" ] || CMD_ENV+=("${line#env }") ;;
+        *) stage=$line ;;
+        esac
+    done <"$1"
+    [ "${#CMD_ARGS[@]}" -gt 0 ] || { REASON="connection-argv printed no $2 command"; return 1; }
+}
+
+# CMD_ENV is what Moniker gives an ssh for the profile PROFILE_ID with a stored
+# password and the one-time token TOKEN: the five variables, in order, the
+# askpass helper being $T/askpass-exec.sh. MONIKER_PID is the id of the helper
+# that printed it; run_built puts the launching process's own id in its place.
+expect_built_env() { # expect_built_env STAGE PROFILE_ID TOKEN
+    local got want
+    got=$(printf '%s~' "${CMD_ENV[@]}" | sed 's/MONIKER_PID=[0-9][0-9]*~/MONIKER_PID=N~/')
+    want="SSH_ASKPASS=$T/askpass-exec.sh~SSH_ASKPASS_REQUIRE=force~MONIKER_PROFILE_ID=$2~MONIKER_PID=N~MONIKER_ASKPASS_TOKEN=$3~"
+    [ "$got" = "$want" ] || { REASON="the $1's variables are $got, expected $want"; return 1; }
+}
+
+# Run CMD_ARGS with CMD_ENV as Moniker runs a command it built: started by a
+# process (a shell) whose id is MONIKER_PID, ssh its child, through the shim
+# (first on PATH, as `ssh`), with no input.
+run_built() {
+    : >"$T/askpass.log"
+    # shellcheck disable=SC2016
+    capture A env PATH="$T/shim:$PATH" "${CMD_ENV[@]}" setsid -w timeout 30 \
+        sh -c 'MONIKER_PID=$$; export MONIKER_PID; "$@"; exit $?' sh "${CMD_ARGS[@]}"
+}
+
+# Run a control command the product built (CMD_ARGS, no variables of its own).
+run_built_control() {
+    capture env PATH="$T/shim:$PATH" timeout 5 "${CMD_ARGS[@]}"
+}
+
+# A connection through a jump host with exactly the commands the product
+# builds (e2e_helper connection-argv). Both profiles have a stored password and
+# an entry in $T/ssh_config (write_ssh_shim) that signs in with the key once
+# the password was answered and refused, so nothing is added to the command
+# line. The target's entry sends it through a ProxyJump of its own, to
+# nowhere.invalid, and names its host key 127.0.0.1 while its host name is
+# localhost: the connection works only if the profile's route (the
+# ProxyCommand on the command line) wins over the configuration, and the
+# target's password is answered only if the helper's `ssh -G`, which sees no
+# ProxyCommand, still gives the identity the prompt names (plan Ruling R1).
+check_connection_through_a_jump_host() {
+    local out sock jump_id target_id jump_token token accepted took
+    jump_setup || return 1
+    jump_id=$(seed_password_profile via-bastion "$VIA_JUMP_HOST" "$JUMP_PORT") &&
+        target_id=$(seed_password_profile via-db "$VIA_TARGET_HOST" "$TARGET_PORT" via-bastion) ||
+        { REASON="cannot seed the profiles"; return 1; }
+    capture env PATH="$T/shim:$PATH" ssh -G -p "$TARGET_PORT" -- "$ME@$VIA_TARGET_HOST"
+    grep -qx 'proxyjump nowhere.invalid' "$OUT" && grep -qx 'hostkeyalias 127.0.0.1' "$OUT" ||
+        { REASON="precondition: the configuration does not send the target through nowhere.invalid"; return 1; }
+    sock=$(jump_socket) jump_token=$(new_token) token=$(new_token) out=$T/connection-argv
+    A "$HELPER" connection-argv --profile via-db --socket "$sock" --askpass "$T/askpass-exec.sh" \
+        --token "$token" --jump-token "$jump_token" >"$out" 2>"$ERR" ||
+        { REASON="connection-argv failed: $(err_summary)"; return 1; }
+
+    # The master signs in to the jump host: its prompt answered by the helper.
+    built_command "$out" master && expect_built_env master "$jump_id" "$jump_token" || return 1
+    JUMP_SOCKETS+=("$sock")
+    run_built
+    [ "$RC" -eq 0 ] || { REASON="the master exited $RC, expected 0: $(err_summary)"; return 1; }
+    [ -e "$(marker_of "$jump_token")" ] ||
+        { REASON="the helper did not answer the master's prompt (askpass log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
+    [ "$(prompts_asked)" -eq 1 ] ||
+        { REASON="the master asked $(prompts_asked) prompts, expected 1 (log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
+
+    # -O check names the master, which is recorded so that it is stopped anyway.
+    built_command "$out" check || return 1
+    run_built_control
+    [ "$RC" -eq 0 ] || { REASON="-O check exited $RC: $(err_summary)"; return 1; }
+    MASTER_PID=$(tr -d '\r' <"$ERR" | sed -n 's/^Master running (pid=\([0-9][0-9]*\))$/\1/p')
+    [ -n "$MASTER_PID" ] || { REASON="-O check said: $(err_summary)"; return 1; }
+    register_pid "$MASTER_PID"
+    JUMP_MASTERS+=("$MASTER_PID")
+
+    # The target, through the master: its own prompt answered, none from the
+    # hop, and the target's sshd let it in.
+    built_command "$out" target && expect_built_env target "$target_id" "$token" || return 1
+    accepted=$(grep -c "Accepted publickey for $ME " "$T/sshd_pwtarget.log")
+    run_built
+    [ "$RC" -eq 0 ] || { REASON="the target exited $RC, expected 0: $(err_summary)"; return 1; }
+    [ -e "$(marker_of "$token")" ] ||
+        { REASON="the helper did not answer the target's prompt (askpass log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
+    [ "$(prompts_asked)" -eq 1 ] && grep -qxF "prompt=$ME@127.0.0.1's password: " "$T/askpass.log" ||
+        { REASON="expected the target's prompt only (log: $(tr '\n' '~' <"$T/askpass.log"))"; return 1; }
+    [ "$(grep -c "Accepted publickey for $ME " "$T/sshd_pwtarget.log")" -eq $((accepted + 1)) ] ||
+        { REASON="the target's sshd did not let the connection in"; return 1; }
+
+    # -O exit ends the master at once.
+    built_command "$out" exit || return 1
+    run_built_control
+    [ "$RC" -eq 0 ] || { REASON="-O exit exited $RC: $(err_summary)"; return 1; }
+    grep -qx 'Exit request sent.' <(tr -d '\r' <"$ERR") || { REASON="-O exit said: $(err_summary)"; return 1; }
+    took=$(wait_gone "$MASTER_PID" "${PID_START[$MASTER_PID]}" "$sock" 1000) ||
+        { REASON="after -O exit (process ms, socket ms): $took"; return 1; }
+}
+
 # ---------- inner main ----------
 
 inner_main() {
@@ -1064,6 +1192,7 @@ inner_main() {
     run_jump_check "jump connection: the master ends at once on -O exit and on SIGTERM" check_master_ends_at_once
     run_jump_check "jump connection: a master nobody uses ends by itself" check_master_backstop
     run_jump_check "jump connection: no listening port" check_no_listening_port
+    run_jump_check "jump connection: the product's commands reach the target through its jump host" check_connection_through_a_jump_host
 
     say "== summary: $PASSED passed, $FAILED failed"
     [ "$FAILED" -eq 0 ]

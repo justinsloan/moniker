@@ -15,15 +15,24 @@
 //! takes a profile id, which is the only way to look at a deleted profile.
 //! `store-path` and `profile-state` let the script look at the instance
 //! through the same code the product uses instead of assuming a file layout.
+//! `connection-argv` prints the commands of a connection through a jump host
+//! as the product builds them, so the script runs exactly those with real
+//! OpenSSH.
 
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use moniker_cli::store_path;
+use moniker_core::askpass::AskpassToken;
+use moniker_core::jump;
 use moniker_core::profile::Profile;
 use moniker_core::secrets::{KeyringSecretStore, SecretStore, password_key};
+use moniker_core::ssh::{
+    JumpControl, SshCommand, hop_command, jump_control_command, jump_master_command,
+    terminal_command,
+};
 use moniker_core::store::ProfileStore;
 use zeroize::Zeroizing;
 
@@ -57,6 +66,28 @@ enum Command {
         /// Use this id (default: the id of the live profile of that name, else a new one)
         #[arg(long)]
         id: Option<String>,
+        /// Go through the live profile of this name
+        #[arg(long)]
+        jump_host: Option<String>,
+    },
+    /// Print the commands of a connection through the profile's jump host, one
+    /// item per line: `master`, `target`, `check` and `exit`, each followed by
+    /// `arg <argument>` lines (the program first) and `env <NAME>=<value>` lines
+    ConnectionArgv {
+        #[arg(long)]
+        profile: String,
+        /// The shared connection's socket
+        #[arg(long)]
+        socket: PathBuf,
+        /// The askpass helper the commands point ssh at
+        #[arg(long)]
+        askpass: PathBuf,
+        /// The target's one-time token (none: no stored password)
+        #[arg(long)]
+        token: Option<String>,
+        /// The jump host's one-time token (none: no stored password)
+        #[arg(long)]
+        jump_token: Option<String>,
     },
     /// Store the password read from stdin for a live profile
     SetSecret { profile: String },
@@ -91,7 +122,17 @@ fn run(command: Command) -> Result<ExitCode, String> {
             user,
             key_file,
             id,
-        } => seed_profile(&name, &host, port, &user, key_file, id).map(|()| ExitCode::SUCCESS),
+            jump_host,
+        } => seed_profile(&name, &host, port, &user, key_file, id, jump_host)
+            .map(|()| ExitCode::SUCCESS),
+        Command::ConnectionArgv {
+            profile,
+            socket,
+            askpass,
+            token,
+            jump_token,
+        } => connection_argv(&profile, &socket, &askpass, token, jump_token)
+            .map(|()| ExitCode::SUCCESS),
         Command::SetSecret { profile } => set_secret(&profile).map(|()| ExitCode::SUCCESS),
         Command::GetSecret { profile } => get_secret(&profile),
         Command::DeleteProfile { name } => delete_profile(&name).map(|()| ExitCode::SUCCESS),
@@ -126,11 +167,17 @@ fn seed_profile(
     user: &str,
     key_file: Option<PathBuf>,
     id: Option<String>,
+    jump_host: Option<String>,
 ) -> Result<(), String> {
     let mut store = open_store()?;
     let mut profile = Profile::new(name, host, user);
     profile.port = port;
     profile.key_file = key_file;
+    if let Some(jump) = jump_host {
+        let id = live_id_by_name(&store, &jump)?
+            .ok_or_else(|| format!("no live profile {jump:?} to go through"))?;
+        profile.jump_host = Some(id);
+    }
     // Only look the name up when no id was given (a duplicate name is then
     // an error that does not matter).
     let id = match id {
@@ -143,6 +190,92 @@ fn seed_profile(
     let id = profile.id.clone();
     store.upsert(profile).map_err(|e| e.to_string())?;
     println!("{id}");
+    Ok(())
+}
+
+/// Print the commands of a connection to the live profile `name` through its
+/// jump host, built as the GUI builds them: the master that signs in to the
+/// jump host, the target's `ssh` with the hop as its `ProxyCommand` (no
+/// startup sequence), and the control commands. A token is given only when a
+/// password is stored, as in the GUI; `MONIKER_PID` is this helper's id, and the
+/// script puts the id of the process that starts `ssh` in its place.
+fn connection_argv(
+    name: &str,
+    socket: &Path,
+    askpass: &Path,
+    token: Option<String>,
+    jump_token: Option<String>,
+) -> Result<(), String> {
+    let store = open_store()?;
+    let id = live_id_by_name(&store, name)?.ok_or_else(|| format!("no live profile {name:?}"))?;
+    let profile = store
+        .get(&id)
+        .ok_or_else(|| format!("no live profile {name:?}"))?;
+    let route = jump::route(profile, |id| store.get(id));
+    if let Some(refusal) = route.refusal() {
+        return Err(refusal);
+    }
+    let jump = route
+        .jump()
+        .ok_or_else(|| format!("{name:?} has no jump host"))?;
+    let token = parse_token(token)?;
+    let jump_token = parse_token(jump_token)?;
+    let hop = hop_command(jump, socket);
+    let commands = [
+        (
+            "master",
+            jump_master_command(jump, socket, askpass, jump_token.as_ref()),
+        ),
+        (
+            "target",
+            terminal_command(profile, None, askpass, token.as_ref(), Some(&hop)),
+        ),
+        (
+            "check",
+            jump_control_command(jump, socket, JumpControl::Check),
+        ),
+        (
+            "exit",
+            jump_control_command(jump, socket, JumpControl::Exit),
+        ),
+    ];
+    let mut text = String::new();
+    for (stage, cmd) in &commands {
+        text.push_str(&format!("{stage}\n"));
+        push_items(&mut text, cmd)?;
+    }
+    let mut out = io::stdout().lock();
+    out.write_all(text.as_bytes())
+        .and_then(|()| out.flush())
+        .map_err(|e| format!("cannot write to standard output: {e}"))
+}
+
+/// The token `text` names, if any; an error if it is not a canonical UUID.
+fn parse_token(text: Option<String>) -> Result<Option<AskpassToken>, String> {
+    text.map(|text| {
+        AskpassToken::parse(&text).ok_or_else(|| format!("not a canonical UUID: {text:?}"))
+    })
+    .transpose()
+}
+
+/// `arg` lines for the program and each argument of `cmd`, then `env` lines.
+/// An item with a newline could not be told from the next one: an error.
+fn push_items(text: &mut String, cmd: &SshCommand) -> Result<(), String> {
+    let args = std::iter::once(&cmd.program).chain(&cmd.args);
+    let env = cmd
+        .env
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"));
+    let items = args
+        .map(|arg| format!("arg {arg}"))
+        .chain(env.map(|var| format!("env {var}")));
+    for item in items {
+        if item.contains('\n') {
+            return Err(format!("an item has a newline: {item:?}"));
+        }
+        text.push_str(&item);
+        text.push('\n');
+    }
     Ok(())
 }
 
