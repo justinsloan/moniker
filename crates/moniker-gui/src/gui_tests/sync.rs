@@ -2134,7 +2134,12 @@ pub(super) fn the_sync_page_turns_sync_off_and_asks_to_turn_it_on(dir: &Path) {
         all_widgets::<adw::AlertDialog>(window).is_empty(),
         "no alert"
     );
-    assert_eq!(ctx.store.borrow().sync_switch(), SyncSwitch::Off);
+    // The context's snapshot follows the file once the save's answer is back on
+    // the main loop, which can come after the file says off and after the
+    // button (an off request counts at once): waited for, not assumed.
+    pump_until("the context to follow the file", || {
+        ctx.store.borrow().sync_switch() == SyncSwitch::Off
+    });
     assert!(!page.sync_switch.is_active());
     assert_eq!(
         page.sync_switch.subtitle().as_deref(),
