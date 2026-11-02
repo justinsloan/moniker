@@ -2,7 +2,9 @@
 //! the person picks what it becomes ([`open`]), and what a new pane shows, made
 //! by splitting one (Ctrl+Shift+R or D, [`fill`]). A pane of a saved session
 //! whose profile has gone shows it too, with a note above the search entry
-//! ([`fill_with_note`], plain text).
+//! ([`fill_with_note`], plain text). The same list, in a small window over a
+//! pane that holds a session, replaces that session ([`choose_new_session`],
+//! issue #20).
 //!
 //! The tab, called "New Tab" (a new pane: "New Pane"), holds a search entry
 //! over a list. The first row
@@ -49,12 +51,21 @@
 //! stale event from it starts nothing. Closing the tab or pane before picking
 //! just closes it: there is no session, so nothing is written.
 //!
+//! In the New Session window the list is not in the pane it acts on, so it is
+//! the window that makes it act once: the first pick closes the window, ends
+//! the pane's session as closing the pane would and makes the pane fresh
+//! ([`terminal_tab::clear_for_new_session`]), and only then starts the session
+//! picked there. A pick after the window closed, or after the pane went (its
+//! session closed it, its tab was closed), starts nothing anywhere; closing the
+//! window (Escape included, also in its search) changes nothing, and gives the
+//! keyboard back to the pane.
+//!
 //! While it is still a list it follows the profiles
 //! ([`AppContext::on_profiles_changed`]), keeping the search, the selected row
 //! (while it exists) and the focus. Profile names, hosts and user names come
 //! from other machines through sync: rows have Pango markup off.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -81,6 +92,13 @@ pub(crate) const LOCAL_ROW: &str = "new-tab-local";
 /// Widget name of the list (tests look for it).
 pub(crate) const LIST_NAME: &str = "new-tab-list";
 
+/// Title of the window that replaces a pane's session ([`choose_new_session`]).
+pub(crate) const NEW_SESSION_TITLE: &str = "New Session";
+
+/// The size of the New Session window's content: a small window over the pane.
+const NEW_SESSION_WIDTH: i32 = 420;
+const NEW_SESSION_HEIGHT: i32 = 520;
+
 /// Open a new tab in `view` that shows the new-tab list, select it, and return
 /// its page. The list fills this page with whatever is picked.
 pub fn open(view: &adw::TabView, ctx: &Rc<AppContext>) -> adw::TabPage {
@@ -94,7 +112,7 @@ pub fn open(view: &adw::TabView, ctx: &Rc<AppContext>) -> adw::TabPage {
 /// Show the new-tab list in `holder`, a fresh pane (a new tab's, or one made by
 /// splitting), which it fills with whatever is picked.
 pub fn fill(holder: &PaneHolder, ctx: &Rc<AppContext>) {
-    let chooser = build(holder, ctx, None);
+    let (chooser, _) = build(Target::Fill, holder, ctx, None);
     terminal_tab::show_chooser(holder, &chooser);
 }
 
@@ -102,27 +120,137 @@ pub fn fill(holder: &PaneHolder, ctx: &Rc<AppContext>) {
 /// (it may quote a name), wrapped if the pane is narrow. A restored pane whose
 /// profile is gone says so this way (`crate::session_layout`).
 pub fn fill_with_note(holder: &PaneHolder, ctx: &Rc<AppContext>, note: &str) {
-    let chooser = build(holder, ctx, Some(note));
+    let (chooser, _) = build(Target::Fill, holder, ctx, Some(note));
     terminal_tab::show_chooser(holder, &chooser);
+}
+
+/// Offer the new-tab list in a small window titled "New Session" over
+/// `holder`'s pane, which holds a session ([`terminal_tab::holds_session`]),
+/// to replace that session (issue #20): the same rows, "›" choices, search and
+/// following of the profiles as [`fill`]'s, with Local terminal selected and
+/// the keyboard on it. The old session stays shown and runs behind the window.
+///
+/// A pick closes the window, ends the old session exactly as closing the pane
+/// would and makes the pane fresh ([`terminal_tab::clear_for_new_session`]:
+/// nothing is asked), then starts what was picked in the same pane, as a pick
+/// in the new-tab list does, with that pick's transcript decision; the pane
+/// keeps its place and its text size and takes the new session's own title.
+/// A pick after the pane went (its session ended and closed it, its tab was
+/// closed) starts nothing, and closes the window. Closing the window any other
+/// way (its close button, Escape, Escape in its search) changes nothing, and
+/// the keyboard goes back to the pane if it may have it
+/// (`crate::panes::in_front`).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the New Session menu items use it (issue #20)")
+)]
+pub(crate) fn choose_new_session(holder: &PaneHolder, ctx: &Rc<AppContext>) {
+    let dialog = adw::Dialog::builder()
+        .title(NEW_SESSION_TITLE)
+        .content_width(NEW_SESSION_WIDTH)
+        .content_height(NEW_SESSION_HEIGHT)
+        .build();
+    let over = Rc::new(Cell::new(false));
+    let target = Target::Replace {
+        dialog: dialog.downgrade(),
+        over: Rc::clone(&over),
+    };
+    let (content, list) = build(target, holder, ctx, None);
+    let view = adw::ToolbarView::new();
+    view.add_top_bar(&adw::HeaderBar::new());
+    view.set_content(Some(&content));
+    dialog.set_child(Some(&view));
+    // Local terminal, selected, takes the keyboard when the window shows, so
+    // Enter picks it, typing searches and Escape closes the window.
+    if let Some(row) = list.selected_row() {
+        dialog.set_focus(Some(&row));
+    }
+    // Closed without a pick: nothing changed, and the keyboard goes back to
+    // the pane. From an idle callback, after libadwaita has given it back to
+    // the widget that had it before the window opened (a header's menu
+    // button, say), as the Layouts menu's questions do.
+    let pane = holder.downgrade();
+    dialog.connect_closed(move |_| {
+        if over.replace(true) {
+            return;
+        }
+        let pane = pane.clone();
+        glib::idle_add_local_once(move || {
+            if let Some(holder) = pane.upgrade()
+                && in_a_tab(&holder)
+                && crate::panes::in_front(&holder)
+            {
+                crate::panes::focus_pane(&holder);
+            }
+        });
+    });
+    dialog.present(Some(holder));
+}
+
+/// Whether the pane of `holder` is still a pane of a tab in a tab view: not
+/// one taken out of its tab (closed in a split), nor one of a tab that was
+/// closed.
+fn in_a_tab(holder: &PaneHolder) -> bool {
+    crate::panes::layout_of(holder)
+        .as_ref()
+        .and_then(crate::panes::page_of)
+        .is_some()
+}
+
+/// Which pane a pick in the list starts its session in.
+enum Target {
+    /// The fresh pane the list is shown in ([`fill`]), while it still shows
+    /// the list.
+    Fill,
+    /// The pane, holding a session, that the New Session window `dialog` is
+    /// over ([`choose_new_session`]): one pick only, and none once the window
+    /// has closed (`over`).
+    Replace {
+        dialog: glib::WeakRef<adw::Dialog>,
+        over: Rc<Cell<bool>>,
+    },
 }
 
 /// What the list's handlers share. It holds no widget, so the handlers that
 /// keep it (and the list keeps them) make no reference cycle.
 struct Chooser {
     ctx: Rc<AppContext>,
-    /// The pane to fill. Weak: the pane owns the list.
+    /// The pane to fill, or whose session to replace. Weak: the pane owns the
+    /// list (or the window over it does).
     holder: glib::WeakRef<PaneHolder>,
+    /// Where a pick goes.
+    target: Target,
     /// The profiles listed, as the store had them at the last (re)build.
     profiles: RefCell<Vec<Profile>>,
 }
 
 impl Chooser {
-    /// The pane to fill, while `list` is still what it shows: once a session
-    /// has replaced the list (or the pane is gone) there is nothing to fill.
-    fn fresh_holder(&self, list: &gtk::ListBox) -> Option<PaneHolder> {
-        self.holder
-            .upgrade()
-            .filter(|holder| list.is_ancestor(holder))
+    /// The pane a pick in `list` starts its session in, ready for it, or none.
+    ///
+    /// For the list in its own pane: that pane, while `list` is still what it
+    /// shows; once a session has replaced the list (or the pane is gone) there
+    /// is nothing to fill. In the New Session window: the first pick only,
+    /// while the window is open; it closes the window and, if the pane is still
+    /// in a tab, ends its session and makes it fresh
+    /// ([`terminal_tab::clear_for_new_session`]).
+    fn pane_to_start_in(&self, list: &gtk::ListBox) -> Option<PaneHolder> {
+        match &self.target {
+            Target::Fill => self
+                .holder
+                .upgrade()
+                .filter(|holder| list.is_ancestor(holder)),
+            Target::Replace { dialog, over } => {
+                if over.replace(true) {
+                    return None;
+                }
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.close();
+                }
+                let holder = self.holder.upgrade().filter(in_a_tab)?;
+                terminal_tab::clear_for_new_session(&holder);
+                Some(holder)
+            }
+        }
     }
 
     /// The listed profile `id`, cloned so no borrow is held while connecting.
@@ -175,7 +303,7 @@ impl Chooser {
     /// Turn the pane into a local shell in the home folder, running
     /// `sequence` first if one is given, and saving its transcript if `save`.
     fn open_local(&self, list: &gtk::ListBox, sequence: Option<&StartupSequence>, save: bool) {
-        if let Some(holder) = self.fresh_holder(list) {
+        if let Some(holder) = self.pane_to_start_in(list) {
             let transcript = terminal_tab::local_transcript_spec(&self.ctx, save);
             terminal_tab::start_local_in(&holder, &glib::home_dir(), sequence, transcript);
         }
@@ -190,7 +318,7 @@ impl Chooser {
         sequence: Option<usize>,
         record: bool,
     ) {
-        if let Some(holder) = self.fresh_holder(list) {
+        if let Some(holder) = self.pane_to_start_in(list) {
             terminal_tab::start_profile(&holder, &self.ctx, profile, sequence, record);
         }
     }
@@ -202,11 +330,18 @@ fn live_profiles(ctx: &AppContext) -> Vec<Profile> {
 }
 
 /// The search entry over the list, in a scrolled column, for `holder`'s pane,
-/// with `note` above them if there is one.
-fn build(holder: &PaneHolder, ctx: &Rc<AppContext>, note: Option<&str>) -> gtk::Widget {
+/// with `note` above them if there is one; and the list. A pick goes where
+/// `target` says.
+fn build(
+    target: Target,
+    holder: &PaneHolder,
+    ctx: &Rc<AppContext>,
+    note: Option<&str>,
+) -> (gtk::Widget, gtk::ListBox) {
     let chooser = Rc::new(Chooser {
         ctx: Rc::clone(ctx),
         holder: holder.downgrade(),
+        target,
         profiles: RefCell::new(live_profiles(ctx)),
     });
     let search = gtk::SearchEntry::builder()
@@ -327,6 +462,16 @@ fn build(holder: &PaneHolder, ctx: &Rc<AppContext>, note: Option<&str>) -> gtk::
         .build();
     // Typing while a row has the focus searches.
     search.set_key_capture_widget(Some(&scroller));
+    // Escape in the search entry stops the search, which takes the key before
+    // the New Session window sees it: there it closes the window too.
+    if let Target::Replace { dialog, .. } = &chooser.target {
+        let dialog = dialog.clone();
+        search.connect_stop_search(move |_| {
+            if let Some(dialog) = dialog.upgrade() {
+                dialog.close();
+            }
+        });
+    }
 
     // The focus goes to the selected row when the list shows, unless it is
     // already somewhere in it (coming back to the tab). After the tab view has
@@ -334,38 +479,41 @@ fn build(holder: &PaneHolder, ctx: &Rc<AppContext>, note: Option<&str>) -> gtk::
     // the keyboard (`crate::panes::in_front`): the focused pane of the tab its
     // window shows, with no dialog open. A list in another pane of a split tab
     // must not take it from the pane in use, nor one shown again as panes
-    // move from a tab that is no longer in sight.
-    scroller.connect_map(glib::clone!(
-        #[weak]
-        list,
-        #[strong]
-        chooser,
-        move |scroller| {
-            let scroller = scroller.downgrade();
-            glib::idle_add_local_once(glib::clone!(
-                #[weak]
-                list,
-                #[strong]
-                chooser,
-                move || {
-                    let Some(scroller) = scroller.upgrade() else {
-                        return;
-                    };
-                    let in_front = chooser
-                        .holder
-                        .upgrade()
-                        .is_some_and(|holder| crate::panes::in_front(&holder));
-                    if scroller.is_mapped()
-                        && in_front
-                        && !focus_within(&scroller)
-                        && let Some(row) = list.selected_row()
-                    {
-                        row.grab_focus();
+    // move from a tab that is no longer in sight. (In the New Session window
+    // the window gives the keyboard to the selected row: `choose_new_session`.)
+    if matches!(chooser.target, Target::Fill) {
+        scroller.connect_map(glib::clone!(
+            #[weak]
+            list,
+            #[strong]
+            chooser,
+            move |scroller| {
+                let scroller = scroller.downgrade();
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    list,
+                    #[strong]
+                    chooser,
+                    move || {
+                        let Some(scroller) = scroller.upgrade() else {
+                            return;
+                        };
+                        let in_front = chooser
+                            .holder
+                            .upgrade()
+                            .is_some_and(|holder| crate::panes::in_front(&holder));
+                        if scroller.is_mapped()
+                            && in_front
+                            && !focus_within(&scroller)
+                            && let Some(row) = list.selected_row()
+                        {
+                            row.grab_focus();
+                        }
                     }
-                }
-            ));
-        }
-    ));
+                ));
+            }
+        ));
+    }
 
     // A change to the profiles shows while this is a list. Weak: the context
     // outlives the list, and this closure lives in the context's list of
@@ -377,7 +525,7 @@ fn build(holder: &PaneHolder, ctx: &Rc<AppContext>, note: Option<&str>) -> gtk::
             refresh(&chooser, &list);
         }
     });
-    scroller.upcast()
+    (scroller.upcast(), list)
 }
 
 /// Rebuild the profile rows from the store, keeping the selected row (Local

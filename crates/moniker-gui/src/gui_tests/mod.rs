@@ -16,7 +16,7 @@
 //! [`windows`], [`save_transcripts`], [`transcript_indicator`],
 //! [`root_indicator`], [`preferences`], [`notifications`], [`sync`],
 //! [`profiles`], [`recordings`], [`sessions`], [`local_terminal`],
-//! [`jump_hosts`]);
+//! [`jump_hosts`], [`new_session`]);
 //! this file holds the test function that calls them, the helpers they
 //! share, and [`markup_is_shown_literally_everywhere`], the one scenario that
 //! spans the areas. The transcripts go to a temporary directory the tests pass
@@ -52,6 +52,7 @@ mod hosts;
 mod jump_hosts;
 mod local_terminal;
 mod main_window;
+mod new_session;
 mod notifications;
 mod panes;
 mod preferences;
@@ -449,6 +450,19 @@ fn gui_integration() {
     fs::create_dir(&bin).expect("bin dir");
     make_helper(&bin);
 
+    // Issue #20, replacing a pane's session from the New Session window.
+    new_session::replacing_a_local_shell_with_a_profile(&bin, &tmp.path().join("ns-profile"));
+    new_session::replacing_writes_the_old_transcript_once(&tmp.path().join("ns-transcript"));
+    new_session::replacing_in_a_split_keeps_the_place(&bin, &tmp.path().join("ns-split"));
+    new_session::cancel_changes_nothing(&tmp.path().join("ns-cancel"));
+    new_session::a_waiting_connection_replaced_never_starts(&bin, &tmp.path().join("ns-waiting"));
+    new_session::a_pick_after_the_pane_went_starts_nothing(&tmp.path().join("ns-gone"));
+    new_session::replacing_a_jump_host_session_closes_its_link(&bin, &tmp.path().join("ns-jump"));
+    new_session::replacing_a_connection_releases_only_its_own_marker(
+        &bin,
+        &tmp.path().join("ns-marker"),
+    );
+    new_session::a_replaced_command_s_exit_leaves_the_pane_alone(&tmp.path().join("ns-command"));
     // Issue #17, the marks of a session that runs as root.
     root_indicator::the_top_bar_follows_the_focused_pane(&tmp.path().join("root-top"));
     root_indicator::a_root_pane_moves_with_its_state(&tmp.path().join("root-moves"));
@@ -888,7 +902,8 @@ fn close_popover(popover: &gtk::Popover) {
 /// parses markup unless told not to.
 ///
 /// Surfaces: the new-tab list (row and the choices behind "›", a profile's and
-/// Local terminal's, whose sequence is named the same way), the tab (title,
+/// Local terminal's, whose sequence is named the same way) and the New Session
+/// window's row (issue #20), the tab (title,
 /// tooltip, as the tab bar draws it), the window title, the same two and a
 /// pane's header for a tab that saves a transcript (REC before the name) and
 /// for a tab whose pane runs as root (its tooltip's last line), a
@@ -986,6 +1001,28 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     assert_eq!(title.title(), MARKUP_NAME);
     literal_labels("window title", &title, MARKUP_NAME);
     set_test_ssh_program(None);
+
+    // The New Session window over that pane (issue #20) lists the same rows,
+    // as plain text.
+    new_tab::choose_new_session(&pane(&page), &ctx);
+    pump_until("the New Session window", || {
+        main.window.visible_dialog().is_some()
+    });
+    let dialog = main
+        .window
+        .visible_dialog()
+        .expect("the New Session window");
+    let session_row = row_for(&dialog, &p.id);
+    assert_plain_row(
+        "New Session row",
+        &session_row,
+        MARKUP_NAME,
+        Some(&subtitle),
+    );
+    dialog.close();
+    pump_until("the New Session window to close", || {
+        main.window.visible_dialog().is_none()
+    });
 
     // With a second pane the headers show: the pane's title there is plain
     // text too, and the tab's tooltip lists both titles, escaped.

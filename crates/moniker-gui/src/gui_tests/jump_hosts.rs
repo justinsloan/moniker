@@ -75,13 +75,13 @@ use crate::{form, keyring, new_tab, preferences, profiles, session_layout, setti
 /// Moniker sets for the askpass helper, as `super::fake_ssh` does, then
 /// `MASTER-END` (a master) or `TARGET-UP` (a target). A target then reads a
 /// line from its terminal and exits with it as its status.
-struct Fake {
-    program: String,
+pub(super) struct Fake {
+    pub(super) program: String,
     state: PathBuf,
 }
 
 impl Fake {
-    fn new(bin: &Path, name: &str, state: &Path) -> Fake {
+    pub(super) fn new(bin: &Path, name: &str, state: &Path) -> Fake {
         fs::create_dir_all(state).expect("the fake's folder");
         let state_text = state.to_str().expect("a UTF-8 temporary path");
         assert!(!state_text.contains('\''), "a path the script can quote");
@@ -218,7 +218,7 @@ exit "$status"
     }
 
     /// The `sleep` that stands for the master at `socket`, once it signed in.
-    fn pid_of(&self, socket: &str) -> i32 {
+    pub(super) fn pid_of(&self, socket: &str) -> i32 {
         let name = Path::new(socket)
             .file_name()
             .and_then(|n| n.to_str())
@@ -234,7 +234,7 @@ exit "$status"
 
     /// Kill every `sleep` this fake started that still sleeps (the scenario
     /// started them: nothing else is touched, [`sleeping`](Self::sleeping)).
-    fn end(&self) {
+    pub(super) fn end(&self) {
         for pid in self.lines("sleeps") {
             let Ok(pid) = pid.trim().parse::<i32>() else {
                 continue;
@@ -251,7 +251,7 @@ exit "$status"
     /// zombie, and not another process that took the id since (another
     /// scenario's `sleep 600` included). The fake starts each with
     /// `MONIKER_FAKE_MASTER` set to its folder, and only such a process counts.
-    fn sleeping(&self, pid: i32) -> bool {
+    pub(super) fn sleeping(&self, pid: i32) -> bool {
         let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return false;
         };
@@ -275,21 +275,21 @@ impl Drop for Fake {
 }
 
 /// The jump host of these scenarios.
-fn bastion() -> Profile {
+pub(super) fn bastion() -> Profile {
     let mut p = Profile::new("bastion", "bastion.example.test", "bob");
     p.port = 2222;
     p
 }
 
 /// A profile that goes through `jump`.
-fn through(jump: &Profile) -> Profile {
+pub(super) fn through(jump: &Profile) -> Profile {
     let mut p = Profile::new("web", "app.example.test", "alice");
     p.jump_host = Some(jump.id.clone());
     p
 }
 
 /// A runtime folder of `dir`'s, private to this user as the real one is.
-fn runtime(dir: &Path) -> PathBuf {
+pub(super) fn runtime(dir: &Path) -> PathBuf {
     let run = dir.join("run");
     fs::create_dir_all(&run).expect("the runtime folder");
     fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).expect("chmod it");
@@ -298,7 +298,7 @@ fn runtime(dir: &Path) -> PathBuf {
 
 /// A context over `profiles`, with `secrets` as the keyring and `run` as the
 /// runtime folder, saving transcripts into `dir`'s `transcripts`.
-fn ctx_for(
+pub(super) fn ctx_for(
     dir: &Path,
     profiles: &[Profile],
     secrets: Arc<dyn SecretStore>,
@@ -384,19 +384,19 @@ fn var(lines: &[String], name: &str) -> Option<String> {
 }
 
 /// A pane connected through its jump host, once its target is up.
-struct Connected {
-    page: adw::TabPage,
-    holder: PaneHolder,
-    terminal: Terminal,
+pub(super) struct Connected {
+    pub(super) page: adw::TabPage,
+    pub(super) holder: PaneHolder,
+    pub(super) terminal: Terminal,
     /// The master's socket.
-    socket: String,
+    pub(super) socket: String,
     /// The pane's shared connection, as it had it once the target was up.
-    link: Rc<JumpLink>,
+    pub(super) link: Rc<JumpLink>,
 }
 
 /// Connect to `p` in a new tab of `view` as a click does, and wait until its
 /// target's `ssh` runs.
-fn connect(view: &adw::TabView, ctx: &Rc<AppContext>, p: &Profile) -> Connected {
+pub(super) fn connect(view: &adw::TabView, ctx: &Rc<AppContext>, p: &Profile) -> Connected {
     open_profile(view, ctx, p, None, false);
     let page = view.selected_page().expect("the new tab");
     let holder = pane(&page);
@@ -405,7 +405,7 @@ fn connect(view: &adw::TabView, ctx: &Rc<AppContext>, p: &Profile) -> Connected 
 
 /// The connection through its jump host in the pane of `holder` (in `page`),
 /// once its target's `ssh` runs.
-fn connected(page: adw::TabPage, holder: PaneHolder) -> Connected {
+pub(super) fn connected(page: adw::TabPage, holder: PaneHolder) -> Connected {
     pump_until("the session", || terminal_in(&holder).is_some());
     let terminal = terminal_in(&holder).expect("the session");
     wait_for_text(&terminal, "TARGET-UP");
@@ -426,7 +426,7 @@ fn connected(page: adw::TabPage, holder: PaneHolder) -> Connected {
 }
 
 /// Wait until the pane of `c` has learned its master's process.
-fn learned(c: &Connected) {
+pub(super) fn learned(c: &Connected) {
     pump_until("the master's process to be learned", || {
         c.link.knows_master()
     });
@@ -434,14 +434,14 @@ fn learned(c: &Connected) {
 
 /// Wait until `link` is closed and none of its commands is still running, so
 /// that nothing of it runs after the scenario.
-fn settled(link: &JumpLink) {
+pub(super) fn settled(link: &JumpLink) {
     pump_until("the shared connection to settle", || {
         link.is_closed() && link.idle()
     });
 }
 
 /// How many `-O exit` named `socket`.
-fn exits_for(fake: &Fake, socket: &str) -> usize {
+pub(super) fn exits_for(fake: &Fake, socket: &str) -> usize {
     fake.exits().iter().filter(|s| *s == socket).count()
 }
 

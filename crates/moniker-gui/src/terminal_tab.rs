@@ -26,6 +26,13 @@
 //! signal) the pane stays open with a short note, so the `ssh` error message
 //! can still be read. Closing the last tab of a window closes the window.
 //!
+//! A pane's session can also be replaced by one picked in the New Session
+//! window (issue #20, `crate::new_tab::choose_new_session`): the old one ends
+//! as closing its pane ends it ([`clear_for_new_session`]), and the new one
+//! starts in the same pane. What the old session's terminal does afterwards
+//! (its child's exit, seen once the hang-up has taken effect, or a title its
+//! program sets) no longer reaches the pane ([`shows`]).
+//!
 //! # Local tabs and commands
 //!
 //! A local tab ([`open_local`]) runs the person's shell, or a command given on
@@ -1565,6 +1572,48 @@ pub(crate) fn new_holder_page_at(
     page
 }
 
+/// Whether the pane of `holder` holds a session, in any state: a local
+/// terminal, or a connection to a profile, while it waits for the keyring,
+/// runs, or after it has ended with its note. Not a pane that shows the
+/// new-tab list or nothing yet: there is no session to replace there (issue
+/// #20).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the New Session menu items use it (issue #20)")
+)]
+pub(crate) fn holds_session(holder: &PaneHolder) -> bool {
+    matches!(
+        *holder.kind().borrow(),
+        PaneKind::Local { .. } | PaneKind::Profile { .. }
+    )
+}
+
+/// End the session in `holder`'s pane exactly as closing the pane would, and
+/// leave the pane fresh for another (issue #20,
+/// `crate::new_tab::choose_new_session`): its transcript is written if it saves
+/// one and has not written it yet ([`write_transcript_of`]), then the session
+/// ends ([`end_session`]: its child hung up and its terminal kept until the
+/// child's exit is seen, its one-time askpass marker released only then, its
+/// shared connection to a jump host ended, its root watch stopped). A
+/// connection still waiting for the keyring never starts: the placeholder it
+/// waits on is gone ([`start_profile`]). Nothing is asked.
+///
+/// The pane keeps its place and its text size; it shows nothing, and the name
+/// the person gave it goes: the next session's automatic title is its title,
+/// as in a fresh tab. [`begin_session`] may then start a session in it.
+pub(crate) fn clear_for_new_session(holder: &PaneHolder) {
+    if let Some(terminal) = terminal_in(holder) {
+        write_transcript_of(&terminal);
+    }
+    end_session(holder);
+    holder.kind().replace(PaneKind::Empty);
+    holder.child_gone().set(false);
+    holder
+        .title()
+        .replace(TabTitle::remote(FALLBACK_TITLE.to_owned()));
+    refresh_title(holder);
+}
+
 /// Show `chooser` in `holder`, a fresh pane that holds nothing yet: what the
 /// pane shows until a session replaces it (the new-tab list).
 pub(crate) fn show_chooser(holder: &PaneHolder, chooser: &impl IsA<gtk::Widget>) {
@@ -1750,8 +1799,9 @@ pub(crate) fn close_pane(holder: &PaneHolder) {
 /// Empty `holder` and put a new terminal in it, with the automatic title
 /// `title` (a name the person gave the pane is kept). The terminal has the
 /// focus if its pane is in front ([`in_front`]). Only for a pane that has not
-/// run a session yet (empty, or showing a chooser): a session replaced here
-/// would lose its unwritten transcript.
+/// run a session yet (empty, or showing a chooser), or one whose session
+/// [`clear_for_new_session`] ended: a session replaced here would lose its
+/// unwritten transcript and be left running unseen.
 fn begin_session(holder: &PaneHolder, title: TabTitle) -> Terminal {
     holder.title().borrow_mut().adopt(title);
     refresh_title(holder);
@@ -1769,10 +1819,17 @@ fn begin_session(holder: &PaneHolder, title: TabTitle) -> Terminal {
         terminal.grab_focus();
     }
     // Connected first, so it is known before anything else hears of the exit.
+    // Only while the pane shows this terminal: a session whose pane got
+    // another one (`clear_for_new_session`) is seen to exit after that one
+    // began, and that one's child has not gone.
     terminal.connect_child_exited(glib::clone!(
         #[weak]
         holder,
-        move |_, _| holder.child_gone().set(true)
+        move |terminal, _| {
+            if shows(&holder, terminal) {
+                holder.child_gone().set(true);
+            }
+        }
     ));
     // A pane that showed a chooser has a terminal now (Copy, Paste and the
     // text size actions apply).
@@ -2025,12 +2082,18 @@ pub(crate) fn start_shell_in(
     holder.kind().replace(PaneKind::Local { started_in: None });
     // A shell that exits closes its pane, and closing a pane or a tab writes
     // the transcript ([`close_pane`], `setup_tab_view`), so there is nothing
-    // more to do when it exits.
+    // more to do when it exits. Not a pane that no longer shows it: one that
+    // was closed, or whose session was replaced (`clear_for_new_session`,
+    // which wrote the transcript), holds nothing of it any more.
     start_recording(&terminal, transcript);
     terminal.connect_child_exited(glib::clone!(
         #[weak]
         holder,
-        move |_, _status| close_pane(&holder)
+        move |terminal, _status| {
+            if shows(&holder, terminal) {
+                close_pane(&holder);
+            }
+        }
     ));
     follow_program_title(holder, &terminal);
     spawn(&terminal, folder_to_spawn_in(dir), &[shell.to_owned()], &[]);
@@ -2139,7 +2202,9 @@ pub(crate) fn start_sequence_in(
 
 /// When the child in `terminal` (`holder`'s pane) exits, end as a command tab
 /// does: write the transcript of `session`, if it records, then close the pane
-/// or keep it with the note, as [`command_exit_action`] says for `hold`.
+/// or keep it with the note, as [`command_exit_action`] says for `hold`. A pane
+/// that no longer shows `terminal` (closed, or holding another session since
+/// `clear_for_new_session`) is left alone.
 fn end_as_a_command(
     holder: &PaneHolder,
     terminal: &Terminal,
@@ -2152,6 +2217,9 @@ fn end_as_a_command(
         move |terminal, status| {
             if let Some(session) = &session {
                 session.write_transcript_once();
+            }
+            if !shows(&holder, terminal) {
+                return;
             }
             match command_exit_action(status, hold) {
                 ExitAction::Close => close_pane(&holder),
@@ -2172,6 +2240,11 @@ fn follow_program_title(holder: &PaneHolder, terminal: &Terminal) {
         #[weak]
         holder,
         move |terminal| {
+            // A program whose pane got another session (`clear_for_new_session`)
+            // names it no more.
+            if !shows(&holder, terminal) {
+                return;
+            }
             let raw = terminal.window_title().unwrap_or_default();
             holder.title().borrow_mut().set_terminal_title(&raw);
             refresh_title(&holder);
@@ -2804,14 +2877,23 @@ pub(crate) fn start_command(
 /// through one, is ended (`crate::jump_link`); its transcript is written; and
 /// the pane closes after a clean exit or keeps the note after any other end.
 ///
-/// A terminal no longer in its pane (the pane was closed, which hung its child
-/// up and took the marker and the shared connection) leaves the pane alone.
+/// A terminal no longer in its pane leaves the pane alone: the pane was
+/// closed, or holds another session since `clear_for_new_session`, and either
+/// hung its child up and took its marker (which goes with the parked terminal,
+/// [`park`]) and its shared connection. What the holder has now is the next
+/// session's, whose marker and shared connection this must never take.
 fn connection_ended(
     holder: &PaneHolder,
     terminal: &Terminal,
     session: Option<&Rc<Session>>,
     status: i32,
 ) {
+    if !shows(holder, terminal) {
+        if let Some(session) = session {
+            session.write_transcript_once();
+        }
+        return;
+    }
     if let Some(marker) = holder.marker().take() {
         marker.release();
     }
@@ -2820,9 +2902,6 @@ fn connection_ended(
     }
     if let Some(session) = session {
         session.write_transcript_once();
-    }
-    if !shows(holder, terminal) {
-        return;
     }
     // Not root any more, whoever it signed in as (issue #17).
     root::show_root(holder, false);

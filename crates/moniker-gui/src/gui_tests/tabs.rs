@@ -455,7 +455,7 @@ pub(super) fn missing_helper_falls_back_to_the_terminal_and_says_so(dir: &Path) 
 }
 
 /// A fake ssh's last command: wait until hung up, then note it in `hup`.
-fn run_until_hangup(hup: &Path) -> String {
+pub(super) fn run_until_hangup(hup: &Path) -> String {
     format!(
         "trap 'touch \"{}\"; exit 129' HUP\nsleep 600 &\nwait $!",
         hup.display()
@@ -463,7 +463,7 @@ fn run_until_hangup(hup: &Path) -> String {
 }
 
 /// Run the main loop until `terminal` has been freed.
-fn pump_until_freed(what: &str, terminal: glib::WeakRef<Terminal>) {
+pub(super) fn pump_until_freed(what: &str, terminal: glib::WeakRef<Terminal>) {
     pump_until(what, || terminal.upgrade().is_none());
 }
 
