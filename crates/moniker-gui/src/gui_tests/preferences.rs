@@ -311,13 +311,30 @@ fn style_in_file(ctx: &AppContext) -> Option<String> {
     value["style"].as_str().map(str::to_owned)
 }
 
+/// The Style row of `dialog`: alone in the first group, Appearance.
+fn style_row_of(dialog: &adw::PreferencesDialog) -> adw::ComboRow {
+    let page = dialog.visible_page().expect("the page");
+    let appearance = all_widgets::<adw::PreferencesGroup>(&page)
+        .into_iter()
+        .next()
+        .expect("a group");
+    assert_eq!(appearance.title(), "Appearance", "the first group");
+    let mut rows = all_widgets::<adw::PreferencesRow>(&appearance);
+    assert_eq!(rows.len(), 1, "the Style row alone");
+    rows.pop()
+        .and_then(|row| row.downcast::<adw::ComboRow>().ok())
+        .expect("a drop-down")
+}
+
 /// The Style row, alone in the first group, Appearance, picks the style
 /// of the whole application at once and saves it: Dark forces dark, Light forces
 /// light, Follow System goes back to the system's. The terminal is the dark
 /// palette's under every choice. The same choice again writes nothing. A choice
 /// that cannot be saved (a damaged settings file) is not used: the row goes
-/// back, the style stays and the file is left byte for byte. A launch takes the
-/// style from the settings (`terminal_tab::use_preferences`).
+/// back, the style stays and the file is left byte for byte. A dialog opened
+/// again starts on the style the file holds, not on Follow System (the first
+/// choice, which a combo row selects by itself). A launch takes the style from
+/// the settings (`terminal_tab::use_preferences`).
 pub(super) fn the_style_row_sets_the_application_style(dir: &Path) {
     let _back = StyleBack;
     let manager = adw::StyleManager::default();
@@ -335,18 +352,7 @@ pub(super) fn the_style_row_sets_the_application_style(dir: &Path) {
 
     // The first group has the row alone, with its texts and three choices.
     let dialog = open(&app, &ctx, &main);
-    let page = dialog.visible_page().expect("the page");
-    let appearance = all_widgets::<adw::PreferencesGroup>(&page)
-        .into_iter()
-        .next()
-        .expect("a group");
-    assert_eq!(appearance.title(), "Appearance", "the first group");
-    let mut rows = all_widgets::<adw::PreferencesRow>(&appearance);
-    assert_eq!(rows.len(), 1, "the Style row alone");
-    let row = rows
-        .pop()
-        .and_then(|row| row.downcast::<adw::ComboRow>().ok())
-        .expect("a drop-down");
+    let row = style_row_of(&dialog);
     assert_plain_row(
         "style row",
         row.upcast_ref(),
@@ -413,8 +419,22 @@ pub(super) fn the_style_row_sets_the_application_style(dir: &Path) {
         damaged,
         "the damaged file is left as it is"
     );
-    // The damage removed (the file as it was before it), choosing works again.
+    // The damage removed (the file as it was before it, which says light), a
+    // dialog opened again starts on that choice, not on the first one, and
+    // choosing works again.
     fs::write(&ctx.settings_path, &bytes).expect("put the file back");
+    assert_eq!(style_in_file(&ctx).as_deref(), Some("light"));
+    close_dialog(&main, &dialog);
+    let dialog = open(&app, &ctx, &main);
+    let row = style_row_of(&dialog);
+    assert_eq!(row.selected(), 1, "the saved choice, Light");
+    assert_eq!(super::profiles::shown_item(&row), "Light");
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::ForceLight);
+    assert_eq!(
+        fs::read(&ctx.settings_path).unwrap(),
+        bytes,
+        "opening writes nothing"
+    );
 
     // Follow System: the system's style again, saved by its name.
     row.set_selected(0);

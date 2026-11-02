@@ -524,10 +524,10 @@ pub(crate) fn handle_command_line(
     (0, None)
 }
 
-/// The launch: the terminal font, scrollback and root marks of the Preferences,
-/// the first window (a shell in the home folder, or what `start` says), and once
-/// it is shown (from an idle callback, so the window and its terminal come
-/// first), the automatic sync.
+/// The launch: the terminal font, scrollback, root marks and application style
+/// of the Preferences, the first window (a shell in the home folder, or what
+/// `start` says), and once it is shown (from an idle callback, so the window
+/// and its terminal come first), the automatic sync.
 ///
 /// The application is held from here until that sync is over, or until it is
 /// known there is none ([`sync_on_launch`]). A launch whose command ends at

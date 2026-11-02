@@ -4,8 +4,9 @@
 //! Preferences (terminal font, scrollback lines, whether to mark a session that
 //! runs as root, the style of the whole application, whether to show the
 //! Layouts button, whether to ping the saved hosts, whether to save a
-//! transcript of every session, and the transcripts folder). Local terminal's startup sequences are not here but in a file of
-//! their own ([`crate::local_terminal`]).
+//! transcript of every session, and the transcripts folder). Local terminal's
+//! startup sequences are not here but in a file of their own
+//! ([`crate::local_terminal`]).
 //!
 //! They live in `gui-settings.json` next to `profiles.json` ([`default_path`]),
 //! not in it: they describe this machine only, so they are never synced. The
