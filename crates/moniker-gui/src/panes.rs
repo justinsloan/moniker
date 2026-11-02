@@ -147,6 +147,11 @@ pub(crate) const PANE_LEFT_ACTION: &str = "pane-left";
 pub(crate) const PANE_RIGHT_ACTION: &str = "pane-right";
 pub(crate) const PANE_UP_ACTION: &str = "pane-up";
 pub(crate) const PANE_DOWN_ACTION: &str = "pane-down";
+/// "New Session…" (issue #20): the name of `win.new-session`, `pane.new-session`
+/// and `tab.new-session`, which offer the new-tab list in a window over a pane
+/// to replace its session, and the label of their menu items.
+pub(crate) const NEW_SESSION_ACTION: &str = "new-session";
+pub(crate) const NEW_SESSION_ITEM: &str = "New Session\u{2026}";
 
 /// The CSS classes of a pane's header, of the focused pane's header, of the
 /// drop highlight and of the dragged pane's icon.
@@ -506,13 +511,22 @@ pub(crate) fn refresh(layout: &TabLayout) {
         }
         pane.title()
             .set_text(&terminal_tab::shown_title(pane.holder()));
-        for name in [TO_TAB_ACTION, TO_WINDOW_ACTION] {
+        for (name, enabled) in [
+            (TO_TAB_ACTION, several),
+            (TO_WINDOW_ACTION, several),
+            // Only where there is a session to replace (issue #20): not on a
+            // pane that shows the new-tab list.
+            (
+                NEW_SESSION_ACTION,
+                terminal_tab::holds_session(pane.holder()),
+            ),
+        ] {
             if let Some(action) = pane
                 .actions()
                 .lookup_action(name)
                 .and_downcast::<gio::SimpleAction>()
             {
-                action.set_enabled(several);
+                action.set_enabled(enabled);
             }
         }
     }
@@ -719,13 +733,20 @@ fn build_pane(holder: &PaneHolder) -> Pane {
     pane
 }
 
-/// The header's menu.
+/// The header's menu: "Rename…" and "New Session…" (issue #20), then the Move
+/// items in a section of their own.
 fn header_menu() -> gio::Menu {
     let menu = gio::Menu::new();
-    menu.append(
+    let own = gio::Menu::new();
+    own.append(
         Some("Rename\u{2026}"),
         Some(&format!("{PANE_ACTIONS}.rename")),
     );
+    own.append(
+        Some(NEW_SESSION_ITEM),
+        Some(&format!("{PANE_ACTIONS}.{NEW_SESSION_ACTION}")),
+    );
+    menu.append_section(None, &own);
     let moves = gio::Menu::new();
     moves.append(
         Some("Move to New Tab"),
@@ -758,6 +779,10 @@ pub(crate) fn split_menu_section() -> gio::Menu {
 /// terminal's menu: they act on this pane, not on the focused one. Splitting
 /// and moving to a new window need what only the window has (the application
 /// and its context), so those focus this pane and run the window's action.
+/// So does "New Session…" (issue #20): `win.new-session` offers the new-tab list
+/// over the focused pane, to replace its session, so the pane is made the
+/// focused one first (its tab selected). It is enabled only while the pane
+/// holds a session ([`refresh`]), and starts disabled.
 /// Those of a menu run once the closing menu has handed the keyboard focus
 /// back (`terminal_tab::after_the_menu_lets_go`), which would otherwise put it
 /// back on the right-clicked terminal or the header button after the change.
@@ -772,8 +797,16 @@ fn add_pane_actions(pane: &Pane) {
             }
         });
     };
-    for name in [SPLIT_RIGHT_ACTION, SPLIT_DOWN_ACTION, TO_WINDOW_ACTION] {
+    for name in [
+        SPLIT_RIGHT_ACTION,
+        SPLIT_DOWN_ACTION,
+        TO_WINDOW_ACTION,
+        NEW_SESSION_ACTION,
+    ] {
         let action = gio::SimpleAction::new(name, None);
+        // A new pane shows the list or nothing: no session to replace until
+        // `refresh` says so.
+        action.set_enabled(name != NEW_SESSION_ACTION);
         action.connect_activate(glib::clone!(
             #[weak]
             pane,

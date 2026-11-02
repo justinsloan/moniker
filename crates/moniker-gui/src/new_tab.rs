@@ -140,10 +140,6 @@ pub fn fill_with_note(holder: &PaneHolder, ctx: &Rc<AppContext>, note: &str) {
 /// way (its close button, Escape, Escape in its search) changes nothing, and
 /// the keyboard goes back to the pane if it may have it
 /// (`crate::panes::in_front`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the New Session menu items use it (issue #20)")
-)]
 pub(crate) fn choose_new_session(holder: &PaneHolder, ctx: &Rc<AppContext>) {
     let dialog = adw::Dialog::builder()
         .title(NEW_SESSION_TITLE)

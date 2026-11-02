@@ -463,6 +463,14 @@ fn gui_integration() {
         &tmp.path().join("ns-marker"),
     );
     new_session::a_replaced_command_s_exit_leaves_the_pane_alone(&tmp.path().join("ns-command"));
+    new_session::the_menus_offer_new_session(&tmp.path().join("ns-menus"));
+    new_session::the_pane_menu_replaces_that_pane(&tmp.path().join("ns-pane-menu"));
+    new_session::the_tab_menu_replaces_that_tabs_pane(&tmp.path().join("ns-tab-menu"));
+    new_session::cancel_gives_the_keyboard_back(&tmp.path().join("ns-keyboard"));
+    new_session::an_ended_session_replaced_is_hung_up_when_its_tab_closes(
+        &tmp.path().join("ns-ended"),
+    );
+    new_session::a_pick_through_the_choices_replaces_the_pane(&bin, &tmp.path().join("ns-choices"));
     // Issue #17, the marks of a session that runs as root.
     root_indicator::the_top_bar_follows_the_focused_pane(&tmp.path().join("root-top"));
     root_indicator::a_root_pane_moves_with_its_state(&tmp.path().join("root-moves"));
@@ -1002,9 +1010,11 @@ fn markup_is_shown_literally_everywhere(bin: &Path, dir: &Path) {
     literal_labels("window title", &title, MARKUP_NAME);
     set_test_ssh_program(None);
 
-    // The New Session window over that pane (issue #20) lists the same rows,
-    // as plain text.
-    new_tab::choose_new_session(&pane(&page), &ctx);
+    // The New Session window over that pane (issue #20), opened from the tab
+    // menu, lists the same rows, as plain text.
+    main.view.emit_by_name::<()>("setup-menu", &[&page]);
+    WidgetExt::activate_action(&main.window, "tab.new-session", None)
+        .expect("the tab.new-session action");
     pump_until("the New Session window", || {
         main.window.visible_dialog().is_some()
     });

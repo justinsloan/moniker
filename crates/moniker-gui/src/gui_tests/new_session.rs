@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::gdk;
+use gtk::{gdk, gio};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::askpass::{TOKEN_ENV, claim_marker, marker_dir};
@@ -35,10 +35,10 @@ use vte4::prelude::*;
 use super::jump_hosts::{
     Connected, Fake, bastion, connect, connected, ctx_for, learned, runtime, settled, through,
 };
-use super::main_window::{ctx_with, ctx_with_secrets, test_app};
-use super::save_transcripts::{click, configure, new_list, say, set_save_all};
+use super::main_window::{choices_parts, ctx_with, ctx_with_secrets, menu_items, test_app};
+use super::save_transcripts::{click, configure, new_list, open_choices, say, set_save_all};
 use super::tabs::{pump_until_freed, run_until_hangup};
-use super::transcript_indicator::{layout_of, pane_of, split_with_local};
+use super::transcript_indicator::{focused, layout_of, pane_of, split_with_local};
 use super::windows::{main_window, named, ssh_args};
 use super::{
     HeldKeyring, all_widgets, fake_ssh, files_in, find_widget, make_helper, pane, profile,
@@ -51,7 +51,7 @@ use crate::terminal_tab::{
     PaneHolder, PaneKind, close_pane, holds_session, open_local, rename_pane, set_test_ssh_program,
     shown_title, tab_title, terminal_in, zoom_selected,
 };
-use crate::{keyring, new_tab, window, zoom};
+use crate::{connect_menu, keyring, new_tab, panes, window, zoom};
 
 /// The New Session window over `main`, once it shows.
 fn new_session_window(main: &window::MainWindow) -> adw::Dialog {
@@ -748,6 +748,468 @@ pub(super) fn a_replaced_command_s_exit_leaves_the_pane_alone(dir: &Path) {
     );
     say(&new, "after");
 
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The label of the tab menu's and the pane header menu's "Rename…" item.
+const RENAME: &str = "Rename\u{2026}";
+/// The label of their "New Session…" item.
+const NEW_SESSION: &str = "New Session\u{2026}";
+
+/// A popover menu of `model`, parented to `parent` so that its items follow the
+/// actions `parent` sees; the caller unparents it.
+fn menu_over(model: Option<gio::MenuModel>, parent: &impl IsA<gtk::Widget>) -> gtk::PopoverMenu {
+    let menu = gtk::PopoverMenu::from_model(model.as_ref());
+    menu.set_parent(parent);
+    menu
+}
+
+/// Whether the item `label` of `menu` can be chosen (its action is enabled).
+fn item_sensitive(menu: &gtk::PopoverMenu, label: &str) -> bool {
+    all_widgets::<gtk::Widget>(menu)
+        .into_iter()
+        .find(|w| {
+            w.type_().name() == "GtkModelButton"
+                && w.property::<Option<String>>("text").as_deref() == Some(label)
+        })
+        .unwrap_or_else(|| panic!("no menu item {label}"))
+        .is_sensitive()
+}
+
+/// The tab menu as the tab bar shows it when opened on `page`: the view says
+/// which page it is for, and the items follow the actions then.
+fn tab_menu_for(main: &window::MainWindow, page: &adw::TabPage) -> gtk::PopoverMenu {
+    main.view.emit_by_name::<()>("setup-menu", &[page]);
+    menu_over(main.view.menu_model(), &main.view)
+}
+
+/// The menu button in the header of `holder`'s pane.
+fn header_menu_button(holder: &PaneHolder) -> gtk::MenuButton {
+    find_widget(pane_of(holder).header()).expect("the header's menu button")
+}
+
+/// The header menu of `holder`'s pane, as its header shows it.
+fn header_menu_for(holder: &PaneHolder) -> gtk::PopoverMenu {
+    let button = header_menu_button(holder);
+    menu_over(button.menu_model(), &button)
+}
+
+/// The new-tab list shown in `holder`'s pane.
+fn list_in_pane(holder: &PaneHolder) -> gtk::ListBox {
+    find_widget::<gtk::ListBox>(holder)
+        .filter(|l| l.widget_name() == new_tab::LIST_NAME)
+        .expect("the pane's new-tab list")
+}
+
+/// The terminal of `holder`, once its pane has one.
+fn shell_of(holder: &PaneHolder) -> Terminal {
+    pump_until("the pane's shell", || terminal_in(holder).is_some());
+    terminal_in(holder).expect("the pane's shell")
+}
+
+/// Open the New Session window the way the tab menu does for `page`: the view
+/// says the menu is for it, and the menu's item `tab.new-session` is chosen.
+fn open_from_tab_menu(main: &window::MainWindow, page: &adw::TabPage) -> adw::Dialog {
+    main.view.emit_by_name::<()>("setup-menu", &[page]);
+    WidgetExt::activate_action(&main.window, "tab.new-session", None)
+        .expect("the tab.new-session action");
+    new_session_window(main)
+}
+
+/// "New Session…" sits right below "Rename…" in the tab menu and in a pane
+/// header's menu (whose Move items stay in their own section), and can be
+/// chosen only where there is a session to replace: not on a pane that shows
+/// the new-tab list (the tab menu is for the tab's focused pane). A pane that
+/// has just begun a session offers it at once.
+pub(super) fn the_menus_offer_new_session(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the window's tab");
+    let first = pane(&page);
+    shell_of(&first);
+
+    let model = main.view.menu_model().expect("the tab menu");
+    assert_eq!(
+        menu_items(&model),
+        [
+            (RENAME.to_owned(), "tab.rename".to_owned()),
+            (NEW_SESSION.to_owned(), "tab.new-session".to_owned()),
+        ]
+    );
+
+    // A split whose new pane shows the list.
+    WidgetExt::activate_action(&main.window, "win.split-right", None).expect("win.split-right");
+    let second = focused(&page);
+    assert_ne!(second, first);
+    assert!(!holds_session(&second), "the list is no session");
+    let model = header_menu_button(&second)
+        .menu_model()
+        .expect("the header's menu");
+    let sections: Vec<_> = (0..model.n_items())
+        .map(|i| {
+            menu_items(
+                &model
+                    .item_link(i, gio::MENU_LINK_SECTION)
+                    .expect("a section"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sections,
+        [
+            vec![
+                (RENAME.to_owned(), "pane.rename".to_owned()),
+                (NEW_SESSION.to_owned(), "pane.new-session".to_owned()),
+            ],
+            vec![
+                ("Move to New Tab".to_owned(), "pane.pane-to-tab".to_owned()),
+                (
+                    "Move to New Window".to_owned(),
+                    "pane.pane-to-window".to_owned()
+                ),
+            ],
+        ]
+    );
+
+    // The pane that shows the list: not offered, in either menu (the tab
+    // menu is for the tab's focused pane, which is that one).
+    let menu = tab_menu_for(&main, &page);
+    assert!(item_sensitive(&menu, RENAME));
+    assert!(
+        !item_sensitive(&menu, NEW_SESSION),
+        "the tab's focused pane shows the list"
+    );
+    menu.unparent();
+    let menu = header_menu_for(&second);
+    assert!(
+        !item_sensitive(&menu, NEW_SESSION),
+        "the pane that shows the list"
+    );
+    menu.unparent();
+    // The pane that holds a shell: offered.
+    let menu = header_menu_for(&first);
+    assert!(
+        item_sensitive(&menu, NEW_SESSION),
+        "the pane that holds a shell"
+    );
+    menu.unparent();
+    panes::focus_pane(&first);
+    let menu = tab_menu_for(&main, &page);
+    assert!(item_sensitive(&menu, NEW_SESSION), "the shell's pane");
+    menu.unparent();
+
+    // The list picked: the pane holds a shell, and both menus offer it.
+    click(&list_in_pane(&second), new_tab::LOCAL_ROW);
+    shell_of(&second);
+    assert!(holds_session(&second));
+    let menu = header_menu_for(&second);
+    assert!(
+        item_sensitive(&menu, NEW_SESSION),
+        "the pane that began a shell"
+    );
+    menu.unparent();
+    panes::focus_pane(&second);
+    let menu = tab_menu_for(&main, &page);
+    assert!(item_sensitive(&menu, NEW_SESSION));
+    menu.unparent();
+
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// "New Session…" in a pane header's menu replaces the session of THAT pane,
+/// not the focused one, even when its tab is not the one in front: the pane's
+/// tab is selected and the pane focused first. The other pane and the other
+/// tab keep their terminals.
+pub(super) fn the_pane_menu_replaces_that_pane(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the window's tab");
+    let first = pane(&page);
+    let first_old = shell_of(&first);
+    let second = split_with_local(&main, &page);
+    let second_old = shell_of(&second);
+    assert_eq!(focused(&page), second, "the new pane has the focus");
+
+    // Another tab in front, so the pane's own tab is not the selected one.
+    let (other, other_list) = new_list(&main, &ctx);
+    click(&other_list, new_tab::LOCAL_ROW);
+    let other_holder = pane(&other);
+    let other_old = shell_of(&other_holder);
+    assert_eq!(main.view.selected_page().as_ref(), Some(&other));
+
+    WidgetExt::activate_action(pane_of(&first).header(), "pane.new-session", None)
+        .expect("pane.new-session");
+    let dialog = new_session_window(&main);
+    assert_eq!(
+        main.view.selected_page().as_ref(),
+        Some(&page),
+        "the pane's tab is in front"
+    );
+    assert_eq!(focused(&page), first, "and the pane is the focused one");
+    click(&list_of(&dialog), new_tab::LOCAL_ROW);
+    gone(&main, &dialog);
+
+    let first_new = new_terminal_in(&first, &first_old);
+    assert_eq!(
+        terminal_in(&second).as_ref(),
+        Some(&second_old),
+        "the pane that was focused is untouched"
+    );
+    assert_eq!(terminal_in(&other_holder).as_ref(), Some(&other_old));
+    assert_eq!(layout_of(&page).holders(), [first.clone(), second.clone()]);
+    say(&first_new, "replaced");
+    say(&second_old, "kept");
+
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// "New Session…" in the tab menu replaces the focused pane of the tab the
+/// menu was opened for, which is selected for it: the tab in front before is
+/// left alone, as is the other pane of the menu's tab.
+pub(super) fn the_tab_menu_replaces_that_tabs_pane(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the window's tab");
+    let first = pane(&page);
+    let first_old = shell_of(&first);
+    let second = split_with_local(&main, &page);
+    let second_old = shell_of(&second);
+    // The tab's focused pane is the first, as it remembers when another tab
+    // is in front.
+    panes::focus_pane(&first);
+    assert_eq!(focused(&page), first);
+
+    let (other, other_list) = new_list(&main, &ctx);
+    click(&other_list, new_tab::LOCAL_ROW);
+    let other_holder = pane(&other);
+    let other_old = shell_of(&other_holder);
+    assert_eq!(
+        main.view.selected_page().as_ref(),
+        Some(&other),
+        "the second tab is in front"
+    );
+
+    let dialog = open_from_tab_menu(&main, &page);
+    assert_eq!(
+        main.view.selected_page().as_ref(),
+        Some(&page),
+        "the menu's tab is in front"
+    );
+    click(&list_of(&dialog), new_tab::LOCAL_ROW);
+    gone(&main, &dialog);
+
+    new_terminal_in(&first, &first_old);
+    assert_eq!(
+        terminal_in(&second).as_ref(),
+        Some(&second_old),
+        "the tab's other pane is untouched"
+    );
+    assert_eq!(
+        terminal_in(&other_holder).as_ref(),
+        Some(&other_old),
+        "so is the other tab"
+    );
+
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// The New Session window opened from a menu and closed without a pick changes
+/// nothing, and the keyboard is back in the pane's terminal: with Escape from
+/// the tab menu, and with the close button from a pane header's menu, whose
+/// button had the keyboard when the window was asked for.
+pub(super) fn cancel_gives_the_keyboard_back(dir: &Path) {
+    fs::create_dir_all(dir).expect("dir");
+    let hup = dir.join("menu.hup");
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the window's tab");
+    let holder = pane(&page);
+    let old = terminal_in(&holder).expect("a local shell");
+    trap_hangup(&old, &hup);
+    old.grab_focus();
+
+    // Escape, from the tab menu.
+    let action = main
+        .window
+        .lookup_action(panes::NEW_SESSION_ACTION)
+        .expect("win.new-session");
+    assert!(action.is_enabled());
+    let dialog = open_from_tab_menu(&main, &page);
+    // Like the window's other tab actions, it waits while a dialog is open:
+    // asking again opens no second window.
+    assert!(!action.is_enabled(), "not while the window is open");
+    WidgetExt::activate_action(&main.window, "win.new-session", None).expect("win.new-session");
+    pump_for(Duration::from_millis(300));
+    assert_eq!(
+        main.window.visible_dialog().as_ref(),
+        Some(&dialog),
+        "the same window"
+    );
+    pump_until("Local terminal to have the keyboard", || {
+        gtk::prelude::GtkWindowExt::focus(&main.window)
+            .is_some_and(|f| f.widget_name() == new_tab::LOCAL_ROW)
+    });
+    press_escape(&gtk::prelude::GtkWindowExt::focus(&main.window).expect("the focus"));
+    gone(&main, &dialog);
+    assert!(action.is_enabled(), "and again once it has closed");
+    pump_until("the keyboard back in the old terminal", || old.has_focus());
+    pump_for(Duration::from_millis(300));
+    assert!(old.has_focus(), "and it stays there");
+    assert!(!hup.exists(), "the shell was not hung up");
+    assert_eq!(terminal_in(&holder).as_ref(), Some(&old));
+
+    // The close button, from a pane header's menu whose button has the keyboard.
+    let second = split_with_local(&main, &page);
+    let second_terminal = shell_of(&second);
+    assert!(
+        header_menu_button(&second).grab_focus(),
+        "the header's menu takes the keyboard"
+    );
+    pump_until("the keyboard on the header", || {
+        !second_terminal.has_focus()
+    });
+    WidgetExt::activate_action(pane_of(&second).header(), "pane.new-session", None)
+        .expect("pane.new-session");
+    let dialog = new_session_window(&main);
+    dialog.close();
+    gone(&main, &dialog);
+    pump_until("the keyboard back in the pane's terminal", || {
+        second_terminal.has_focus()
+    });
+    assert_eq!(terminal_in(&second).as_ref(), Some(&second_terminal));
+
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A session that had already ended (a command that exited with status 1 and
+/// kept its note) is replaced by a local shell, and that shell is a session
+/// like any: when its tab closes it is hung up (its `trap` on `HUP` writes a
+/// file). Without the reset of "its child has gone" the new session would be
+/// taken for an ended one and left running when its pane closes.
+pub(super) fn an_ended_session_replaced_is_hung_up_when_its_tab_closes(dir: &Path) {
+    fs::create_dir_all(dir).expect("dir");
+    let hup = dir.join("ended.hup");
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let start = Start {
+        dir: dir.to_path_buf(),
+        title: None,
+        run: Run::Command {
+            argv: vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "echo ENDED-$((40+2)); exit 1".to_owned(),
+            ],
+            hold: false,
+        },
+        dir_refused: None,
+    };
+    let old = open_local(&main.view, zoom::DEFAULT, &start, None);
+    wait_for_text(&old, "[session ended: status 1]");
+    let page = main.view.selected_page().expect("the command's tab");
+    let holder = pane(&page);
+    assert!(holds_session(&holder), "an ended session is one to replace");
+
+    replace(&main, &holder, &ctx, new_tab::LOCAL_ROW);
+    let new = new_terminal_in(&holder, &old);
+    trap_hangup(&new, &hup);
+    pump_for(Duration::from_millis(300));
+    assert!(!hup.exists(), "the new shell runs");
+    // `new` is kept here, so only the hang-up can end the shell: a freed
+    // terminal would close its pty and hang it up all the same.
+    main.view.close_page(&page);
+    pump_until("the new shell to be hung up", || hup.exists());
+    assert!(new.parent().is_none(), "it left its pane");
+
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// A pick made through a "›" choice inside the New Session window replaces the
+/// pane as a plain click does: a profile's sequence (the fake `ssh` shows the
+/// commands it was given), Local terminal's Open with the Save transcript box
+/// checked (the new shell saves one), and a plain click on Local terminal. The
+/// keyboard ends in the new terminal each time.
+pub(super) fn a_pick_through_the_choices_replaces_the_pane(bin: &Path, dir: &Path) {
+    let fake = fake_ssh(bin, "ns-choices", "echo FAKE-END\nexec sleep 600");
+    let web = profile(&[("Marker", &["echo SEQ-MARKER"])]);
+    let transcripts = dir.join("transcripts");
+    let ctx = ctx_with(dir, std::slice::from_ref(&web));
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    configure(&ctx, &transcripts, false);
+    set_test_ssh_program(Some(fake));
+    let page = main.view.selected_page().expect("the window's tab");
+    let holder = pane(&page);
+    let local = shell_of(&holder);
+
+    // A profile's sequence, behind its ›.
+    new_tab::choose_new_session(&holder, &ctx);
+    let dialog = new_session_window(&main);
+    let (_popover, column) = open_choices(&list_of(&dialog), &web.id, connect_menu::CHOICES_NAME);
+    let choices = choices_parts(&column);
+    let labels: Vec<_> = choices.labels.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!(labels, ["Just connect", "Marker"]);
+    assert!(!choices.record.is_active());
+    choices.buttons[1].emit_clicked();
+    gone(&main, &dialog);
+    let remote = new_terminal_in(&holder, &local);
+    wait_for_text(&remote, "FAKE-END");
+    assert!(
+        ssh_args(&remote)
+            .iter()
+            .any(|a| a.contains("echo SEQ-MARKER")),
+        "{:?}",
+        ssh_args(&remote)
+    );
+    pump_until("the keyboard in the connection", || remote.has_focus());
+    assert!(!holder.recording().get(), "nothing asked for a transcript");
+
+    // Local terminal's Open, with the Save transcript box checked.
+    new_tab::choose_new_session(&holder, &ctx);
+    let dialog = new_session_window(&main);
+    let (_popover, column) = open_choices(
+        &list_of(&dialog),
+        new_tab::LOCAL_ROW,
+        connect_menu::LOCAL_CHOICES_NAME,
+    );
+    let choices = choices_parts(&column);
+    choices.record.set_active(true);
+    choices.buttons[0].emit_clicked();
+    gone(&main, &dialog);
+    let shell = new_terminal_in(&holder, &remote);
+    assert!(holder.recording().get(), "the box asked for a transcript");
+    assert_eq!(
+        *holder.kind().borrow(),
+        PaneKind::Local { started_in: None }
+    );
+    pump_until("the keyboard in the shell", || shell.has_focus());
+    say(&shell, "opened");
+
+    // A plain click on Local terminal: the new shell has the keyboard too, and
+    // the shell it replaced wrote its transcript.
+    new_tab::choose_new_session(&holder, &ctx);
+    let dialog = new_session_window(&main);
+    click(&list_of(&dialog), new_tab::LOCAL_ROW);
+    gone(&main, &dialog);
+    let plain = new_terminal_in(&holder, &shell);
+    pump_until("the keyboard in the plain shell", || plain.has_focus());
+    assert!(!holder.recording().get(), "a plain click saves nothing");
+    say(&plain, "plain");
+    let files = files_in(&transcripts);
+    assert_eq!(files.len(), 1, "the replaced shell's transcript: {files:?}");
+
+    set_test_ssh_program(None);
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }

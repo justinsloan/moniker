@@ -443,8 +443,10 @@ fn add_tab_actions(window: &adw::ApplicationWindow, view: &adw::TabView, ctx: &R
 /// `win.split-right` and `win.split-down` (a new pane beside it, which shows
 /// the new-tab list), `win.close-pane` (as its close button does; with one
 /// pane, the tab's), `win.pane-to-tab`, `win.pane-to-window`, and
-/// `win.pane-left`, `win.pane-right`, `win.pane-up` and `win.pane-down`. The
-/// window owns them, so the view and the application are held weakly.
+/// `win.pane-left`, `win.pane-right`, `win.pane-up` and `win.pane-down`, and
+/// `win.new-session` (the new-tab list in a window over it, to replace its
+/// session, issue #20). The window owns them, so the view and the application
+/// are held weakly.
 fn add_pane_actions(
     window: &adw::ApplicationWindow,
     view: &adw::TabView,
@@ -513,6 +515,25 @@ fn add_pane_actions(
             }
         ))
         .build();
+    // New Session… (issue #20): the new-tab list in a window over the focused
+    // pane of the selected tab, if that pane holds a session; a pick there
+    // replaces it. The menus' items select the pane's tab and focus the pane
+    // before they run it.
+    let new_session = gio::ActionEntry::builder(panes::NEW_SESSION_ACTION)
+        .activate(glib::clone!(
+            #[weak]
+            view,
+            #[strong]
+            ctx,
+            move |_: &adw::ApplicationWindow, _, _| {
+                if let Some(holder) = terminal_tab::selected_holder(&view)
+                    && terminal_tab::holds_session(&holder)
+                {
+                    new_tab::choose_new_session(&holder, &ctx);
+                }
+            }
+        ))
+        .build();
     let toward = |name: &str, direction: panes::Direction| {
         gio::ActionEntry::builder(name)
             .activate(glib::clone!(
@@ -528,6 +549,7 @@ fn add_pane_actions(
         close,
         to_tab,
         to_window,
+        new_session,
         toward(panes::PANE_LEFT_ACTION, panes::Direction::Left),
         toward(panes::PANE_RIGHT_ACTION, panes::Direction::Right),
         toward(panes::PANE_UP_ACTION, panes::Direction::Up),

@@ -1369,8 +1369,10 @@ pub(super) fn the_tab_menu_renames_the_tab_it_was_opened_for() {
     let second = new_holder_page(&fx.view, "Second");
     assert_eq!(fx.view.selected_page().as_ref(), Some(&second));
 
+    // "Rename…", then "New Session…" (issue #20; its own scenarios are in
+    // `new_session`).
     let menu = fx.view.menu_model().expect("a tab menu");
-    assert_eq!(menu.n_items(), 1);
+    assert_eq!(menu.n_items(), 2);
     let label = menu.item_attribute_value(0, "label", None);
     let action = menu.item_attribute_value(0, "action", None);
     assert_eq!(label.as_ref().and_then(|v| v.str()), Some("Rename\u{2026}"));

@@ -704,6 +704,10 @@ pub(super) fn the_header_acts_on_its_own_pane(bin: &Path, dir: &Path) {
         items,
         [
             ("Rename\u{2026}".to_owned(), "pane.rename".to_owned()),
+            (
+                "New Session\u{2026}".to_owned(),
+                "pane.new-session".to_owned()
+            ),
             ("Move to New Tab".to_owned(), "pane.pane-to-tab".to_owned()),
             (
                 "Move to New Window".to_owned(),

@@ -770,10 +770,16 @@ impl<F: FnOnce() + 'static> MenuWait<F> {
     }
 }
 
-/// The tab menu: what the person gets by right clicking a tab.
+/// The tab menu: what the person gets by right clicking a tab. "Rename…", then
+/// "New Session…" (issue #20), which replaces the session of the tab's focused
+/// pane.
 fn tab_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(Some("Rename\u{2026}"), Some("tab.rename"));
+    menu.append(
+        Some(panes::NEW_SESSION_ITEM),
+        Some(&format!("tab.{}", panes::NEW_SESSION_ACTION)),
+    );
     menu
 }
 
@@ -797,7 +803,11 @@ const TAB_VIEW_SHORTCUTS: adw::TabViewShortcuts = adw::TabViewShortcuts::NONE;
 ///   and ends their sessions ([`end_session`]): each child is hung up, and its
 ///   one-time askpass marker is removed once it has exited.
 /// * The menu's "Rename…" is the action `tab.rename`, on the page the menu was
-///   opened for.
+///   opened for. Its "New Session…" is `tab.new-session`: it selects that page
+///   and runs `win.new-session`, which offers the new-tab list in a window over
+///   the tab's focused pane, to replace that pane's session (issue #20). It
+///   can be chosen only while that pane holds a session ([`holds_session`]),
+///   which is looked at when the menu opens for the page.
 /// * When the last page goes the window closes. A page leaving for another
 ///   window (`page-detached`) writes nothing and keeps its askpass markers: its
 ///   sessions carry on over there.
@@ -839,12 +849,19 @@ pub fn setup_tab_view(view: &adw::TabView) {
     // also says so (with no page) when it closes, which may be before the action
     // runs, so that is ignored and the weak reference keeps a closed page away.
     let menu_page = Rc::new(glib::WeakRef::<adw::TabPage>::new());
+    let new_session = gio::SimpleAction::new(panes::NEW_SESSION_ACTION, None);
+    new_session.set_enabled(false);
     view.connect_setup_menu(glib::clone!(
         #[strong]
         menu_page,
+        #[weak]
+        new_session,
         move |_, page| {
             if let Some(page) = page {
                 menu_page.set(Some(page));
+                // Only where there is a session to replace: not on a pane that
+                // shows the new-tab list.
+                new_session.set_enabled(holder_of(page).is_some_and(|h| holds_session(&h)));
             }
         }
     ));
@@ -852,14 +869,43 @@ pub fn setup_tab_view(view: &adw::TabView) {
     // focus back a moment later, which would take it from the dialog's name
     // field. So the dialog opens once the focus has left the menu.
     let rename = gio::SimpleAction::new("rename", None);
-    rename.connect_activate(move |_, _| {
-        if let Some(page) = menu_page.upgrade() {
-            let window = page.child().root().and_downcast::<gtk::Window>();
-            after_the_menu_lets_go(window.as_ref(), move || ask_rename(&page));
+    rename.connect_activate(glib::clone!(
+        #[strong]
+        menu_page,
+        move |_, _| {
+            if let Some(page) = menu_page.upgrade() {
+                let window = page.child().root().and_downcast::<gtk::Window>();
+                after_the_menu_lets_go(window.as_ref(), move || ask_rename(&page));
+            }
         }
-    });
+    ));
+    // The same wait, then the tab is selected (the window's action acts on the
+    // focused pane of the selected tab), unless it went meanwhile.
+    new_session.connect_activate(glib::clone!(
+        #[strong]
+        menu_page,
+        #[weak]
+        view,
+        move |_, _| {
+            if let Some(page) = menu_page.upgrade() {
+                let window = page.child().root().and_downcast::<gtk::Window>();
+                after_the_menu_lets_go(window.as_ref(), move || {
+                    let in_view = page
+                        .child()
+                        .ancestor(adw::TabView::static_type())
+                        .is_some_and(|ancestor| &ancestor == view.upcast_ref::<gtk::Widget>());
+                    if in_view {
+                        view.set_selected_page(&page);
+                        let _ = view
+                            .activate_action(&format!("win.{}", panes::NEW_SESSION_ACTION), None);
+                    }
+                });
+            }
+        }
+    ));
     let actions = gio::SimpleActionGroup::new();
     actions.add_action(&rename);
+    actions.add_action(&new_session);
     // The menu's popover hangs off the tab bar, not off the view, so the actions
     // go on the window around both.
     let install = move |view: &adw::TabView| {
@@ -1439,13 +1485,14 @@ pub(crate) fn paste_clipboard(view: &adw::TabView) {
 
 /// The main window's actions that act on its tabs and panes, enabled whenever
 /// no dialog is open over the window ([`sync_window_actions`]).
-const TAB_WINDOW_ACTIONS: [&str; 6] = [
+const TAB_WINDOW_ACTIONS: [&str; 7] = [
     NEW_TAB_ACTION,
     panes::CLOSE_PANE_ACTION,
     NEXT_TAB_ACTION,
     PREVIOUS_TAB_ACTION,
     panes::SPLIT_RIGHT_ACTION,
     panes::SPLIT_DOWN_ACTION,
+    panes::NEW_SESSION_ACTION,
 ];
 
 /// The main window's actions that act among the panes of the selected tab
@@ -1483,9 +1530,10 @@ const TERMINAL_WINDOW_ACTIONS: [&str; 5] = [
 ///   while the selected tab has two panes or more.
 /// * While a dialog is open over the window (Rename, About, Keyboard Shortcuts, a
 ///   confirmation), every one of these actions is disabled, the tab actions
-///   (new, close, next, previous) as well. GTK runs application accelerators from
-///   the window's capture-phase shortcut controller, before the focused widget,
-///   and a dialog is a widget of that window: left enabled, Ctrl+Shift+V would
+///   (new, close, next, previous, split, new session) as well. GTK runs
+///   application accelerators from the window's capture-phase shortcut
+///   controller, before the focused widget, and a dialog is a widget of that
+///   window: left enabled, Ctrl+Shift+V would
 ///   paste into the terminal behind the dialog instead of its text field,
 ///   Ctrl+plus would resize that terminal, and Ctrl+Shift+W would close its
 ///   tab. App actions (New Window) are not tab actions and stay as they are.
@@ -1577,10 +1625,6 @@ pub(crate) fn new_holder_page_at(
 /// runs, or after it has ended with its note. Not a pane that shows the
 /// new-tab list or nothing yet: there is no session to replace there (issue
 /// #20).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the New Session menu items use it (issue #20)")
-)]
 pub(crate) fn holds_session(holder: &PaneHolder) -> bool {
     matches!(
         *holder.kind().borrow(),
@@ -2080,6 +2124,8 @@ pub(crate) fn start_shell_in(
     root::watch_local(holder, &terminal);
     // The shell reports its own folder.
     holder.kind().replace(PaneKind::Local { started_in: None });
+    // The pane holds a session now (New Session… is offered).
+    refresh_title(holder);
     // A shell that exits closes its pane, and closing a pane or a tab writes
     // the transcript ([`close_pane`], `setup_tab_view`), so there is nothing
     // more to do when it exits. Not a pane that no longer shows it: one that
@@ -2131,6 +2177,8 @@ pub(crate) fn start_command_in(
     holder.kind().replace(PaneKind::Local {
         started_in: started_in(dir),
     });
+    // The pane holds a session now (New Session… is offered).
+    refresh_title(holder);
     let session = start_recording(&terminal, transcript);
     end_as_a_command(holder, &terminal, session, hold);
     follow_program_title(holder, &terminal);
@@ -2187,6 +2235,8 @@ pub(crate) fn start_sequence_in(
     holder.kind().replace(PaneKind::Local {
         started_in: started_in(dir),
     });
+    // The pane holds a session now (New Session… is offered).
+    refresh_title(holder);
     let session = start_recording(&terminal, transcript);
     end_as_a_command(holder, &terminal, session, false);
     follow_program_title(holder, &terminal);
