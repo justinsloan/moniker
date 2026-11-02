@@ -1632,11 +1632,23 @@ mod tests {
                 text: "moniker: arguments must be valid UTF-8\n".to_string()
             }
         );
-        // The version is the package's, which is a version number.
+        // The version is the package's, which is a version number: three
+        // numbers with dots between them, whatever the release.
         let Local::Print { text, .. } = said(&["--version"]) else {
             panic!("printed");
         };
-        assert!(text.starts_with("moniker 0."), "{text:?}");
+        let version = text
+            .strip_prefix("moniker ")
+            .and_then(|rest| rest.strip_suffix('\n'))
+            .unwrap_or_else(|| panic!("{text:?}"));
+        let numbers: Vec<&str> = version.split('.').collect();
+        assert!(
+            numbers.len() == 3
+                && numbers
+                    .iter()
+                    .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+            "{text:?}"
+        );
     }
 
     #[test]
