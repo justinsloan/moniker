@@ -705,6 +705,7 @@ fn gui_integration() {
     save_transcripts::the_launch_tab_saves_when_save_all_is_on(&tmp.path().join("v-launch"));
     save_transcripts::transcripts_go_to_the_chosen_folder(&bin, &tmp.path().join("v-folder"));
     preferences::preferences_has_the_four_settings_and_sync(&tmp.path().join("f-rows"));
+    preferences::the_style_row_sets_the_application_style(&tmp.path().join("f-style"));
     preferences::changing_the_font_applies_to_open_terminals(&tmp.path().join("f-font"));
     preferences::the_font_can_go_back_to_the_system_font(&tmp.path().join("f-reset"));
     preferences::scrollback_applies_to_new_ordinary_tabs(&tmp.path().join("f-scroll"));

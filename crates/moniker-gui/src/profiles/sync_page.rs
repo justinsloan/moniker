@@ -1041,8 +1041,9 @@ pub(crate) fn ask_to_turn_sync_on(
 
 /// A list item factory for a string list whose labels show the text as it is
 /// (Pango markup off): the entries are profile names, or the names of a
-/// profile's sequences (the profile page's default sequence row uses it too).
-pub(super) fn plain_text_factory() -> gtk::SignalListItemFactory {
+/// profile's sequences (the profile page's default sequence row uses it too),
+/// or the fixed choices of the Preferences' Style row, which shares it.
+pub(crate) fn plain_text_factory() -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {

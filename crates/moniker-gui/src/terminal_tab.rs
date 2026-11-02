@@ -163,14 +163,15 @@
 //! it runs if its profile signs in as `root` ([`Launch::as_root`],
 //! [`start_launch`]), and not once it has ended ([`connection_ended`]).
 //!
-//! # Font, scrollback and the root marks
+//! # Font, scrollback, the root marks and the style
 //!
 //! The Preferences' terminal font ([`apply_font`]) applies to every open
 //! terminal at once and to every new one; the scrollback of ordinary tabs
 //! ([`set_scrollback`]) applies to tabs opened after the change. Both are kept
 //! here for [`new_terminal`] and set once per terminal, never per frame. The
 //! switch "Show when a session runs as root" is kept in `crate::root`
-//! (`root::set_enabled`); [`use_preferences`] takes all three from the
+//! (`root::set_enabled`) and the application's style in `crate::theme`
+//! (`theme::use_style`); [`use_preferences`] takes all four from the
 //! settings file at launch.
 
 use std::cell::{Cell, RefCell};
@@ -1230,16 +1231,20 @@ thread_local! {
     static SCROLLBACK: Cell<c_long> = const { Cell::new(settings::SCROLLBACK_DEFAULT as c_long) };
 }
 
-/// Take the terminal font, the scrollback and whether root sessions are marked
-/// from `settings` (the settings file read at launch): the open terminals get
-/// the font, new tabs the scrollback, and the open windows the marks.
+/// Take the terminal font, the scrollback, whether root sessions are marked and
+/// the application's style from `settings` (the settings file read at launch):
+/// the open terminals get the font, new tabs the scrollback, the open windows
+/// the marks, and every window the style.
 ///
-/// The marks are touched only if the setting differs from what they are now.
-/// This runs once per process, from `main::launch` on the first launch, when no
-/// window is open yet; the guard is defensive, so that a caller that finds the
-/// marks as the file says never starts the checks of the windows already open
-/// over again.
+/// This runs once per process, from `main::launch` on the first launch, as the
+/// first thing it does: no window is open yet, and the first one is built after
+/// the style is in force, so a dark choice never shows a light window first.
+/// The marks are touched only if the setting differs from what they are now;
+/// that guard is defensive, so that a caller that finds the marks as the file
+/// says never starts the checks of the windows already open over again. The
+/// style needs none: the same style again changes nothing.
 pub(crate) fn use_preferences(settings: &GuiSettings) {
+    theme::use_style(settings.style);
     apply_font(font_description(settings.font.as_deref()).as_ref());
     set_scrollback(settings.scrollback_lines);
     if root::enabled() != settings.mark_root {

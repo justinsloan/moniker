@@ -2,6 +2,10 @@
 //! `adw::PreferencesDialog` over the window it was opened from, so, like every
 //! dialog, it pauses that window's tab and terminal shortcuts while it is open.
 //!
+//! * **Appearance**: "Style", Follow System, Light or Dark for the whole
+//!   application (the header bars, menus, dialogs, lists and side windows),
+//!   applied at once in every window (`theme::use_style`). The terminal is dark
+//!   under every choice. Follow System is the default.
 //! * **Terminal**: the font (a font chooser that offers monospace fonts only;
 //!   with none chosen the button shows the system monospace font, and while one
 //!   is chosen a reset button beside it goes back to that), used at once by
@@ -53,8 +57,8 @@ use moniker_core::transcript::{MoveReport, move_transcripts, prepare_folder};
 
 use crate::context::AppContext;
 use crate::notify;
-use crate::settings::{self, GuiSettings};
-use crate::{profiles, recordings, root, sessions_menu, terminal_tab, window};
+use crate::settings::{self, GuiSettings, Style};
+use crate::{profiles, recordings, root, sessions_menu, terminal_tab, theme, window};
 
 /// Widget name of the dialog, how [`present`] finds an open one.
 const DIALOG_NAME: &str = "moniker-preferences";
@@ -66,6 +70,18 @@ const CHOOSE_NAME: &str = "preferences-choose-folder";
 
 /// Widget name of the Font row's reset button, how the tests find it.
 const FONT_RESET_NAME: &str = "preferences-font-reset";
+
+const APPEARANCE_TITLE: &str = "Appearance";
+const STYLE_TITLE: &str = "Style";
+const STYLE_SUBTITLE: &str = "The terminal is always dark.";
+/// The Style row's choices, in the order it lists them: each style with its
+/// text. The row's list and the way a position is read back both come from
+/// this one table.
+const STYLE_CHOICES: [(Style, &str); 3] = [
+    (Style::Follow, "Follow System"),
+    (Style::Light, "Light"),
+    (Style::Dark, "Dark"),
+];
 
 const FONT_SUBTITLE: &str = "Used by every terminal; changes apply at once";
 const FONT_RESET_TOOLTIP: &str = "Use the System Font";
@@ -215,6 +231,7 @@ fn named<T: IsA<gtk::Widget>>(root: &impl IsA<gtk::Widget>, name: &str) -> Optio
 fn build(app: &adw::Application, ctx: &Rc<AppContext>) -> adw::PreferencesDialog {
     let now = ctx.settings();
     let page = adw::PreferencesPage::new();
+    page.add(&appearance_group(ctx, &now));
     page.add(&terminal_group(ctx, &now));
     page.add(&sessions_group(ctx, &now));
     page.add(&profiles_group(ctx, &now));
@@ -299,6 +316,65 @@ fn switch_row(
                 apply(on);
             } else {
                 row.set_active(saved.get());
+            }
+        }
+    ));
+    row
+}
+
+// ----- Appearance -----
+
+fn appearance_group(ctx: &Rc<AppContext>, now: &GuiSettings) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title(APPEARANCE_TITLE)
+        .build();
+    group.add(&style_row(ctx, now.style));
+    group
+}
+
+/// The position of `style` in [`STYLE_CHOICES`].
+fn style_position(style: Style) -> u32 {
+    STYLE_CHOICES
+        .iter()
+        .position(|(choice, _)| *choice == style)
+        .map_or(0, |index| index as u32)
+}
+
+/// The Style row: Follow System, Light or Dark for the whole application,
+/// which the file now says is `now`. A choice is saved at once ([`save`]) and
+/// then made the style of every window ([`theme::use_style`]); one that cannot
+/// be saved is not used, and the row goes back. The terminal is not touched:
+/// it is dark under every choice, which the subtitle says.
+///
+/// The choices are fixed texts, shown plain like every text in the dialog; the
+/// list uses the profile pages' plain-text factory.
+fn style_row(ctx: &Rc<AppContext>, now: Style) -> adw::ComboRow {
+    let texts: Vec<&str> = STYLE_CHOICES.iter().map(|(_, text)| *text).collect();
+    let row = adw::ComboRow::builder()
+        .title(STYLE_TITLE)
+        .subtitle(STYLE_SUBTITLE)
+        .use_markup(false)
+        .factory(&profiles::sync_page::plain_text_factory())
+        .model(&gtk::StringList::new(&texts))
+        .selected(style_position(now))
+        .build();
+    let saved = Cell::new(now);
+    row.connect_selected_notify(glib::clone!(
+        #[strong]
+        ctx,
+        move |row| {
+            // No position (nothing selected) is no choice.
+            let Some(&(chosen, _)) = STYLE_CHOICES.get(row.selected() as usize) else {
+                return;
+            };
+            if chosen == saved.get() {
+                return;
+            }
+            if save(&ctx, row, |s| s.style = chosen) {
+                saved.set(chosen);
+                theme::use_style(chosen);
+            } else {
+                row.set_selected(style_position(saved.get()));
             }
         }
     ));

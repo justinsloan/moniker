@@ -33,7 +33,7 @@ use super::{
 };
 use crate::context::AppContext;
 use crate::terminal_tab::{self, TranscriptSpec, open_local_shell, terminal_of};
-use crate::{preferences, profiles, recordings, settings, window, zoom};
+use crate::{preferences, profiles, recordings, settings, theme, window, zoom};
 
 /// The Preferences dialog over `main`, as ☰ → Preferences opens it.
 fn open(
@@ -106,11 +106,13 @@ fn assert_notice_starts(ctx: &AppContext, start: &str) {
     assert!(last.starts_with(start), "{last:?} starts with {start:?}");
 }
 
-/// The Preferences dialog has the groups and rows of the design: Terminal (Font,
-/// a font button limited to monospace fonts; Scrollback, 1,000 to 1,000,000 in
-/// steps of 1,000), Transcripts (with the warning; the save-all switch, off; the
-/// folder, plain text, with Choose…) and Sync (Open). It is a dialog over the
-/// main window, so the window's tab and terminal actions pause while it is open.
+/// The Preferences dialog has the groups and rows of the design: Appearance
+/// first (the Style row, see [`the_style_row_sets_the_application_style`]),
+/// Terminal (Font, a font button limited to monospace fonts; Scrollback, 1,000
+/// to 1,000,000 in steps of 1,000), Transcripts (with the warning; the save-all
+/// switch, off; the folder, plain text, with Choose…) and Sync (Open). It is a
+/// dialog over the main window, so the window's tab and terminal actions pause
+/// while it is open.
 pub(super) fn preferences_has_the_four_settings_and_sync(dir: &Path) {
     let folder = dir.join("<b>transcripts</b> &amp;");
     let ctx = ctx_with(dir, &[]);
@@ -245,6 +247,7 @@ pub(super) fn preferences_has_the_four_settings_and_sync(dir: &Path) {
     assert_eq!(
         titles,
         [
+            "Appearance",
             "Terminal",
             "Layouts",
             "Connection Profiles",
@@ -286,6 +289,158 @@ pub(super) fn preferences_has_the_four_settings_and_sync(dir: &Path) {
             .is_some_and(|a| a.is_enabled()),
         "the actions come back"
     );
+    main.window.destroy();
+    pump_for(Duration::from_millis(200));
+}
+
+/// Puts the application's style back to the system's when dropped, also on the
+/// way out of a failing assertion: the style is the whole process's, and the
+/// scenarios after this one expect the system's.
+struct StyleBack;
+
+impl Drop for StyleBack {
+    fn drop(&mut self) {
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::Default);
+    }
+}
+
+/// The `"style"` the settings file of `ctx` holds, if it has one.
+fn style_in_file(ctx: &AppContext) -> Option<String> {
+    let text = fs::read_to_string(&ctx.settings_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value["style"].as_str().map(str::to_owned)
+}
+
+/// The Style row, alone in the first group, Appearance, picks the style
+/// of the whole application at once and saves it: Dark forces dark, Light forces
+/// light, Follow System goes back to the system's. The terminal is the dark
+/// palette's under every choice. The same choice again writes nothing. A choice
+/// that cannot be saved (a damaged settings file) is not used: the row goes
+/// back, the style stays and the file is left byte for byte. A launch takes the
+/// style from the settings (`terminal_tab::use_preferences`).
+pub(super) fn the_style_row_sets_the_application_style(dir: &Path) {
+    let _back = StyleBack;
+    let manager = adw::StyleManager::default();
+    assert_eq!(
+        manager.color_scheme(),
+        adw::ColorScheme::Default,
+        "the system's style to start with"
+    );
+    let ctx = ctx_with(dir, &[]);
+    let app = test_app();
+    let main = main_window(&app, &ctx);
+    let terminal = terminal_of(&main.view.selected_page().expect("a tab")).expect("a shell");
+    let dark = theme::palette().background;
+    assert_eq!(terminal.color_background_for_draw(), dark);
+
+    // The first group has the row alone, with its texts and three choices.
+    let dialog = open(&app, &ctx, &main);
+    let page = dialog.visible_page().expect("the page");
+    let appearance = all_widgets::<adw::PreferencesGroup>(&page)
+        .into_iter()
+        .next()
+        .expect("a group");
+    assert_eq!(appearance.title(), "Appearance", "the first group");
+    let mut rows = all_widgets::<adw::PreferencesRow>(&appearance);
+    assert_eq!(rows.len(), 1, "the Style row alone");
+    let row = rows
+        .pop()
+        .and_then(|row| row.downcast::<adw::ComboRow>().ok())
+        .expect("a drop-down");
+    assert_plain_row(
+        "style row",
+        row.upcast_ref(),
+        "Style",
+        Some("The terminal is always dark."),
+    );
+    assert_eq!(
+        super::profiles::items_of(&row),
+        ["Follow System", "Light", "Dark"]
+    );
+    assert_eq!(row.selected(), 0);
+    assert_eq!(super::profiles::shown_item(&row), "Follow System");
+    assert_eq!(ctx.settings().style, settings::Style::Follow);
+
+    // Dark: forced dark and saved, the terminal as it was.
+    row.set_selected(2);
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::ForceDark);
+    assert!(manager.is_dark());
+    assert_eq!(style_in_file(&ctx).as_deref(), Some("dark"));
+    assert_eq!(ctx.settings().style, settings::Style::Dark);
+    assert_eq!(terminal.color_background_for_draw(), dark);
+
+    // Light: forced light, the terminal still dark.
+    row.set_selected(1);
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::ForceLight);
+    assert!(!manager.is_dark());
+    assert_eq!(style_in_file(&ctx).as_deref(), Some("light"));
+    assert_eq!(terminal.color_background_for_draw(), dark);
+
+    // The same choice again, as a position set again and as a notification
+    // that arrives with the value already saved, writes nothing.
+    let bytes = fs::read(&ctx.settings_path).expect("the settings file");
+    let modified = fs::metadata(&ctx.settings_path)
+        .and_then(|m| m.modified())
+        .expect("its time");
+    row.set_selected(1);
+    row.notify("selected");
+    pump_for(Duration::from_millis(100));
+    assert_eq!(fs::read(&ctx.settings_path).unwrap(), bytes, "unchanged");
+    assert_eq!(
+        fs::metadata(&ctx.settings_path)
+            .and_then(|m| m.modified())
+            .unwrap(),
+        modified,
+        "not written again"
+    );
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::ForceLight);
+
+    // A choice that cannot be saved is not used: the row goes back, the style
+    // stays, the file is left as it is.
+    let damaged = damage_settings(&ctx);
+    let shown = ctx.notice.delivered();
+    row.set_selected(2);
+    pump_until("the row to go back", || row.selected() == 1);
+    pump_for(Duration::from_millis(100));
+    assert_eq!(row.selected(), 1, "it stays back");
+    assert_notice_starts(&ctx, "Could not save the preferences: ");
+    assert_eq!(ctx.notice.delivered(), shown + 1, "one notice");
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::ForceLight);
+    assert!(!manager.is_dark());
+    assert_eq!(terminal.color_background_for_draw(), dark);
+    assert_eq!(
+        fs::read_to_string(&ctx.settings_path).unwrap(),
+        damaged,
+        "the damaged file is left as it is"
+    );
+    // The damage removed (the file as it was before it), choosing works again.
+    fs::write(&ctx.settings_path, &bytes).expect("put the file back");
+
+    // Follow System: the system's style again, saved by its name.
+    row.set_selected(0);
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::Default);
+    assert_eq!(style_in_file(&ctx).as_deref(), Some("follow"));
+    assert_eq!(ctx.settings().style, settings::Style::Follow);
+    assert_eq!(terminal.color_background_for_draw(), dark);
+
+    close_dialog(&main, &dialog);
+
+    // A launch takes the style from the settings, before any window.
+    terminal_tab::use_preferences(&settings::GuiSettings {
+        style: settings::Style::Dark,
+        ..ctx.settings()
+    });
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::ForceDark);
+    assert!(manager.is_dark());
+    terminal_tab::use_preferences(&settings::GuiSettings {
+        style: settings::Style::Light,
+        ..ctx.settings()
+    });
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::ForceLight);
+    terminal_tab::use_preferences(&ctx.settings());
+    assert_eq!(manager.color_scheme(), adw::ColorScheme::Default);
+    assert_eq!(terminal.color_background_for_draw(), dark);
+
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }

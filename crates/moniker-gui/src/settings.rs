@@ -2,9 +2,9 @@
 //! machine automatic sync and Sync Now talk to), whether to sync
 //! automatically on launch, the text size the next launch starts at, and the
 //! Preferences (terminal font, scrollback lines, whether to mark a session that
-//! runs as root, whether to show the Layouts button, whether to ping the saved
-//! hosts, whether to save a transcript of every session, and the transcripts
-//! folder). Local terminal's startup sequences are not here but in a file of
+//! runs as root, the style of the whole application, whether to show the
+//! Layouts button, whether to ping the saved hosts, whether to save a
+//! transcript of every session, and the transcripts folder). Local terminal's startup sequences are not here but in a file of
 //! their own ([`crate::local_terminal`]).
 //!
 //! They live in `gui-settings.json` next to `profiles.json` ([`default_path`]),
@@ -94,6 +94,11 @@ pub struct GuiSettings {
     /// tab turn red (`crate::root`; the Preferences switch, on by default).
     /// Off, nothing is checked and nothing is marked.
     pub mark_root: bool,
+    /// The style of the whole application (the Preferences' Style, issue #19):
+    /// the system's, or light or dark whatever the system says. The terminal
+    /// area is dark under every choice. Written as the name [`Style::as_str`]
+    /// gives; a missing, mistyped or unknown value is [`Style::Follow`].
+    pub style: Style,
     /// The size of the main window that closed last, which new main windows
     /// open at (issue #14); `None` is the built-in size.
     pub main_window: Option<WindowSize>,
@@ -101,6 +106,52 @@ pub struct GuiSettings {
     pub profiles_window: Option<WindowSize>,
     /// The same for the Transcripts window.
     pub transcripts_window: Option<WindowSize>,
+}
+
+/// The style of the whole application: what the Preferences' Style row
+/// chooses, and `"style"` in the settings file.
+///
+/// The three are libadwaita's own color schemes (`crate::theme::scheme_of`).
+/// Only the terminal area ignores them: it is always dark.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Style {
+    /// The system's style, light or dark as the desktop says (the default).
+    #[default]
+    Follow,
+    /// Light, whatever the system says.
+    Light,
+    /// Dark, whatever the system says.
+    Dark,
+}
+
+impl Style {
+    /// The name the settings file holds: `"follow"`, `"light"` or `"dark"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Style::Follow => "follow",
+            Style::Light => "light",
+            Style::Dark => "dark",
+        }
+    }
+
+    /// The style `value` names. Only the three exact, lowercase strings name
+    /// one; anything else (another case, another string, another type) is
+    /// [`Style::Follow`], so a hand-edit slip never forces a style.
+    pub fn from_value(value: &serde_json::Value) -> Style {
+        match value.as_str() {
+            Some("light") => Style::Light,
+            Some("dark") => Style::Dark,
+            _ => Style::Follow,
+        }
+    }
+}
+
+impl Serialize for Style {
+    /// As its name ([`Style::as_str`]), the only form [`Style::from_value`]
+    /// reads.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
 }
 
 /// A window's size as it was when it closed: its size when not maximized or
@@ -207,6 +258,9 @@ impl GuiSettings {
                 .get("mark_root")
                 .and_then(Value::as_bool)
                 .unwrap_or(defaults.mark_root),
+            style: fields
+                .get("style")
+                .map_or(defaults.style, Style::from_value),
             main_window: fields.get("main_window").and_then(WindowSize::from_json),
             profiles_window: fields
                 .get("profiles_window")
@@ -250,6 +304,7 @@ impl Default for GuiSettings {
             ping_hosts: true,
             show_sessions: true,
             mark_root: true,
+            style: Style::Follow,
             main_window: None,
             profiles_window: None,
             transcripts_window: None,
@@ -409,6 +464,7 @@ mod tests {
             ping_hosts: false,
             show_sessions: false,
             mark_root: false,
+            style: Style::Dark,
             main_window: Some(WindowSize {
                 width: 1200,
                 height: 800,
@@ -594,6 +650,7 @@ mod tests {
             ping_hosts: false,
             show_sessions: false,
             mark_root: false,
+            style: Style::Light,
             main_window: Some(WindowSize {
                 width: 1000,
                 height: 600,
@@ -744,6 +801,7 @@ mod tests {
             assert!(loaded.ping_hosts, "{text}: on unless turned off");
             assert!(loaded.show_sessions, "{text}: shown unless turned off");
             assert!(loaded.mark_root, "{text}: marked unless turned off");
+            assert_eq!(loaded.style, Style::Follow, "{text}: the system's style");
             assert_eq!(loaded.main_window, None, "{text}");
             assert_eq!(loaded.profiles_window, None, "{text}");
             assert_eq!(loaded.transcripts_window, None, "{text}");
@@ -896,6 +954,122 @@ mod tests {
     }
 
     #[test]
+    fn the_style_follows_the_system_unless_the_file_names_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        // No key at all.
+        fs::write(&path, "{}").unwrap();
+        assert_eq!(load(&path).style, Style::Follow, "a missing key");
+        assert_eq!(GuiSettings::default().style, Style::Follow);
+        // The three values are exact, lowercase strings.
+        for (text, want) in [
+            (r#"{"style": "follow"}"#, Style::Follow),
+            (r#"{"style": "light"}"#, Style::Light),
+            (r#"{"style": "dark"}"#, Style::Dark),
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(load(&path).style, want, "{text}");
+        }
+        // Anything else, whatever its type, is Follow System.
+        for text in [
+            r#"{"style": "Dark"}"#,
+            r#"{"style": "DARK"}"#,
+            r#"{"style": "Light"}"#,
+            r#"{"style": " dark"}"#,
+            r#"{"style": ""}"#,
+            r#"{"style": "auto"}"#,
+            r#"{"style": 1}"#,
+            r#"{"style": true}"#,
+            r#"{"style": null}"#,
+            r#"{"style": ["dark"]}"#,
+            r#"{"style": {"dark": true}}"#,
+        ] {
+            fs::write(&path, text).unwrap();
+            assert_eq!(load(&path).style, Style::Follow, "{text}");
+        }
+        // A wrong style costs the other settings nothing.
+        fs::write(
+            &path,
+            r#"{"style": 7, "auto_sync": false, "font_scale": 1.5}"#,
+        )
+        .unwrap();
+        let loaded = load(&path);
+        assert_eq!(loaded.style, Style::Follow);
+        assert!(!loaded.auto_sync);
+        assert_eq!(loaded.font_scale, 1.5);
+    }
+
+    #[test]
+    fn each_style_is_written_as_its_name_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        for (style, name) in [
+            (Style::Follow, "follow"),
+            (Style::Light, "light"),
+            (Style::Dark, "dark"),
+        ] {
+            assert_eq!(style.as_str(), name);
+            assert_eq!(Style::from_value(&serde_json::json!(name)), style);
+            let settings = GuiSettings {
+                style,
+                ..GuiSettings::default()
+            };
+            save(&path, &settings).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(written["style"], serde_json::json!(name));
+            assert_eq!(load(&path), settings);
+        }
+    }
+
+    #[test]
+    fn choosing_a_style_writes_only_that_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        let before = GuiSettings {
+            sync_partner: Some(ID.to_owned()),
+            auto_sync: false,
+            font: Some("Monospace 11".to_owned()),
+            ..GuiSettings::default()
+        };
+        save(&path, &before).unwrap();
+        let mut fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+
+        update(&path, |s| s.style = Style::Dark).unwrap();
+        fields.insert("style".to_owned(), serde_json::json!("dark"));
+        let after: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after, fields, "only style differs from the file before");
+        assert_eq!(
+            load(&path),
+            GuiSettings {
+                style: Style::Dark,
+                ..before.clone()
+            }
+        );
+        assert_eq!(mode(&path), 0o600);
+
+        // The same choice again writes nothing.
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let bytes = fs::read(&path).unwrap();
+        update(&path, |s| s.style = Style::Dark).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+
+        update(&path, |s| s.style = Style::Follow).unwrap();
+        assert_eq!(load(&path), before);
+    }
+
+    #[test]
+    fn choosing_the_style_the_default_has_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        update(&path, |s| s.style = Style::Follow).unwrap();
+        assert!(!path.exists(), "Follow System is the default");
+    }
+
+    #[test]
     fn good_preference_values_are_read_as_they_are() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
@@ -1045,6 +1219,7 @@ mod tests {
             ping_hosts: false,
             show_sessions: false,
             mark_root: false,
+            style: Style::Dark,
             main_window: Some(WindowSize {
                 width: 1000,
                 height: 600,

@@ -3,7 +3,8 @@
 //!
 //! The terminal area is always dark (issue #19, the user's word "always");
 //! everything around it, the header bars, menus, dialogs and lists, follows the
-//! application's style. Colors are set once on a terminal ([`paint`]) and never
+//! application's style, which the Preferences' Style setting can force
+//! ([`use_style`]). Colors are set once on a terminal ([`paint`]) and never
 //! change, so there is no style handler and nothing runs per frame: this costs
 //! the render path nothing.
 //!
@@ -18,8 +19,11 @@ use std::cell::RefCell;
 use gtk::gdk;
 use gtk::glib;
 use gtk4 as gtk;
+use libadwaita as adw;
 use vte4::Terminal;
 use vte4::prelude::*;
+
+use crate::settings::Style;
 
 /// The terminal's colors.
 pub struct Palette {
@@ -47,6 +51,24 @@ pub fn palette() -> Palette {
         ]
         .map(rgb),
     }
+}
+
+/// The color scheme libadwaita uses for `style`: Follow System leaves the
+/// choice to the desktop, Light and Dark force it.
+pub fn scheme_of(style: Style) -> adw::ColorScheme {
+    match style {
+        Style::Follow => adw::ColorScheme::Default,
+        Style::Light => adw::ColorScheme::ForceLight,
+        Style::Dark => adw::ColorScheme::ForceDark,
+    }
+}
+
+/// Make `style` the style of the whole application, in every window at once
+/// (libadwaita's style manager is the application's, not a window's). A
+/// terminal is not touched: its palette is set once and is dark under every
+/// style. The same style again changes nothing.
+pub fn use_style(style: Style) {
+    adw::StyleManager::default().set_color_scheme(scheme_of(style));
 }
 
 /// Give `terminal` the palette now, and remember it so that [`live_terminals`]
@@ -91,6 +113,14 @@ mod tests {
     /// Relative brightness, 0 (black) to 1 (white), from the sRGB channels.
     fn luminance(color: &gdk::RGBA) -> f32 {
         0.2126 * color.red() + 0.7152 * color.green() + 0.0722 * color.blue()
+    }
+
+    /// Follow System leaves the choice to the desktop, Light and Dark force it.
+    #[test]
+    fn each_style_maps_to_its_color_scheme() {
+        assert_eq!(scheme_of(Style::Follow), adw::ColorScheme::Default);
+        assert_eq!(scheme_of(Style::Light), adw::ColorScheme::ForceLight);
+        assert_eq!(scheme_of(Style::Dark), adw::ColorScheme::ForceDark);
     }
 
     /// The terminal is always dark (issue #19): a dark background, with text
