@@ -657,7 +657,7 @@ fn gui_integration() {
     tabs::opening_after_the_menu_waits_for_the_focus_to_leave_it();
     tabs::double_clicking_a_tab_asks_for_a_new_name();
     tabs::the_tab_bars_close_button_closes_the_tab(&bin, &tmp.path().join("t-bar"));
-    tabs::terminal_colors_follow_light_and_dark();
+    tabs::terminal_colors_stay_dark();
     tabs::copy_and_paste_round_trip(&bin, &tmp.path().join("c-trip"));
     tabs::paste_is_bracketed_when_the_program_asks(&bin, &tmp.path().join("c-bracket"));
     tabs::the_copy_key_is_handled_without_a_selection(&bin, &tmp.path().join("c-select"));

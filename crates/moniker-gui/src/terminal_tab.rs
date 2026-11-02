@@ -1275,10 +1275,10 @@ pub(crate) fn set_scrollback(lines: i64) {
     SCROLLBACK.set(c_long::try_from(lines).unwrap_or(c_long::MAX));
 }
 
-/// A terminal that fills its pane, in the colors of the current light or dark
-/// style and the font of the Preferences, with the Preferences' scrollback (a
-/// session that saves a transcript then gets unlimited scrollback instead) and
-/// its right-click menu ([`terminal_menu`]).
+/// A terminal that fills its pane, in the dark palette (always, whatever the
+/// application's style) and the font of the Preferences, with the Preferences'
+/// scrollback (a session that saves a transcript then gets unlimited scrollback
+/// instead) and its right-click menu ([`terminal_menu`]).
 fn new_terminal() -> Terminal {
     let terminal = Terminal::new();
     terminal.set_hexpand(true);
@@ -1291,7 +1291,7 @@ fn new_terminal() -> Terminal {
     });
     add_menu_actions(&terminal);
     terminal.set_context_menu_model(Some(&terminal_menu()));
-    theme::follow_style(&terminal);
+    theme::paint(&terminal);
     terminal
 }
 

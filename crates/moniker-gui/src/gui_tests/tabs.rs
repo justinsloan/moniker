@@ -1591,32 +1591,34 @@ pub(super) fn the_tab_bars_close_button_closes_the_tab(bin: &Path, dir: &Path) {
     fx.window.destroy();
 }
 
-/// A terminal gets the palette of the current style when it is made, and the
-/// palette of the other style when the application's style changes.
-pub(super) fn terminal_colors_follow_light_and_dark() {
+/// A terminal has the dark palette whatever the application's style: when it
+/// is made, and after the style changes (issue #19).
+pub(super) fn terminal_colors_stay_dark() {
     let manager = adw::StyleManager::default();
     let fx = fixture();
-    let wanted = |dark: bool| theme::palette(dark).background;
+    let dark = theme::palette().background;
 
     manager.set_color_scheme(adw::ColorScheme::ForceDark);
-    assert!(manager.is_dark());
     let first = open_local_shell(&fx.view, zoom::DEFAULT, None);
-    assert_eq!(first.color_background_for_draw(), wanted(true));
+    assert_eq!(first.color_background_for_draw(), dark);
 
     manager.set_color_scheme(adw::ColorScheme::ForceLight);
     assert!(!manager.is_dark());
-    assert_eq!(first.color_background_for_draw(), wanted(false));
+    assert_eq!(
+        first.color_background_for_draw(),
+        dark,
+        "unchanged by a light style"
+    );
     let second = open_local_shell(&fx.view, zoom::DEFAULT, None);
-    assert_eq!(second.color_background_for_draw(), wanted(false));
-
-    // A terminal that is gone is not a problem for the next change.
-    fx.click_close(&first);
-    pump_for(Duration::from_millis(200));
-    drop(first);
-    manager.set_color_scheme(adw::ColorScheme::ForceDark);
-    assert_eq!(second.color_background_for_draw(), wanted(true));
+    assert_eq!(
+        second.color_background_for_draw(),
+        dark,
+        "made while light, still dark"
+    );
 
     manager.set_color_scheme(adw::ColorScheme::Default);
+    assert_eq!(second.color_background_for_draw(), dark);
+    fx.click_close(&first);
     fx.click_close(&second);
     fx.window.destroy();
 }
