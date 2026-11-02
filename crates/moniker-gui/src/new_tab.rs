@@ -55,10 +55,10 @@
 //! the window that makes it act once: the first pick closes the window, ends
 //! the pane's session as closing the pane would and makes the pane fresh
 //! ([`terminal_tab::clear_for_new_session`]), and only then starts the session
-//! picked there. A pick after the window closed, or after the pane went (its
-//! session closed it, its tab was closed), starts nothing anywhere; closing the
-//! window (Escape included, also in its search) changes nothing, and gives the
-//! keyboard back to the pane.
+//! picked there. The window closes when the pane goes (its session closed it,
+//! its tab or window was closed), changing nothing. A pick after the window
+//! closed starts nothing anywhere; closing the window (Escape included, also in
+//! its search) changes nothing, and gives the keyboard back to the pane.
 //!
 //! While it is still a list it follows the profiles
 //! ([`AppContext::on_profiles_changed`]), keeping the search, the selected row
@@ -135,11 +135,13 @@ pub fn fill_with_note(holder: &PaneHolder, ctx: &Rc<AppContext>, note: &str) {
 /// nothing is asked), then starts what was picked in the same pane, as a pick
 /// in the new-tab list does, with that pick's transcript decision; the pane
 /// keeps its place and its text size and takes the new session's own title.
-/// A pick after the pane went (its session ended and closed it, its tab was
-/// closed) starts nothing, and closes the window. Closing the window any other
-/// way (its close button, Escape, Escape in its search) changes nothing, and
-/// the keyboard goes back to the pane if it may have it
-/// (`crate::panes::in_front`).
+/// The window closes when the pane goes (its session ended and closed it, its
+/// tab or window was closed: the paths that end the pane's session close it,
+/// [`PaneHolder::new_session`]), changing nothing, and a pick in it afterwards
+/// starts nothing. Closing the window any other way (its close button, Escape,
+/// Escape in its search) changes nothing as well, and the keyboard goes back to
+/// the pane if it may have it (`crate::panes::in_front`), or to the pane in
+/// front if the pane went.
 pub(crate) fn choose_new_session(holder: &PaneHolder, ctx: &Rc<AppContext>) {
     let dialog = adw::Dialog::builder()
         .title(NEW_SESSION_TITLE)
@@ -161,19 +163,35 @@ pub(crate) fn choose_new_session(holder: &PaneHolder, ctx: &Rc<AppContext>) {
     if let Some(row) = list.selected_row() {
         dialog.set_focus(Some(&row));
     }
-    // Closed without a pick: nothing changed, and the keyboard goes back to
-    // the pane. From an idle callback, after libadwaita has given it back to
+    // The pane knows its window, so that the paths that end the pane's session
+    // (its close button, its shell exiting, its tab or window closing) can
+    // close the window: with the pane gone there is nothing left to replace.
+    holder.new_session().replace(Some(dialog.downgrade()));
+    // Closed without a pick (or because the pane went): nothing changed, and
+    // the keyboard goes back to the pane, or to the pane that took its room if
+    // it went. From an idle callback, after libadwaita has given it back to
     // the widget that had it before the window opened (a header's menu
     // button, say), as the Layouts menu's questions do.
     let pane = holder.downgrade();
+    let view = crate::panes::layout_of(holder)
+        .as_ref()
+        .and_then(crate::panes::page_of)
+        .map(|(view, _)| view.downgrade());
     dialog.connect_closed(move |_| {
+        if let Some(holder) = pane.upgrade() {
+            holder.new_session().take();
+        }
         if over.replace(true) {
             return;
         }
         let pane = pane.clone();
+        let view = view.clone();
         glib::idle_add_local_once(move || {
-            if let Some(holder) = pane.upgrade()
-                && in_a_tab(&holder)
+            let heir = || {
+                let view = view.as_ref()?.upgrade()?;
+                terminal_tab::selected_holder(&view)
+            };
+            if let Some(holder) = pane.upgrade().filter(in_a_tab).or_else(heir)
                 && crate::panes::in_front(&holder)
             {
                 crate::panes::focus_pane(&holder);
@@ -221,15 +239,19 @@ struct Chooser {
 }
 
 impl Chooser {
-    /// The pane a pick in `list` starts its session in, ready for it, or none.
+    /// Claim the pane a pick in `list` starts its session in, ready for it, or
+    /// none. Claiming consumes the pick and, in the New Session window, has
+    /// effects: it closes the window and ends the pane's session.
     ///
     /// For the list in its own pane: that pane, while `list` is still what it
     /// shows; once a session has replaced the list (or the pane is gone) there
     /// is nothing to fill. In the New Session window: the first pick only,
-    /// while the window is open; it closes the window and, if the pane is still
-    /// in a tab, ends its session and makes it fresh
-    /// ([`terminal_tab::clear_for_new_session`]).
-    fn pane_to_start_in(&self, list: &gtk::ListBox) -> Option<PaneHolder> {
+    /// while the window is open (it is not, once the pane went: the paths that
+    /// end the pane close the window); it closes the window and ends the pane's
+    /// session, making the pane fresh
+    /// ([`terminal_tab::clear_for_new_session`]). The pane is still checked to
+    /// be in a tab, as a last guard.
+    fn claim_pane(&self, list: &gtk::ListBox) -> Option<PaneHolder> {
         match &self.target {
             Target::Fill => self
                 .holder
@@ -239,10 +261,16 @@ impl Chooser {
                 if over.replace(true) {
                     return None;
                 }
+                let holder = self.holder.upgrade();
+                // The pane's session ends next: it must not close the window
+                // that is already closing.
+                if let Some(holder) = &holder {
+                    holder.new_session().take();
+                }
                 if let Some(dialog) = dialog.upgrade() {
                     dialog.close();
                 }
-                let holder = self.holder.upgrade().filter(in_a_tab)?;
+                let holder = holder.filter(in_a_tab)?;
                 terminal_tab::clear_for_new_session(&holder);
                 Some(holder)
             }
@@ -299,7 +327,7 @@ impl Chooser {
     /// Turn the pane into a local shell in the home folder, running
     /// `sequence` first if one is given, and saving its transcript if `save`.
     fn open_local(&self, list: &gtk::ListBox, sequence: Option<&StartupSequence>, save: bool) {
-        if let Some(holder) = self.pane_to_start_in(list) {
+        if let Some(holder) = self.claim_pane(list) {
             let transcript = terminal_tab::local_transcript_spec(&self.ctx, save);
             terminal_tab::start_local_in(&holder, &glib::home_dir(), sequence, transcript);
         }
@@ -314,7 +342,7 @@ impl Chooser {
         sequence: Option<usize>,
         record: bool,
     ) {
-        if let Some(holder) = self.pane_to_start_in(list) {
+        if let Some(holder) = self.claim_pane(list) {
             terminal_tab::start_profile(&holder, &self.ctx, profile, sequence, record);
         }
     }

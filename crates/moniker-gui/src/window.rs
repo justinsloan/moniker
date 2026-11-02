@@ -25,13 +25,17 @@
 //! `win.close-pane` (the tab, with one pane), `win.pane-to-tab` and
 //! `win.pane-to-window`, and `win.pane-left`, `win.pane-right`, `win.pane-up`
 //! and `win.pane-down` (going to another pane; the last four and the moves are
-//! enabled only in a tab with several); and `win.copy`, `win.paste`,
-//! `win.zoom-in`, `win.zoom-out` and `win.zoom-reset`, which act on the focused
-//! pane's terminal and are enabled while it has one
-//! ([`terminal_tab::sync_window_actions`]). `main.rs` gives them their
-//! accelerators. While a dialog (Rename, About, Keyboard Shortcuts ...) is open
-//! over the window all of these are disabled, so an accelerator's key reaches
-//! the dialog and not the tab behind it.
+//! enabled only in a tab with several); `win.new-session` (the new-tab list in a
+//! window over the focused pane, to replace its session, issue #20; the menus of
+//! the tab, of a pane's header and of a terminal run it, and it has no
+//! accelerator); and `win.copy`, `win.paste`, `win.zoom-in`, `win.zoom-out` and
+//! `win.zoom-reset`, which act on the focused pane's terminal and are enabled
+//! while it has one ([`terminal_tab::sync_window_actions`]). `main.rs` gives the
+//! rest their accelerators. While a dialog (Rename, About, Keyboard Shortcuts
+//! ...) is open over the window all of these are disabled, `win.new-session`
+//! too (it is one of the tab actions), so an accelerator's key reaches the
+//! dialog and not the tab behind it, and no second New Session window opens
+//! over the first.
 //!
 //! Every pane has its own text size. The zoom row of ☰ ([`zoom_row`]) shows the
 //! focused pane's of the selected tab and follows it as the tab, the pane or

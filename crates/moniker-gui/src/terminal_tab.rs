@@ -105,7 +105,7 @@
 //! `term.copy`, which follows that terminal's selection, so the menu shows it
 //! insensitive without one. Its Paste is the terminal's own `term.paste`, so a
 //! right click in a pane that does not have the focus pastes there, and its
-//! Split Right and Split Down split that pane.
+//! Split Right, Split Down and New Session… act on that pane.
 //!
 //! # Text size
 //!
@@ -462,6 +462,7 @@ mod holder {
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
     use gtk4 as gtk;
+    use libadwaita as adw;
 
     use super::{FALLBACK_TITLE, OneTimeMarker, PaneKind, TabTitle, zoom};
     use crate::jump_link::JumpLink;
@@ -490,6 +491,9 @@ mod holder {
             /// The shared connection of a session through a jump host, until
             /// its connection ends (issue #9).
             pub(super) jump: RefCell<Option<Rc<JumpLink>>>,
+            /// The New Session window open over the pane, until it closes
+            /// (issue #20).
+            pub(super) new_session: RefCell<Option<glib::WeakRef<adw::Dialog>>>,
         }
 
         impl Default for PaneHolder {
@@ -504,6 +508,7 @@ mod holder {
                     as_root: Cell::new(false),
                     root_watch: RefCell::new(None),
                     jump: RefCell::new(None),
+                    new_session: RefCell::new(None),
                 }
             }
         }
@@ -595,6 +600,15 @@ mod holder {
         /// ends nothing of it.
         pub(crate) fn jump(&self) -> &RefCell<Option<Rc<JumpLink>>> {
             &self.imp().jump
+        }
+
+        /// The New Session window open over the pane
+        /// (`crate::new_tab::choose_new_session`), from the moment it opens
+        /// until it closes. Weak: the window owns its list, which holds the
+        /// pane weakly in turn. The paths that end the pane's session close
+        /// it ([`super::end_session`]); a pick takes it out first.
+        pub(crate) fn new_session(&self) -> &RefCell<Option<glib::WeakRef<adw::Dialog>>> {
+            &self.imp().new_session
         }
     }
 }
@@ -1424,11 +1438,12 @@ fn add_menu_actions(terminal: &Terminal) {
 }
 
 /// The menu a terminal shows on right-click: Copy (`term.copy`, insensitive
-/// without a selection) and Paste (`term.paste`), then Split Right and Split
-/// Down, which split this terminal's pane (`crate::panes`). VTE shows it on a
-/// plain right-click, and on Shift+right-click when the program has turned on
-/// mouse reporting (htop, mc, tmux with mouse on), which then gets the plain
-/// right-click itself.
+/// without a selection) and Paste (`term.paste`), then Split Right, Split Down
+/// and New Session…, which act on this terminal's pane (`crate::panes`; New
+/// Session… is insensitive while the pane holds no session,
+/// [`holds_session`]). VTE shows it on a plain right-click, and on
+/// Shift+right-click when the program has turned on mouse reporting (htop, mc,
+/// tmux with mouse on), which then gets the plain right-click itself.
 pub(crate) fn terminal_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(
@@ -1439,7 +1454,7 @@ pub(crate) fn terminal_menu() -> gio::Menu {
         Some("Paste"),
         Some(&format!("{TERMINAL_ACTIONS}.{MENU_PASTE_ACTION}")),
     );
-    menu.append_section(None, &panes::split_menu_section());
+    menu.append_section(None, &panes::pane_menu_section());
     menu
 }
 
@@ -1533,10 +1548,10 @@ const TERMINAL_WINDOW_ACTIONS: [&str; 5] = [
 ///   (new, close, next, previous, split, new session) as well. GTK runs
 ///   application accelerators from the window's capture-phase shortcut
 ///   controller, before the focused widget, and a dialog is a widget of that
-///   window: left enabled, Ctrl+Shift+V would
-///   paste into the terminal behind the dialog instead of its text field,
-///   Ctrl+plus would resize that terminal, and Ctrl+Shift+W would close its
-///   tab. App actions (New Window) are not tab actions and stay as they are.
+///   window: left enabled, Ctrl+Shift+V would paste into the terminal behind
+///   the dialog instead of its text field, Ctrl+plus would resize that
+///   terminal, and Ctrl+Shift+W would close its tab. App actions (New Window)
+///   are not tab actions and stay as they are.
 ///
 /// A disabled action leaves its accelerator's key to the focused widget, e.g.
 /// the new-tab list's search entry, or the field of the dialog. Does nothing for
@@ -1685,7 +1700,16 @@ pub fn terminal_of(page: &adw::TabPage) -> Option<Terminal> {
 /// hangup alone: a child that ignores `SIGHUP` (Moniker started under `nohup`)
 /// would live on, and a later prompt of its connection must not find the
 /// marker gone. A child that has already exited released its marker then.
+///
+/// A New Session window open over the pane closes first (issue #20): with the
+/// pane gone it has nothing to replace.
 fn end_session(holder: &PaneHolder) {
+    // A New Session window over the pane has nothing left to replace: it
+    // closes, changing nothing (issue #20). A pick that replaces the session
+    // took it out already.
+    if let Some(dialog) = holder.new_session().take().and_then(|w| w.upgrade()) {
+        dialog.close();
+    }
     // Nothing looks at it any more, even if its child outlives the hang-up
     // (issue #17).
     root::stop(holder);

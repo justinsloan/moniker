@@ -1970,7 +1970,8 @@ pub(super) fn the_window_actions_wait_while_a_dialog_is_open(bin: &Path, dir: &P
 
 /// Every terminal has the right-click menu: Copy and Paste, the terminal's own
 /// actions (a right click does not focus its pane, so the window's Paste would
-/// go to another pane), and Split Right and Split Down, its pane's.
+/// go to another pane), and Split Right, Split Down and New Session…, its
+/// pane's.
 pub(super) fn terminals_have_the_copy_paste_menu(bin: &Path, dir: &Path) {
     let (_app, main, terminal) =
         main_window_with_shell(bin, dir, "menu-shell", "echo MENU\nexec sleep 600");
@@ -1979,6 +1980,10 @@ pub(super) fn terminals_have_the_copy_paste_menu(bin: &Path, dir: &Path) {
         ("Paste".to_owned(), "term.paste".to_owned()),
         ("Split Right".to_owned(), "pane.split-right".to_owned()),
         ("Split Down".to_owned(), "pane.split-down".to_owned()),
+        (
+            "New Session\u{2026}".to_owned(),
+            "pane.new-session".to_owned(),
+        ),
     ];
     let menu = terminal.context_menu_model().expect("a context menu");
     assert_eq!(menu_items(&menu), expected);

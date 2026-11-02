@@ -466,6 +466,9 @@ fn gui_integration() {
     new_session::the_menus_offer_new_session(&tmp.path().join("ns-menus"));
     new_session::the_pane_menu_replaces_that_pane(&tmp.path().join("ns-pane-menu"));
     new_session::the_tab_menu_replaces_that_tabs_pane(&tmp.path().join("ns-tab-menu"));
+    new_session::the_terminal_menu_replaces_its_own_panes_session(
+        &tmp.path().join("ns-terminal-menu"),
+    );
     new_session::cancel_gives_the_keyboard_back(&tmp.path().join("ns-keyboard"));
     new_session::an_ended_session_replaced_is_hung_up_when_its_tab_closes(
         &tmp.path().join("ns-ended"),

@@ -760,9 +760,12 @@ fn header_menu() -> gio::Menu {
     menu
 }
 
-/// The Split Right and Split Down entries of a terminal's right-click menu,
-/// which split the pane the terminal is in.
-pub(crate) fn split_menu_section() -> gio::Menu {
+/// The Split Right, Split Down and New Session… entries of a terminal's
+/// right-click menu, which act on the pane the terminal is in. New Session…
+/// (issue #20) is here because this menu is the one place every window offers
+/// it: the tab bar is hidden while there is one tab, and a pane's header shows
+/// only in a split.
+pub(crate) fn pane_menu_section() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append(
         Some("Split Right"),
@@ -771,6 +774,10 @@ pub(crate) fn split_menu_section() -> gio::Menu {
     menu.append(
         Some("Split Down"),
         Some(&format!("{PANE_ACTIONS}.{SPLIT_DOWN_ACTION}")),
+    );
+    menu.append(
+        Some(NEW_SESSION_ITEM),
+        Some(&format!("{PANE_ACTIONS}.{NEW_SESSION_ACTION}")),
     );
     menu
 }

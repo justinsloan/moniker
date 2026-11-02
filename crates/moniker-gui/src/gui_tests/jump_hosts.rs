@@ -441,7 +441,7 @@ pub(super) fn settled(link: &JumpLink) {
 }
 
 /// How many `-O exit` named `socket`.
-pub(super) fn exits_for(fake: &Fake, socket: &str) -> usize {
+fn exits_for(fake: &Fake, socket: &str) -> usize {
     fake.exits().iter().filter(|s| *s == socket).count()
 }
 
