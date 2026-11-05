@@ -460,8 +460,8 @@ impl SyncTarget for LocalState {
     /// it is newer.
     ///
     /// Still under the lock, the secrets go first: the passwords of incoming
-    /// winners are stored and the passwords of profiles this sync deletes are
-    /// removed (never that of a profile kept on this machine, see
+    /// winners are stored, then the passwords of profiles this sync deletes
+    /// are removed (never that of a profile kept on this machine, see
     /// `plan_apply`), each previous value recorded in an undo log. Only then is the
     /// profile file written. If a secret operation or the file write fails, the
     /// secrets are restored from the log (best effort) and the file is left as
@@ -583,7 +583,7 @@ impl UndoLog {
 
 /// Merge `incoming` into `local` (the file's current entries with their
 /// passwords). Returns the profiles to write, the outcome, and the secret
-/// store changes to make before the write.
+/// store changes to make before the write, every store before any removal.
 ///
 /// # Removing a password does not propagate (intentional, documented limit)
 ///
@@ -656,6 +656,7 @@ fn plan_apply(
 
     let mut outcome = SyncOutcome::default();
     let mut ops = Vec::new();
+    let mut removals = Vec::new();
     let mut profiles = Vec::with_capacity(winners.len());
     for w in &winners {
         let prev = before.get(&w.profile.id);
@@ -673,7 +674,7 @@ fn plan_apply(
             // tombstones were cleaned up when they were applied.
             if was_live {
                 outcome.removed += 1;
-                ops.push(SecretOp::Delete {
+                removals.push(SecretOp::Delete {
                     id: w.profile.id.clone(),
                 });
             }
@@ -707,6 +708,11 @@ fn plan_apply(
         }
         profiles.push(w.profile.clone());
     }
+    // Every store before any removal (issue #22). Undoing a store removes
+    // the password or changes one the keyring holds; undoing a removal stores
+    // it again as a new item, which a keyring with no default refuses. So a
+    // failed store never has a removal to undo.
+    ops.extend(removals);
     (profiles, (outcome, ops))
 }
 
@@ -1754,7 +1760,7 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
     use std::thread;
     use std::time::Instant;
     use tempfile::TempDir;
@@ -1778,6 +1784,13 @@ mod tests {
         fail_at: AtomicUsize,
         /// The error that write fails with; none means a `Backend` one.
         fail_as: Mutex<Option<fn() -> SecretError>>,
+        /// Like a keyring with no default one whose passwords are in another
+        /// (issue #22): a key it holds can be changed or removed, a key it
+        /// does not hold cannot be stored, as creating the default was
+        /// canceled.
+        no_default: AtomicBool,
+        /// How many stores of a key it did not hold were refused.
+        refused: AtomicUsize,
     }
 
     #[derive(Clone, Default)]
@@ -1812,6 +1825,14 @@ mod tests {
             *self.0.fail_as.lock().unwrap() = Some(err);
             self.fail_nth_write(n);
         }
+        /// From now on, refuse to store a key it does not hold (see
+        /// `Counted::no_default`).
+        fn lose_default_keyring(&self) {
+            self.0.no_default.store(true, Ordering::SeqCst);
+        }
+        fn refused(&self) -> usize {
+            self.0.refused.load(Ordering::SeqCst)
+        }
         /// Count a write; `Err` if it is the one chosen to fail.
         fn write(&self) -> Result<(), SecretError> {
             let n = self.0.writes.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1833,6 +1854,10 @@ mod tests {
         }
         fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
             self.write()?;
+            if self.0.no_default.load(Ordering::SeqCst) && self.0.inner.get(key)?.is_none() {
+                self.0.refused.fetch_add(1, Ordering::SeqCst);
+                return Err(SecretError::KeyringNotCreated);
+            }
             self.0.inner.set(key, value)
         }
         fn delete(&self, key: &str) -> Result<(), SecretError> {
@@ -2761,7 +2786,9 @@ mod tests {
                 after: vec![(ID_A, true, Some("pw-a-new")), (ID_C, false, None)],
             },
             RollbackCase {
-                what: "delete, then a failing set",
+                // A plan stores before it removes (issue #22), so the removal
+                // of A comes after B's store although A's id is first.
+                what: "a new password, then a failing delete",
                 incoming: vec![entry(&tomb_a, None), entry(&b, Some("pw-b"))],
                 after: vec![
                     (ID_A, false, None),
@@ -2840,6 +2867,52 @@ mod tests {
         s.state.apply(incoming).unwrap();
         assert_eq!(s.secrets.password(ID_A).as_deref(), Some("pw-a-new"));
         assert_eq!(s.secrets.password(ID_B).as_deref(), Some("pw-b"));
+    }
+
+    #[test]
+    fn a_plan_stores_every_password_before_it_removes_any() {
+        // In profile-id order the removal of A's password would come first
+        // (issue #22).
+        let a = fixed("a", ID_A, 1_000);
+        let b = fixed("b", ID_B, 2_000);
+        let c = fixed("c", ID_C, 1_000);
+        let (_, (_, ops)) = plan_apply(
+            vec![entry(&a, Some("pw-a")), entry(&c, Some("pw-c"))],
+            vec![
+                entry(&a.tombstone(2_000), None),
+                entry(&b, Some("pw-b")),
+                entry(&c.tombstone(2_000), None),
+            ],
+            None,
+        );
+        let order: Vec<(&str, &str)> = ops
+            .iter()
+            .map(|op| match op {
+                SecretOp::Set { id, .. } => ("set", id.as_str()),
+                SecretOp::Delete { id } => ("delete", id.as_str()),
+            })
+            .collect();
+        assert_eq!(order, [("set", ID_B), ("delete", ID_A), ("delete", ID_C)]);
+    }
+
+    #[test]
+    fn with_no_default_keyring_a_failed_sync_keeps_every_password() {
+        // Issue #22: the keyring changes and removes the passwords it holds
+        // but cannot store a new one. One sync removes A's password (a peer
+        // deleted A) and brings B's, which the keyring refuses.
+        let mut s = rollback_start();
+        let file = file_of(&s.path);
+        s.secrets.lose_default_keyring();
+        let incoming = vec![
+            entry(&fixed("a", ID_A, 0).tombstone(2_000), None),
+            entry(&fixed("b", ID_B, 2_000), Some("pw-b")),
+        ];
+        let err = s.state.apply(incoming).unwrap_err();
+        assert!(matches!(err, SyncError::Store(_)), "{err:?}");
+        assert_rolled_back(&s, &file, "no default keyring");
+        // Only B's store asked for a keyring: undoing asks for none, so
+        // GNOME's prompt is not shown a second time.
+        assert_eq!(s.secrets.refused(), 1);
     }
 
     #[test]
