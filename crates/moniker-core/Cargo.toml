@@ -14,6 +14,9 @@ chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["
 getrandom = "0.4.3"
 keyring = "4.2.0"
 rustix = { version = "1.1.5", features = ["fs", "net", "process", "termios"] }
+# The version and features the `keyring` crate's Secret Service store already
+# uses, for creating the default keyring it cannot create itself (issue #18).
+secret-service = { version = "5.2.0", features = ["crypto-rust"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"

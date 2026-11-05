@@ -21,7 +21,8 @@ use moniker_core::askpass::{DevTty, TtyPrompter};
 use moniker_core::jump::{self, JumpLeg, JumpSocket, Route};
 use moniker_core::profile::Profile;
 use moniker_core::secrets::{
-    KeyringSecretStore, SYNC_PASSPHRASE_KEY, SecretStore, check_sync_passphrase, password_key,
+    KeyringSecretStore, MissingKeyring, SYNC_PASSPHRASE_KEY, SecretStore, check_sync_passphrase,
+    password_key,
 };
 use moniker_core::ssh::{SERVER_PROGRAM, sync_command};
 use moniker_core::store::{ProfileStore, SyncSwitch};
@@ -152,6 +153,21 @@ fn main() -> ExitCode {
 
 // ----- subcommands -----
 
+/// The keyring of a command typed at this machine (`sync-key set`, `sync`): a
+/// missing default keyring is created, and GNOME asks for its password
+/// (issue #18).
+fn this_machines_keyring() -> KeyringSecretStore {
+    KeyringSecretStore::new(MissingKeyring::Create)
+}
+
+/// The keyring `sync-serve` keeps received passwords in. Another machine
+/// started it, so a missing default keyring is never created here: no prompt
+/// appears on this machine's screen unasked, and the other machine's sync does
+/// not wait for one (issue #18).
+fn served_keyring() -> KeyringSecretStore {
+    KeyringSecretStore::new(MissingKeyring::Refuse)
+}
+
 /// `moniker-server profile list`. Never touches the keyring.
 fn profile_list() -> Result<(), String> {
     let store = open_store()?;
@@ -165,7 +181,7 @@ fn sync_key_set(from_stdin: bool) -> Result<(), String> {
     } else {
         prompt_passphrase(&mut DevTty)?
     };
-    KeyringSecretStore::new()
+    this_machines_keyring()
         .set(SYNC_PASSPHRASE_KEY, &key)
         .map_err(|e| format!("cannot save the sync key: {e}"))?;
     print_stdout("Sync key saved.\n")
@@ -198,7 +214,7 @@ fn sync_switch(command: SyncSwitchCommand) -> Result<(), String> {
 fn sync_serve() -> Result<(), String> {
     serve_with(
         open_store()?,
-        Box::new(KeyringSecretStore::new()),
+        Box::new(served_keyring()),
         io::stdin().lock(),
         io::stdout().lock(),
     )
@@ -242,7 +258,7 @@ fn sync(name: &str, allow_stale: bool) -> Result<(), String> {
     let profile = find_profile(&store, name)?.clone();
     let jump = partner_jump(&store, &profile)?;
 
-    let secrets = KeyringSecretStore::new();
+    let secrets = this_machines_keyring();
     let passphrase = sync_passphrase(&secrets, NO_SYNC_KEY_LOCAL)?;
     let has_password = stored_password(&secrets, &profile, "the stored password")?;
     let jump_has_password = match &jump {
@@ -630,6 +646,17 @@ mod tests {
     use moniker_core::secrets::MemorySecretStore;
     use moniker_core::sync::{KIND_ERROR, KIND_HELLO, read_frame, write_frame};
     use std::io;
+
+    #[test]
+    fn only_commands_typed_here_create_a_default_keyring() {
+        // Issue #18: `sync-key set` and `sync` are asked for at this machine;
+        // `sync-serve` is started by another one.
+        assert_eq!(
+            this_machines_keyring().missing_keyring(),
+            MissingKeyring::Create
+        );
+        assert_eq!(served_keyring().missing_keyring(), MissingKeyring::Refuse);
+    }
 
     #[test]
     fn sync_takes_allow_stale() {

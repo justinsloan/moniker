@@ -15,7 +15,9 @@
 #
 # What it touches (nothing else)
 #   * One temp dir /tmp/moniker-e2e.XXXXXXXX ($T): configs, keys, the private
-#     bus socket, the private keyring, logs. Removed on exit.
+#     bus socket, the private keyring, logs, and for one check a second private
+#     bus and keyring daemon (a machine that logged in automatically, with no
+#     default keyring). Removed on exit.
 #   * The real ~/.ssh/known_hosts: `moniker-server sync` pins StrictHostKeyChecking=yes
 #     and ssh reads that file from the passwd entry, so the throwaway host key
 #     has to be in it for the sync checks. It is backed up first, one line is
@@ -125,14 +127,16 @@ build_binaries() {
 
 # The private session bus: a socket in $T/run and no service directories, so
 # nothing can be activated except what this script starts itself.
-write_dbus_conf() {
-    cat >"$T/dbus.conf" <<EOF
+write_dbus_conf() { write_bus_conf "$T/dbus.conf" "$T/run/bus"; }
+
+write_bus_conf() { # write_bus_conf FILE SOCKET
+    cat >"$1" <<EOF
 <!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
   <type>session</type>
   <keep_umask/>
-  <listen>unix:path=$T/run/bus</listen>
+  <listen>unix:path=$2</listen>
   <auth>EXTERNAL</auth>
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
@@ -258,6 +262,10 @@ MSG_WRONG_KEY="the sync passphrases differ (or the data was corrupted on the way
 MSG_NO_SERVER="moniker-server is not installed on the remote machine (or not on its PATH)"
 # SyncError::PeerTooOld: a machine older than jump hosts turned a sync away.
 MSG_PEER_TOO_OLD="the other machine runs an older Moniker, which does not know jump hosts; update it to sync while a profile has a jump host"
+# Issue #18: SyncError::PeerNoDefaultKeyring, and the CLI's sync-key set over
+# SecretError::KeyringNotCreated (crates/moniker-core/src/secrets.rs).
+MSG_PEER_NO_KEYRING="the other machine has no default keyring: open Moniker on it and save a password, then sync again"
+MSG_KEYRING_CANCELED="cannot save the sync key: this computer has no default keyring, and creating one was canceled"
 
 # Refuse unless this really is the private setup.
 assert_private_env() {
@@ -356,6 +364,13 @@ ME=$(id -un)
 
 A() { env XDG_CONFIG_HOME="$T/A/cfg" MONIKER_KEYRING_SERVICE=moniker-e2e-a "$@"; }
 B() { env XDG_CONFIG_HOME="$T/B/cfg" MONIKER_KEYRING_SERVICE=moniker-e2e-b "$@"; }
+# A machine that logged in automatically, on a bus and keyring of its own
+# (check_no_default_keyring_here).
+C() {
+    env XDG_CONFIG_HOME="$T/C/cfg" MONIKER_KEYRING_SERVICE=moniker-e2e-c \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=$T/run2/bus" XDG_RUNTIME_DIR="$T/run2" \
+        XDG_DATA_HOME="$T/data2" "$@"
+}
 
 random_token() { head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 
@@ -369,9 +384,11 @@ free_port() {
 }
 
 # sshd_config for one throwaway server. B's environment is set with SetEnv, so
-# `moniker-server sync-serve` in the session is instance B on the private bus.
-write_sshd_config() { # write_sshd_config FILE PORT NAME REMOTE_PATH key|password|both
+# `moniker-server sync-serve` in the session is instance B on the private bus
+# (or, given ENV, whatever instance and bus ENV names).
+write_sshd_config() { # write_sshd_config FILE PORT NAME REMOTE_PATH key|password|both [ENV]
     local auth="PasswordAuthentication no" pubkey="PubkeyAuthentication yes" penalties="" listen6=""
+    local env=${6:-"XDG_CONFIG_HOME=$T/B/cfg MONIKER_KEYRING_SERVICE=moniker-e2e-b DBUS_SESSION_BUS_ADDRESS=unix:path=$T/run/bus XDG_RUNTIME_DIR=$T/run XDG_DATA_HOME=$T/data"}
     # A user-level sshd cannot check passwords, so every password login fails;
     # OpenSSH 9.8 and later then penalize the source address, 127.0.0.1, and
     # drop the next checks' connections. The password servers have none. "both"
@@ -395,7 +412,7 @@ UsePAM no
 PermitUserRC no
 StrictModes no
 LogLevel VERBOSE
-SetEnv XDG_CONFIG_HOME=$T/B/cfg MONIKER_KEYRING_SERVICE=moniker-e2e-b DBUS_SESSION_BUS_ADDRESS=unix:path=$T/run/bus XDG_RUNTIME_DIR=$T/run XDG_DATA_HOME=$T/data HOME=$T/home PATH=$4
+SetEnv $env HOME=$T/home PATH=$4
 EOF
 }
 
@@ -406,11 +423,11 @@ port_speaks_ssh() { # port_speaks_ssh PORT [ADDRESS]: it answers with an SSH ban
 }
 
 # Start a throwaway sshd; sets SSHD_PORT. Retries on another port if it fails.
-start_sshd() { # start_sshd NAME REMOTE_PATH key|password|both
+start_sshd() { # start_sshd NAME REMOTE_PATH key|password|both [ENV]
     local try port pid
     for try in 1 2 3; do
         port=$(free_port) || return 1
-        write_sshd_config "$T/sshd_$1.conf" "$port" "$1" "$2" "$3"
+        write_sshd_config "$T/sshd_$1.conf" "$port" "$1" "$2" "$3" "${4:-}"
         /usr/sbin/sshd -D -e -f "$T/sshd_$1.conf" >"$T/sshd_$1.log" 2>&1 &
         pid=$!
         register_pid "$pid"
@@ -572,6 +589,103 @@ check_wrong_key() {
     [ "$RC" -ne 0 ] || { REASON="exit status 0, expected a failure"; return 1; }
     grep -qF "$MSG_WRONG_KEY" "$ERR" || { REASON="unexpected message: $(err_summary)"; return 1; }
     unchanged_since "$before"
+}
+
+# ---------- no default keyring (issue #18) ----------
+#
+# A second private bus and keyring daemon, C, stand for a machine that logged
+# in automatically. check_no_default_keyring_here starts them and
+# check_no_default_keyring_there uses them; stop_second_keyring ends both.
+
+# The object path the alias "default" names on the bus at $1 ("/" for none).
+default_alias() { # default_alias BUS_ADDRESS
+    busctl --address="$1" call org.freedesktop.secrets /org/freedesktop/secrets \
+        org.freedesktop.Secret.Service ReadAlias s default 2>/dev/null |
+        sed -n 's/^o "\(.*\)"$/\1/p'
+}
+
+secrets_owned_on() { # secrets_owned_on BUS_ADDRESS
+    busctl --address="$1" list --no-legend 2>/dev/null | grep -q '^org\.freedesktop\.secrets '
+}
+
+# A machine that logged in automatically: its keyring daemon was started
+# without the login password (no --unlock), in a data folder of its own, so
+# there is no login keyring and the alias "default" names nothing. It runs on
+# a second private bus, which like the first can start nothing, so no
+# prompter either: `sync-key set` (typed at this machine) asks for the default
+# keyring to be created, the prompt cannot be shown and counts as canceled,
+# and the command says so and stores nothing.
+check_no_default_keyring_here() {
+    local addr="unix:path=$T/run2/bus"
+    mkdir -m 700 "$T/run2" "$T/data2" "$T/C" || { REASON="cannot create the dirs of the second keyring"; return 1; }
+    write_bus_conf "$T/dbus2.conf" "$T/run2/bus" || { REASON="cannot write the second bus config"; return 1; }
+    dbus-daemon --config-file="$T/dbus2.conf" --nofork --nopidfile >>"$T/dbus2.log" 2>&1 &
+    BUS2_PID=$!
+    register_pid "$BUS2_PID"
+    wait_for 10 test -S "$T/run2/bus" || { REASON="the second bus did not start (see $T/dbus2.log)"; return 1; }
+    env DBUS_SESSION_BUS_ADDRESS="$addr" XDG_RUNTIME_DIR="$T/run2" XDG_DATA_HOME="$T/data2" \
+        gnome-keyring-daemon --foreground --components=secrets >>"$T/gkd2.log" 2>&1 &
+    GKD2_PID=$!
+    register_pid "$GKD2_PID"
+    wait_for 30 secrets_owned_on "$addr" || { REASON="the second keyring did not start (see $T/gkd2.log)"; return 1; }
+    [ "$(default_alias "$addr")" = / ] ||
+        { REASON="a keyring started without a password has a default keyring: $(default_alias "$addr")"; return 1; }
+
+    printf '%s\n' "$SYNC_KEY" | C "${MONX[@]}" sync-key set --stdin >"$OUT" 2>"$ERR"
+    RC=$?
+    [ "$RC" -ne 124 ] || { REASON="sync-key set waited for the prompt until its time limit"; return 1; }
+    [ "$RC" -ne 0 ] || { REASON="exit status 0, expected a failure"; return 1; }
+    grep -qF "$MSG_KEYRING_CANCELED" "$ERR" || { REASON="unexpected message: $(err_summary)"; return 1; }
+    [ "$(default_alias "$addr")" = / ] || { REASON="a default keyring exists after the creation was canceled"; return 1; }
+    ! compgen -G "$T/data2/keyrings/*.keyring" >/dev/null ||
+        { REASON="a keyring file was written: $(ls "$T/data2/keyrings")"; return 1; }
+}
+
+# The machine with no default keyring has a sync key all the same, kept in the
+# daemon's in-memory session keyring (where the reads find it, and which needs
+# no prompt), and A syncs with it through an sshd whose sessions are instance
+# C. Its sync-serve was started by A and may not create a keyring, so the first
+# password it has to keep stops the sync with error 6, A says so in the
+# decided words, and nothing changes on either side. Had sync-serve tried to
+# create one, its prompt could not be shown and A would get another message.
+check_no_default_keyring_there() {
+    local addr="unix:path=$T/run2/bus" before rc
+    [ -n "$GKD2_PID" ] && secrets_owned_on "$addr" ||
+        { REASON="the second keyring is not running (see the check before this one)"; return 1; }
+    [ "$(default_alias "$addr")" = / ] ||
+        { REASON="precondition: C has a default keyring before the sync"; return 1; }
+    printf '%s\n' "$SYNC_KEY" | C "$HELPER" put-session-secret sync-passphrase ||
+        { REASON="could not put C's sync key in the session keyring"; return 1; }
+    start_sshd nokeyring "$BIN:$SYSTEM_PATH" key \
+        "XDG_CONFIG_HOME=$T/C/cfg MONIKER_KEYRING_SERVICE=moniker-e2e-c DBUS_SESSION_BUS_ADDRESS=$addr XDG_RUNTIME_DIR=$T/run2 XDG_DATA_HOME=$T/data2" ||
+        { REASON="the sshd for C did not start"; return 1; }
+    add_known_host "$SSHD_PORT" || { REASON="could not add C's sshd to known_hosts"; return 1; }
+    A "$HELPER" seed-profile --name nokeyring --host 127.0.0.1 --port "$SSHD_PORT" \
+        --user "$ME" --key-file "$T/client_key" >/dev/null || { REASON="could not seed nokeyring on A"; return 1; }
+    before=$(state_snapshot) || { REASON="cannot read the state before the sync"; return 1; }
+
+    capture A "${MONX[@]}" sync nokeyring
+    no_keyring_sync_refused "$before" "$addr"
+    rc=$?
+    # The partner is deleted, so that only its tombstone reaches B later.
+    A "$HELPER" delete-profile nokeyring || { REASON="could not delete nokeyring on A afterwards"; return 1; }
+    return "$rc"
+}
+
+no_keyring_sync_refused() { # no_keyring_sync_refused SNAPSHOT_BEFORE BUS_ADDRESS
+    [ "$RC" -ne 0 ] || { REASON="exit status 0, expected a failure"; return 1; }
+    grep -qF "$MSG_PEER_NO_KEYRING" "$ERR" || { REASON="unexpected message: $(err_summary)"; return 1; }
+    local names
+    unchanged_since "$1" || return 1
+    names=$(C "$HELPER" list) || { REASON="cannot list C's profiles"; return 1; }
+    [ -z "$names" ] || { REASON="C took profiles: $(tr '\n' ' ' <<<"$names")"; return 1; }
+    [ "$(default_alias "$2")" = / ] || { REASON="sync-serve made a default keyring on C"; return 1; }
+}
+
+stop_second_keyring() {
+    [ -n "$GKD2_PID" ] && stop_pid "$GKD2_PID"
+    [ -n "$BUS2_PID" ] && stop_pid "$BUS2_PID"
+    GKD2_PID= BUS2_PID=
 }
 
 check_delete_propagates() {
@@ -1447,6 +1561,10 @@ inner_main() {
     run_check "sync-serve stdout purity" check_serve_purity
     run_check "converge" check_converge
     run_check "wrong sync key" check_wrong_key
+    BUS2_PID= GKD2_PID=
+    run_check "no default keyring here (automatic login): a creation that cannot be shown stores nothing" check_no_default_keyring_here
+    run_check "no default keyring on the other machine: sync-serve creates none, the sync says so, nothing changes" check_no_default_keyring_there
+    stop_second_keyring
     run_check "delete propagates" check_delete_propagates
     run_check "idempotent" check_idempotent
     run_check "moniker-server not on remote PATH" check_server_not_on_path

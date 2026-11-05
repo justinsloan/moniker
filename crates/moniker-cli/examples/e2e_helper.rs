@@ -6,8 +6,9 @@
 //! `XDG_CONFIG_HOME` picks the profile file and `MONIKER_KEYRING_SERVICE` the
 //! keyring namespace.
 //!
-//! Secrets only ever travel on stdin (`set-secret`) and stdout (`get-secret`,
-//! which the script captures in a variable and compares without echoing).
+//! Secrets only ever travel on stdin (`set-secret`, `put-session-secret`) and
+//! stdout (`get-secret`, which the script captures in a variable and compares
+//! without echoing).
 //! Nothing here puts a secret in an argument, an environment variable, a log
 //! line or an error message.
 //!
@@ -20,6 +21,7 @@
 //! OpenSSH. `serve-version-1` stands in for the `sync-serve` of a Moniker that
 //! predates jump hosts.
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -29,10 +31,12 @@ use moniker_cli::store_path;
 use moniker_core::askpass::AskpassToken;
 use moniker_core::jump;
 use moniker_core::profile::Profile;
-use moniker_core::secrets::{KeyringSecretStore, SecretStore, password_key};
+use moniker_core::secrets::{KeyringSecretStore, MissingKeyring, SecretStore, password_key};
 use moniker_core::ssh::SshCommand;
 use moniker_core::store::ProfileStore;
 use moniker_core::sync::{KIND_ERROR, KIND_HELLO, SyncError, read_frame, write_frame};
+use secret_service::EncryptionType;
+use secret_service::blocking::SecretService;
 use zeroize::Zeroizing;
 
 /// Exit status of `get-secret` when there is no secret (other failures use 2).
@@ -88,6 +92,9 @@ enum Command {
     },
     /// Store the password read from stdin for a live profile
     SetSecret { profile: String },
+    /// Store the secret read from stdin under KEY in the Secret Service's
+    /// session keyring, which needs no default keyring
+    PutSessionSecret { key: String },
     /// Print the password of a profile (name or id); exit 1 if there is none
     GetSecret { profile: String },
     /// Tombstone a live profile and delete its password
@@ -134,6 +141,7 @@ fn run(command: Command) -> Result<ExitCode, String> {
             jump_token,
         } => connection_argv(&profile, &askpass, token, jump_token).map(|()| ExitCode::SUCCESS),
         Command::SetSecret { profile } => set_secret(&profile).map(|()| ExitCode::SUCCESS),
+        Command::PutSessionSecret { key } => put_session_secret(&key).map(|()| ExitCode::SUCCESS),
         Command::GetSecret { profile } => get_secret(&profile),
         Command::DeleteProfile { name } => delete_profile(&name).map(|()| ExitCode::SUCCESS),
         Command::List => list().map(|()| ExitCode::SUCCESS),
@@ -141,6 +149,12 @@ fn run(command: Command) -> Result<ExitCode, String> {
         Command::ProfileState { id } => profile_state(&id).map(|()| ExitCode::SUCCESS),
         Command::ServeVersion1 => serve_version_1().map(|()| ExitCode::SUCCESS),
     }
+}
+
+/// The private keyring. Test tooling never creates a default keyring: a check
+/// that needs one sets it up itself.
+fn keyring() -> KeyringSecretStore {
+    KeyringSecretStore::new(MissingKeyring::Refuse)
 }
 
 fn open_store() -> Result<ProfileStore, String> {
@@ -289,8 +303,30 @@ fn set_secret(name: &str) -> Result<(), String> {
     let store = open_store()?;
     let id = live_id_by_name(&store, name)?.ok_or_else(|| format!("no live profile {name:?}"))?;
     let secret = read_stdin_secret()?;
-    KeyringSecretStore::new()
+    keyring()
         .set(&password_key(&id), &secret)
+        .map_err(|e| format!("cannot store the secret: {e}"))
+}
+
+/// Puts the secret on stdin under `key` in the Secret Service's `session`
+/// keyring (in memory, unlocked, never the default), with the attributes the
+/// `keyring` crate gives its entries. Moniker's reads search every keyring and
+/// find it there, while a write still finds no default keyring: a machine with
+/// a sync key and no default keyring, which no prompt is needed to make
+/// (issue #18).
+fn put_session_secret(key: &str) -> Result<(), String> {
+    let secret = read_stdin_secret()?;
+    let store = keyring();
+    let service = SecretService::connect(EncryptionType::Dh)
+        .map_err(|e| format!("cannot reach the Secret Service: {e}"))?;
+    let session = service
+        .get_collection_by_alias("session")
+        .map_err(|e| format!("no session keyring: {e}"))?;
+    let attributes = HashMap::from([("service", store.service()), ("username", key)]);
+    let label = format!("keyring:{key}@{}", store.service());
+    session
+        .create_item(&label, attributes, secret.as_bytes(), true, "text/plain")
+        .map(|_| ())
         .map_err(|e| format!("cannot store the secret: {e}"))
 }
 
@@ -324,7 +360,7 @@ fn get_secret(profile: &str) -> Result<ExitCode, String> {
         None if store.all().iter().any(|p| p.id == profile) => profile.to_owned(),
         None => return Err(format!("no profile {profile:?}")),
     };
-    let secret = KeyringSecretStore::new()
+    let secret = keyring()
         .get(&password_key(&id))
         .map_err(|e| format!("cannot read the secret: {e}"))?;
     let Some(secret) = secret else {
@@ -341,7 +377,7 @@ fn delete_profile(name: &str) -> Result<(), String> {
     let mut store = open_store()?;
     let id = live_id_by_name(&store, name)?.ok_or_else(|| format!("no live profile {name:?}"))?;
     store.delete(&id).map_err(|e| e.to_string())?;
-    KeyringSecretStore::new()
+    keyring()
         .delete(&password_key(&id))
         .map_err(|e| format!("cannot delete the secret: {e}"))
 }

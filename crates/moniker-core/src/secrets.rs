@@ -18,11 +18,24 @@
 //! * Stores that hold secrets do not derive `Debug`.
 //! * `get` of a missing key is `Ok(None)`, `delete` of a missing key is `Ok(())`,
 //!   and `set` overwrites.
+//!
+//! # No default keyring (issue #18)
+//!
+//! GNOME makes the Login keyring, the default one, with the password typed at
+//! login, so a desktop that logs in automatically has none until someone makes
+//! one. The `keyring` crate can read there but cannot store anything: it never
+//! creates the default keyring, and reports it missing as "locked or access
+//! denied". [`KeyringSecretStore::set`] then asks the Secret Service whether a
+//! default keyring exists and, if it does not, does what its
+//! [`MissingKeyring`] says: create one (GNOME asks the person to choose its
+//! password) and store again, or fail with [`SecretError::NoDefaultKeyring`].
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use secret_service::EncryptionType;
+use secret_service::blocking::SecretService;
 use zeroize::Zeroizing;
 
 /// Keyring key under which the sync passphrase is stored. Part of the stored
@@ -77,7 +90,33 @@ pub enum SecretError {
     /// or access denied, an ambiguous entry, an unreadable value, ...).
     #[error("secret store error: {0}")]
     Backend(String),
+    /// There is no default keyring to store into, and this store may not
+    /// create one ([`MissingKeyring::Refuse`]). Nothing was stored.
+    #[error("this computer has no default keyring")]
+    NoDefaultKeyring,
+    /// There is no default keyring, and creating one was canceled: the person
+    /// dismissed the prompt, or no prompt could be shown. Nothing was stored.
+    #[error("this computer has no default keyring, and creating one was canceled")]
+    KeyringNotCreated,
 }
+
+/// What [`KeyringSecretStore::set`] does when the Secret Service has no
+/// default keyring (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingKeyring {
+    /// Create the default keyring and store again: for writes asked for at
+    /// this machine (its windows, `moniker-server sync-key set` and `sync`,
+    /// the syncs they start). GNOME asks the person to choose its password.
+    Create,
+    /// Store nothing and fail with [`SecretError::NoDefaultKeyring`]: for
+    /// `moniker-server sync-serve`, which another machine starts, so that no
+    /// prompt appears on this machine's screen unasked and the other machine's
+    /// sync does not wait for one. Also for what only reads or tests.
+    Refuse,
+}
+
+/// The label of a default keyring Moniker creates: GNOME's own name for it.
+const DEFAULT_KEYRING_LABEL: &str = "Login";
 
 /// A place to keep secrets by key. Implementations are shared across threads
 /// (the GUI runs sync on a worker thread).
@@ -166,21 +205,34 @@ fn service_name_from(env_value: Option<&str>) -> String {
 #[derive(Debug)]
 pub struct KeyringSecretStore {
     service: String,
+    missing: MissingKeyring,
 }
 
 impl KeyringSecretStore {
     /// A store using the service name from `$MONIKER_KEYRING_SERVICE`, read
     /// once here (empty or not valid Unicode counts as unset), else `"moniker"`.
-    pub fn new() -> Self {
+    /// `missing` says what a write does with no default keyring.
+    pub fn new(missing: MissingKeyring) -> Self {
         let env_value = std::env::var(SERVICE_ENV).ok();
-        Self::with_service(service_name_from(env_value.as_deref()))
+        Self::with_service(service_name_from(env_value.as_deref()), missing)
     }
 
     /// A store using an explicit service name (tests use a throwaway one).
-    pub fn with_service(service: impl Into<String>) -> Self {
+    pub fn with_service(service: impl Into<String>, missing: MissingKeyring) -> Self {
         Self {
             service: service.into(),
+            missing,
         }
+    }
+
+    /// What a write does with no default keyring.
+    pub fn missing_keyring(&self) -> MissingKeyring {
+        self.missing
+    }
+
+    /// The service name of this store's entries.
+    pub fn service(&self) -> &str {
+        &self.service
     }
 
     fn entry(&self, key: &str) -> Result<keyring::Entry, SecretError> {
@@ -190,12 +242,6 @@ impl KeyringSecretStore {
             return Err(SecretError::Unavailable(describe(err)));
         }
         keyring::Entry::new(&self.service, key).map_err(|err| backend_error(&err))
-    }
-}
-
-impl Default for KeyringSecretStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -218,9 +264,10 @@ impl SecretStore for KeyringSecretStore {
     }
 
     fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
-        self.entry(key)?
-            .set_secret(value.as_bytes())
-            .map_err(|err| backend_error(&err))
+        let entry = self.entry(key)?;
+        set_creating_keyring(self.missing, &SessionKeyring, || {
+            entry.set_secret(value.as_bytes())
+        })
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretError> {
@@ -246,6 +293,91 @@ impl SecretStore for KeyringSecretStore {
             }
             Err(keyring::Error::NoEntry) => Ok(()),
             Err(err) => Err(SecretError::Unavailable(describe(&err))),
+        }
+    }
+}
+
+/// The Secret Service's default keyring, as [`set_creating_keyring`] sees it.
+trait DefaultKeyring {
+    /// `Some(true)` if there is a default keyring, `Some(false)` if there is
+    /// none, `None` if the Secret Service could not tell.
+    fn exists(&self) -> Option<bool>;
+    /// Ask the Secret Service for one. [`SecretError::KeyringNotCreated`] if
+    /// the person canceled it.
+    fn create(&self) -> Result<(), SecretError>;
+}
+
+/// Store with `store`; with no default keyring, create one and store once
+/// more, or refuse, as `missing` says (issue #18).
+fn set_creating_keyring(
+    missing: MissingKeyring,
+    keyring: &dyn DefaultKeyring,
+    mut store: impl FnMut() -> Result<(), keyring::Error>,
+) -> Result<(), SecretError> {
+    let err = match store() {
+        Ok(()) => return Ok(()),
+        Err(err) => err,
+    };
+    // Asked again because the Secret Service's "no result" is not only for an
+    // alias that names nothing. Anything it cannot confirm, or any other
+    // failure (a locked keyring whose unlock was canceled, say), is reported
+    // as it is.
+    let no_keyring = names_no_keyring(&err) && keyring.exists() == Some(false);
+    if !no_keyring {
+        return Err(backend_error(&err));
+    }
+    match missing {
+        MissingKeyring::Refuse => Err(SecretError::NoDefaultKeyring),
+        MissingKeyring::Create => {
+            keyring.create()?;
+            store().map_err(|err| backend_error(&err))
+        }
+    }
+}
+
+/// Whether `err` is how the `keyring` crate fails a write with no default
+/// keyring: no access, caused by the Secret Service's "no result" for the
+/// alias `default` (a locked keyring is no access too, with another cause).
+fn names_no_keyring(err: &keyring::Error) -> bool {
+    match err {
+        keyring::Error::NoStorageAccess(cause) => matches!(
+            cause.downcast_ref::<secret_service::Error>(),
+            Some(secret_service::Error::NoResult)
+        ),
+        _ => false,
+    }
+}
+
+/// The default keyring of the Secret Service on the session bus, looked at
+/// and created on a connection of its own (no secret travels on it).
+struct SessionKeyring;
+
+impl DefaultKeyring for SessionKeyring {
+    fn exists(&self) -> Option<bool> {
+        let service = SecretService::connect(EncryptionType::Plain).ok()?;
+        match service.get_default_collection() {
+            Ok(_) => Some(true),
+            // The alias "default" names no keyring.
+            Err(secret_service::Error::NoResult) => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    /// Blocks until the person answers the prompt: callers already run the
+    /// keyring off the GUI's main thread (issue #4).
+    fn create(&self) -> Result<(), SecretError> {
+        // The causes are the Secret Service's own; creating a keyring sends no
+        // secret, so none can carry one.
+        let failed = |err: secret_service::Error| {
+            SecretError::Backend(format!(
+                "this computer has no default keyring, and creating one failed: {err}"
+            ))
+        };
+        let service = SecretService::connect(EncryptionType::Plain).map_err(failed)?;
+        match service.create_collection(DEFAULT_KEYRING_LABEL, "default") {
+            Ok(_) => Ok(()),
+            Err(secret_service::Error::Prompt) => Err(SecretError::KeyringNotCreated),
+            Err(err) => Err(failed(err)),
         }
     }
 }
@@ -459,7 +591,259 @@ mod tests {
 
     #[test]
     fn with_service_sets_service() {
-        assert_eq!(KeyringSecretStore::with_service("x").service, "x");
+        assert_eq!(
+            KeyringSecretStore::with_service("x", MissingKeyring::Refuse).service,
+            "x"
+        );
+    }
+
+    #[test]
+    fn a_store_says_what_it_does_without_a_default_keyring() {
+        for missing in [MissingKeyring::Create, MissingKeyring::Refuse] {
+            assert_eq!(KeyringSecretStore::new(missing).missing_keyring(), missing);
+            assert_eq!(
+                KeyringSecretStore::with_service("x", missing).missing_keyring(),
+                missing
+            );
+        }
+    }
+
+    // ----- no default keyring (issue #18) -----
+
+    use std::cell::Cell;
+
+    /// A stand-in for the Secret Service's default keyring: whether there is
+    /// one, and what asking for one gives. Counts both.
+    struct FakeKeyring {
+        exists: Option<bool>,
+        create: fn() -> Result<(), SecretError>,
+        asked: Cell<usize>,
+        created: Cell<usize>,
+    }
+
+    impl FakeKeyring {
+        fn new(exists: Option<bool>, create: fn() -> Result<(), SecretError>) -> Self {
+            Self {
+                exists,
+                create,
+                asked: Cell::new(0),
+                created: Cell::new(0),
+            }
+        }
+    }
+
+    impl DefaultKeyring for FakeKeyring {
+        fn exists(&self) -> Option<bool> {
+            self.asked.set(self.asked.get() + 1);
+            self.exists
+        }
+
+        fn create(&self) -> Result<(), SecretError> {
+            self.created.set(self.created.get() + 1);
+            (self.create)()
+        }
+    }
+
+    fn created() -> Result<(), SecretError> {
+        Ok(())
+    }
+
+    fn canceled() -> Result<(), SecretError> {
+        Err(SecretError::KeyringNotCreated)
+    }
+
+    /// What the `keyring` crate gives for a write with no default keyring.
+    fn no_default() -> keyring::Error {
+        keyring::Error::NoStorageAccess(Box::new(secret_service::Error::NoResult))
+    }
+
+    /// What it gives for a keyring whose unlock was canceled, the default one
+    /// or another that holds the entry.
+    fn canceled_unlock() -> keyring::Error {
+        keyring::Error::NoStorageAccess(Box::new(secret_service::Error::Prompt))
+    }
+
+    /// Runs `set_creating_keyring` with a store that gives `results` in turn,
+    /// and returns its result and how many times it stored.
+    fn run(
+        missing: MissingKeyring,
+        keyring: &FakeKeyring,
+        results: Vec<Result<(), keyring::Error>>,
+    ) -> (Result<(), SecretError>, usize) {
+        let mut results = results.into_iter();
+        let mut stores = 0;
+        let out = set_creating_keyring(missing, keyring, || {
+            stores += 1;
+            results
+                .next()
+                .expect("stored more often than the test expects")
+        });
+        (out, stores)
+    }
+
+    #[test]
+    fn the_two_texts_are_the_ones_decided() {
+        assert_eq!(
+            SecretError::KeyringNotCreated.to_string(),
+            "this computer has no default keyring, and creating one was canceled"
+        );
+        assert_eq!(
+            SecretError::NoDefaultKeyring.to_string(),
+            "this computer has no default keyring"
+        );
+    }
+
+    #[test]
+    fn a_write_that_works_never_asks_about_the_keyring() {
+        for missing in [MissingKeyring::Create, MissingKeyring::Refuse] {
+            let keyring = FakeKeyring::new(Some(false), created);
+            let (out, stores) = run(missing, &keyring, vec![Ok(())]);
+            assert!(out.is_ok(), "{out:?}");
+            assert_eq!(
+                (stores, keyring.asked.get(), keyring.created.get()),
+                (1, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn with_no_default_keyring_one_is_created_and_the_secret_stored() {
+        let keyring = FakeKeyring::new(Some(false), created);
+        let (out, stores) = run(
+            MissingKeyring::Create,
+            &keyring,
+            vec![Err(no_default()), Ok(())],
+        );
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!((stores, keyring.created.get()), (2, 1));
+    }
+
+    #[test]
+    fn a_canceled_keyring_stores_nothing_and_says_so() {
+        let keyring = FakeKeyring::new(Some(false), canceled);
+        let (out, stores) = run(MissingKeyring::Create, &keyring, vec![Err(no_default())]);
+        assert!(
+            matches!(out, Err(SecretError::KeyringNotCreated)),
+            "{out:?}"
+        );
+        assert_eq!((stores, keyring.created.get()), (1, 1));
+    }
+
+    #[test]
+    fn a_keyring_that_could_not_be_created_says_why() {
+        fn failed() -> Result<(), SecretError> {
+            Err(SecretError::Backend("the bus went away".to_owned()))
+        }
+        let keyring = FakeKeyring::new(Some(false), failed);
+        let (out, stores) = run(MissingKeyring::Create, &keyring, vec![Err(no_default())]);
+        assert!(
+            matches!(&out, Err(SecretError::Backend(why)) if why == "the bus went away"),
+            "{out:?}"
+        );
+        assert_eq!(stores, 1);
+    }
+
+    #[test]
+    fn refuse_never_creates_a_keyring() {
+        let keyring = FakeKeyring::new(Some(false), created);
+        let (out, stores) = run(MissingKeyring::Refuse, &keyring, vec![Err(no_default())]);
+        assert!(matches!(out, Err(SecretError::NoDefaultKeyring)), "{out:?}");
+        assert_eq!(
+            (stores, keyring.asked.get(), keyring.created.get()),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_locked_keyring_that_exists_keeps_todays_error() {
+        for missing in [MissingKeyring::Create, MissingKeyring::Refuse] {
+            let keyring = FakeKeyring::new(Some(true), created);
+            let (out, stores) = run(missing, &keyring, vec![Err(canceled_unlock())]);
+            assert!(
+                matches!(&out, Err(SecretError::Backend(why))
+                    if why == "keyring is locked or access was denied: SS error: prompt dismissed"),
+                "{out:?}"
+            );
+            assert_eq!((stores, keyring.created.get()), (1, 0));
+        }
+    }
+
+    #[test]
+    fn a_canceled_unlock_never_creates_a_keyring() {
+        // The entry is in a keyring that is not the default and there is no
+        // default: canceling its unlock is not a reason to make one.
+        for missing in [MissingKeyring::Create, MissingKeyring::Refuse] {
+            let keyring = FakeKeyring::new(Some(false), created);
+            let (out, stores) = run(missing, &keyring, vec![Err(canceled_unlock())]);
+            assert!(
+                matches!(&out, Err(SecretError::Backend(why))
+                    if why == "keyring is locked or access was denied: SS error: prompt dismissed"),
+                "{out:?}"
+            );
+            assert_eq!((stores, keyring.created.get()), (1, 0));
+        }
+    }
+
+    #[test]
+    fn a_default_keyring_that_turns_out_to_exist_is_not_created() {
+        // Made by someone else since the write failed, say.
+        let keyring = FakeKeyring::new(Some(true), created);
+        let (out, stores) = run(MissingKeyring::Create, &keyring, vec![Err(no_default())]);
+        assert!(
+            matches!(&out, Err(SecretError::Backend(why))
+                if why.starts_with("keyring is locked or access was denied")),
+            "{out:?}"
+        );
+        assert_eq!(
+            (stores, keyring.asked.get(), keyring.created.get()),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_keyring_that_cannot_be_looked_at_is_not_created() {
+        let keyring = FakeKeyring::new(None, created);
+        let (out, stores) = run(MissingKeyring::Create, &keyring, vec![Err(no_default())]);
+        assert!(
+            matches!(&out, Err(SecretError::Backend(why))
+                if why.starts_with("keyring is locked or access was denied")),
+            "{out:?}"
+        );
+        assert_eq!(
+            (stores, keyring.asked.get(), keyring.created.get()),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn other_failures_never_ask_about_the_keyring() {
+        let keyring = FakeKeyring::new(Some(false), created);
+        let failure = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("boom")));
+        let (out, stores) = run(MissingKeyring::Create, &keyring, vec![Err(failure)]);
+        assert!(
+            matches!(&out, Err(SecretError::Backend(why)) if why == "platform failure: boom"),
+            "{out:?}"
+        );
+        assert_eq!(
+            (stores, keyring.asked.get(), keyring.created.get()),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_write_that_fails_again_after_creating_is_tried_only_twice() {
+        let keyring = FakeKeyring::new(Some(false), created);
+        let (out, stores) = run(
+            MissingKeyring::Create,
+            &keyring,
+            vec![Err(no_default()), Err(no_default())],
+        );
+        assert!(
+            matches!(&out, Err(SecretError::Backend(why))
+                if why.starts_with("keyring is locked or access was denied")),
+            "{out:?}"
+        );
+        assert_eq!((stores, keyring.created.get()), (2, 1));
     }
 
     /// Talks to the real Secret Service (needs an unlocked login keyring), so it
@@ -468,7 +852,10 @@ mod tests {
     #[test]
     #[ignore = "needs a running, unlocked Secret Service"]
     fn keyring_roundtrip() {
-        let store = KeyringSecretStore::with_service(service_name_from(Some("moniker-test")));
+        let store = KeyringSecretStore::with_service(
+            service_name_from(Some("moniker-test")),
+            MissingKeyring::Refuse,
+        );
         let key = format!("moniker-test-{}", uuid::Uuid::new_v4());
 
         /// Deletes the entry however the test exits, including a failed assertion.

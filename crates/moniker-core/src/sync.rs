@@ -19,8 +19,12 @@
 //! [`SyncError::PeerTooOld`] for it), 3 no secret store,
 //! 4 the server has been away ([`SyncError::Stale`] there,
 //! [`SyncError::PeerStale`] here), 5 sync is turned off on the server
-//! ([`SyncError::SyncOff`] there, [`SyncError::PeerSyncOff`] here), 255
-//! anything else. Messages are fixed, non-secret text.
+//! ([`SyncError::SyncOff`] there, [`SyncError::PeerSyncOff`] here), 6 the
+//! server has no default keyring for the passwords it received and may not
+//! create one (issue #18; [`SyncError::NoDefaultKeyring`] there,
+//! [`SyncError::PeerNoDefaultKeyring`] here), 255 anything else. Messages are
+//! fixed, non-secret text; codes 4 to 6 carry it in the client's words, for a
+//! Moniker that knows no such code and shows the text as it is.
 //!
 //! The client's HELLO flags byte has one flag, bit 0: the person accepted
 //! syncing with a machine that has been away ([`StaleSync::Allow`]). A client
@@ -215,6 +219,7 @@ const CODE_VERSION_MISMATCH: u8 = 2;
 const CODE_NO_SECRET_STORE: u8 = 3;
 const CODE_STALE: u8 = 4;
 const CODE_SYNC_OFF: u8 = 5;
+const CODE_NO_DEFAULT_KEYRING: u8 = 6;
 const CODE_OTHER: u8 = 255;
 
 /// The bit of the client's HELLO flags byte that says the person accepted
@@ -304,6 +309,17 @@ pub enum SyncError {
     /// HELLO.
     #[error("sync is turned off on the other machine")]
     PeerSyncOff,
+    /// This machine has no default keyring to keep the passwords it received
+    /// in, and the store may not create one (issue #18): `sync-serve` never
+    /// does, as another machine started it. Nothing was changed.
+    #[error("this computer has no default keyring")]
+    NoDefaultKeyring,
+    /// The other machine has no default keyring and did not create one; it
+    /// changed nothing, and neither did this one.
+    #[error(
+        "the other machine has no default keyring: open Moniker on it and save a password, then sync again"
+    )]
+    PeerNoDefaultKeyring,
     /// The other machine runs a Moniker older than jump hosts (issue #9) while
     /// a profile has one; nothing was sent but the HELLO.
     #[error(
@@ -752,8 +768,9 @@ fn store_error(e: StoreError) -> SyncError {
 fn secret_error(e: SecretError) -> SyncError {
     match e {
         SecretError::Unavailable(_) => SyncError::NoSecretStore,
+        SecretError::NoDefaultKeyring => SyncError::NoDefaultKeyring,
         // SecretError messages never carry a secret value.
-        SecretError::Backend(_) => SyncError::Store(e.to_string()),
+        SecretError::Backend(_) | SecretError::KeyringNotCreated => SyncError::Store(e.to_string()),
     }
 }
 
@@ -829,6 +846,7 @@ fn error_from_payload(payload: &[u8]) -> SyncError {
         CODE_NO_SECRET_STORE => SyncError::NoSecretStore,
         CODE_STALE => SyncError::PeerStale,
         CODE_SYNC_OFF => SyncError::PeerSyncOff,
+        CODE_NO_DEFAULT_KEYRING => SyncError::PeerNoDefaultKeyring,
         _ => {
             let text = clean(&String::from_utf8_lossy(message));
             SyncError::Remote(first_bytes(&text, MAX_SHOWN_MESSAGE).to_string())
@@ -845,12 +863,14 @@ fn send_error(w: &mut impl Write, err: &SyncError) {
         SyncError::NoSecretStore => CODE_NO_SECRET_STORE,
         SyncError::Stale { .. } | SyncError::PeerStale => CODE_STALE,
         SyncError::SyncOff | SyncError::PeerSyncOff => CODE_SYNC_OFF,
+        SyncError::NoDefaultKeyring | SyncError::PeerNoDefaultKeyring => CODE_NO_DEFAULT_KEYRING,
         _ => CODE_OTHER,
     };
     let text = match err {
-        // Said from the peer's side, for a Moniker that knows no code 4 or 5
-        // and shows the text as it is.
+        // Said from the peer's side, for a Moniker that knows no code 4, 5
+        // or 6 and shows the text as it is.
         SyncError::SyncOff => SyncError::PeerSyncOff.to_string(),
+        SyncError::NoDefaultKeyring => SyncError::PeerNoDefaultKeyring.to_string(),
         SyncError::Stale { days } => format!(
             "the other machine has not synced for {days} days, so a profile deleted on another \
              machine more than a year ago could come back on every machine; a newer Moniker can \
@@ -1756,6 +1776,8 @@ mod tests {
         /// The write number (1-based, counting all writes so far) that fails;
         /// 0 means none. Only that one write fails.
         fail_at: AtomicUsize,
+        /// The error that write fails with; none means a `Backend` one.
+        fail_as: Mutex<Option<fn() -> SecretError>>,
     }
 
     #[derive(Clone, Default)]
@@ -1785,11 +1807,19 @@ mod tests {
         fn fail_nth_write(&self, n: usize) {
             self.0.fail_at.store(self.writes() + n, Ordering::SeqCst);
         }
+        /// Make the `n`-th write from now fail (once) with `err`.
+        fn fail_nth_write_as(&self, n: usize, err: fn() -> SecretError) {
+            *self.0.fail_as.lock().unwrap() = Some(err);
+            self.fail_nth_write(n);
+        }
         /// Count a write; `Err` if it is the one chosen to fail.
         fn write(&self) -> Result<(), SecretError> {
             let n = self.0.writes.fetch_add(1, Ordering::SeqCst) + 1;
             if n == self.0.fail_at.load(Ordering::SeqCst) {
-                Err(SecretError::Backend("injected failure".to_string()))
+                Err(match *self.0.fail_as.lock().unwrap() {
+                    Some(err) => err(),
+                    None => SecretError::Backend("injected failure".to_string()),
+                })
             } else {
                 Ok(())
             }
@@ -3078,6 +3108,10 @@ mod tests {
             error_from_payload(b"\x05x"),
             SyncError::PeerSyncOff
         ));
+        assert!(matches!(
+            error_from_payload(b"\x06x"),
+            SyncError::PeerNoDefaultKeyring
+        ));
         assert!(matches!(error_from_payload(b""), SyncError::Protocol(_)));
         let SyncError::Remote(msg) = error_from_payload(b"\xffdisk \x1b[2Jfull\n\xff") else {
             panic!("expected Remote");
@@ -3827,6 +3861,79 @@ mod tests {
             assert_eq!(shown, text);
         }
         assert_eq!(file_of(&b.path), b_file);
+    }
+
+    // ----- no default keyring (issue #18) -----
+
+    #[test]
+    fn a_server_with_no_default_keyring_says_so_and_nothing_changes() {
+        // `sync-serve` may not create a default keyring: its store refuses
+        // the first password it has to keep.
+        let p1 = prof("one");
+        let mut a = side(&[(p1.clone(), Some("pw-one"))]);
+        let b = side(&[]);
+        b.secrets
+            .fail_nth_write_as(1, || SecretError::NoDefaultKeyring);
+        let a_file = file_of(&a.path);
+        let b_file = file_of(&b.path);
+        let (cs, ss) = pair();
+        let server = spawn_server(ss, b.state, PASS);
+
+        let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
+        drop(cs);
+        let (served, _) = server.join().unwrap();
+
+        assert!(
+            matches!(served, Err(SyncError::NoDefaultKeyring)),
+            "server got {served:?}"
+        );
+        assert!(
+            matches!(err, SyncError::PeerNoDefaultKeyring),
+            "client got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "the other machine has no default keyring: open Moniker on it and save a \
+             password, then sync again"
+        );
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(file_of(&b.path), b_file);
+        assert_eq!(b.secrets.password(&p1.id), None);
+        assert_eq!(a.secrets.writes(), 0);
+    }
+
+    #[test]
+    fn no_default_keyring_goes_as_code_6_in_the_peers_words() {
+        let mut said = Vec::new();
+        send_error(&mut said, &SyncError::NoDefaultKeyring);
+        let frames = frames(&said);
+        let [(kind, payload)] = &frames[..] else {
+            panic!("expected one frame, got {frames:?}");
+        };
+        assert_eq!(*kind, KIND_ERROR);
+        assert_eq!(payload[0], CODE_NO_DEFAULT_KEYRING);
+        let text = String::from_utf8_lossy(&payload[1..]).into_owned();
+        assert_eq!(text, SyncError::PeerNoDefaultKeyring.to_string());
+        assert!(matches!(
+            error_from_payload(payload),
+            SyncError::PeerNoDefaultKeyring
+        ));
+        // A Moniker that knows no code 6 shows the text as it is.
+        let unknown_code = [&[9u8][..], &payload[1..]].concat();
+        let SyncError::Remote(shown) = error_from_payload(&unknown_code) else {
+            panic!("expected Remote");
+        };
+        assert_eq!(shown, text);
+    }
+
+    #[test]
+    fn a_keyring_not_created_here_is_this_machines_store_error() {
+        let err = secret_error(SecretError::KeyringNotCreated);
+        assert!(
+            matches!(&err, SyncError::Store(text)
+                if text.ends_with("this computer has no default keyring, and creating one was canceled")),
+            "{err:?}"
+        );
     }
 
     #[test]

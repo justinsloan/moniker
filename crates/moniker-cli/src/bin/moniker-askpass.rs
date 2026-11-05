@@ -43,7 +43,7 @@ use moniker_core::askpass::{
     effective_identity, parent_in_stat, started_by_moniker,
 };
 use moniker_core::profile::Profile;
-use moniker_core::secrets::{KeyringSecretStore, SecretStore};
+use moniker_core::secrets::{KeyringSecretStore, MissingKeyring, SecretStore};
 use moniker_core::ssh_config::login_config;
 use moniker_core::store::ProfileStore;
 
@@ -106,7 +106,8 @@ fn run_from_environment() -> ExitCode {
         &prompt,
         &env,
         expected,
-        &KeyringSecretStore::new(),
+        // It only reads, so what a write would do does not matter.
+        &KeyringSecretStore::new(MissingKeyring::Refuse),
         &mut DevTty,
         &mut io::stdout().lock(),
     );

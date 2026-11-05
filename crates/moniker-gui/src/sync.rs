@@ -49,8 +49,6 @@ use gtk::glib;
 use gtk4 as gtk;
 use moniker_core::jump::{self, JumpLeg};
 use moniker_core::profile::Profile;
-#[cfg(not(test))]
-use moniker_core::secrets::KeyringSecretStore;
 use moniker_core::secrets::{
     SYNC_PASSPHRASE_KEY, SecretStore, check_sync_passphrase, password_key,
 };
@@ -122,6 +120,9 @@ pub(crate) fn explain(err: &SyncError) -> String {
         }
         SyncError::SyncOff => SYNC_IS_OFF.to_owned(),
         SyncError::PeerSyncOff => "Sync is turned off on the other machine.".to_owned(),
+        SyncError::PeerNoDefaultKeyring => "The other machine has no default keyring: open \
+            Moniker on it and save a password, then sync again."
+            .to_owned(),
         SyncError::PeerTooOld => "The other machine runs an older Moniker, which does not know \
             jump hosts. Update it to sync while a profile has a jump host."
             .to_owned(),
@@ -681,7 +682,7 @@ pub(crate) fn start_sync(
 /// system `ssh`, and `moniker-server` on the other machine's PATH.
 #[cfg(not(test))]
 fn run_sync(inputs: SyncInputs) -> Result<SyncOutcome, SyncError> {
-    run_with(inputs, Box::new(KeyringSecretStore::new()), |_| {})
+    run_with(inputs, Box::new(crate::keyring::system_store()), |_| {})
 }
 
 /// A sync's worker function, as [`runner`] gives it.
@@ -713,7 +714,7 @@ pub(crate) type OpenSecrets = Arc<dyn Fn() -> Box<dyn SecretStore> + Send + Sync
 /// keyring.
 #[cfg(not(test))]
 fn worker_secrets(_ctx: &AppContext) -> OpenSecrets {
-    Arc::new(|| Box::new(KeyringSecretStore::new()))
+    Arc::new(|| Box::new(crate::keyring::system_store()))
 }
 
 /// The secret store a sync's worker reads. In tests it is whatever the test
@@ -1103,6 +1104,17 @@ mod tests {
         assert_eq!(
             switch_subtitle(SyncSwitch::Unreadable),
             "Off: the setting could not be read. Turn sync on to replace it."
+        );
+    }
+
+    #[test]
+    fn the_other_machines_missing_keyring_is_explained() {
+        // Issue #18: the other machine never creates a keyring for a sync this
+        // one started, so the person is sent there.
+        assert_eq!(
+            explain(&SyncError::PeerNoDefaultKeyring),
+            "The other machine has no default keyring: open Moniker on it and save a \
+             password, then sync again."
         );
     }
 

@@ -23,4 +23,6 @@ zeroize = "1.9.1"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+# For the e2e helper's put-session-secret (issue #18); what moniker-core uses.
+secret-service = { version = "5.2.0", features = ["crypto-rust"] }
 tempfile = "3.27.0"

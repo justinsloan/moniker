@@ -1169,6 +1169,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "moniker-core",
+ "secret-service",
  "tempfile",
  "zeroize",
 ]
@@ -1182,6 +1183,7 @@ dependencies = [
  "getrandom",
  "keyring",
  "rustix",
+ "secret-service",
  "serde",
  "serde_json",
  "tempfile",

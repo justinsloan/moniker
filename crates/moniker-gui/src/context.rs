@@ -35,7 +35,7 @@ use gtk::{gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 use moniker_core::profile::Profile;
-use moniker_core::secrets::{KeyringSecretStore, SecretStore};
+use moniker_core::secrets::SecretStore;
 use moniker_core::store::{ProfileStore, StoreError};
 use moniker_core::transcript;
 
@@ -283,7 +283,7 @@ impl AppContext {
             .map_err(|err| format!("cannot find the path of this program: {err}"))?;
         Ok(AppContext::with_paths(
             store,
-            Arc::new(KeyringSecretStore::new()),
+            Arc::new(crate::keyring::system_store()),
             exe.with_file_name("moniker-askpass"),
             settings::default_path(),
             runtime_dir_from(std::env::var_os("XDG_RUNTIME_DIR")),

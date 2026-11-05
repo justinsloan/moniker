@@ -47,7 +47,7 @@ use std::thread;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
-use moniker_core::secrets::SecretStore;
+use moniker_core::secrets::{KeyringSecretStore, MissingKeyring, SecretStore};
 use moniker_core::store::ProfileStore;
 
 use crate::context::AppContext;
@@ -184,6 +184,14 @@ pub(crate) fn write_profiles<R: Send + 'static>(
     );
 }
 
+/// The system keyring, as the app opens it: for this worker (`AppContext::new`)
+/// and for every sync's worker (`crate::sync`). Everything the app stores, the person
+/// asked for at this machine, so a missing default keyring is created and
+/// GNOME asks for its password (issue #18).
+pub(crate) fn system_store() -> KeyringSecretStore {
+    KeyringSecretStore::new(MissingKeyring::Create)
+}
+
 /// A handle of its own on the profile file at `path`, for a call that writes
 /// it on the worker (module docs). The message never quotes the file.
 pub(crate) fn own_store(path: &Path) -> Result<RefCell<ProfileStore>, String> {
@@ -255,4 +263,15 @@ impl SecretStore for MainThreadWatch {
 #[cfg(test)]
 pub(crate) fn main_thread_calls() -> usize {
     MAIN_THREAD_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_app_creates_a_missing_default_keyring() {
+        // Every write the app does was asked for at this machine (issue #18).
+        assert_eq!(system_store().missing_keyring(), MissingKeyring::Create);
+    }
 }
