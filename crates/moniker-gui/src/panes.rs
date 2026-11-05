@@ -452,11 +452,19 @@ pub(crate) fn pane_of(holder: &PaneHolder) -> Option<Pane> {
 
 /// The tab view `layout` is shown in and its page there, unless it is not in
 /// one right now (its tab was closed, or is being dragged).
+///
+/// A closed tab's widgets stay inside the view for a moment after its page has
+/// gone (libadwaita 1.9 announces `n-pages` before it takes them out), and
+/// `TabView::page` aborts the process for a child that is no page's, so the
+/// page is looked for among the view's pages (issue #21: closing the dialogs
+/// over a window as its last tab closes gives the keyboard back into that tab).
 pub(crate) fn page_of(layout: &TabLayout) -> Option<(adw::TabView, adw::TabPage)> {
     let view = layout
         .ancestor(adw::TabView::static_type())
         .and_downcast::<adw::TabView>()?;
-    let page = view.page(layout);
+    let page = (0..view.n_pages())
+        .map(|i| view.nth_page(i))
+        .find(|page| page.child() == *layout.upcast_ref::<gtk::Widget>())?;
     Some((view, page))
 }
 

@@ -8,6 +8,7 @@
 //! `TabView::transfer_page` (what a drop does) and a drop outside every window
 //! with the view's `create-window` signal, as `AdwTabBar` emits it.
 
+use std::cell::RefCell;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -34,7 +35,7 @@ use super::{
 use crate::context::{AppContext, Notice};
 use crate::form::{self, Field};
 use crate::terminal_tab::{self, TranscriptSpec, open_command, tab_title, terminal_of};
-use crate::{connect_menu, keyring, new_tab, profiles, settings, window, zoom};
+use crate::{connect_menu, keyring, new_tab, preferences, profiles, settings, window, zoom};
 
 /// A presented main window with one local tab.
 pub(super) fn main_window(app: &adw::Application, ctx: &Rc<AppContext>) -> window::MainWindow {
@@ -1248,6 +1249,62 @@ pub(super) fn quitting_saves_the_last_windows_active_tab(dir: &Path) {
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+/// A window whose last tab closes by itself while dialogs are open over it
+/// closes too, and the dialogs close with it as Escape would close them (issue
+/// #21): libadwaita turns a window's close into closing the dialog on top, which
+/// used to leave the window open with no tab.
+pub(super) fn the_last_tab_closing_under_dialogs_closes_the_window(dir: &Path) {
+    let ctx = ctx_with(dir, &[]);
+    let path = ctx.settings_path.clone();
+    let app = test_app();
+
+    // The New Session window alone, as in the issue: the shell it was opened
+    // for exits.
+    let main = main_window(&app, &ctx);
+    let page = main.view.selected_page().expect("the window's tab");
+    let shell = terminal_of(&page).expect("its shell");
+    new_tab::choose_new_session(&super::pane(&page), &ctx);
+    pump_until("the New Session window", || {
+        main.window.visible_dialog().is_some()
+    });
+    shell.feed_child(b"exit\n");
+    pump_until("the window to close with its last tab", || {
+        !main.window.is_visible()
+    });
+    assert!(app.windows().is_empty(), "no window is left");
+
+    // Preferences, the New Session window over it, and a question on top.
+    let main = main_window(&app, &ctx);
+    zoom_to(&main, 1.2);
+    let page = main.view.selected_page().expect("the window's tab");
+    let shell = terminal_of(&page).expect("its shell");
+    preferences::present(&main.window, &app, &ctx);
+    new_tab::choose_new_session(&super::pane(&page), &ctx);
+    let question = adw::AlertDialog::new(Some("Question"), None);
+    question.add_responses(&[("cancel", "Cancel"), ("go", "Go")]);
+    question.set_close_response("cancel");
+    let answers = Rc::new(RefCell::new(Vec::<String>::new()));
+    question.connect_response(None, {
+        let answers = answers.clone();
+        move |_, response| answers.borrow_mut().push(response.to_owned())
+    });
+    question.present(Some(&main.window));
+    pump_until("three dialogs over the window", || {
+        main.window.dialogs().n_items() == 3
+    });
+
+    // The shell ends, its tab closes, and the window closes with it.
+    shell.feed_child(b"exit\n");
+    pump_until("the window to close with its last tab", || {
+        !main.window.is_visible()
+    });
+    assert!(app.windows().is_empty(), "no window is left");
+    assert_eq!(*answers.borrow(), ["cancel"], "answered as Escape answers");
+    // The window's own close ran: the last window saves its text size.
+    assert_eq!(settings::load(&path).font_scale, 1.2);
+    pump_for(Duration::from_millis(200));
 }
 
 /// The launch starts its first tab at the saved size (a damaged file is

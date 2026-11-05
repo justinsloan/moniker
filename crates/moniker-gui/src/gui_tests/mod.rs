@@ -719,6 +719,7 @@ fn gui_integration() {
     windows::a_new_tab_starts_at_the_active_tabs_size(&bin, &tmp.path().join("z-new"));
     windows::the_menu_row_shows_and_resets_the_size(&tmp.path().join("z-row"));
     windows::quitting_saves_the_last_windows_active_tab(&tmp.path().join("z-quit"));
+    windows::the_last_tab_closing_under_dialogs_closes_the_window(&tmp.path().join("z-dialogs"));
     windows::launch_starts_at_the_saved_size(&bin, &tmp.path().join("z-launch"));
     windows::zoom_shortcuts_exist();
     save_transcripts::a_local_tab_can_save_its_transcript(&tmp.path().join("v-local"));

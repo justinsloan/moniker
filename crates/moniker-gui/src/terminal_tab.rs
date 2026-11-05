@@ -809,6 +809,26 @@ fn tab_menu() -> gio::Menu {
 /// Ctrl+plus, Ctrl+minus and Ctrl+0 (the text size).
 const TAB_VIEW_SHORTCUTS: adw::TabViewShortcuts = adw::TabViewShortcuts::NONE;
 
+/// Close every dialog over `window`, the one on top first, so that closing the
+/// window then goes through (issue #21): while a dialog is open, libadwaita
+/// turns a close of the window into a close of the dialog on top, and a window
+/// whose last tab had closed stayed open, empty. Each closes as Escape closes it
+/// (an alert answers its close response); `force_close` because a window with no
+/// tab left must not stay for a dialog that will not close.
+fn close_dialogs_over(window: &gtk::Window) {
+    let Some(window) = window.downcast_ref::<adw::ApplicationWindow>() else {
+        return;
+    };
+    // Read first: a dialog leaves the list as it closes.
+    let dialogs = window.dialogs();
+    let open: Vec<adw::Dialog> = (0..dialogs.n_items())
+        .filter_map(|i| dialogs.item(i).and_downcast())
+        .collect();
+    for dialog in open.iter().rev() {
+        dialog.force_close();
+    }
+}
+
 /// Set up `view` as the tabs of a window: the tab menu, the tab view's own
 /// shortcuts ([`TAB_VIEW_SHORTCUTS`]), what closing a tab does, and closing the
 /// window with its last tab.
@@ -855,6 +875,7 @@ pub fn setup_tab_view(view: &adw::TabView) {
         if view.n_pages() == 0
             && let Some(window) = view.root().and_downcast::<gtk::Window>()
         {
+            close_dialogs_over(&window);
             window.close();
         }
     });
