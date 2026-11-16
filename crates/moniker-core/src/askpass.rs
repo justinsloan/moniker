@@ -7,8 +7,10 @@
 //!
 //! 1. `SSH_ASKPASS_PROMPT=none` marks a message to display, not a question:
 //!    show it on the terminal and answer with nothing.
-//! 2. `SSH_ASKPASS_PROMPT=confirm` marks a yes/no question, which is host-key
-//!    confirmation. It always goes to the user; the helper never answers it.
+//! 2. `SSH_ASKPASS_PROMPT=confirm` marks a yes/no question. It always goes to
+//!    the user, with what is typed shown; the helper never answers it. (The
+//!    host-key question can come without the mark: rule 4 knows it by its
+//!    words.)
 //! 3. A password prompt for this profile's own login is answered from the
 //!    keyring for the profile named by `MONIKER_PROFILE_ID`. That id arrives
 //!    through the environment, so it is only used if it is a canonical UUID and
@@ -33,7 +35,12 @@
 //!
 //!    Anything else, in particular a hop's prompt, another host's, a bare
 //!    `Password:` or `New password:`, never receives the stored password.
-//! 4. Anything else is put to the user.
+//! 4. Anything else is put to the user, with what is typed hidden, unless the
+//!    prompt is one of `ssh`'s own yes/no questions (the host-key question,
+//!    [`SSH_QUESTION_ENDINGS`] and [`SSH_QUESTIONS`]). `ssh` does not pass on
+//!    whether a server asked for its answer to be shown, and a
+//!    keyboard-interactive prompt's words are the server's, so the words never
+//!    decide that a secret is shown.
 //!
 //! Rule 3 has a second condition in a terminal tab: the stored password is
 //! sent at most once per connection. A wrong one makes the server ask again,
@@ -329,11 +336,44 @@ pub fn answer(
         return Ok(secret);
     }
 
-    let hidden = lower.contains("passphrase")
-        || lower.contains("password")
-        || lower.contains("code")
-        || has_word(&lower, "pin");
-    tty.ask(prompt, !hidden).map(Zeroizing::new)
+    // What is typed is hidden unless the prompt is one of `ssh`'s own yes/no
+    // questions. `ssh` does not tell the helper whether a server asked for its
+    // answer to be shown, and a keyboard-interactive prompt's text is the
+    // server's own ("First Factor:", "Passwort:"), so the words of a prompt
+    // never decide that a secret is shown, in the terminal, its scrollback and
+    // a transcript.
+    tty.ask(prompt, is_ssh_yes_no_question(prompt))
+        .map(Zeroizing::new)
+}
+
+/// The endings of the yes/no questions `ssh` itself asks (OpenSSH 8.4 to
+/// 10.2): the host-key question, with and without a fingerprint to type, after
+/// the lines that name the host and its key.
+const SSH_QUESTION_ENDINGS: [&str; 2] = [
+    "Are you sure you want to continue connecting (yes/no/[fingerprint])?",
+    "Are you sure you want to continue connecting (yes/no)?",
+];
+
+/// The whole of the other yes/no questions `ssh` itself asks: the host-key
+/// question asked again after an answer it did not take, and
+/// `UpdateHostKeys=ask`'s question.
+const SSH_QUESTIONS: [&str; 3] = [
+    "Please type 'yes', 'no' or the fingerprint:",
+    "Please type 'yes' or 'no':",
+    "Accept updated hostkeys? (yes/no):",
+];
+
+/// Whether `prompt`, apart from trailing whitespace, is one of `ssh`'s own
+/// yes/no questions ([`SSH_QUESTION_ENDINGS`], [`SSH_QUESTIONS`]): the only
+/// prompts whose answer is shown as it is typed, since it is a yes, a no or a
+/// host key's fingerprint, never a secret. A server can write a prompt that
+/// reads the same, but its answer is still a yes or a no.
+fn is_ssh_yes_no_question(prompt: &str) -> bool {
+    let prompt = prompt.trim_end();
+    SSH_QUESTION_ENDINGS
+        .iter()
+        .any(|ending| prompt.ends_with(ending))
+        || SSH_QUESTIONS.contains(&prompt)
 }
 
 /// True if `prompt` is, apart from trailing whitespace, exactly one of the two
@@ -361,14 +401,6 @@ fn after_identity<'a>(text: &'a str, user: &str, host: &str) -> Option<&'a str> 
     text.strip_prefix(user)?
         .strip_prefix('@')?
         .strip_prefix(host)
-}
-
-/// True if `word` is one of the alphanumeric words of `lower` (a lowercased
-/// prompt): `pin` is in "enter pin for key" but not in "spinning".
-fn has_word(lower: &str, word: &str) -> bool {
-    lower
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|w| w == word)
 }
 
 /// The `(user, host)` that `ssh`'s password prompt names for a connection,
@@ -1180,9 +1212,16 @@ mod tests {
     }
 
     #[test]
-    fn echo_is_off_for_secret_looking_prompts_and_on_otherwise() {
+    fn echo_is_on_only_for_ssh_s_own_yes_no_questions() {
         let store = MemorySecretStore::default();
+        let host_key = "The authenticity of host 'h (192.0.2.1)' can't be established.\n\
+             ED25519 key fingerprint is SHA256:abcdefCODEpin0123456789.\n\
+             This key is not known by any other names.\n\
+             Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
         let cases = [
+            // A secret, whatever its words: the security review's F2. A
+            // keyboard-interactive prompt is the server's text, and `ssh` does
+            // not say whether the server wanted the answer shown.
             ("Enter passphrase for key 'k': ", false),
             ("Password: ", false),
             ("Verification code: ", false),
@@ -1192,9 +1231,33 @@ mod tests {
                 false,
             ),
             ("Enter your Pin: ", false),
-            ("Enter your name: ", true),
-            ("Spinner name: ", true),
-            ("Are you sure (yes/no)? ", true),
+            ("First Factor: ", false),
+            ("Passwort: ", false),
+            ("Mot de passe : ", false),
+            ("Secret: ", false),
+            ("Enter your name: ", false),
+            ("Spinner name: ", false),
+            ("Are you sure (yes/no)? ", false),
+            ("", false),
+            // `ssh`'s own questions, whose answer is a yes, a no or a
+            // fingerprint.
+            (host_key, true),
+            (HOST_KEY_PROMPT, true),
+            (
+                "Warning: the ECDSA host key for 'h' differs from the key for the IP address '192.0.2.1'\n\
+                 Offending key for IP in /home/u/.ssh/known_hosts:3\n\
+                 Are you sure you want to continue connecting (yes/no)? ",
+                true,
+            ),
+            ("Please type 'yes', 'no' or the fingerprint: ", true),
+            ("Please type 'yes' or 'no': ", true),
+            ("Accept updated hostkeys? (yes/no): ", true),
+            // Words after the question are not `ssh`'s.
+            (
+                "Are you sure you want to continue connecting (yes/no)? Password: ",
+                false,
+            ),
+            ("Password: Please type 'yes' or 'no': ", false),
         ];
         for (prompt, echo) in cases {
             let mut tty = FakeTty::replying("x");
