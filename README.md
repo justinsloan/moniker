@@ -31,7 +31,7 @@ If you log in to the same machines many times a day, an ordinary terminal has yo
 Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, renders htop, tmux and vim, and Moniker adds no per-frame work on top of it. Next to that, a saved **connection profile** is one click from a logged-in shell, and profiles sync between your own machines over plain SSH, encrypted with a key that only those machines hold.
 
 > [!NOTE]
-> Moniker is beta software (1.0.1, the 1.0 beta). Expect rough edges, and see the [known limitations](#known-limitations).
+> Moniker is beta software (1.0.2, the 1.0 beta). Expect rough edges, and see the [known limitations](#known-limitations).
 
 ## Features
 
@@ -74,9 +74,9 @@ Moniker is a terminal first. VTE, the engine behind GNOME Terminal and Console, 
 
 ```sh
 # Ubuntu
-sudo apt install ./moniker_1.0.1_amd64.deb ./moniker-server_1.0.1_amd64.deb
+sudo apt install ./moniker_1.0.2_amd64.deb ./moniker-server_1.0.2_amd64.deb
 # Fedora
-sudo dnf install ./moniker-1.0.1-1.fc44.x86_64.rpm ./moniker-server-1.0.1-1.fc44.x86_64.rpm
+sudo dnf install ./moniker-1.0.2-1.fc44.x86_64.rpm ./moniker-server-1.0.2-1.fc44.x86_64.rpm
 ```
 
 A headless machine that only syncs needs just `moniker-server`. Passwords and the sync key are kept in the system keyring (a Secret Service such as GNOME Keyring), which must be running and unlocked.
@@ -87,7 +87,7 @@ To check a download against the release's `SHA256SUMS`, and, with GitHub CLI 2.4
 
 ```sh
 sha256sum --ignore-missing -c SHA256SUMS
-gh attestation verify moniker_1.0.1_amd64.deb --repo justinsloan/moniker
+gh attestation verify moniker_1.0.2_amd64.deb --repo justinsloan/moniker
 ```
 
 ### Run from source
@@ -218,8 +218,8 @@ A profile can reach its host *through* another saved profile, its **jump host** 
 - **Sync: the field.** The jump host is a field of the profile, so it syncs with it. A profile that arrives on a machine that does not have its jump host (it is kept on the other machine only, or was deleted there) is accepted and waits as above; it never makes a sync fail. A jump host kept on this machine only can be chosen for a profile that syncs, and the row says "bastion is kept on this machine only, so your other machines won't have it.", since to them it is a deletion.
 - **Sync: through the jump host.** A sync with a partner whose profile has a jump host goes through it the way a tab does: the Sync page, **Sync Now**, the sync at launch and `moniker-server sync` all do. A sync cannot ask anything (see [Known limitations](#known-limitations)), so the jump host's host key must be known and its password stored, or its key in ssh-agent. An unknown (or changed) host key stops the sync with "Connect to bastion once in a tab first, so its host key is known." (the command line says "connect to bastion once with ssh first, so its host key is known"). A login that fails stops it with "Could not connect to the jump host bastion." and, for a refused password or key, what a sync cannot do (the command line adds ssh's own last lines instead). In both cases the partner is not tried.
 - **Sync: what is refused.** A partner whose jump host is not saved is not synced at all, with the pane's text. `moniker-server sync` needs a private `XDG_RUNTIME_DIR` like a pane does ("cannot connect through the jump host bastion: no private runtime folder for its shared connection"). Nothing is ever synced straight to the partner in place of a route that cannot be used.
-- **Older versions are kept out of a sync.** A Moniker from before jump hosts (0.7.0 and older) does not know the field. It drops it when it writes a profile and would connect that profile straight to its host. So while any profile that would be sent live has a jump host (a profile kept on this machine only goes as a deletion, and does not count), the two machines speak sync protocol version 2 instead of 1, and an older one refuses it before any profile is sent. Neither machine changes. With or without a jump host, Moniker 1.0.1 and older cannot sync with this version: see [How it keeps your passwords safe](#how-it-keeps-your-passwords-safe).
-- **What each side says.** This version, starting a sync with a Moniker from before jump hosts while a profile it would send has one, says "The other machine runs an older Moniker, which does not know jump hosts. Update it to sync while a profile has a jump host." (`moniker-server sync` writes it in lower case, with a semicolon). Every other sync with Moniker 1.0.1 or older stops with the messages under [How it keeps your passwords safe](#how-it-keeps-your-passwords-safe).
+- **Older versions are kept out of a sync.** A Moniker from before jump hosts (0.7.0 and older) does not know the field. It drops it when it writes a profile and would connect that profile straight to its host. So while any profile that would be sent live has a jump host (a profile kept on this machine only goes as a deletion, and does not count), the two machines speak sync protocol version 2 instead of 1, and an older one refuses it before any profile is sent. Neither machine changes. With or without a jump host, Moniker 1.0.1 and older cannot sync with 1.0.2 and newer: see [How it keeps your passwords safe](#how-it-keeps-your-passwords-safe).
+- **What each side says.** Moniker 1.0.2 and newer, starting a sync with a Moniker from before jump hosts while a profile it would send has one, says "The other machine runs an older Moniker, which does not know jump hosts. Update it to sync while a profile has a jump host." (`moniker-server sync` writes it in lower case, with a semicolon). Every other sync with Moniker 1.0.1 or older stops with the messages under [How it keeps your passwords safe](#how-it-keeps-your-passwords-safe).
 - **Older versions and `profiles.json`.** While a live profile has a jump host, the file is format version 3, which an older Moniker on the same machine refuses instead of connecting those profiles directly (0.7.0 says "unsupported profile store version 3 (this build reads versions 1 and 2)" and shows no profiles). Removing the last jump host takes it back to version 1 or 2. A machine that has received profiles with jump hosts from a machine of this version has such a file too, so an older Moniker there cannot take part in a sync at all: its `moniker-server` refuses the file before it reads the other side's HELLO.
 - **The marks.** A profile behind a jump host is never pinged: its mark is the dimmed dash with the tooltip "Not checked: reached through bastion" (a waiting one: "Not checked: its jump host is no longer saved"). The jump host's own row keeps its own mark, so whether it answers still shows, and the Preferences switch hides these marks with the others.
 - **The command line.** `moniker-server profile list` ends a profile's line with `  via bastion`, or `  (jump host no longer saved)`, before `  (this machine only)`. There is no command that sets a jump host: use the row.
@@ -472,7 +472,7 @@ The HELLO carries the sync protocol version: 1, or 2 only while a live profile t
 
 - **A machine holding your sync key is trusted.** It sees every password in the bundle and can add, change or delete your profiles. What it sends is still checked at the edge: ids must be canonical UUIDs, host and user names are restricted, control characters are refused, and one bad entry rejects the whole sync.
 - **A sync completes only with a machine that holds your sync key.** A bundle opens only as the other machine's message of this very sync. An end that does not hold the key cannot pass for a machine that does by sending your own bundle back, or a bundle it kept from an earlier sync: the sync fails as with a wrong sync key, nothing changes on this machine, and no sync is recorded.
-- **Moniker 1.0.1 and older cannot sync with this version.** They send no random number, and they seal a bundle that opens in any sync, so nothing could tell their bundle from one played back. A sync between the two stops before any profile is sent, and neither machine changes. The machine that started it says why: this version, "The other machine runs Moniker 1.0.1 or older, which this version no longer syncs with. Update it." (`moniker-server sync`: "the other machine runs Moniker 1.0.1 or older, which this version no longer syncs with; update it"); an older one, "remote error: the other machine runs a newer Moniker, which no longer syncs with Moniker 1.0.1 and older; update this one". Update every machine you sync.
+- **Moniker 1.0.1 and older cannot sync with 1.0.2 and newer.** They send no random number, and they seal a bundle that opens in any sync, so nothing could tell their bundle from one played back. A sync between the two stops before any profile is sent, and neither machine changes. The machine that started it says why: 1.0.2 and newer, "The other machine runs Moniker 1.0.1 or older, which this version no longer syncs with. Update it." (`moniker-server sync`: "the other machine runs Moniker 1.0.1 or older, which this version no longer syncs with; update it"); an older one, "remote error: the other machine runs a newer Moniker, which no longer syncs with Moniker 1.0.1 and older; update this one". Update every machine you sync.
 - **Use a long sync key.** The client sends its bundle once the other end has answered, but before it has shown that it knows the key.
 - **Off means off, and kept means kept.** With sync turned off this machine neither starts a sync nor accepts one, and the refusal comes before the keyring is asked for anything, the sync key included. A profile kept on this machine leaves it only as a deletion with no password: its password is never put in a bundle or sent (a sync reads the sync key and the passwords of the profiles that do sync; and if the kept profile is the one the sync connects through, its stored password logs in to that machine, as for any connection). Both are decided in the code that does the syncing.
 - **A jump host is signed in to by an `ssh` of its own.** The helper answers a password prompt only for an `ssh` that is Moniker's direct child when it asks, and the hop of a ProxyJump is its grandchild, so it never qualifies. A [jump host](#jump-hosts) chosen on a profile is therefore signed in to by a separate `ssh` that Moniker starts itself, the master of the shared connection, which is told the jump host profile's id and gets a one-time token of its own; the target's `ssh` has its own id and token. Each is answered at most once, from its own profile's stored password, for exactly the user and host `ssh -G` reports for that profile (for the target, as the command will really run, with Moniker's route in place of any proxy in `~/.ssh/config`). The command that asks the shared connection for a channel to the target is never answered from the keyring, and runs in batch mode so that it asks for nothing. The shared connection is a socket in a folder only you can use, not a port; while it is open any process of your own user can open channels through it, the same boundary as an unlocked keyring or a running ssh-agent.
@@ -534,8 +534,8 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request.
 To make a release, raise `version` in `Cargo.toml`, add the version to the release list in `data/org.moniker.Moniker.metainfo.xml`, commit, and push a tag named after it:
 
 ```sh
-git tag v1.0.1
-git push origin v1.0.1
+git tag v1.0.2
+git push origin v1.0.2
 ```
 
 The workflow runs every check, builds and install-tests both packages, and only then makes a **draft** release with the four packages, `SHA256SUMS` and a build-provenance attestation for each package. A draft is not public: download its packages, try them, and publish it on GitHub when they are good. A tag that does not match the version in `Cargo.toml` makes no release.
