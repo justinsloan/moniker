@@ -126,6 +126,9 @@ pub(crate) fn explain(err: &SyncError) -> String {
         SyncError::PeerTooOld => "The other machine runs an older Moniker, which does not know \
             jump hosts. Update it to sync while a profile has a jump host."
             .to_owned(),
+        SyncError::PeerUnbound => "The other machine runs Moniker 1.0.1 or older, which this \
+            version no longer syncs with. Update it."
+            .to_owned(),
         SyncError::JumpHostKeyUnknown { name } => {
             format!("Connect to {name} once in a tab first, so its host key is known.")
         }
@@ -975,6 +978,17 @@ mod tests {
             assert!(explain(&err).contains(SENTINEL));
             assert_eq!(explain(&err), err.to_string());
         }
+    }
+
+    #[test]
+    fn explain_a_machine_too_old_to_bind_its_bundles() {
+        // The security review's F1: a Moniker 1.0.1 or older says no session
+        // nonce in its HELLO.
+        assert_eq!(
+            explain(&SyncError::PeerUnbound),
+            "The other machine runs Moniker 1.0.1 or older, which this version no longer \
+             syncs with. Update it."
+        );
     }
 
     #[test]

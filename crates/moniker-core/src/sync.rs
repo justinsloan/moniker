@@ -10,7 +10,7 @@
 //!
 //! | kind | name   | payload                                          |
 //! |------|--------|--------------------------------------------------|
-//! | 1    | HELLO  | `[protocol version]` (1, or 2 while a profile sent has a jump host or in answer to a 2), from the client optionally followed by a flags byte |
+//! | 1    | HELLO  | `[protocol version][flags]` (the version is 1, or 2 while a profile sent has a jump host or in answer to a 2), then the sender's session nonce, 32 random bytes |
 //! | 2    | BUNDLE | a sealed bundle (see [`crate::crypto`])          |
 //! | 3    | ERROR  | `[code u8]` then a UTF-8 message                 |
 //!
@@ -22,24 +22,26 @@
 //! ([`SyncError::SyncOff`] there, [`SyncError::PeerSyncOff`] here), 6 the
 //! server has no default keyring for the passwords it received and may not
 //! create one (issue #18; [`SyncError::NoDefaultKeyring`] there,
-//! [`SyncError::PeerNoDefaultKeyring`] here), 255 anything else. Messages are
-//! fixed, non-secret text; codes 4 to 6 carry it in the client's words, for a
-//! Moniker that knows no such code and shows the text as it is.
+//! [`SyncError::PeerNoDefaultKeyring`] here), 7 the receiver's HELLO had no
+//! session nonce, so it runs Moniker 1.0.1 or older (below;
+//! [`SyncError::PeerUnbound`] on the side that sends it), 255 anything else.
+//! Messages are fixed, non-secret text; codes 4 to 7 carry it in the
+//! receiver's words, for a Moniker that knows no such code and shows the text
+//! as it is.
 //!
-//! The client's HELLO flags byte has one flag, bit 0: the person accepted
-//! syncing with a machine that has been away ([`StaleSync::Allow`]). A client
-//! that accepts nothing sends a one-byte HELLO, exactly what clients sent
-//! before the flags existed, and servers that predate them read only the first
-//! byte, so the flags need no new protocol version.
+//! The flags byte has one flag, bit 0, in the client's HELLO: the person
+//! accepted syncing with a machine that has been away ([`StaleSync::Allow`]).
+//! The server's flags byte is 0.
 //!
 //! # Exchange
 //!
 //! ```text
 //! client                                  server
 //!   export (once)
-//!   HELLO [1 or 2]  ──────────────────▶   sync on? passphrase set? ready()?
-//!                                         version 1 or 2? not away? export (once)
-//!              ◀───────────────────────   HELLO [1 or 2]        (or ERROR, stop)
+//!   HELLO [1 or 2, flags, nonce]  ────▶   sync on? passphrase set? ready()?
+//!                                         version 1 or 2? a nonce? not away?
+//!                                         export (once)
+//!              ◀───────────────────────   HELLO [1 or 2, 0, nonce] (or ERROR, stop)
 //!   BUNDLE(seal(export))  ────────────▶   open, validate, merge with export,
 //!                                         seal the merged set, apply
 //!              ◀───────────────────────   BUNDLE(seal(merged)) (or ERROR, stop)
@@ -51,6 +53,33 @@
 //! profile data leaves the client. The sync passphrase never goes on the wire;
 //! only sealed bundles do. A side that fails before its peer is done sends an
 //! ERROR frame (best effort) so the peer reports the real reason.
+//!
+//! # A bundle belongs to one exchange and one direction
+//!
+//! Each side draws a fresh random nonce for every sync and says it in its
+//! HELLO. A bundle is sealed with the role of the side that seals it and both
+//! nonces as associated data ([`Session`], see [`crate::crypto`]), and opened
+//! as the other role's message of the same two nonces, so it opens only as the
+//! other side's message of this very exchange. That is what shows that the
+//! other end holds the sync key now. An end that does not hold it cannot
+//! answer with the client's own bundle sent back (the role differs), nor with
+//! a bundle kept from an earlier sync under the same key, this machine's or
+//! another's (the nonces differ): both fail like a wrong sync key
+//! ([`SyncError::WrongSyncKey`]), and nothing is applied and no sync is
+//! recorded. A server refuses a client's bundle that was not sealed for the
+//! nonce it just drew in the same way.
+//!
+//! A Moniker from before this (1.0.1 and older) says no nonce and seals a
+//! bundle that any holder of the key opens in any sync, so neither side could
+//! tell its bundle from one played back, and there is no falling back to that:
+//! a HELLO without a nonce is refused with [`SyncError::PeerUnbound`], by a
+//! server with error 7 in place of its HELLO, by a client in place of its
+//! bundle, and that older format is not read at all. Neither machine changes.
+//! Error 7's text tells the older machine that the other runs a newer Moniker
+//! and that it is the one to update; it knows no code 7 and shows the text as
+//! it is. (Error 2 would read to an older machine that has a jump host as if
+//! the other were older.) The version byte keeps its meaning (jump hosts,
+//! below).
 //!
 //! # Nothing partial
 //!
@@ -133,8 +162,7 @@
 //! straight to its host, so it must not take part in a sync that carries one.
 //! The HELLO's version says so: a machine announces [`PROTOCOL_JUMP_HOSTS`]
 //! (2) exactly when a live profile it sends has a jump host
-//! ([`holds_jump_host`]), and [`PROTOCOL_VERSION`] (1) otherwise, so two
-//! machines with no jump host say byte for byte what machines said before.
+//! ([`holds_jump_host`]), and [`PROTOCOL_VERSION`] (1) otherwise.
 //! A profile kept on this machine goes as its tombstone, which has none, so it
 //! does not count.
 //!
@@ -142,13 +170,14 @@
 //!   the client said it or if its own export needs it, else 1. A client that
 //!   said 2 accepts only a 2 back; one that said 1 accepts either, since this
 //!   build can read what a server with jump hosts sends it.
-//! * An older server turns a 2 away with error 2 before reading any bundle, and
-//!   the client reports [`SyncError::PeerTooOld`] (it sent nothing but the
-//!   HELLO). An older client turns a server's 2 away the same way, with its
-//!   "incompatible versions" text, and the server (which answered 2) reports
-//!   [`SyncError::PeerTooOld`] and applies nothing. Either way both machines are
-//!   left as they were, and syncing works again as soon as no live profile has
-//!   a jump host, or the older machine is updated.
+//! * A server older than jump hosts turns a 2 away with error 2 before reading
+//!   any bundle, and the client reports [`SyncError::PeerTooOld`] (it sent
+//!   nothing but the HELLO). A client that turns a server's 2 away the same way
+//!   makes the server (which answered 2) report [`SyncError::PeerTooOld`] and
+//!   apply nothing; a client older than jump hosts is turned away before that,
+//!   as its HELLO has no session nonce (above). Either way both machines are
+//!   left as they were, and syncing works again once the older machine is
+//!   updated.
 //! * The export a side's HELLO is decided from is the one it sends or merges:
 //!   each side reads it once per sync ([`SyncTarget::export`]; the file is read
 //!   afresh at each call, so a second read could differ). A client reads it
@@ -187,7 +216,7 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use crate::bundle::{BundleEntry, merge};
-use crate::crypto::{self, CryptoError};
+use crate::crypto::{self, CryptoError, Role, SESSION_NONCE_LEN, Session, SessionNonce};
 use crate::jump::{CONTROL_LIMIT, JumpLeg, end_master, holds_jump_host, learn_master, run_control};
 use crate::profile::{Profile, now_ms};
 use crate::secrets::{SecretError, SecretStore, password_key};
@@ -205,7 +234,7 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// would connect such a profile straight to its host, so it refuses this
 /// version (error 2) and the sync stops before any profile data is sent.
 pub const PROTOCOL_JUMP_HOSTS: u8 = 2;
-/// Frame kind: HELLO `[version]`.
+/// Frame kind: HELLO `[version][flags][session nonce]`.
 pub const KIND_HELLO: u8 = 1;
 /// Frame kind: BUNDLE (sealed bytes).
 pub const KIND_BUNDLE: u8 = 2;
@@ -220,11 +249,24 @@ const CODE_NO_SECRET_STORE: u8 = 3;
 const CODE_STALE: u8 = 4;
 const CODE_SYNC_OFF: u8 = 5;
 const CODE_NO_DEFAULT_KEYRING: u8 = 6;
+/// The receiver's HELLO had no session nonce ([`SyncError::PeerUnbound`] on the
+/// sender's side). Never mapped back: only a Moniker 1.0.1 or older receives
+/// it, and shows its text.
+const CODE_UPDATE_THIS: u8 = 7;
 const CODE_OTHER: u8 = 255;
+
+/// Error 7's text, from the receiver's side: a Moniker 1.0.1 or older shows it
+/// as it is.
+const UPDATE_THIS_TEXT: &str = "the other machine runs a newer Moniker, which no longer syncs with Moniker 1.0.1 and older; update this one";
 
 /// The bit of the client's HELLO flags byte that says the person accepted
 /// syncing with a machine that has been away ([`StaleSync::Allow`]).
 const HELLO_ALLOW_STALE: u8 = 1;
+/// A HELLO flags byte with no flag set: every server's, and a client's that
+/// accepts nothing.
+const HELLO_NO_FLAGS: u8 = 0;
+/// Where the session nonce starts in a HELLO: after the version and the flags.
+const HELLO_NONCE_AT: usize = 2;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
@@ -326,6 +368,14 @@ pub enum SyncError {
         "the other machine runs an older Moniker, which does not know jump hosts; update it to sync while a profile has a jump host"
     )]
     PeerTooOld,
+    /// The other machine's HELLO had no session nonce: it runs Moniker 1.0.1
+    /// or older, whose bundles are not bound to their exchange, so its answer
+    /// could not be told from one played back. Nothing was sent but the HELLO
+    /// (and, to a server, the ERROR in place of the bundle); nothing changed.
+    #[error(
+        "the other machine runs Moniker 1.0.1 or older, which this version no longer syncs with; update it"
+    )]
+    PeerUnbound,
     /// The sync goes through a jump host (issue #9) whose host key is not
     /// known yet: its connection, which has no terminal to ask in and checks
     /// host keys strictly, stopped there. Nothing was sent. `name` is the jump
@@ -870,11 +920,13 @@ fn send_error(w: &mut impl Write, err: &SyncError) {
         SyncError::Stale { .. } | SyncError::PeerStale => CODE_STALE,
         SyncError::SyncOff | SyncError::PeerSyncOff => CODE_SYNC_OFF,
         SyncError::NoDefaultKeyring | SyncError::PeerNoDefaultKeyring => CODE_NO_DEFAULT_KEYRING,
+        SyncError::PeerUnbound => CODE_UPDATE_THIS,
         _ => CODE_OTHER,
     };
     let text = match err {
-        // Said from the peer's side, for a Moniker that knows no code 4, 5
-        // or 6 and shows the text as it is.
+        // Said from the peer's side, for a Moniker that knows no code 4, 5,
+        // 6 or 7 and shows the text as it is.
+        SyncError::PeerUnbound => UPDATE_THIS_TEXT.to_owned(),
         SyncError::SyncOff => SyncError::PeerSyncOff.to_string(),
         SyncError::NoDefaultKeyring => SyncError::PeerNoDefaultKeyring.to_string(),
         SyncError::Stale { days } => format!(
@@ -918,9 +970,8 @@ fn check_not_away(local: &dyn SyncTarget, stale: StaleSync) -> Result<(), SyncEr
     Ok(())
 }
 
-/// What the client's HELLO says about a server that has been away: its
-/// optional second byte. A one-byte HELLO (every client before issue #8)
-/// accepts nothing.
+/// What the client's HELLO says about a server that has been away: its flags
+/// byte. A HELLO without one accepts nothing.
 fn stale_from_hello(hello: &[u8]) -> StaleSync {
     match hello.get(1) {
         Some(flags) if flags & HELLO_ALLOW_STALE != 0 => StaleSync::Allow,
@@ -928,14 +979,43 @@ fn stale_from_hello(hello: &[u8]) -> StaleSync {
     }
 }
 
-/// The client's HELLO: the protocol version `said`, then the flags byte only
-/// when there is a flag to send, so a client that accepts nothing and has no
-/// jump host sends exactly what clients before issues #8 and #9 sent.
-fn client_hello(said: u8, stale: StaleSync) -> Vec<u8> {
-    match stale {
-        StaleSync::Refuse => vec![said],
-        StaleSync::Allow => vec![said, HELLO_ALLOW_STALE],
-    }
+/// A HELLO's payload: the protocol version, the flags byte, and the sender's
+/// session nonce for this sync.
+fn hello_payload(version: u8, flags: u8, nonce: &SessionNonce) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(HELLO_NONCE_AT + SESSION_NONCE_LEN);
+    payload.extend_from_slice(&[version, flags]);
+    payload.extend_from_slice(nonce);
+    payload
+}
+
+/// The client's HELLO: the protocol version `said`, whether a server that has
+/// been away is accepted, and the client's session nonce.
+fn client_hello(said: u8, stale: StaleSync, nonce: &SessionNonce) -> Vec<u8> {
+    let flags = match stale {
+        StaleSync::Refuse => HELLO_NO_FLAGS,
+        StaleSync::Allow => HELLO_ALLOW_STALE,
+    };
+    hello_payload(said, flags, nonce)
+}
+
+/// The session nonce in a peer's HELLO: the [`SESSION_NONCE_LEN`] bytes after
+/// the version and the flags. A HELLO too short to hold one is that of a
+/// Moniker from before bundles were bound to their exchange (1.0.1 and older):
+/// [`SyncError::PeerUnbound`], because without the peer's nonce its bundle
+/// could not be told from one played back, and this side's would open for
+/// anyone who holds the key, in any sync.
+fn peer_nonce(hello: &[u8]) -> Result<SessionNonce, SyncError> {
+    hello
+        .get(HELLO_NONCE_AT..)
+        .and_then(|rest| rest.first_chunk::<SESSION_NONCE_LEN>())
+        .copied()
+        .ok_or(SyncError::PeerUnbound)
+}
+
+/// This side's session nonce for one sync, fresh from the OS.
+fn fresh_nonce() -> Result<SessionNonce, SyncError> {
+    // Random: about this machine; the message is fixed text.
+    crypto::session_nonce().map_err(|e| SyncError::Store(e.to_string()))
 }
 
 /// The version `entries` need (issue #9): [`PROTOCOL_JUMP_HOSTS`] while a live
@@ -989,8 +1069,15 @@ fn refused_version(err: SyncError, said: u8) -> SyncError {
     }
 }
 
-fn seal_bundle(passphrase: &str, entries: &[BundleEntry]) -> Result<Vec<u8>, SyncError> {
-    let sealed = crypto::seal(passphrase, entries).map_err(|e| match e {
+/// Seal this side's bundle: the message of `from` in `session`, which the
+/// other side opens only as that.
+fn seal_bundle(
+    passphrase: &str,
+    from: Role,
+    session: &Session,
+    entries: &[BundleEntry],
+) -> Result<Vec<u8>, SyncError> {
+    let sealed = crypto::seal(passphrase, from, session, entries).map_err(|e| match e {
         CryptoError::EmptyPassphrase => SyncError::EmptyPassphrase,
         // Serialize, TooLarge, Random: about local data; messages are fixed text.
         other => SyncError::Store(other.to_string()),
@@ -1001,12 +1088,22 @@ fn seal_bundle(passphrase: &str, entries: &[BundleEntry]) -> Result<Vec<u8>, Syn
     Ok(sealed)
 }
 
-/// Open the peer's bundle. Whether a profile is kept on this machine is this
+/// Open the peer's bundle, which must be the message of `from` (the peer's
+/// role) in `session`: this side's own bundle sent back, or a bundle of another
+/// sync, is [`SyncError::WrongSyncKey`] like one sealed with another key, so
+/// only an end that holds the sync key in this very exchange is believed.
+///
+/// Whether a profile is kept on this machine is this
 /// machine's own choice, so `local_only` is cleared on every entry: a peer
 /// (an older version, a bug, a hostile one) cannot make this machine stop
 /// sending a profile and delete it from every other machine.
-fn open_bundle(passphrase: &str, sealed: &[u8]) -> Result<Vec<BundleEntry>, SyncError> {
-    let mut entries = crypto::open(passphrase, sealed).map_err(|e| match e {
+fn open_bundle(
+    passphrase: &str,
+    from: Role,
+    session: &Session,
+    sealed: &[u8],
+) -> Result<Vec<BundleEntry>, SyncError> {
+    let mut entries = crypto::open(passphrase, from, session, sealed).map_err(|e| match e {
         CryptoError::WrongKeyOrCorrupt => SyncError::WrongSyncKey,
         CryptoError::EmptyPassphrase => SyncError::EmptyPassphrase,
         CryptoError::BadFormat => {
@@ -1032,15 +1129,24 @@ pub fn serve(
     passphrase: &str,
 ) -> Result<SyncOutcome, SyncError> {
     let hello = read_expected(&mut r, KIND_HELLO)?;
-    let (said, entries) = tell(&mut w, accept_hello(&*local, passphrase, &hello))?;
+    let (said, client, entries) = tell(&mut w, accept_hello(&*local, passphrase, &hello))?;
     // Version 2 if the client said it or if what this server sends needs it
-    // (issue #9). A client of an older Moniker turns 2 away, and nothing more
-    // is sent or applied.
+    // (issue #9). A client that turns 2 away sends nothing more, and nothing
+    // is applied.
     let answer = said.max(version_for(&entries));
-    write_frame(&mut w, KIND_HELLO, &[answer])?;
+    // This server's nonce for this one sync. The client's bundle has to be
+    // sealed for it, so one kept from an earlier sync is not taken for this
+    // client's, and the reply is sealed for the client's nonce in turn.
+    let server = tell(&mut w, fresh_nonce())?;
+    let session = Session { client, server };
+    write_frame(
+        &mut w,
+        KIND_HELLO,
+        &hello_payload(answer, HELLO_NO_FLAGS, &server),
+    )?;
 
     let sealed = read_expected(&mut r, KIND_BUNDLE).map_err(|e| refused_version(e, answer))?;
-    let (merged, reply) = tell(&mut w, server_merge(entries, passphrase, &sealed))?;
+    let (merged, reply) = tell(&mut w, server_merge(entries, passphrase, &session, &sealed))?;
     let outcome = tell(&mut w, local.apply(merged))?;
     write_frame(&mut w, KIND_BUNDLE, &reply)?;
     local.record_sync();
@@ -1049,21 +1155,23 @@ pub fn serve(
 
 /// What a server checks before it answers a HELLO, in this order (the first
 /// failure is the answer): sync is on (issue #10), a sync key is set, the secret
-/// store works, the version is one this build speaks, this machine has not been
+/// store works, the version is one this build speaks and the HELLO has the
+/// client's session nonce ([`peer_nonce`]), this machine has not been
 /// away (issue #8). Only then is its export read, once: the HELLO's version and
 /// the merge are both made from that one read (issue #9). Returns the client's
-/// version and the export.
+/// version, its session nonce and the export.
 fn accept_hello(
     local: &dyn SyncTarget,
     passphrase: &str,
     hello: &[u8],
-) -> Result<(u8, Vec<BundleEntry>), SyncError> {
+) -> Result<(u8, SessionNonce, Vec<BundleEntry>), SyncError> {
     local.sync_on()?;
     check_passphrase(passphrase)?;
     local.ready()?;
     let said = peer_version(hello)?;
+    let client = peer_nonce(hello)?;
     check_not_away(local, stale_from_hello(hello))?;
-    Ok((said, local.export()?))
+    Ok((said, client, local.export()?))
 }
 
 /// Answer the client's HELLO with `err` and do nothing else, for a server that
@@ -1079,16 +1187,18 @@ pub fn refuse(mut r: impl Read, mut w: impl Write, err: SyncError) -> Result<(),
 
 /// Open and check the client's bundle, merge it with the local export
 /// (`exported`, read once in [`accept_hello`]), and seal the result. Nothing is
-/// changed yet.
+/// changed yet. The bundle must be the client's of this `session`, and the
+/// reply is sealed as the server's of it.
 fn server_merge(
     exported: Vec<BundleEntry>,
     passphrase: &str,
+    session: &Session,
     sealed: &[u8],
 ) -> Result<(Vec<BundleEntry>, Vec<u8>), SyncError> {
-    let incoming = open_bundle(passphrase, sealed)?;
+    let incoming = open_bundle(passphrase, Role::Client, session, sealed)?;
     validate_entries(&incoming)?;
     let merged = merge(exported, incoming);
-    let reply = seal_bundle(passphrase, &merged)?;
+    let reply = seal_bundle(passphrase, Role::Server, session, &merged)?;
     Ok((merged, reply))
 }
 
@@ -1112,19 +1222,32 @@ pub fn run_client(
     // ERROR there), so it reports why instead of a connection that closed.
     let entries = tell(&mut w, local.export())?;
     let said = version_for(&entries);
-    write_frame(&mut w, KIND_HELLO, &client_hello(said, stale))?;
+    // This client's nonce for this one sync: the reply has to be sealed for
+    // it, so it can only have been made now, by an end that holds the key.
+    let client = tell(&mut w, fresh_nonce())?;
+    write_frame(&mut w, KIND_HELLO, &client_hello(said, stale, &client))?;
     let hello = read_expected(&mut r, KIND_HELLO).map_err(|e| refused_version(e, said))?;
+    // A server that says no nonce of its own gets an ERROR, never the bundle.
     let sealed = tell(
         &mut w,
-        check_reply(&hello, said).and_then(|()| seal_bundle(passphrase, &entries)),
+        check_reply(&hello, said)
+            .and_then(|()| peer_nonce(&hello))
+            .and_then(|server| {
+                let session = Session { client, server };
+                let sealed = seal_bundle(passphrase, Role::Client, &session, &entries)?;
+                Ok((session, sealed))
+            }),
     );
     // The export holds every password in plain text (zeroized when dropped):
     // gone now that it is sealed, not once the server has answered.
     drop(entries);
-    write_frame(&mut w, KIND_BUNDLE, &sealed?)?;
+    let (session, sealed) = sealed?;
+    write_frame(&mut w, KIND_BUNDLE, &sealed)?;
 
+    // Only the server's message of this exchange opens: not this client's own
+    // bundle sent back, and not a bundle of an earlier sync.
     let reply = read_expected(&mut r, KIND_BUNDLE)?;
-    let merged = open_bundle(passphrase, &reply)?;
+    let merged = open_bundle(passphrase, Role::Server, &session, &reply)?;
     validate_entries(&merged)?;
     let outcome = local.apply(merged)?;
     local.record_sync();
@@ -1979,6 +2102,49 @@ mod tests {
         out
     }
 
+    /// The session nonce of a side that a test plays by hand.
+    const HAND_NONCE: SessionNonce = [0xab; SESSION_NONCE_LEN];
+
+    /// A HELLO of `version` with no flag, as a side played by hand says it.
+    fn hand_hello(version: u8) -> Vec<u8> {
+        hello_payload(version, HELLO_NO_FLAGS, &HAND_NONCE)
+    }
+
+    /// Be a server by hand for its first step: read the client's HELLO and
+    /// answer it with `version`. The client's HELLO, and the session, which a
+    /// reply has to be sealed for (as [`Role::Server`]).
+    fn answer_hello(mut ss: &UnixStream, version: u8) -> (Vec<u8>, Session) {
+        let (kind, hello) = read_frame(&mut ss).unwrap();
+        assert_eq!(kind, KIND_HELLO);
+        let session = Session {
+            client: peer_nonce(&hello).unwrap(),
+            server: HAND_NONCE,
+        };
+        write_frame(&mut ss, KIND_HELLO, &hand_hello(version)).unwrap();
+        (hello, session)
+    }
+
+    /// Be a client by hand for its first step: say HELLO `version` and read
+    /// the server's HELLO. That HELLO, and the session, which a bundle has to
+    /// be sealed for (as [`Role::Client`]).
+    fn say_hello(mut cs: &UnixStream, version: u8) -> (Vec<u8>, Session) {
+        write_frame(&mut cs, KIND_HELLO, &hand_hello(version)).unwrap();
+        let (kind, hello) = read_frame(&mut cs).unwrap();
+        assert_eq!(kind, KIND_HELLO);
+        let session = Session {
+            client: HAND_NONCE,
+            server: peer_nonce(&hello).unwrap(),
+        };
+        (hello, session)
+    }
+
+    /// The version and the flags of a HELLO, which must go on with a session
+    /// nonce and nothing after it.
+    fn said_in(hello: &[u8]) -> [u8; 2] {
+        assert_eq!(hello.len(), HELLO_NONCE_AT + SESSION_NONCE_LEN, "{hello:?}");
+        [hello[0], hello[1]]
+    }
+
     fn assert_no_secret_in(err: &SyncError, secrets: &[&str]) {
         let shown = format!("{err} {err:?}");
         for s in secrets {
@@ -2110,9 +2276,7 @@ mod tests {
         let a_file = file_of(&a.path);
         let (cs, ss) = pair();
         let server = thread::spawn(move || {
-            let (kind, _) = read_frame(&mut &ss).unwrap();
-            assert_eq!(kind, KIND_HELLO);
-            write_frame(&mut &ss, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
+            answer_hello(&ss, PROTOCOL_VERSION);
             let (kind, _) = read_frame(&mut &ss).unwrap();
             assert_eq!(kind, KIND_BUNDLE);
             // Hang up without replying.
@@ -2514,12 +2678,15 @@ mod tests {
         let (good2, bad2) = (good.clone(), bad.clone());
         let (cs, ss) = pair();
         let server = thread::spawn(move || {
+            let (_, session) = answer_hello(&ss, PROTOCOL_VERSION);
             read_frame(&mut &ss).unwrap();
-            write_frame(&mut &ss, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
-            read_frame(&mut &ss).unwrap();
-            let reply =
-                crate::crypto::seal(PASS, &[entry(&good2, Some("g")), entry(&bad2, Some("b"))])
-                    .unwrap();
+            let reply = crate::crypto::seal(
+                PASS,
+                Role::Server,
+                &session,
+                &[entry(&good2, Some("g")), entry(&bad2, Some("b"))],
+            )
+            .unwrap();
             write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
         });
         let err = run_client(&cs, &cs, &mut a.state, PASS, StaleSync::Refuse).unwrap_err();
@@ -3704,37 +3871,99 @@ mod tests {
     }
 
     #[test]
-    fn a_one_byte_hello_from_an_older_client_still_works() {
+    fn a_hello_without_a_session_nonce_is_refused() {
+        // What a client of Moniker 1.0.1 or older says: the version, then a
+        // flags byte only when it has a flag to send. It seals no bundle for
+        // this exchange, so it is turned away with error 7 where the HELLO
+        // would be, before this machine reads anything to send. A nonce cut
+        // short is no nonce.
         let clock = Clock::starting_now();
         let start = clock.now();
-        let mut b = Machine::new(&clock, &[]);
-        // Fresh: the HELLO is answered as before.
-        let (cs, ss) = pair();
-        let server = spawn_server(ss, b.state.take().unwrap(), PASS);
-        write_frame(&mut &cs, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
-        assert_eq!(
-            read_frame(&mut &cs).unwrap(),
-            (KIND_HELLO, vec![PROTOCOL_VERSION])
-        );
-        drop(cs);
-        b.state = Some(server.join().unwrap().1);
+        let (_, _, both) = bastion_and_db();
+        let mut b = Machine::new(&clock, &both);
+        let b_file = file_of(&b.path);
+        let cut_short = hand_hello(1)[..HELLO_NONCE_AT + SESSION_NONCE_LEN - 1].to_vec();
+        for (hello, away) in [
+            (vec![1u8], false),
+            (vec![1, HELLO_ALLOW_STALE], false),
+            (vec![2], false),
+            (vec![2, HELLO_ALLOW_STALE], false),
+            (cut_short, false),
+            // On a machine that has been away as well: still error 7, not
+            // error 4, whose question would only lead an older client here.
+            (vec![1], true),
+        ] {
+            if away {
+                crate::sync_state::record_sync(&b.path, start - 200 * DAY_MS).unwrap();
+            }
+            let (cs, ss) = pair();
+            cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let counted = CountedExports::new(b.state.take().unwrap());
+            let server = spawn_server(ss, counted, PASS);
+            write_frame(&mut &cs, KIND_HELLO, &hello).unwrap();
+            let (kind, payload) = read_frame(&mut &cs).unwrap();
+            let mut rest = Vec::new();
+            (&cs).read_to_end(&mut rest).unwrap();
+            drop(cs);
+            let (served, counted) = server.join().unwrap();
 
-        // Away: error 4, with a text an older client shows as it is.
-        crate::sync_state::record_sync(&b.path, start - 200 * DAY_MS).unwrap();
-        let (cs, ss) = pair();
-        let server = spawn_server(ss, b.state.take().unwrap(), PASS);
-        write_frame(&mut &cs, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
-        let (kind, payload) = read_frame(&mut &cs).unwrap();
-        drop(cs);
-        let _ = server.join().unwrap();
-        assert_eq!(kind, KIND_ERROR);
-        assert_eq!(payload[0], CODE_STALE);
-        let text = String::from_utf8_lossy(&payload[1..]).into_owned();
-        assert!(
-            text.starts_with("the other machine has not synced for 200 days"),
-            "{text}"
+            assert_eq!(kind, KIND_ERROR, "{hello:?}");
+            assert_eq!(payload[0], CODE_UPDATE_THIS, "{hello:?}");
+            // What the older client shows for it, as it knows no code 7: that
+            // it is the one to update, also where it has a jump host (it would
+            // read error 2 as the other machine being the older one).
+            assert_eq!(
+                String::from_utf8_lossy(&payload[1..]),
+                "the other machine runs a newer Moniker, which no longer syncs with Moniker 1.0.1 \
+                 and older; update this one"
+            );
+            assert!(
+                matches!(error_from_payload(&payload), SyncError::Remote(_)),
+                "shown as its text"
+            );
+            assert!(rest.is_empty(), "no HELLO and nothing else: {rest:?}");
+            assert!(
+                matches!(served, Err(SyncError::PeerUnbound)),
+                "{hello:?}: got {served:?}"
+            );
+            assert_eq!(counted.exports.get(), 0, "{hello:?}");
+            b.state = Some(counted.inner);
+        }
+        assert_eq!(file_of(&b.path), b_file);
+        assert_eq!(b.secrets.writes(), 0);
+        assert_eq!(
+            b.last_sync(),
+            Some(start - 200 * DAY_MS),
+            "nothing recorded"
         );
-        assert!(matches!(error_from_payload(&payload), SyncError::PeerStale));
+    }
+
+    #[test]
+    fn a_hello_s_nonce_is_what_follows_its_version_and_flags() {
+        let hello = client_hello(PROTOCOL_JUMP_HOSTS, StaleSync::Allow, &HAND_NONCE);
+        let mut want = vec![PROTOCOL_JUMP_HOSTS, HELLO_ALLOW_STALE];
+        want.extend_from_slice(&HAND_NONCE);
+        assert_eq!(hello, want);
+        assert_eq!(
+            client_hello(PROTOCOL_VERSION, StaleSync::Refuse, &HAND_NONCE)[..HELLO_NONCE_AT],
+            [PROTOCOL_VERSION, HELLO_NO_FLAGS]
+        );
+        assert_eq!(peer_nonce(&hello).unwrap(), HAND_NONCE);
+        assert!(matches!(stale_from_hello(&hello), StaleSync::Allow));
+
+        // Whatever a later version may say after the nonce is not part of it.
+        let longer = [&hello[..], &[7u8, 7, 7][..]].concat();
+        assert_eq!(peer_nonce(&longer).unwrap(), HAND_NONCE);
+
+        for len in [0, 1, 2, HELLO_NONCE_AT + SESSION_NONCE_LEN - 1] {
+            assert!(
+                matches!(peer_nonce(&hello[..len]), Err(SyncError::PeerUnbound)),
+                "a HELLO of {len} bytes"
+            );
+        }
+
+        // Each sync has nonces of its own.
+        assert_ne!(fresh_nonce().unwrap(), fresh_nonce().unwrap());
     }
 
     #[test]
@@ -3910,7 +4139,7 @@ mod tests {
         let b_file = file_of(&b.path);
         for hello in [
             vec![PROTOCOL_VERSION],
-            client_hello(PROTOCOL_VERSION, StaleSync::Allow),
+            vec![PROTOCOL_VERSION, HELLO_ALLOW_STALE],
         ] {
             let (cs, ss) = pair();
             let served = spawn_server(ss, b.state.take().unwrap(), PASS);
@@ -4549,8 +4778,13 @@ mod tests {
             local_only: true,
             ..prof("marked by the peer")
         };
-        let sealed = seal_bundle(PASS, &[entry(&marked, Some("pw"))]).unwrap();
-        let opened = open_bundle(PASS, &sealed).unwrap();
+        let session = Session {
+            client: HAND_NONCE,
+            server: HAND_NONCE,
+        };
+        let sent = [entry(&marked, Some("pw"))];
+        let sealed = seal_bundle(PASS, Role::Client, &session, &sent).unwrap();
+        let opened = open_bundle(PASS, Role::Client, &session, &sealed).unwrap();
         assert_eq!(opened.len(), 1);
         assert_eq!(
             opened[0].profile,
@@ -4580,8 +4814,8 @@ mod tests {
         let (cs, ss) = pair();
         cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let served = spawn_server(ss, b.state.take().unwrap(), PASS);
-        write_frame(&mut &cs, KIND_HELLO, &[PROTOCOL_VERSION]).unwrap();
-        assert_eq!(read_frame(&mut &cs).unwrap().0, KIND_HELLO);
+        let (_, session) = say_hello(&cs, PROTOCOL_VERSION);
+        let sealed = seal_bundle(PASS, Role::Client, &session, &sent).unwrap();
         write_frame(&mut &cs, KIND_BUNDLE, &sealed).unwrap();
         assert_eq!(read_frame(&mut &cs).unwrap().0, KIND_BUNDLE);
         drop(cs);
@@ -4674,12 +4908,12 @@ mod tests {
         (out, served, relay.join().unwrap())
     }
 
-    /// The payload of the HELLO the client (`true`) or the server (`false`)
-    /// sent.
-    fn hello_from(seen: &Seen, client: bool) -> Vec<u8> {
+    /// The version and the flags of the HELLO the client (`true`) or the
+    /// server (`false`) sent, which went on with its session nonce.
+    fn hello_from(seen: &Seen, client: bool) -> [u8; 2] {
         seen.iter()
             .find(|(from_client, kind, _)| *from_client == client && *kind == KIND_HELLO)
-            .map(|(_, _, payload)| payload.clone())
+            .map(|(_, _, payload)| said_in(payload))
             .expect("a HELLO was sent")
     }
 
@@ -4702,11 +4936,11 @@ mod tests {
 
     #[test]
     fn two_new_machines_without_jump_hosts_say_version_1() {
-        // Byte for byte what machines said before jump hosts, the stale flag
-        // included: the literals are the point.
+        // The version and the flags byte, the stale flag in it: the literals
+        // are the point.
         for (stale, client_hello) in [
-            (StaleSync::Refuse, vec![1u8]),
-            (StaleSync::Allow, vec![1u8, 1u8]),
+            (StaleSync::Refuse, [1u8, 0u8]),
+            (StaleSync::Allow, [1u8, 1u8]),
         ] {
             let clock = Clock::starting_now();
             let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
@@ -4715,15 +4949,15 @@ mod tests {
             out.unwrap();
             served.unwrap();
             assert_eq!(hello_from(&seen, true), client_hello);
-            assert_eq!(hello_from(&seen, false), vec![1u8]);
+            assert_eq!(hello_from(&seen, false), [1u8, 0u8]);
         }
     }
 
     #[test]
     fn a_jump_host_on_the_client_says_version_2() {
         for (stale, client_hello) in [
-            (StaleSync::Refuse, vec![2u8]),
-            (StaleSync::Allow, vec![2u8, 1u8]),
+            (StaleSync::Refuse, [2u8, 0u8]),
+            (StaleSync::Allow, [2u8, 1u8]),
         ] {
             let clock = Clock::starting_now();
             let (bastion, db, both) = bastion_and_db();
@@ -4735,7 +4969,7 @@ mod tests {
             assert_eq!(out.unwrap().added, 1);
             assert_eq!(served.unwrap().added, 2);
             assert_eq!(hello_from(&seen, true), client_hello);
-            assert_eq!(hello_from(&seen, false), vec![2u8]);
+            assert_eq!(hello_from(&seen, false), [2u8, 0u8]);
             let arrived = b.profile(&db.id).unwrap();
             assert_eq!(arrived.jump_host.as_deref(), Some(bastion.id.as_str()));
             assert_eq!(b.secrets.password(&db.id).as_deref(), Some("pw-db"));
@@ -4755,8 +4989,8 @@ mod tests {
         // This client has none, so it says 1, and accepts the 2 it is answered.
         assert_eq!(out.unwrap().added, 2);
         assert_eq!(served.unwrap().added, 1);
-        assert_eq!(hello_from(&seen, true), vec![1u8]);
-        assert_eq!(hello_from(&seen, false), vec![2u8]);
+        assert_eq!(hello_from(&seen, true), [1u8, 0u8]);
+        assert_eq!(hello_from(&seen, false), [2u8, 0u8]);
         let arrived = a.profile(&db.id).unwrap();
         assert_eq!(arrived.jump_host.as_deref(), Some(bastion.id.as_str()));
         assert_eq!(a.secrets.password(&db.id).as_deref(), Some("pw-db"));
@@ -4788,7 +5022,7 @@ mod tests {
             "the other machine runs an older Moniker, which does not know jump hosts; \
              update it to sync while a profile has a jump host"
         );
-        assert_eq!(hello, (KIND_HELLO, vec![2u8]));
+        assert_eq!((hello.0, said_in(&hello.1)), (KIND_HELLO, [2u8, 0u8]));
         assert!(rest.is_empty(), "nothing at all after the HELLO: {rest:?}");
         assert_eq!(file_of(&a.path), a_file);
         assert_eq!(a.secrets.writes(), 0);
@@ -4796,7 +5030,7 @@ mod tests {
     }
 
     #[test]
-    fn an_old_client_is_answered_version_2_and_sends_nothing() {
+    fn a_client_that_turns_a_2_away_changes_nothing() {
         let clock = Clock::starting_now();
         let (_, _, both) = bastion_and_db();
         let mut b = Machine::new(&clock, &both);
@@ -4805,10 +5039,13 @@ mod tests {
         let (cs, ss) = pair();
         cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let server = spawn_server(ss, b.state.take().unwrap(), PASS);
-        // What a client that predates jump hosts does: a HELLO of 1, and on a
-        // HELLO of 2 an error 2 (its check_version) and nothing else.
-        write_frame(&mut &cs, KIND_HELLO, &[1]).unwrap();
-        assert_eq!(read_frame(&mut &cs).unwrap(), (KIND_HELLO, vec![2u8]));
+        // A client that says 1 and does not take the 2 it is answered: an
+        // error 2 and nothing else, as a client's check of the version did
+        // before jump hosts. (A client that old says no session nonce and is
+        // turned away before this; see
+        // `a_hello_without_a_session_nonce_is_refused`.)
+        let (answer, _) = say_hello(&cs, 1);
+        assert_eq!(said_in(&answer), [2u8, 0u8]);
         write_frame(&mut &cs, KIND_ERROR, OLD_VERSION_ERROR).unwrap();
         let mut rest = Vec::new();
         (&cs).read_to_end(&mut rest).unwrap();
@@ -4827,28 +5064,43 @@ mod tests {
     }
 
     #[test]
-    fn an_old_server_still_syncs_without_jump_hosts() {
+    fn a_server_that_says_no_session_nonce_is_sent_no_bundle() {
+        // A server of Moniker 1.0.1 or older answers with its version alone:
+        // 1, or 2 where it knows jump hosts. Whatever it sent next could not
+        // be told from a bundle played back, so the client stops there, with
+        // an error in place of its bundle.
         let clock = Clock::starting_now();
-        let two = prof("two");
-        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+        let (_, _, both) = bastion_and_db();
+        let plain = vec![(prof("one"), Some("pw-one"))];
+        for (profiles, version) in [(&plain, 1u8), (&both, 2u8)] {
+            let mut a = Machine::new(&clock, profiles);
+            let a_file = file_of(&a.path);
 
-        let (cs, ss) = pair();
-        let reply = crate::crypto::seal(PASS, &[entry(&two, Some("pw-two"))]).unwrap();
-        let old_server = thread::spawn(move || {
-            let hello = read_frame(&mut &ss).unwrap();
-            write_frame(&mut &ss, KIND_HELLO, &[1]).unwrap();
-            let (kind, _) = read_frame(&mut &ss).unwrap();
-            assert_eq!(kind, KIND_BUNDLE);
-            write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
-            hello
-        });
-        let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
-        drop(cs);
+            let (cs, ss) = pair();
+            cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let old_server = thread::spawn(move || {
+                let hello = read_frame(&mut &ss).unwrap();
+                write_frame(&mut &ss, KIND_HELLO, &[version]).unwrap();
+                let mut rest = Vec::new();
+                (&ss).read_to_end(&mut rest).unwrap();
+                (hello, rest)
+            });
+            let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+            drop(cs);
+            let (hello, rest) = old_server.join().unwrap();
 
-        assert_eq!(out.unwrap().added, 1);
-        assert_eq!(old_server.join().unwrap(), (KIND_HELLO, vec![1u8]));
-        assert!(a.profile(&two.id).is_some());
-        assert_eq!(a.secrets.password(&two.id).as_deref(), Some("pw-two"));
+            let err = out.unwrap_err();
+            assert!(matches!(err, SyncError::PeerUnbound), "got {err:?}");
+            assert_eq!((hello.0, said_in(&hello.1)), (KIND_HELLO, [version, 0u8]));
+            let rest = frames(&rest);
+            assert_eq!(rest.len(), 1, "only the error, never the bundle: {rest:?}");
+            assert_eq!((rest[0].0, rest[0].1[0]), (KIND_ERROR, CODE_UPDATE_THIS));
+            // What the older server says for it: the text, as it is.
+            assert_eq!(String::from_utf8_lossy(&rest[0].1[1..]), UPDATE_THIS_TEXT);
+            assert_eq!(file_of(&a.path), a_file);
+            assert_eq!(a.secrets.writes(), 0);
+            assert_eq!(a.last_sync(), None);
+        }
     }
 
     #[test]
@@ -4864,7 +5116,7 @@ mod tests {
         cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let server = thread::spawn(move || {
             read_frame(&mut &ss).unwrap();
-            write_frame(&mut &ss, KIND_HELLO, &[1]).unwrap();
+            write_frame(&mut &ss, KIND_HELLO, &hand_hello(1)).unwrap();
             let mut rest = Vec::new();
             (&ss).read_to_end(&mut rest).unwrap();
             rest
@@ -4901,8 +5153,8 @@ mod tests {
 
         out.unwrap();
         served.unwrap();
-        assert_eq!(hello_from(&seen, true), vec![1u8]);
-        assert_eq!(hello_from(&seen, false), vec![1u8]);
+        assert_eq!(hello_from(&seen, true), [1u8, 0u8]);
+        assert_eq!(hello_from(&seen, false), [1u8, 0u8]);
         assert!(a.profile(&db.id).unwrap().local_only);
         assert_eq!(b.profile(&db.id).and_then(|p| p.jump_host), None);
     }
@@ -4920,7 +5172,7 @@ mod tests {
         let (out, served, seen) = sync_seen(&mut a, &mut b, StaleSync::Refuse);
         out.unwrap();
         served.unwrap();
-        assert_eq!(hello_from(&seen, true), vec![2u8]);
+        assert_eq!(hello_from(&seen, true), [2u8, 0u8]);
         let arrived = b.profile(&db.id).unwrap();
         assert!(!arrived.deleted);
         assert_eq!(arrived.jump_host.as_deref(), Some(bastion.id.as_str()));
@@ -4964,11 +5216,15 @@ mod tests {
         let (cs, ss) = pair();
         cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let server = spawn_server(ss, b.state.take().unwrap(), PASS);
-        write_frame(&mut &cs, KIND_HELLO, &[2]).unwrap();
-        assert_eq!(read_frame(&mut &cs).unwrap(), (KIND_HELLO, vec![2u8]));
-        let sealed =
-            crate::crypto::seal(PASS, &[entry(&good, Some("g")), entry(&looped, Some("l"))])
-                .unwrap();
+        let (answer, session) = say_hello(&cs, 2);
+        assert_eq!(said_in(&answer), [2u8, 0u8]);
+        let sealed = crate::crypto::seal(
+            PASS,
+            Role::Client,
+            &session,
+            &[entry(&good, Some("g")), entry(&looped, Some("l"))],
+        )
+        .unwrap();
         write_frame(&mut &cs, KIND_BUNDLE, &sealed).unwrap();
         let (kind, _) = read_frame(&mut &cs).unwrap();
         drop(cs);
@@ -4982,12 +5238,12 @@ mod tests {
         // A hostile server: the client rejects its reply.
         let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
         let a_file = file_of(&a.path);
-        let reply = crate::crypto::seal(PASS, &[entry(&looped, Some("l"))]).unwrap();
+        let sent = [entry(&looped, Some("l"))];
         let (cs, ss) = pair();
         let server = thread::spawn(move || {
+            let (_, session) = answer_hello(&ss, 2);
             read_frame(&mut &ss).unwrap();
-            write_frame(&mut &ss, KIND_HELLO, &[2]).unwrap();
-            read_frame(&mut &ss).unwrap();
+            let reply = crate::crypto::seal(PASS, Role::Server, &session, &sent).unwrap();
             write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
         });
         let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
@@ -5094,9 +5350,10 @@ mod tests {
         assert!(matches!(out, Err(SyncError::SyncOff)), "{out:?}");
         assert_eq!(client.exports.get(), 0);
 
-        // A server with sync off, a version it does not know, or away: the
-        // HELLO is refused before it reads anything.
-        for case in ["sync off", "version 9", "away"] {
+        // A server with sync off, a version it does not know, a HELLO with
+        // no session nonce, or away: the HELLO is refused before it reads
+        // anything.
+        for case in ["sync off", "version 9", "no nonce", "away"] {
             let b = Machine::new(&clock, &[one()]);
             match case {
                 "sync off" => b.sync_off(),
@@ -5106,8 +5363,12 @@ mod tests {
             let (cs, ss) = pair();
             cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             let server = spawn_server(ss, CountedExports::new(b.state.unwrap()), PASS);
-            let hello: &[u8] = if case == "version 9" { &[9] } else { &[1] };
-            write_frame(&mut &cs, KIND_HELLO, hello).unwrap();
+            let hello = match case {
+                "version 9" => hand_hello(9),
+                "no nonce" => vec![1],
+                _ => hand_hello(1),
+            };
+            write_frame(&mut &cs, KIND_HELLO, &hello).unwrap();
             assert_eq!(read_frame(&mut &cs).unwrap().0, KIND_ERROR, "{case}");
             drop(cs);
             let (served, server) = server.join().unwrap();
@@ -5167,25 +5428,24 @@ mod tests {
                 later: later.clone(),
                 applied: None,
             };
-            let nothing = crate::crypto::seal(PASS, &[]).unwrap();
 
             // As a client: the bundle is what the HELLO's version was decided
             // from, and the target was read once.
             let mut client = target();
             let (cs, ss) = pair();
-            let reply = nothing.clone();
             let raw_server = thread::spawn(move || {
-                let hello = read_frame(&mut &ss).unwrap();
-                write_frame(&mut &ss, KIND_HELLO, &[2]).unwrap();
+                let (hello, session) = answer_hello(&ss, 2);
                 let (kind, sealed) = read_frame(&mut &ss).unwrap();
                 assert_eq!(kind, KIND_BUNDLE);
+                let reply = crate::crypto::seal(PASS, Role::Server, &session, &[]).unwrap();
                 write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
-                (hello, open_bundle(PASS, &sealed).unwrap())
+                let sent = open_bundle(PASS, Role::Client, &session, &sealed).unwrap();
+                (hello, sent)
             });
             run_client(&cs, &cs, &mut client, PASS, StaleSync::Refuse).unwrap();
             drop(cs);
             let (hello, sent) = raw_server.join().unwrap();
-            assert_eq!(hello, (KIND_HELLO, vec![said]));
+            assert_eq!(said_in(&hello), [said, 0u8]);
             assert!(
                 by_id(sent) == by_id(first.clone()),
                 "client: not what was read"
@@ -5196,16 +5456,16 @@ mod tests {
             let (cs, ss) = pair();
             cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             let server = spawn_server(ss, target(), PASS);
-            write_frame(&mut &cs, KIND_HELLO, &[1]).unwrap();
-            let answer = read_frame(&mut &cs).unwrap();
+            let (answer, session) = say_hello(&cs, 1);
+            let nothing = crate::crypto::seal(PASS, Role::Client, &session, &[]).unwrap();
             write_frame(&mut &cs, KIND_BUNDLE, &nothing).unwrap();
             let (kind, sealed) = read_frame(&mut &cs).unwrap();
             drop(cs);
             let (served, server) = server.join().unwrap();
             served.unwrap();
-            assert_eq!(answer, (KIND_HELLO, vec![said]));
+            assert_eq!(said_in(&answer), [said, 0u8]);
             assert_eq!(kind, KIND_BUNDLE);
-            let replied = by_id(open_bundle(PASS, &sealed).unwrap());
+            let replied = by_id(open_bundle(PASS, Role::Server, &session, &sealed).unwrap());
             assert!(replied == by_id(first.clone()), "server: not what was read");
             assert!(
                 by_id(server.applied.clone().unwrap()) == replied,
@@ -5264,6 +5524,157 @@ mod tests {
         assert_eq!(file_of(&b.path), b_file);
         assert_eq!(b.secrets.writes(), 0);
         assert_eq!(b.last_sync(), None);
+    }
+
+    // ----- a bundle belongs to one exchange and one direction -----
+
+    /// The payload of the frame of `kind` that the client (`true`) or the
+    /// server (`false`) sent in a sync that was listened to.
+    fn frame_from(seen: &Seen, client: bool, kind: u8) -> Vec<u8> {
+        seen.iter()
+            .find(|(from_client, k, _)| *from_client == client && *k == kind)
+            .map(|(_, _, payload)| payload.clone())
+            .expect("such a frame was sent")
+    }
+
+    #[test]
+    fn an_end_that_sends_every_frame_back_completes_no_sync() {
+        // `cat` where `moniker-server sync-serve` should run: an end that does
+        // not hold the sync key and answers with what it was sent.
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+        let a_file = file_of(&a.path);
+        let (cs, ss) = pair();
+        cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let echo = thread::spawn(move || {
+            let mut sent_back = Vec::new();
+            while let Ok((kind, payload)) = read_frame(&mut &ss) {
+                if write_frame(&mut &ss, kind, &payload).is_err() {
+                    break;
+                }
+                sent_back.push(kind);
+            }
+            sent_back
+        });
+
+        let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+        drop(cs);
+
+        // The client's HELLO, sent back, reads as an answer (a version and a
+        // nonce), so the bundle followed. Sent back too, it does not open: it
+        // is the client's message, and the server's was expected.
+        assert_eq!(echo.join().unwrap(), vec![KIND_HELLO, KIND_BUNDLE]);
+        assert!(matches!(out, Err(SyncError::WrongSyncKey)), "got {out:?}");
+        assert_eq!(file_of(&a.path), a_file);
+        assert_eq!(a.secrets.writes(), 0);
+        assert_eq!(a.last_sync(), None, "no sync was completed");
+    }
+
+    #[test]
+    fn a_bundle_kept_from_an_earlier_sync_is_not_an_answer() {
+        // A real sync, which the end the client talks to has seen go by.
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+        let mut b = Machine::new(&clock, &[(prof("two"), Some("pw-two"))]);
+        let (out, served, seen) = sync_seen(&mut a, &mut b, StaleSync::Refuse);
+        out.unwrap();
+        served.unwrap();
+        let old_hello = frame_from(&seen, false, KIND_HELLO);
+        let old_reply = frame_from(&seen, false, KIND_BUNDLE);
+        let old_own = frame_from(&seen, true, KIND_BUNDLE);
+
+        let recorded = a.last_sync();
+        assert!(recorded.is_some());
+        clock.set(clock.now() + DAY_MS);
+        let a_file = file_of(&a.path);
+        let writes = a.secrets.writes();
+
+        // A day later that end, which does not hold the sync key, answers
+        // with what it kept: the server's reply of then, after the server's
+        // HELLO of then or after one of its own, or the client's own bundle
+        // of then. Each was sealed with the key, for another exchange.
+        for (what, hello, reply) in [
+            ("the old reply, after the old HELLO", &old_hello, &old_reply),
+            (
+                "the old reply, after another HELLO",
+                &hand_hello(1),
+                &old_reply,
+            ),
+            ("the client's own old bundle", &hand_hello(1), &old_own),
+        ] {
+            let (hello, reply) = (hello.clone(), reply.clone());
+            let (cs, ss) = pair();
+            cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let end = thread::spawn(move || {
+                assert_eq!(read_frame(&mut &ss).unwrap().0, KIND_HELLO);
+                write_frame(&mut &ss, KIND_HELLO, &hello).unwrap();
+                assert_eq!(read_frame(&mut &ss).unwrap().0, KIND_BUNDLE);
+                write_frame(&mut &ss, KIND_BUNDLE, &reply).unwrap();
+            });
+            let out = run_client(&cs, &cs, a.state.as_mut().unwrap(), PASS, StaleSync::Refuse);
+            drop(cs);
+            end.join().unwrap();
+
+            assert!(
+                matches!(out, Err(SyncError::WrongSyncKey)),
+                "{what}: got {out:?}"
+            );
+            assert_eq!(file_of(&a.path), a_file, "{what}");
+            assert_eq!(a.secrets.writes(), writes, "{what}");
+            assert_eq!(a.last_sync(), recorded, "{what}: no sync is recorded");
+        }
+    }
+
+    #[test]
+    fn a_server_takes_no_bundle_kept_from_an_earlier_sync() {
+        // The same, the other way around: what a client said in a real sync,
+        // said again to the server by an end that does not hold the sync key.
+        let clock = Clock::starting_now();
+        let mut a = Machine::new(&clock, &[(prof("one"), Some("pw-one"))]);
+        let mut b = Machine::new(&clock, &[(prof("two"), Some("pw-two"))]);
+        let (out, served, seen) = sync_seen(&mut a, &mut b, StaleSync::Refuse);
+        out.unwrap();
+        served.unwrap();
+        let old_hello = frame_from(&seen, true, KIND_HELLO);
+        let old_bundle = frame_from(&seen, true, KIND_BUNDLE);
+        let old_reply = frame_from(&seen, false, KIND_BUNDLE);
+
+        let recorded = b.last_sync();
+        assert!(recorded.is_some());
+        clock.set(clock.now() + DAY_MS);
+        let b_file = file_of(&b.path);
+        let writes = b.secrets.writes();
+
+        // The client's HELLO of then, nonce and all, then its bundle of then,
+        // or the server's own reply of then. The server's nonce is new.
+        for (what, bundle) in [
+            ("the client's old bundle", &old_bundle),
+            ("the server's own old reply", &old_reply),
+        ] {
+            let (cs, ss) = pair();
+            cs.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let server = spawn_server(ss, b.state.take().unwrap(), PASS);
+            write_frame(&mut &cs, KIND_HELLO, &old_hello).unwrap();
+            assert_eq!(read_frame(&mut &cs).unwrap().0, KIND_HELLO);
+            write_frame(&mut &cs, KIND_BUNDLE, bundle).unwrap();
+            let (kind, payload) = read_frame(&mut &cs).unwrap();
+            drop(cs);
+            let (served, back) = server.join().unwrap();
+            b.state = Some(back);
+
+            assert_eq!(
+                (kind, payload[0]),
+                (KIND_ERROR, CODE_WRONG_SYNC_KEY),
+                "{what}"
+            );
+            assert!(
+                matches!(served, Err(SyncError::WrongSyncKey)),
+                "{what}: got {served:?}"
+            );
+            assert_eq!(file_of(&b.path), b_file, "{what}");
+            assert_eq!(b.secrets.writes(), writes, "{what}");
+            assert_eq!(b.last_sync(), recorded, "{what}: no sync is recorded");
+        }
     }
 
     // ----- a sync through the partner's jump host (issue #9) -----

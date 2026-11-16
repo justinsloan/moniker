@@ -4,10 +4,10 @@
 //! reverses it. The passphrase never leaves the machine: only the sealed bytes
 //! travel over SSH.
 //!
-//! Format (version 1, every length fixed):
+//! Format (version 2, every length fixed):
 //!
 //! ```text
-//! magic "MONIKER1" (8) ‖ salt (16) ‖ nonce (24) ‖ XChaCha20-Poly1305 ciphertext ‖ tag (16)
+//! magic "MONIKER2" (8) ‖ salt (16) ‖ nonce (24) ‖ XChaCha20-Poly1305 ciphertext ‖ tag (16)
 //! ```
 //!
 //! * The plaintext is the JSON serialization of the entry list.
@@ -15,10 +15,26 @@
 //!   with m = 64 MiB, t = 3, p = 1 and a 32-byte output. The parameters are
 //!   constants tied to the magic and are never read from the blob, so a
 //!   tampered blob cannot pick a weaker (or ruinously expensive) KDF.
-//! * The magic is the AEAD associated data. Salt and nonce are not authenticated
-//!   directly, but changing either changes the key or the keystream, so the tag
-//!   check fails all the same.
+//! * The AEAD associated data binds a bundle to the one sync it was sealed for
+//!   and to the side that sealed it:
+//!
+//!   ```text
+//!   magic (8) ‖ role (1: 'C' client, 'S' server) ‖ client's session nonce (32) ‖ server's session nonce (32)
+//!   ```
+//!
+//!   Of these only the magic is in the blob. The role and the [`Session`] are
+//!   given to [`seal`] and again to [`open`], which is told whose bundle it
+//!   expects and in which exchange, so a bundle authenticates only as the
+//!   other side's message of that very exchange. One handed back to the side
+//!   that sealed it, or kept from another sync under the same passphrase,
+//!   fails the tag check exactly as a wrong passphrase does.
+//! * Salt and nonce are not authenticated directly, but changing either
+//!   changes the key or the keystream, so the tag check fails all the same.
 //! * Salt and nonce come fresh from the OS CSPRNG on every [`seal`].
+//!
+//! Version 1 (`MONIKER1`, Moniker 1.0.1 and older) had the magic alone as
+//! associated data, so a bundle opened for any holder of the passphrase, in
+//! either direction and in any sync. It is not read.
 //!
 //! Secret handling (best effort; Rust can move or copy values in ways that
 //! cannot be fully controlled):
@@ -71,21 +87,79 @@ pub enum CryptoError {
     Random,
 }
 
-/// Format magic, also the AEAD associated data. Bump it to change anything
-/// in the format, the KDF parameters included.
-const MAGIC: &[u8; MAGIC_LEN] = b"MONIKER1";
+/// Format magic, and the start of the AEAD associated data. Bump it to change
+/// anything in the format, the KDF parameters and the associated data included.
+const MAGIC: &[u8; MAGIC_LEN] = b"MONIKER2";
 const MAGIC_LEN: usize = 8;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 const HEADER_LEN: usize = MAGIC_LEN + SALT_LEN + NONCE_LEN;
+/// Magic, role, and the two session nonces.
+const AAD_LEN: usize = MAGIC_LEN + 1 + 2 * SESSION_NONCE_LEN;
 
-/// Argon2id memory cost in KiB (64 MiB), for format `MONIKER1`.
+/// Length of a [`SessionNonce`].
+pub const SESSION_NONCE_LEN: usize = 32;
+
+/// The random value one side draws for one sync ([`session_nonce`]) and says
+/// in its HELLO. Not a secret. (Not the AEAD nonce, which is in the blob.)
+pub type SessionNonce = [u8; SESSION_NONCE_LEN];
+
+/// Which side of a sync sealed a bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The side that started the sync.
+    Client,
+    /// The side that answered it.
+    Server,
+}
+
+impl Role {
+    /// The byte that stands for the role in the associated data.
+    const fn byte(self) -> u8 {
+        match self {
+            Role::Client => b'C',
+            Role::Server => b'S',
+        }
+    }
+}
+
+/// One sync exchange: the nonce each side drew for it. A bundle is sealed for
+/// one session and opens in no other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Session {
+    /// The nonce in the client's HELLO.
+    pub client: SessionNonce,
+    /// The nonce in the server's HELLO.
+    pub server: SessionNonce,
+}
+
+/// A session nonce, fresh from the OS CSPRNG. Each side draws one per sync.
+pub fn session_nonce() -> Result<SessionNonce, CryptoError> {
+    let mut nonce = [0u8; SESSION_NONCE_LEN];
+    getrandom::fill(&mut nonce).map_err(|_| CryptoError::Random)?;
+    Ok(nonce)
+}
+
+/// The AEAD associated data of a bundle that `from` seals in `session`.
+fn associated_data(from: Role, session: &Session) -> [u8; AAD_LEN] {
+    let mut aad = [0u8; AAD_LEN];
+    let (magic, rest) = aad.split_at_mut(MAGIC_LEN);
+    magic.copy_from_slice(MAGIC);
+    let (role, nonces) = rest.split_at_mut(1);
+    role[0] = from.byte();
+    let (client, server) = nonces.split_at_mut(SESSION_NONCE_LEN);
+    client.copy_from_slice(&session.client);
+    server.copy_from_slice(&session.server);
+    aad
+}
+
+/// Argon2id memory cost in KiB (64 MiB), for format `MONIKER2`.
 const KDF_M_COST_KIB: u32 = 64 * 1024;
-/// Argon2id iterations, for format `MONIKER1`.
+/// Argon2id iterations, for format `MONIKER2`.
 const KDF_T_COST: u32 = 3;
-/// Argon2id parallelism, for format `MONIKER1`.
+/// Argon2id parallelism, for format `MONIKER2`.
 const KDF_P_COST: u32 = 1;
 /// Checked at compile time.
 const KDF_PARAMS: Params = match Params::new(KDF_M_COST_KIB, KDF_T_COST, KDF_P_COST, Some(KEY_LEN))
@@ -94,11 +168,17 @@ const KDF_PARAMS: Params = match Params::new(KDF_M_COST_KIB, KDF_T_COST, KDF_P_C
     Err(_) => panic!("invalid Argon2 parameters"),
 };
 
-/// Encrypt `entries` under `passphrase`.
+/// Encrypt `entries` under `passphrase`, as the message of `from` in
+/// `session`.
 ///
 /// Each call uses a fresh random salt and nonce, so sealing the same input
 /// twice gives different bytes. Takes a fraction of a second (the KDF).
-pub fn seal(passphrase: &str, entries: &[BundleEntry]) -> Result<Vec<u8>, CryptoError> {
+pub fn seal(
+    passphrase: &str,
+    from: Role,
+    session: &Session,
+    entries: &[BundleEntry],
+) -> Result<Vec<u8>, CryptoError> {
     if passphrase.is_empty() {
         return Err(CryptoError::EmptyPassphrase);
     }
@@ -106,16 +186,27 @@ pub fn seal(passphrase: &str, entries: &[BundleEntry]) -> Result<Vec<u8>, Crypto
     let mut nonce = [0u8; NONCE_LEN];
     getrandom::fill(&mut salt).map_err(|_| CryptoError::Random)?;
     getrandom::fill(&mut nonce).map_err(|_| CryptoError::Random)?;
-    seal_with(passphrase, entries, &salt, &nonce)
+    seal_with(passphrase, from, session, entries, &salt, &nonce)
 }
 
-/// Decrypt a bundle made by [`seal`] with the same passphrase.
+/// Decrypt a bundle that `from` sealed in `session` with [`seal`] and the same
+/// passphrase.
+///
+/// A bundle sealed by the other role, or in another session, fails with
+/// [`CryptoError::WrongKeyOrCorrupt`] like one sealed with another passphrase:
+/// the caller says whose message it expects and in which exchange, and nothing
+/// else opens.
 ///
 /// Input that cannot be a sealed bundle (wrong magic, too short) is rejected
 /// with [`CryptoError::BadFormat`] before the KDF runs, so garbage is cheap to
 /// refuse. The entries are not validated here; callers must still run
 /// [`Profile::validate`](crate::profile::Profile::validate) on them.
-pub fn open(passphrase: &str, sealed: &[u8]) -> Result<Vec<BundleEntry>, CryptoError> {
+pub fn open(
+    passphrase: &str,
+    from: Role,
+    session: &Session,
+    sealed: &[u8],
+) -> Result<Vec<BundleEntry>, CryptoError> {
     if passphrase.is_empty() {
         return Err(CryptoError::EmptyPassphrase);
     }
@@ -128,7 +219,7 @@ pub fn open(passphrase: &str, sealed: &[u8]) -> Result<Vec<BundleEntry>, CryptoE
     cipher(&key)
         .decrypt_inout_detached(
             <&XNonce>::from(parts.nonce),
-            MAGIC,
+            &associated_data(from, session),
             buf.as_mut_slice().into(),
             <&Tag>::from(parts.tag),
         )
@@ -168,6 +259,8 @@ impl<'a> Parts<'a> {
 /// reach this through [`seal`]; tests use it to pin the format.
 fn seal_with(
     passphrase: &str,
+    from: Role,
+    session: &Session,
     entries: &[BundleEntry],
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
@@ -194,13 +287,21 @@ fn seal_with(
         // The two passes disagreed; never happens for derived serializers.
         return Err(CryptoError::Serialize);
     }
-    encrypt_sealed(passphrase, salt, nonce, buf)
+    encrypt_sealed(
+        passphrase,
+        &associated_data(from, session),
+        salt,
+        nonce,
+        buf,
+    )
 }
 
-/// Encrypt `buf` (header ‖ plaintext) in place and append the tag, giving the
-/// sealed blob. `buf` should have room for the tag so it does not reallocate.
+/// Encrypt `buf` (header ‖ plaintext) in place under the associated data `aad`
+/// and append the tag, giving the sealed blob. `buf` should have room for the
+/// tag so it does not reallocate.
 fn encrypt_sealed(
     passphrase: &str,
+    aad: &[u8; AAD_LEN],
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
     mut buf: Zeroizing<Vec<u8>>,
@@ -209,18 +310,14 @@ fn encrypt_sealed(
     derive_key(passphrase, salt, &mut key)?;
 
     let tag = cipher(&key)
-        .encrypt_inout_detached(
-            <&XNonce>::from(nonce),
-            MAGIC,
-            (&mut buf[HEADER_LEN..]).into(),
-        )
+        .encrypt_inout_detached(<&XNonce>::from(nonce), aad, (&mut buf[HEADER_LEN..]).into())
         .map_err(|_| CryptoError::TooLarge)?;
     // Only ciphertext is in `buf` from here on.
     buf.extend_from_slice(&tag);
     Ok(std::mem::take(&mut *buf))
 }
 
-/// Argon2id(passphrase, salt) with the `MONIKER1` parameters, written into
+/// Argon2id(passphrase, salt) with the `MONIKER2` parameters, written into
 /// `key`. The KDF's working memory is zeroized before it is freed.
 fn derive_key(
     passphrase: &str,
@@ -301,6 +398,14 @@ mod tests {
     const ID_B: &str = "00000000-0000-4000-8000-00000000000b";
     const ID_C: &str = "00000000-0000-4000-8000-00000000000c";
 
+    /// The exchange these tests seal and open in, as its client unless a test
+    /// says otherwise.
+    const SESSION: Session = Session {
+        client: [0xc1; SESSION_NONCE_LEN],
+        server: [0x5e; SESSION_NONCE_LEN],
+    };
+    const FROM: Role = Role::Client;
+
     /// A live entry for `id` with fixed fields.
     fn live(id: &str, password: Option<&str>) -> BundleEntry {
         let mut profile = Profile::new("web", "example.com", "alice");
@@ -361,27 +466,87 @@ mod tests {
     #[test]
     fn roundtrip() {
         let entries = sample();
-        let sealed = seal(PASS, &entries).unwrap();
-        assert_eq!(&sealed[..MAGIC_LEN], b"MONIKER1");
-        assert_eq!(open(PASS, &sealed).unwrap(), entries);
+        let sealed = seal(PASS, FROM, &SESSION, &entries).unwrap();
+        assert_eq!(&sealed[..MAGIC_LEN], b"MONIKER2");
+        assert_eq!(open(PASS, FROM, &SESSION, &sealed).unwrap(), entries);
     }
 
     #[test]
     fn wrong_passphrase_fails() {
-        let sealed = seal(PASS, &sample()).unwrap();
+        let sealed = seal(PASS, FROM, &SESSION, &sample()).unwrap();
         assert_eq!(
-            open("correct horse battery stapler", &sealed),
+            open("correct horse battery stapler", FROM, &SESSION, &sealed),
             Err(CryptoError::WrongKeyOrCorrupt)
         );
     }
 
     #[test]
+    fn a_bundle_opens_only_as_its_sender_s_message_of_its_session() {
+        let entries = sample();
+        let other = |role: Role| match role {
+            Role::Client => Role::Server,
+            Role::Server => Role::Client,
+        };
+        for from in [Role::Client, Role::Server] {
+            let sealed = seal(PASS, from, &SESSION, &entries).unwrap();
+            assert_eq!(open(PASS, from, &SESSION, &sealed).unwrap(), entries);
+
+            // Handed back to the side that sealed it, which expects the other
+            // side's message: the right passphrase does not help.
+            assert_eq!(
+                open(PASS, other(from), &SESSION, &sealed),
+                Err(CryptoError::WrongKeyOrCorrupt),
+                "sealed by {from:?}, opened as the other role's"
+            );
+
+            // Kept from another exchange: one nonce of the two differs, by a
+            // single bit, or the two are the other way around.
+            let mut later_client = SESSION;
+            later_client.client[SESSION_NONCE_LEN - 1] ^= 0x01;
+            let mut later_server = SESSION;
+            later_server.server[0] ^= 0x80;
+            let swapped = Session {
+                client: SESSION.server,
+                server: SESSION.client,
+            };
+            for (what, session) in [
+                ("another client nonce", later_client),
+                ("another server nonce", later_server),
+                ("the nonces swapped", swapped),
+            ] {
+                assert_eq!(
+                    open(PASS, from, &session, &sealed),
+                    Err(CryptoError::WrongKeyOrCorrupt),
+                    "sealed by {from:?}, opened with {what}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_associated_data_is_magic_role_and_both_nonces() {
+        let aad = associated_data(Role::Server, &SESSION);
+        let mut want = b"MONIKER2S".to_vec();
+        want.extend_from_slice(&SESSION.client);
+        want.extend_from_slice(&SESSION.server);
+        assert_eq!(aad.as_slice(), want.as_slice());
+        assert_eq!(associated_data(Role::Client, &SESSION)[MAGIC_LEN], b'C');
+    }
+
+    #[test]
+    fn session_nonces_differ_each_time() {
+        let (one, two) = (session_nonce().unwrap(), session_nonce().unwrap());
+        assert_ne!(one, two);
+        assert_ne!(one, [0u8; SESSION_NONCE_LEN]);
+    }
+
+    #[test]
     fn flipped_byte_fails() {
-        let sealed = seal(PASS, &[live(ID_A, Some(SECRET))]).unwrap();
+        let sealed = seal(PASS, FROM, &SESSION, &[live(ID_A, Some(SECRET))]).unwrap();
         let flipped = |at: usize| {
             let mut copy = sealed.clone();
             copy[at] ^= 0x01;
-            open(PASS, &copy)
+            open(PASS, FROM, &SESSION, &copy)
         };
         // Ciphertext body, last tag byte, salt, nonce: authentication fails.
         for (what, at) in [
@@ -403,16 +568,19 @@ mod tests {
     #[test]
     fn garbage_is_bad_format() {
         reset_kdf_runs();
-        assert_eq!(open(PASS, b"nope"), Err(CryptoError::BadFormat));
-        assert_eq!(open(PASS, b""), Err(CryptoError::BadFormat));
+        assert_eq!(
+            open(PASS, FROM, &SESSION, b"nope"),
+            Err(CryptoError::BadFormat)
+        );
+        assert_eq!(open(PASS, FROM, &SESSION, b""), Err(CryptoError::BadFormat));
         assert_eq!(kdf_runs(), 0, "garbage must be rejected before the KDF");
 
-        let sealed = seal(PASS, &[]).unwrap();
+        let sealed = seal(PASS, FROM, &SESSION, &[]).unwrap();
         reset_kdf_runs();
         // Too short to hold a header and a tag.
         for len in [0, MAGIC_LEN, HEADER_LEN, HEADER_LEN + TAG_LEN - 1] {
             assert_eq!(
-                open(PASS, &sealed[..len]),
+                open(PASS, FROM, &SESSION, &sealed[..len]),
                 Err(CryptoError::BadFormat),
                 "truncated to {len} bytes"
             );
@@ -422,7 +590,7 @@ mod tests {
         // Long enough to parse but missing ciphertext bytes: the tag no
         // longer matches, which is indistinguishable from corruption.
         assert_eq!(
-            open(PASS, &sealed[..sealed.len() - 1]),
+            open(PASS, FROM, &SESSION, &sealed[..sealed.len() - 1]),
             Err(CryptoError::WrongKeyOrCorrupt)
         );
     }
@@ -434,20 +602,24 @@ mod tests {
         for plaintext in [&b"not json"[..], br#"{"profile":1}"#] {
             let mut buf =
                 Zeroizing::new(Vec::with_capacity(HEADER_LEN + plaintext.len() + TAG_LEN));
-            buf.extend_from_slice(b"MONIKER1");
+            buf.extend_from_slice(b"MONIKER2");
             buf.extend_from_slice(&salt);
             buf.extend_from_slice(&nonce);
             buf.extend_from_slice(plaintext);
-            let sealed = encrypt_sealed(PASS, &salt, &nonce, buf).unwrap();
-            assert_eq!(open(PASS, &sealed), Err(CryptoError::BadFormat));
+            let aad = associated_data(FROM, &SESSION);
+            let sealed = encrypt_sealed(PASS, &aad, &salt, &nonce, buf).unwrap();
+            assert_eq!(
+                open(PASS, FROM, &SESSION, &sealed),
+                Err(CryptoError::BadFormat)
+            );
         }
     }
 
     #[test]
     fn seals_differ_each_time() {
         let entries = [live(ID_A, Some(SECRET))];
-        let one = seal(PASS, &entries).unwrap();
-        let two = seal(PASS, &entries).unwrap();
+        let one = seal(PASS, FROM, &SESSION, &entries).unwrap();
+        let two = seal(PASS, FROM, &SESSION, &entries).unwrap();
         assert_ne!(one, two);
         // Fresh salt and fresh nonce, not just one of them.
         assert_ne!(
@@ -462,7 +634,7 @@ mod tests {
 
     #[test]
     fn password_not_visible_in_sealed_bytes() {
-        let sealed = seal(PASS, &[live(ID_A, Some(SECRET))]).unwrap();
+        let sealed = seal(PASS, FROM, &SESSION, &[live(ID_A, Some(SECRET))]).unwrap();
         for needle in [SECRET, PASS, "example.com", "alice", "password", ID_A] {
             assert!(
                 !contains(&sealed, needle.as_bytes()),
@@ -475,14 +647,20 @@ mod tests {
     fn empty_passphrase_rejected() {
         reset_kdf_runs();
         assert_eq!(
-            seal("", &[live(ID_A, Some(SECRET))]),
+            seal("", FROM, &SESSION, &[live(ID_A, Some(SECRET))]),
             Err(CryptoError::EmptyPassphrase)
         );
         // Even a blob with a valid header.
-        let mut blob = b"MONIKER1".to_vec();
+        let mut blob = b"MONIKER2".to_vec();
         blob.resize(HEADER_LEN + TAG_LEN + 2, 0);
-        assert_eq!(open("", &blob), Err(CryptoError::EmptyPassphrase));
-        assert_eq!(open("", b"nope"), Err(CryptoError::EmptyPassphrase));
+        assert_eq!(
+            open("", FROM, &SESSION, &blob),
+            Err(CryptoError::EmptyPassphrase)
+        );
+        assert_eq!(
+            open("", FROM, &SESSION, b"nope"),
+            Err(CryptoError::EmptyPassphrase)
+        );
         assert_eq!(
             kdf_runs(),
             0,
@@ -492,28 +670,37 @@ mod tests {
 
     #[test]
     fn empty_entry_list_roundtrips() {
-        let sealed = seal(PASS, &[]).unwrap();
+        let sealed = seal(PASS, FROM, &SESSION, &[]).unwrap();
         // "[]" plus the header and tag.
         assert_eq!(sealed.len(), HEADER_LEN + 2 + TAG_LEN);
-        assert_eq!(open(PASS, &sealed).unwrap(), Vec::<BundleEntry>::new());
+        assert_eq!(
+            open(PASS, FROM, &SESSION, &sealed).unwrap(),
+            Vec::<BundleEntry>::new()
+        );
     }
 
     #[test]
     fn rejects_wrong_magic_without_running_kdf() {
-        let mut sealed = seal(PASS, &[live(ID_A, Some(SECRET))]).unwrap();
-        for (i, b) in b"MONIKER2".iter().enumerate() {
-            sealed[i] = *b;
+        // The magic of the format before this one (Moniker 1.0.1 and older),
+        // and one that never was.
+        for magic in [b"MONIKER1", b"MONIKER3"] {
+            let mut sealed = seal(PASS, FROM, &SESSION, &[live(ID_A, Some(SECRET))]).unwrap();
+            sealed[..MAGIC_LEN].copy_from_slice(magic);
+            reset_kdf_runs();
+            // The correct passphrase does not help: the format is not ours.
+            assert_eq!(
+                open(PASS, FROM, &SESSION, &sealed),
+                Err(CryptoError::BadFormat)
+            );
+            assert_eq!(kdf_runs(), 0, "wrong magic must be rejected before the KDF");
         }
-        reset_kdf_runs();
-        // The correct passphrase does not help: the format is not ours.
-        assert_eq!(open(PASS, &sealed), Err(CryptoError::BadFormat));
-        assert_eq!(kdf_runs(), 0, "wrong magic must be rejected before the KDF");
     }
 
     #[test]
     fn tombstones_roundtrip_without_password() {
         let entries = vec![tomb(ID_A), tomb(ID_B)];
-        let back = open(PASS, &seal(PASS, &entries).unwrap()).unwrap();
+        let sealed = seal(PASS, FROM, &SESSION, &entries).unwrap();
+        let back = open(PASS, FROM, &SESSION, &sealed).unwrap();
         assert_eq!(back, entries);
         assert!(
             back.iter()
@@ -527,20 +714,28 @@ mod tests {
         let mut entry = live(ID_A, Some(SECRET));
         entry.profile.key_file = Some(PathBuf::from(std::ffi::OsStr::from_bytes(b"/k\xff")));
         reset_kdf_runs();
-        assert_eq!(seal(PASS, &[entry]), Err(CryptoError::Serialize));
+        assert_eq!(
+            seal(PASS, FROM, &SESSION, &[entry]),
+            Err(CryptoError::Serialize)
+        );
         assert_eq!(kdf_runs(), 0, "serialization fails before the KDF");
     }
 
-    /// Pins the wire format: magic, layout, KDF parameters, AEAD and the
-    /// JSON encoding of `BundleEntry`. If this fails after a change to
-    /// `Profile`, sealing changed: bump the magic or make sure the committed
-    /// blob still opens (the `open` half must never stop passing).
+    /// Pins the wire format: magic, layout, KDF parameters, AEAD, associated
+    /// data and the JSON encoding of `BundleEntry`. If this fails after a
+    /// change to `Profile`, sealing changed: bump the magic or make sure the
+    /// committed blob still opens (the `open` half must never stop passing).
     #[test]
     fn format_is_stable() {
-        // Generated once from this implementation and cross-checked with
-        // libsodium (Argon2id t=3/64 MiB/p=1 + XChaCha20-Poly1305-IETF).
+        // The passphrase, salt, nonce and entries are those of the `MONIKER1`
+        // blob this test pinned before, which was generated from this
+        // implementation and cross-checked with libsodium (Argon2id t=3/64
+        // MiB/p=1 + XChaCha20-Poly1305-IETF). The key and the keystream do not
+        // depend on the associated data, so the ciphertext is that blob's,
+        // byte for byte. The magic and the tag (the last 16 bytes, which now
+        // cover the role and the session) are from this implementation alone.
         const SEALED: &str = concat!(
-            "4d4f4e494b455231000102030405060708090a0b0c0d0e0fa0a1a2a3a4a5a6a7",
+            "4d4f4e494b455232000102030405060708090a0b0c0d0e0fa0a1a2a3a4a5a6a7",
             "a8a9aaabacadaeafb0b1b2b3b4b5b6b766498352ef1da65301e15314fcdc52aa",
             "4274545435bc8119c95cf5082fdb946e8626e72f1177f8a1b905fa9c61b31365",
             "0283388f6e5c22eed3ec01a6f79782527771498673e285f1f1e2b39321896235",
@@ -556,8 +751,8 @@ mod tests {
             "dc2583de66e10f46283592402b284911730d281167d6bf62279eccf68a7d74d7",
             "e6c49b34ed54872e82d27b370f0c245a0943fc73f4330a55305af09f5b647924",
             "e4b0147fd84d3e1e1318dfa703feec185df48195cc6115be2299674b1f8c6cae",
-            "61d4c74a720dd7a36a2b5a595bb29fac36e934b862d3c5a0026ba08ff904114e",
-            "61b16e",
+            "61d4c74a720dd7a36a2b5a595bb29fac36e9344a7a9faad7c700b977d9f08d61",
+            "feee6e",
         );
         let mut entry = live(ID_A, Some("s3cret"));
         entry.profile.sequences.push(StartupSequence {
@@ -567,9 +762,16 @@ mod tests {
         let entries = vec![entry, tomb(ID_B)];
         let salt: [u8; SALT_LEN] = core::array::from_fn(|i| i as u8);
         let nonce: [u8; NONCE_LEN] = core::array::from_fn(|i| 0xa0 + i as u8);
+        let session = Session {
+            client: core::array::from_fn(|i| 0x40 + i as u8),
+            server: core::array::from_fn(|i| 0x80 + i as u8),
+        };
 
-        let sealed = seal_with(PASS, &entries, &salt, &nonce).unwrap();
+        let sealed = seal_with(PASS, Role::Client, &session, &entries, &salt, &nonce).unwrap();
         assert_eq!(hex(&sealed), SEALED, "sealed output changed");
-        assert_eq!(open(PASS, &unhex(SEALED)).unwrap(), entries);
+        assert_eq!(
+            open(PASS, Role::Client, &session, &unhex(SEALED)).unwrap(),
+            entries
+        );
     }
 }
