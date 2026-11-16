@@ -131,8 +131,8 @@ pub(crate) enum Kind {
     /// A connection to a saved profile, by id. `name` is the profile's name at
     /// the time, kept only to say which profile is gone.
     Profile { id: String, name: String },
-    /// A local terminal and the folder its shell last reported (an absolute
-    /// path), if it did.
+    /// A local terminal and the folder its program was in (an absolute path),
+    /// if that could be read.
     Local { dir: Option<PathBuf> },
     /// The new-tab list.
     List,

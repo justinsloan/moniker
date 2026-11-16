@@ -564,7 +564,7 @@ fn gui_integration() {
     sessions::a_profile_gone_shows_the_list_with_a_note(&tmp.path().join("sess-gone"));
     sessions::a_renamed_profile_still_connects(&bin, &tmp.path().join("sess-renamed"));
     sessions::a_folder_gone_starts_at_home(&tmp.path().join("sess-folder"));
-    sessions::a_folder_reported_for_another_machine_is_not_saved(&tmp.path().join("sess-host"));
+    sessions::a_folder_printed_to_the_terminal_is_not_saved(&tmp.path().join("sess-host"));
     sessions::restored_panes_save_a_transcript_as_a_plain_click_would(
         &bin,
         &tmp.path().join("sess-transcripts"),

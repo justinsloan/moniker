@@ -11,8 +11,8 @@
 //! title, text size, transcript, askpass marker and root state. The tab, the
 //! window's actions and the ☰ menu go by the tab's focused pane. The holder
 //! also keeps what its pane shows ([`PaneKind`]), which a saved session
-//! records (`crate::session_layout`, issue #12), with the folder a local shell
-//! last reported ([`current_folder`]).
+//! records (`crate::session_layout`, issue #12), with the folder a local
+//! pane's program is in, as the kernel says ([`current_folder`]).
 //!
 //! [`open_profile`] turns a profile into an `ssh` command with
 //! `moniker_core::ssh::terminal_command` and runs it in a VTE tab. The command
@@ -436,10 +436,10 @@ pub(crate) enum PaneKind {
     /// A local terminal: the person's shell (after one of Local terminal's
     /// startup sequences or not, issue #13), or a command started with
     /// `moniker -- COMMAND` (issue #15). A session saves each as a shell in the
-    /// folder the terminal last reported, never a sequence or a command;
-    /// `started_in` is the folder a command or a sequence was started in, for
-    /// one that never reports one (none for a plain shell, which reports its
-    /// own).
+    /// folder its program is in ([`current_folder`]), never a sequence or a
+    /// command; `started_in` is the folder a command or a sequence was started
+    /// in, for when that cannot be read (the program has ended), and none for a
+    /// plain shell.
     Local { started_in: Option<PathBuf> },
     /// A connection to the saved profile `id`, from the moment it is picked:
     /// while it waits for the keyring, and after its session has ended too.
@@ -2133,27 +2133,44 @@ fn can_enter(dir: &Path) -> bool {
     rustix::fs::access(dir, rustix::fs::Access::EXEC_OK).is_ok()
 }
 
-/// The folder the program in `terminal` last reported as its own (the shell's
-/// OSC 7, VTE's current directory: `file://HOST/PATH`, percent-encoded), if it
-/// did ([`folder_of_uri`]). Read when a session is saved, never followed.
+/// The folder the program in `terminal` is in, as the kernel has it: the
+/// working directory of its pty's foreground process group (the shell at its
+/// prompt, or the program it runs), else of the pty's session leader (the
+/// shell or the command Moniker started), each read from `/proc`
+/// ([`folder_of_process`]). Read when a session is saved, never followed.
+///
+/// Never what the terminal was told (a shell's OSC 7, VTE's current
+/// directory): that is text any program in the pane can print, and so can a
+/// server behind an `ssh` typed in a local pane, whatever host it names, and
+/// the folder a restored shell and Local terminal's default sequence start in
+/// is not theirs to choose. A program run as another user (`sudo`) cannot be
+/// read, and the session leader is asked instead. Only a process of the pane is
+/// asked ([`signal_target`]: never Moniker's own, nor the ids 0 and 1).
 pub(crate) fn current_folder(terminal: &Terminal) -> Option<PathBuf> {
-    folder_of_uri(&terminal.current_directory_uri()?, &local_host_name())
+    let pty = terminal.pty()?;
+    let group = tcgetpgrp(pty.fd()).ok().map(Pid::as_raw_pid);
+    let leader = pty_session(pty.fd());
+    [group, leader]
+        .into_iter()
+        .flatten()
+        .filter_map(signal_target)
+        .find_map(|pid| folder_of_process(pid.as_raw_pid()))
 }
 
-/// The folder that the OSC 7 address `uri` names, an absolute path, if the
-/// address is one on this machine: a host that is empty, `localhost` or
-/// `node_name` (this machine's name as `uname` reports it, which names local
-/// transcripts too: [`local_host_name`]), in any case. Any other host is none:
-/// a shell over `ssh` run by hand in a local pane reports the remote machine's
-/// folders, and a program can print the sequence, and neither may choose the
-/// folder a restored local shell starts in.
-fn folder_of_uri(uri: &str, node_name: &str) -> Option<PathBuf> {
-    let (path, host) = glib::filename_from_uri(uri).ok()?;
-    let here = host.as_deref().is_none_or(|host| {
-        let host = host.to_lowercase();
-        host.is_empty() || host == "localhost" || host == node_name.to_lowercase()
-    });
-    (here && path.is_absolute()).then_some(path)
+/// The working directory of the process `pid`, from `/proc/<pid>/cwd`: the
+/// path the link names, only if that path is that very folder now (the same
+/// device and inode). The kernel adds " (deleted)" to a folder that was
+/// removed, and a folder can be renamed or replaced meanwhile: none then. None
+/// as well when the process cannot be read: gone, or another user's (reading
+/// the link takes the right to trace the process).
+fn folder_of_process(pid: c_int) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let link = PathBuf::from(format!("/proc/{pid}/cwd"));
+    let path = std::fs::read_link(&link).ok()?;
+    let there = std::fs::metadata(&link).ok()?;
+    let named = std::fs::metadata(&path).ok()?;
+    let same = there.is_dir() && there.dev() == named.dev() && there.ino() == named.ino();
+    (same && path.is_absolute()).then_some(path)
 }
 
 /// [`start_local_shell_in`] with the shell and the directory given (the tests
@@ -2167,7 +2184,7 @@ pub(crate) fn start_shell_in(
 ) -> Terminal {
     let terminal = begin_session(holder, TabTitle::local());
     root::watch_local(holder, &terminal);
-    // The shell reports its own folder.
+    // Where the shell is, the kernel says ([`current_folder`]).
     holder.kind().replace(PaneKind::Local { started_in: None });
     // The pane holds a session now (New Session… is offered).
     refresh_title(holder);
@@ -3505,42 +3522,53 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_is_taken_only_from_this_machine() {
-        let folder = |uri: &str, node: &str| folder_of_uri(uri, node);
-        let tmp = Some(PathBuf::from("/tmp/My Files/Ü"));
-        let encoded = "/tmp/My%20Files/%C3%9C";
-        // No host, localhost, or this machine's node name, in any case.
-        for host in ["", "localhost", "LocalHost", "box", "BOX", "Box"] {
-            assert_eq!(
-                folder(&format!("file://{host}{encoded}"), "box"),
-                tmp,
-                "{host:?}"
-            );
-        }
+    fn a_folder_is_where_the_kernel_says_the_process_is() {
+        // This process: where it runs.
+        let here = std::env::current_dir().expect("this process's folder");
+        assert_eq!(folder_of_process(std::process::id() as c_int), Some(here));
+
+        // A child in a folder of its own, with a space and letters beyond
+        // ASCII in its name: that folder, as the kernel names it.
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("My Files").join("Ünï");
+        std::fs::create_dir_all(&folder).unwrap();
+        let folder = std::fs::canonicalize(&folder).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&folder)
+            .spawn()
+            .expect("sleep");
+        let pid = child.id() as c_int;
+        assert_eq!(folder_of_process(pid), Some(folder.clone()));
+
+        // Removed under it, the folder is none: the kernel names it
+        // "… (deleted)", which is no folder, or another one, even a folder
+        // that someone made with that very name.
+        std::fs::remove_dir(&folder).unwrap();
+        assert_eq!(folder_of_process(pid), None, "a folder removed");
+        std::fs::create_dir(&folder).unwrap();
+        assert_eq!(folder_of_process(pid), None, "a new folder of that name");
+        let named = folder.with_file_name("Ünï (deleted)");
+        std::fs::create_dir(&named).unwrap();
         assert_eq!(
-            folder(&format!("file://box{encoded}"), "BOX"),
-            tmp,
-            "a node name in capitals"
+            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap(),
+            named,
+            "the name the kernel gives"
         );
-        // Any other host is not this machine: a shell over ssh run by hand in
-        // a local pane, or a printed escape sequence, reports one.
-        for host in [
-            "other",
-            "box.example.org",
-            "boxes",
-            "bo",
-            "127.0.0.1",
-            "[::1]",
-        ] {
-            assert_eq!(
-                folder(&format!("file://{host}{encoded}"), "box"),
-                None,
-                "{host:?}"
-            );
-        }
-        // Not a file address, or not one at all.
-        for uri in ["http://box/tmp", "/tmp", "", "file:tmp"] {
-            assert_eq!(folder(uri, "box"), None, "{uri:?}");
+        assert_eq!(
+            folder_of_process(pid),
+            None,
+            "a folder of the name it gives"
+        );
+
+        // Ended, it has no folder.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(folder_of_process(pid), None, "a process that has ended");
+
+        // Another user's process cannot be read (init, unless this is root).
+        if !rustix::process::geteuid().is_root() {
+            assert_eq!(folder_of_process(1), None, "init");
         }
     }
 

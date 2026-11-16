@@ -7,10 +7,9 @@
 //! waiting for the keyring, one whose session ended and a command tab are
 //! saved as.
 //!
-//! The window suite has no `$SHELL`, so a local pane runs `/bin/sh`, which does
-//! not report its folder by itself: a scenario feeds it the `printf` of an OSC 7
-//! that bash and zsh send on Ubuntu (`vte-2.91.sh`), and reads `$PWD` back the
-//! same way.
+//! The window suite has no `$SHELL`, so a local pane runs `/bin/sh`: a scenario
+//! moves it with `cd` (where it is, the kernel says, which is what a layout
+//! saves) and reads `$PWD` back the same way.
 //!
 //! The Layouts menu beside ＋ (the last scenarios) is how a person does it:
 //! saving a window under a name, opening a saved layout in a new window (issue
@@ -69,15 +68,23 @@ fn percent_encoded(path: &str) -> String {
         .collect()
 }
 
-/// Have the `/bin/sh` in `terminal` report `folder` as a shell does when it
-/// changes folder (OSC 7, `file://HOST/PATH` percent-encoded, with this
-/// machine's name as the host), and wait until the terminal has it.
-fn report_folder(terminal: &Terminal, folder: &str) {
-    report_folder_from(terminal, &terminal_tab::local_host_name(), folder);
+/// Have the `/bin/sh` in `terminal` go to `folder` (`cd`), and wait until the
+/// kernel has it there ([`terminal_tab::current_folder`]).
+fn go_to_folder(terminal: &Terminal, folder: &str) {
+    assert!(!folder.contains('\''), "{folder}");
+    // Input sent before the shell has started is lost.
+    wait_for_text(terminal, "$");
+    terminal.feed_child(format!("cd '{folder}'\n").as_bytes());
+    pump_until("the shell to be in the folder", || {
+        terminal_tab::current_folder(terminal).as_deref() == Some(Path::new(folder))
+    });
 }
 
-/// [`report_folder`] with the host `host`.
-fn report_folder_from(terminal: &Terminal, host: &str, folder: &str) {
+/// Have the `/bin/sh` in `terminal` print an OSC 7 naming `folder` on `host`
+/// (`file://HOST/PATH`, percent-encoded, as a shell sends it, and as a server
+/// behind an `ssh` typed in the pane or a file printed there can), and wait
+/// until the terminal has taken it as its current directory.
+fn print_folder(terminal: &Terminal, host: &str, folder: &str) {
     let encoded = percent_encoded(folder);
     assert!(
         encoded.contains("%20") && encoded.contains("%C3%9C"),
@@ -87,31 +94,45 @@ fn report_folder_from(terminal: &Terminal, host: &str, folder: &str) {
     wait_for_text(terminal, "$");
     let uri = format!("file://{host}{encoded}");
     terminal.feed_child(format!("printf '\\033]7;%s\\007' '{uri}'\n").as_bytes());
-    pump_until("the folder to be reported", || {
+    pump_until("the folder to be printed", || {
         terminal.current_directory_uri().as_deref() == Some(uri.as_str())
     });
 }
 
-/// A folder reported for another machine (a shell over `ssh` run by hand in a
-/// local pane, or a printed escape sequence) is not saved: the pane is saved
-/// with no folder. One reported for this machine afterwards is.
-pub(super) fn a_folder_reported_for_another_machine_is_not_saved(dir: &Path) {
+/// A folder printed to the terminal is not saved (the security review's F3 and
+/// F4): an OSC 7 for no host, `localhost` or this machine's name, which a
+/// server behind an `ssh` typed in a local pane, or a file printed there, can
+/// send as well as a shell, chooses nothing. The folder the shell is in, as the
+/// kernel says, is saved; and once the shell goes to the folder, that one.
+pub(super) fn a_folder_printed_to_the_terminal_is_not_saved(dir: &Path) {
     let folder = dir.join("My Files").join("Ünï");
     fs::create_dir_all(&folder).expect("the folder");
     let there = canonical(&folder);
+    let home = canonical(&glib::home_dir());
     let ctx = ctx_with(dir, &[]);
     let app = test_app();
     let main = main_window(&app, &ctx);
     let terminal = session_in(&pane(&main.view.selected_page().expect("the launch tab")));
-    let local = |dir: Option<PathBuf>| Node::Pane(pane_record(Kind::Local { dir }, None, 1.0));
-    report_folder_from(&terminal, "elsewhere.example.test", &there);
-    assert_eq!(capture(&main.view)[0].root, local(None), "another host");
-    report_folder(&terminal, &there);
-    assert_eq!(
-        capture(&main.view)[0].root,
-        local(Some(PathBuf::from(&there))),
-        "this machine"
-    );
+    let local = |dir: &str| {
+        Node::Pane(pane_record(
+            Kind::Local {
+                dir: Some(PathBuf::from(dir)),
+            },
+            None,
+            1.0,
+        ))
+    };
+    for host in [
+        "",
+        "localhost",
+        &terminal_tab::local_host_name(),
+        "elsewhere.example.test",
+    ] {
+        print_folder(&terminal, host, &there);
+        assert_eq!(capture(&main.view)[0].root, local(&home), "{host:?}");
+    }
+    go_to_folder(&terminal, &there);
+    assert_eq!(capture(&main.view)[0].root, local(&there), "gone there");
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }
@@ -263,10 +284,10 @@ pub(super) fn a_window_comes_back_as_saved(bin: &Path, dir: &Path) {
             .unwrap_or_else(|err| panic!("win.{name}: {err}"));
     };
 
-    // Tab 1: the launch tab's shell reports the folder.
+    // Tab 1: the launch tab's shell goes to the folder.
     let first = a.view.selected_page().expect("the launch tab");
     let local = pane(&first);
-    report_folder(&session_in(&local), &there);
+    go_to_folder(&session_in(&local), &there);
     // Beside it a profile pane, picked from the list as a click does.
     act(&a, panes::SPLIT_RIGHT_ACTION);
     let logs = layout_of(&first).focused_holder().expect("the new pane");
@@ -743,7 +764,7 @@ pub(super) fn a_renamed_profile_still_connects(bin: &Path, dir: &Path) {
 /// one with no folder does, and so does one whose folder is still there but
 /// cannot be entered (no search permission); nothing is said about either. A
 /// recorded name of nothing is no name: the pane is named as a local terminal
-/// is, and saved again with none.
+/// is, and saved again with none, in the home folder it is in now.
 pub(super) fn a_folder_gone_starts_at_home(dir: &Path) {
     let gone = dir.join("gone");
     fs::create_dir_all(&gone).expect("the folder");
@@ -806,8 +827,9 @@ pub(super) fn a_folder_gone_starts_at_home(dir: &Path) {
     assert_eq!(ctx.notice.printed().len(), printed, "no message");
     assert_eq!(main.view.nth_page(1).title(), "Local terminal");
     let again = capture(&main.view);
-    assert_eq!(again[1].root, local(None, None));
-    assert_eq!(again[2].root, local(None, None));
+    let at_home = local(Some(PathBuf::from(&home)), None);
+    assert_eq!(again[1].root, at_home);
+    assert_eq!(again[2].root, at_home);
     main.window.destroy();
     pump_for(Duration::from_millis(200));
 }

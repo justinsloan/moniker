@@ -12,8 +12,8 @@
 //! is) and, for each pane, what it shows ([`PaneKind`]), the name the person
 //! gave it and its text size, and which pane is the tab's focused one. Not
 //! whether it saves a transcript: that is decided again when it is restored. A
-//! local pane is recorded with the folder its terminal last reported for this
-//! machine ([`terminal_tab::current_folder`], the shell's OSC 7); a
+//! local pane is recorded with the folder its program is in, as the kernel says
+//! ([`terminal_tab::current_folder`], never what the terminal was told); a
 //! command started with `moniker -- COMMAND` is recorded as a local pane in that
 //! folder, or the one it was started in, never as its command, and so is a pane
 //! that runs one of Local terminal's startup sequences (issue #13), never its
